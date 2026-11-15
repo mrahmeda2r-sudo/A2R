@@ -342,7 +342,7 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
       bd!.buffer.asUint8List(),
       minWidth: w,
       minHeight: h,
-      quality: 82,
+      quality: await Store.jpegQuality(),
       format: CompressFormat.jpeg,
     );
   } catch (e, st) { AppLog.e('applyFilter', e, st);
@@ -371,7 +371,7 @@ Future<String> persistImage(String src, String name,
       src,
       minWidth: maxSide,
       minHeight: maxSide,
-      quality: mode == PerfMode.pro ? 90 : 82,
+      quality: await Store.jpegQuality(),
       format: CompressFormat.jpeg,
       keepExif: false,
     );
@@ -388,7 +388,7 @@ Future<String> persistImage(String src, String name,
         bd!.buffer.asUint8List(),
         minWidth: w,
         minHeight: h,
-        quality: mode == PerfMode.pro ? 90 : 82,
+        quality: await Store.jpegQuality(),
         format: CompressFormat.jpeg,
       );
     } catch (e, st) { AppLog.e('persistImage', e, st);}
@@ -453,6 +453,14 @@ class TagPos {
   }
 }
 
+/// بتتأكد إن الورقة كلها جوه الصورة، حتى لو مكانها المحفوظ كان لصورة بأبعاد تانية.
+TagPos fitTagPos(TagPos p, Tag t, double aspect) {
+  final th = p.s * t.h / t.w; // ارتفاع الورقة كنسبة من عرض الصورة
+  final cx = p.cx.clamp(p.s / 2, 1 - p.s / 2).toDouble();
+  final cy = th >= aspect ? aspect / 2 : p.cy.clamp(th / 2, aspect - th / 2).toDouble();
+  return p.copyWith(cx: cx, cy: cy);
+}
+
 Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
   final fs = w * kTagFont;
   final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
@@ -487,6 +495,7 @@ Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
 /// صورة الباتش + الورقة فوقها في المكان اللي الموظف اختاره (ضغط واحد بس في الآخر).
 Future<Uint8List> composeBatch(String path, Session s) async {
   final src = await File(path).readAsBytes();
+  if (await Store.noTag(path)) return src; // من غير ورقة
   final sz = await imageSize(src);
   final mode = await Store.perfMode();
   final maxSide = getMaxSide(mode);
@@ -494,7 +503,7 @@ Future<Uint8List> composeBatch(String path, Session s) async {
   final w = img.width.toDouble();
   final h = img.height.toDouble();
   final ref = await receiptTag(1000, s, batch: true);
-  final pos = await Store.pos(path) ?? TagPos.initial(ref);
+  final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref), ref, h / w);
   final tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
   final tImg = await decodeImage(tag.png);
   final rec = ui.PictureRecorder();
@@ -511,7 +520,7 @@ Future<Uint8List> composeBatch(String path, Session s) async {
     bd!.buffer.asUint8List(),
     minWidth: iw,
     minHeight: ih,
-    quality: 82,
+    quality: await Store.jpegQuality(),
     format: CompressFormat.jpeg,
   );
 }
@@ -535,13 +544,15 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
       final bytes = await File(receipts[i]).readAsBytes();
       final sz = await imageSize(bytes);
       final imgH = pageW * sz.h / sz.w;
-      final pageH = bandH + imgH + 1;
+      final hide = await Store.noTag(receipts[i]);
+      final pageH = (hide ? 0.0 : bandH) + imgH + 1;
       final image = pw.MemoryImage(bytes);
       doc.addPage(pw.Page(
         pageFormat: PdfPageFormat(pageW, pageH),
         margin: pw.EdgeInsets.zero,
         build: (_) => pw.Column(children: [
-          pw.Container(
+          if (!hide)
+            pw.Container(
             width: pageW,
             height: bandH,
             alignment: pw.Alignment.center,
@@ -592,6 +603,7 @@ class Store {
       final p = await _p;
       await p.remove('pos:$path');
       await p.remove('edit:$path');
+      await p.remove('notag:$path');
     } catch (e, st) { AppLog.e('del', e, st);}
   }
 
@@ -603,6 +615,39 @@ class Store {
   }
 
   static Future<void> setPerfMode(PerfMode m) async => (await _p).setInt('perfMode', m.index);
+
+  /// وضع الماسح: 0 تلقائي، 1 قص بس، 2 قص + فلتر، 3 كامل
+  static Future<int> scanSetting() async => ((await _p).getInt('scanMode') ?? 0).clamp(0, 3);
+  static Future<void> setScanSetting(int v) async => (await _p).setInt('scanMode', v);
+
+  /// جودة الصورة: 0 صغيرة، 1 عادية، 2 عالية
+  static Future<int> qualitySetting() async => ((await _p).getInt('jpegQ') ?? 1).clamp(0, 2);
+  static Future<void> setQualitySetting(int v) async => (await _p).setInt('jpegQ', v);
+
+  static Future<int> jpegQuality() async {
+    switch (await qualitySetting()) {
+      case 0:
+        return 65;
+      case 2:
+        return 92;
+      default:
+        return (await perfMode()) == PerfMode.pro ? 90 : 82;
+    }
+  }
+
+  /// شيل الصورة من المسودة من غير ما نمسح الملف (عشان "تراجع").
+  static Future<void> unlistFromDraft(String path) async {
+    final l = await draft();
+    l.remove(path);
+    await (await _p).setStringList('draft', l);
+  }
+
+  static Future<void> relistInDraft(String path, int index) async {
+    if (!File(path).existsSync()) return;
+    final l = await draft();
+    if (!l.contains(path)) l.insert(index.clamp(0, l.length), path);
+    await (await _p).setStringList('draft', l);
+  }
 
   static Future<ScanFilter> filter() async {
     final i = (await _p).getInt('filter') ?? 0;
@@ -693,6 +738,18 @@ class Store {
   // --- نسخة الصورة الأصلية + إعدادات التعديل (تعديل غير مدمّر) ---
   static String baseOf(String path) => path.replaceFirst(RegExp(r'\.jpg$'), '_base.jpg');
 
+  /// صورة معلّم عليها "من غير ورقة". الصورة الجديدة دايماً بتبدأ بالورقة.
+  static Future<bool> noTag(String path) async => (await _p).getBool('notag:$path') ?? false;
+
+  static Future<void> setNoTag(String path, bool v) async {
+    final p = await _p;
+    if (v) {
+      await p.setBool('notag:$path', true);
+    } else {
+      await p.remove('notag:$path');
+    }
+  }
+
   static Future<EditParams?> editOf(String path) async =>
       EditParams.decode((await _p).getString('edit:$path'));
 
@@ -709,6 +766,7 @@ class Store {
       l[i] = neu;
     }
     await (await _p).setStringList('draft', l);
+    if (await noTag(old)) await setNoTag(neu, true); // الاختيار يفضل بعد التعديل
     await del(old);
   }
 
@@ -918,6 +976,32 @@ Future<List<String>> _manualPick(BuildContext context, {bool multi = false}) asy
   return r;
 }
 
+ScannerMode _scanModeOf(int i, ScannerMode fallback) {
+  switch (i) {
+    case 1:
+      return ScannerMode.base;
+    case 2:
+      return ScannerMode.baseWithFilter;
+    case 3:
+      return ScannerMode.full;
+    default:
+      return fallback;
+  }
+}
+
+const _scanOpts = <(int, String, String)>[
+  (0, 'تلقائي', 'الباتش كامل والإيصالات قص بس (الافتراضي)'),
+  (1, 'قص بس', 'أسرع وأخف، من غير تحسينات'),
+  (2, 'قص + فلتر', 'قص مع تحسين تلقائي للألوان'),
+  (3, 'كامل', 'قص وتنضيف الصورة وإزالة الصوابع'),
+];
+
+const _qualOpts = <(int, String, String)>[
+  (0, 'صغيرة', 'ملف أخف وأسرع في الإرسال'),
+  (1, 'عادية', 'متوازنة (الافتراضي)'),
+  (2, 'عالية', 'أوضح وحجم أكبر'),
+];
+
 bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
 
 Future<List<String>> scanImages(BuildContext context, int limit,
@@ -938,8 +1022,10 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
   if (!context.mounted) return [];
   final perf = await Store.perfMode();
   if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1);
+  final sm = await Store.scanSetting();
+  final effMode = _scanModeOf(sm, perf == PerfMode.pro ? ScannerMode.full : mode);
   final scanner = DocumentScanner(
-    options: DocumentScannerOptions(mode: perf == PerfMode.pro ? ScannerMode.full : mode, pageLimit: limit, isGalleryImport: true),
+    options: DocumentScannerOptions(mode: effMode, pageLimit: limit, isGalleryImport: true),
   );
   try {
     final r = await scanner.scanDocument();
@@ -1025,13 +1111,15 @@ class TaggedImage extends StatelessWidget {
   final TagPos pos;
   final double? aspect;
   final ValueChanged<TagPos>? onChanged;
+  final bool showTag;
   const TaggedImage(
       {super.key,
       required this.path,
       required this.tag,
       required this.pos,
       this.aspect,
-      this.onChanged});
+      this.onChanged,
+      this.showTag = true});
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
@@ -1068,7 +1156,8 @@ class TaggedImage extends StatelessWidget {
                 width: cw, fit: BoxFit.fitWidth, cacheWidth: 1000, errorBuilder: err);
         final stack = Stack(clipBehavior: Clip.hardEdge, children: [
           img,
-          Positioned(
+          if (showTag)
+            Positioned(
               left: pos.cx * cw - dw / 2,
               top: pos.cy * cw - dh / 2,
               width: dw,
@@ -1139,12 +1228,18 @@ class ReceiptPreview extends StatelessWidget {
   final String path;
   final Tag tag;
   final int cacheWidth;
+  final bool showTag;
   const ReceiptPreview(
-      {super.key, required this.path, required this.tag, this.cacheWidth = kMaxSide});
+      {super.key,
+      required this.path,
+      required this.tag,
+      this.cacheWidth = kMaxSide,
+      this.showTag = true});
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
         final cw = cons.maxWidth;
         return Column(mainAxisSize: MainAxisSize.min, children: [
+          if (showTag)
           Container(
             width: cw,
             color: Colors.white,
@@ -1502,6 +1597,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   Future<void> _showSettings() async {
     var mode = await Store.perfMode();
+    var scan = await Store.scanSetting();
+    var qual = await Store.qualitySetting();
     if (!mounted) return;
     await showDialog(
       context: context,
@@ -1535,6 +1632,38 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                     groupValue: mode,
                     onChanged: (v) { setS(() => mode = v!); Store.setPerfMode(v!); },
                   ),
+                  const Divider(),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    child: Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: Text('وضع الماسح', style: TextStyle(fontWeight: FontWeight.bold))),
+                  ),
+                  for (final o in _scanOpts)
+                    RadioListTile<int>(
+                      dense: true,
+                      title: Text(o.$2),
+                      subtitle: Text(o.$3),
+                      value: o.$1,
+                      groupValue: scan,
+                      onChanged: (v) { setS(() => scan = v!); Store.setScanSetting(v!); },
+                    ),
+                  const Divider(),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    child: Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: Text('جودة الصورة', style: TextStyle(fontWeight: FontWeight.bold))),
+                  ),
+                  for (final o in _qualOpts)
+                    RadioListTile<int>(
+                      dense: true,
+                      title: Text(o.$2),
+                      subtitle: Text(o.$3),
+                      value: o.$1,
+                      groupValue: qual,
+                      onChanged: (v) { setS(() => qual = v!); Store.setQualitySetting(v!); },
+                    ),
                 ],
               ),
             ),
@@ -1849,11 +1978,19 @@ class _BatchScreenState extends State<BatchScreen> {
   TagPos? pos;
   double? aspect;
   bool busy = false;
+  bool noTag = false; // الصورة دي من غير ورقة بيانات
 
   @override
   void initState() {
     super.initState();
     _init();
+  }
+
+  Future<void> _toggleTag(bool hide) async {
+    final path = img;
+    if (path == null) return;
+    setState(() => noTag = hide);
+    await Store.setNoTag(path, hide);
   }
 
   Future<void> _init() async {
@@ -1883,9 +2020,13 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final t = tag ?? await receiptTag(1000, widget.session, batch: true);
       final a = await imageAspect(path);
-      final p = await Store.assignPos(path, t, true);
+      final p0 = await Store.assignPos(path, t, true);
+      final p = fitTagPos(p0, t, a);
+      if (p.cx != p0.cx || p.cy != p0.cy) await Store.savePos(path, p, true);
+      final nt = await Store.noTag(path);
       if (!mounted) return;
       setState(() {
+        noTag = nt;
         tag = t;
         img = path;
         aspect = a;
@@ -1991,6 +2132,7 @@ class _BatchScreenState extends State<BatchScreen> {
     if (out == null || !mounted) return;
     setState(() => busy = true);
     try {
+      if (noTag) await Store.setNoTag(out, true); // الاختيار يفضل بعد التعديل
       await Store.setBatchImg(out); // بتمسح القديمة
       await _show(out);
     } catch (e) {
@@ -2026,8 +2168,21 @@ class _BatchScreenState extends State<BatchScreen> {
                 child: Padding(
                   padding: const EdgeInsets.all(8),
                   child: TaggedImage(
-                      path: img!, tag: tag!, pos: pos!, aspect: aspect, onChanged: _set),
+                      path: img!,
+                      tag: tag!,
+                      pos: pos!,
+                      aspect: aspect,
+                      showTag: !noTag,
+                      onChanged: noTag ? null : _set),
                 ),
+              ),
+              SwitchListTile(
+                dense: true,
+                title: const Text('ورقة البيانات على الصورة دي'),
+                subtitle: const Text('اقفلها لو الصورة مش محتاجة ورقة (الصورة الجاية بتبدأ بالورقة)',
+                    style: TextStyle(fontSize: 11)),
+                value: !noTag,
+                onChanged: busy ? null : (v) => _toggleTag(!v),
               ),
               const Text('اسحب الورقة لتحريكها، وبإصبعين لتكبيرها أو تصغيرها',
                   style: TextStyle(fontSize: 12, color: Colors.grey)),
@@ -2040,13 +2195,13 @@ class _BatchScreenState extends State<BatchScreen> {
                       value: pos!.s.clamp(0.1, 0.98).toDouble(),
                       min: 0.1,
                       max: 0.98,
-                      onChanged: (v) => _set(pos!.copyWith(s: v)),
+                      onChanged: noTag ? null : (v) => _set(pos!.copyWith(s: v)),
                     ),
                   ),
                   IconButton(
                     tooltip: 'المكان الأصلي',
                     icon: const Icon(Icons.restart_alt),
-                    onPressed: () => _set(TagPos.initial(tag!)),
+                    onPressed: noTag ? null : () => _set(TagPos.initial(tag!)),
                   ),
                 ]),
               ),
@@ -2738,7 +2893,7 @@ class _EditorPageState extends State<EditorPage> {
         png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
         minWidth: w,
         minHeight: h,
-        quality: 82,
+        quality: await Store.jpegQuality(),
         format: CompressFormat.jpeg,
       );
       final dir = (await Store.dir()).path;
@@ -3078,6 +3233,22 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   bool continuous = true;
   ScanFilter filter = ScanFilter.original;
   String? progress;
+  final Set<String> noTags = {}; // إيصالات من غير ورقة
+
+  Future<void> _toggleTag(String path) async {
+    final hide = !noTags.contains(path);
+    await Store.setNoTag(path, hide);
+    if (built != null) await Store.clearPdf(); // الـ PDF القديم مبقاش مظبوط
+    if (!mounted) return;
+    setState(() {
+      if (hide) {
+        noTags.add(path);
+      } else {
+        noTags.remove(path);
+      }
+      built = null;
+    });
+  }
 
   @override
   void initState() {
@@ -3092,6 +3263,10 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final used = await Store.pdfImgs();
     final fl = await Store.filter();
     final co = await Store.continuous();
+    final nts = <String>{};
+    for (final x in d) {
+      if (await Store.noTag(x)) nts.add(x);
+    }
     File? b;
     if (f != null && d.isNotEmpty && used.length == d.length) {
       var same = true;
@@ -3102,6 +3277,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
     if (!mounted) return;
     setState(() {
+      noTags
+        ..clear()
+        ..addAll(nts);
       imgs = d;
       tag = t;
       built = b;
@@ -3171,16 +3349,38 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (added > 0 && mounted && r.length > 1) snack(context, 'اتضاف $added إيصال');
   }
 
+  /// مسح مع "تراجع": الملف بيتمسح فعلاً بعد ما الرسالة تختفي من غير ما تضغط تراجع.
   Future<void> _remove(int i) async {
-    if (!await askYesNo(context, 'مسح الصورة؟', 'الصورة دي هتتمسح.', yes: 'امسح', no: 'إلغاء')) {
+    if (i < 0 || i >= imgs.length) return;
+    final path = imgs[i];
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    await Store.unlistFromDraft(path);
+    if (!mounted) {
+      await Store.del(path);
       return;
     }
-    await Store.removeFromDraft(imgs[i]);
-    if (!mounted) return;
     setState(() {
-      imgs.removeAt(i);
+      imgs.remove(path);
       built = null;
     });
+    final ctrl = messenger.showSnackBar(SnackBar(
+      content: const Text('اتمسح الإيصال'),
+      duration: const Duration(seconds: 6),
+      action: SnackBarAction(
+        label: 'تراجع',
+        onPressed: () async {
+          await Store.relistInDraft(path, i);
+          if (!mounted) return;
+          setState(() {
+            if (!imgs.contains(path)) imgs.insert(i.clamp(0, imgs.length), path);
+            built = null;
+          });
+        },
+      ),
+    ));
+    final reason = await ctrl.closed;
+    if (reason != SnackBarClosedReason.action) await Store.del(path);
   }
 
   Future<void> _reorder(int oldI, int newI) async {
@@ -3255,7 +3455,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
         onTap: () => Navigator.push(
             context,
             MaterialPageRoute(
-                builder: (_) => ZoomPage(child: ReceiptPreview(path: path, tag: tag!)))),
+                builder: (_) => ZoomPage(
+                    child: ReceiptPreview(
+                        path: path, tag: tag!, showTag: !noTags.contains(path))))),
         child: Padding(
           padding: const EdgeInsets.all(8),
           child: Row(children: [
@@ -3278,12 +3480,20 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                   clipBehavior: Clip.hardEdge,
                   child: SizedBox(
                       width: 300,
-                      child: ReceiptPreview(path: path, tag: tag!, cacheWidth: 300)),
+                      child: ReceiptPreview(
+                          path: path,
+                          tag: tag!,
+                          cacheWidth: 300,
+                          showTag: !noTags.contains(path))),
                 ),
               ),
             ),
             const SizedBox(width: 12),
             const Expanded(child: Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey))),
+            IconButton(
+                tooltip: noTags.contains(path) ? 'إظهار الورقة' : 'إخفاء الورقة',
+                icon: Icon(noTags.contains(path) ? Icons.label_off_outlined : Icons.label_outline),
+                onPressed: busy ? null : () => _toggleTag(path)),
             IconButton(
                 tooltip: 'تعديل',
                 icon: const Icon(Icons.tune),
