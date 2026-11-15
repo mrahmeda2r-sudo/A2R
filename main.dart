@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
@@ -45,7 +46,7 @@ class Unit {
   const Unit(this.num, this.name, this.tid, [this.buildings = const []]);
 
   factory Unit.fromJson(Map<String, dynamic> j) => Unit(
-        (j['num'] as num).toInt(),
+        double.parse(j['num'].toString().trim()).toInt(),
         (j['name'] as String).trim(),
         j['tid'].toString().trim(),
         ((j['buildings'] as List?) ?? const []).map((e) => e.toString()).toList(),
@@ -694,6 +695,17 @@ Future<bool> askYesNo(BuildContext context, String title, String body,
   return r ?? false;
 }
 
+/// بيتطلب أول ما التطبيق يفتح عشان الموظف يشوف طلب الأذونات (الكاميرا والصور).
+Future<void> requestAllPermissions() async {
+  try {
+    await Permission.camera.request();
+    final ph = await Permission.photos.request();
+    if (!ph.isGranted && !ph.isLimited) {
+      await Permission.storage.request();
+    }
+  } catch (_) {}
+}
+
 Future<bool> ensureCamera(BuildContext context) async {
   var st = await Permission.camera.status;
   if (st.isGranted) return true;
@@ -1205,6 +1217,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _init() async {
+    await requestAllPermissions();
     try {
       await Store.cleanup();
     } catch (_) {}
@@ -1568,6 +1581,48 @@ class _BatchScreenState extends State<BatchScreen> {
     Store.savePos(img!, p, true);
   }
 
+  /// معرض: يختار صورة، وبعدين شاشة القص (تعديل) تفتح لوحدها.
+  Future<void> _gallery() async {
+    XFile? x;
+    try {
+      x = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 90);
+    } catch (_) {
+      if (mounted) snack(context, 'تعذر فتح المعرض');
+      return;
+    }
+    if (x == null || !mounted) return;
+    setState(() => busy = true);
+    try {
+      final path =
+          await persistImage(x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      await Store.setBatchImg(path);
+      await _show(path);
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+    if (mounted && img != null) await _edit();
+  }
+
+  /// تعديل: قص بأربع نقط وتدوير للصورة الحالية.
+  Future<void> _edit() async {
+    final cur = img;
+    if (cur == null) return;
+    final out = await Navigator.push<String>(
+        context, MaterialPageRoute(builder: (_) => CropPage(path: cur)));
+    if (out == null || !mounted) return;
+    setState(() => busy = true);
+    try {
+      await Store.setBatchImg(out); // بتمسح القديمة
+      await _show(out);
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   Future<void> _send() async {
     setState(() => busy = true);
     try {
@@ -1620,16 +1675,36 @@ class _BatchScreenState extends State<BatchScreen> {
               SafeArea(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                  child: Row(children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: busy ? null : _capture,
-                        icon: const Icon(Icons.add_a_photo),
-                        label: const Text('تصوير / معرض'),
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Row(children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: busy ? null : _capture,
+                          icon: const Icon(Icons.add_a_photo),
+                          label: const Text('تصوير'),
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: busy ? null : _gallery,
+                          icon: const Icon(Icons.photo_library),
+                          label: const Text('معرض'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: busy ? null : _edit,
+                          icon: const Icon(Icons.crop),
+                          label: const Text('تعديل'),
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50,
                       child: FilledButton.icon(
                         onPressed: busy ? null : _send,
                         icon: busy
@@ -1647,6 +1722,241 @@ class _BatchScreenState extends State<BatchScreen> {
             ]),
     );
   }
+}
+
+// =====================================================================
+//  شاشة تعديل الصورة (قص + تدوير)
+// =====================================================================
+
+/// بترجّع مسار الصورة الجديدة بعد القص، أو null لو الموظف رجع من غير تأكيد.
+class CropPage extends StatefulWidget {
+  final String path;
+  const CropPage({super.key, required this.path});
+  @override
+  State<CropPage> createState() => _CropPageState();
+}
+
+class _CropPageState extends State<CropPage> {
+  static const _full = Rect.fromLTRB(0.02, 0.02, 0.98, 0.98);
+  double? aspect; // ارتفاع/عرض الصورة الأصلية
+  int turns = 0; // عدد اللفّات 90 درجة مع عقارب الساعة
+  Rect crop = _full; // نسب من الصورة بعد التدوير
+  int drag = -1; // 0..3 = الزوايا، 4 = تحريك المربع كله
+  bool busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    imageAspect(widget.path).then((a) {
+      if (mounted) setState(() => aspect = a);
+    }).catchError((_) {
+      if (mounted) Navigator.pop(context);
+    });
+  }
+
+  void _start(Offset p, Size size) {
+    final r = Rect.fromLTRB(crop.left * size.width, crop.top * size.height,
+        crop.right * size.width, crop.bottom * size.height);
+    final corners = [r.topLeft, r.topRight, r.bottomRight, r.bottomLeft];
+    var best = -1;
+    var bd = 44.0;
+    for (var i = 0; i < 4; i++) {
+      final d = (corners[i] - p).distance;
+      if (d < bd) {
+        bd = d;
+        best = i;
+      }
+    }
+    drag = best != -1 ? best : (r.contains(p) ? 4 : -1);
+  }
+
+  void _update(Offset delta, Size size) {
+    if (drag < 0) return;
+    final dx = delta.dx / size.width, dy = delta.dy / size.height;
+    var l = crop.left, t = crop.top, r = crop.right, b = crop.bottom;
+    const m = 0.08;
+    if (drag == 4) {
+      final w = r - l, h = b - t;
+      final nl = (l + dx).clamp(0.0, 1.0 - w).toDouble();
+      final nt = (t + dy).clamp(0.0, 1.0 - h).toDouble();
+      l = nl;
+      r = nl + w;
+      t = nt;
+      b = nt + h;
+    } else {
+      if (drag == 0 || drag == 3) l = (l + dx).clamp(0.0, r - m).toDouble();
+      if (drag == 1 || drag == 2) r = (r + dx).clamp(l + m, 1.0).toDouble();
+      if (drag == 0 || drag == 1) t = (t + dy).clamp(0.0, b - m).toDouble();
+      if (drag == 2 || drag == 3) b = (b + dy).clamp(t + m, 1.0).toDouble();
+    }
+    setState(() => crop = Rect.fromLTRB(l, t, r, b));
+  }
+
+  Future<void> _apply() async {
+    setState(() => busy = true);
+    Store.working++;
+    try {
+      final src = await decodeImage(await File(widget.path).readAsBytes());
+      final sw = src.width.toDouble(), sh = src.height.toDouble();
+      final rw = turns.isOdd ? sh : sw, rh = turns.isOdd ? sw : sh;
+      final cw = (crop.width * rw).round(), ch = (crop.height * rh).round();
+      if (cw < 8 || ch < 8) throw Exception('المنطقة المقصوصة صغيرة جداً');
+      final rec = ui.PictureRecorder();
+      final c = Canvas(rec, Rect.fromLTWH(0, 0, cw.toDouble(), ch.toDouble()));
+      c.translate(-crop.left * rw, -crop.top * rh);
+      switch (turns % 4) {
+        case 1:
+          c.translate(rw, 0);
+          c.rotate(math.pi / 2);
+          break;
+        case 2:
+          c.translate(rw, rh);
+          c.rotate(math.pi);
+          break;
+        case 3:
+          c.translate(0, rh);
+          c.rotate(-math.pi / 2);
+          break;
+      }
+      c.drawImage(src, Offset.zero, Paint());
+      final out = await rec.endRecording().toImage(cw, ch);
+      final bd = await out.toByteData(format: ui.ImageByteFormat.png);
+      src.dispose();
+      out.dispose();
+      final jpg = await FlutterImageCompress.compressWithList(
+        bd!.buffer.asUint8List(),
+        minWidth: cw,
+        minHeight: ch,
+        quality: 82,
+        format: CompressFormat.jpeg,
+      );
+      final f = File(
+          '${(await Store.dir()).path}/batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      await f.writeAsBytes(jpg, flush: true);
+      if (mounted) Navigator.pop(context, f.path);
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    } finally {
+      Store.working--;
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('تعديل الصورة')),
+      body: aspect == null
+          ? const Center(child: CircularProgressIndicator())
+          : Column(children: [
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: LayoutBuilder(builder: (ctx, cons) {
+                    final asp = turns.isOdd ? 1 / aspect! : aspect!;
+                    var w = cons.maxWidth, h = w * asp;
+                    if (h > cons.maxHeight) {
+                      h = cons.maxHeight;
+                      w = h / asp;
+                    }
+                    final size = Size(w, h);
+                    return Center(
+                      child: SizedBox(
+                        width: w,
+                        height: h,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onPanStart: (d) => _start(d.localPosition, size),
+                          onPanUpdate: (d) => _update(d.delta, size),
+                          onPanEnd: (_) => drag = -1,
+                          child: Stack(children: [
+                            Positioned.fill(
+                              child: RotatedBox(
+                                quarterTurns: turns,
+                                child: Image.file(File(widget.path), fit: BoxFit.fill),
+                              ),
+                            ),
+                            Positioned.fill(child: CustomPaint(painter: _CropPainter(crop))),
+                          ]),
+                        ),
+                      ),
+                    );
+                  }),
+                ),
+              ),
+              const Text('اسحب النقط في الأركان لتحديد حدود الباتش، واسحب جوه المربع لتحريكه',
+                  style: TextStyle(fontSize: 12, color: Colors.grey)),
+              SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                  child: Row(children: [
+                    IconButton.filledTonal(
+                      tooltip: 'تدوير',
+                      icon: const Icon(Icons.rotate_right),
+                      onPressed: busy
+                          ? null
+                          : () => setState(() {
+                                turns = (turns + 1) % 4;
+                                crop = _full;
+                              }),
+                    ),
+                    const SizedBox(width: 8),
+                    TextButton(
+                      onPressed: busy ? null : () => setState(() => crop = _full),
+                      child: const Text('إعادة ضبط'),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: busy ? null : _apply,
+                        icon: busy
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.check),
+                        label: const Text('تم'),
+                      ),
+                    ),
+                  ]),
+                ),
+              ),
+            ]),
+    );
+  }
+}
+
+class _CropPainter extends CustomPainter {
+  final Rect r;
+  _CropPainter(this.r);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Rect.fromLTRB(
+        r.left * size.width, r.top * size.height, r.right * size.width, r.bottom * size.height);
+    canvas.drawPath(
+        Path.combine(PathOperation.difference, Path()..addRect(Offset.zero & size),
+            Path()..addRect(rect)),
+        Paint()..color = Colors.black54);
+    canvas.drawRect(
+        rect,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2
+          ..color = Colors.white);
+    final fill = Paint()..color = Colors.white;
+    final ring = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..color = const Color(0xFF0B5FA5);
+    for (final p in [rect.topLeft, rect.topRight, rect.bottomRight, rect.bottomLeft]) {
+      canvas.drawCircle(p, 11, fill);
+      canvas.drawCircle(p, 11, ring);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_CropPainter o) => o.r != r;
 }
 
 // =====================================================================
