@@ -30,6 +30,20 @@ jobs:
       - name: Add packages
         run: flutter pub add google_mlkit_document_scanner:^0.4.0 pdf:^3.11.0 path_provider:^2.1.0 share_plus:^10.0.0 shared_preferences:^2.2.0 flutter_image_compress:^2.3.0 image_picker:^1.1.0 permission_handler:^11.3.1 open_filex:^4.5.0
 
+      - name: Add logo asset (shown in the app)
+        run: |
+          mkdir -p assets
+          cp logo_splash.png assets/logo.png
+          python3 - <<'PY'
+          import re
+          p = 'pubspec.yaml'
+          s = open(p, encoding='utf-8').read()
+          s, n = re.subn(r'(?m)^flutter:[ \t]*$', 'flutter:\n  assets:\n    - assets/logo.png', s, count=1)
+          assert n == 1, 'flutter: section not found in pubspec.yaml'
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          sed -n '/^flutter:/,$p' pubspec.yaml
+
       - name: Move main.dart into lib
         run: mv -f main.dart lib/
 
