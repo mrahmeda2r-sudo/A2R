@@ -981,7 +981,8 @@ ScannerMode _scanModeOf(int i, ScannerMode fallback) {
     case 1:
       return ScannerMode.base;
     case 2:
-      return ScannerMode.baseWithFilter;
+      // الوضع الأوسط (قص + فلتر): بنختاره بالترتيب عشان اسمه بيختلف بين نسخ الحزمة
+      return ScannerMode.values.length > 2 ? ScannerMode.values[1] : ScannerMode.base;
     case 3:
       return ScannerMode.full;
     default:
