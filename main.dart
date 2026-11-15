@@ -31,6 +31,7 @@ const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الص�
 const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
+const kBatchTagW = 0.8; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
 enum PerfMode { lite, balanced, pro }
 
 /// الدقة الافتراضية لمعاينة الإيصال (نفس وضع balanced).
@@ -229,7 +230,8 @@ class AppData {
       units = u;
       rev.value++;
       return true;
-    } catch (e, st) { AppLog.e('_apply', e, st);
+    } catch (e, st) {
+      AppLog.e('_apply', e, st);
       return false;
     }
   }
@@ -239,7 +241,9 @@ class AppData {
     try {
       final raw = await rootBundle.loadString('assets/data.json');
       if (_apply(raw)) status.value = 'بيانات من ملف الإكسل';
-    } catch (e, st) { AppLog.e('load', e, st);}
+    } catch (e, st) {
+      AppLog.e('load', e, st);
+    }
   }
 }
 
@@ -247,7 +251,8 @@ class AppData {
 //  أدوات الصور (خفيفة على الذاكرة)
 // =====================================================================
 
-enum ScanFilter { original, enhance, bw }
+// receipt لازم يفضل آخر واحد (عشان الإعدادات المحفوظة)
+enum ScanFilter { original, enhance, bw, receipt }
 
 String errText(Object e) {
   if (e is FileSystemException && (e.osError?.errorCode == 28)) {
@@ -288,6 +293,7 @@ List<double> editMatrix(ScanFilter f, double contrast, double brightness) {
   late double t0;
   switch (f) {
     case ScanFilter.original:
+    case ScanFilter.receipt: // المعالجة الحقيقية في _cleanJob، والمصفوفة هنا للتباين والسطوع بس
       w = [
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
@@ -326,15 +332,171 @@ List<double> editMatrix(ScanFilter f, double contrast, double brightness) {
 
 List<double> _matrix(ScanFilter f) => editMatrix(f, 0, 0);
 
+/// فلتر "إيصال": بيقسم الصورة بلاطات، يقدّر لون الورق في كل بلاطة (أفتح 20%)،
+/// ويقسم الصورة عليه. النتيجة: ورق أبيض متساوي، الأزرق/الظلال بتروح، الحبر يفضل واضح.
+/// بيشتغل في Isolate.
+Uint8List _cleanJob(Map<String, dynamic> a) {
+  final src = a['src'] as Uint8List;
+  final w = a['w'] as int, h = a['h'] as int;
+  final gray = a['gray'] as bool;
+  final bs = math.max(16, (math.max(w, h) / 40).round());
+  final gw = (w + bs - 1) ~/ bs, gh = (h + bs - 1) ~/ bs;
+  final bg = List.generate(3, (_) => List<double>.filled(gw * gh, 255.0));
+  final hist = List<int>.filled(256, 0);
+
+  for (var gy = 0; gy < gh; gy++) {
+    for (var gx = 0; gx < gw; gx++) {
+      final x0 = gx * bs, y0 = gy * bs;
+      final x1 = math.min(w, x0 + bs), y1 = math.min(h, y0 + bs);
+      hist.fillRange(0, 256, 0);
+      for (var y = y0; y < y1; y++) {
+        var i = (y * w + x0) * 4;
+        for (var x = x0; x < x1; x++, i += 4) {
+          hist[(src[i] * 54 + src[i + 1] * 183 + src[i + 2] * 19) >> 8]++;
+        }
+      }
+      final target = ((x1 - x0) * (y1 - y0) * 0.8).floor();
+      var acc = 0, thr = 255;
+      for (var t = 0; t < 256; t++) {
+        acc += hist[t];
+        if (acc >= target) {
+          thr = t;
+          break;
+        }
+      }
+      var sr = 0, sg = 0, sb = 0, n = 0;
+      for (var y = y0; y < y1; y++) {
+        var i = (y * w + x0) * 4;
+        for (var x = x0; x < x1; x++, i += 4) {
+          if (((src[i] * 54 + src[i + 1] * 183 + src[i + 2] * 19) >> 8) >= thr) {
+            sr += src[i];
+            sg += src[i + 1];
+            sb += src[i + 2];
+            n++;
+          }
+        }
+      }
+      if (n > 0) {
+        final k = gy * gw + gx;
+        bg[0][k] = sr / n;
+        bg[1][k] = sg / n;
+        bg[2][k] = sb / n;
+      }
+    }
+  }
+
+  List<double> blur(List<double> g) {
+    final o = List<double>.filled(g.length, 0);
+    for (var y = 0; y < gh; y++) {
+      for (var x = 0; x < gw; x++) {
+        var s = 0.0;
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            final yy = (y + dy).clamp(0, gh - 1).toInt();
+            final xx = (x + dx).clamp(0, gw - 1).toInt();
+            s += g[yy * gw + xx];
+          }
+        }
+        o[y * gw + x] = s / 9;
+      }
+    }
+    return o;
+  }
+
+  for (var c = 0; c < 3; c++) {
+    bg[c] = blur(blur(bg[c]));
+  }
+
+  // أي قيمة من 238 لفوق = أبيض صافي (بيضغط أحسن بكتير)، وجاما خفيفة بتغمّق الحبر
+  final lut = List<int>.generate(
+      256, (i) => (255 * math.pow(math.min(1.0, i / 238), 1.25)).round().clamp(0, 255).toInt());
+
+  final cx0 = List<int>.filled(w, 0), cx1 = List<int>.filled(w, 0);
+  final ctx = List<double>.filled(w, 0);
+  for (var x = 0; x < w; x++) {
+    final fx = ((x + 0.5) / bs - 0.5).clamp(0.0, gw - 1.0).toDouble();
+    cx0[x] = fx.floor();
+    cx1[x] = math.min(gw - 1, cx0[x] + 1);
+    ctx[x] = fx - cx0[x];
+  }
+
+  final out = Uint8List(w * h * 4);
+  for (var y = 0; y < h; y++) {
+    final fy = ((y + 0.5) / bs - 0.5).clamp(0.0, gh - 1.0).toDouble();
+    final y0 = fy.floor();
+    final y1 = math.min(gh - 1, y0 + 1);
+    final ty = fy - y0;
+    for (var x = 0; x < w; x++) {
+      final i = (y * w + x) * 4;
+      final tx = ctx[x];
+      final a0 = y0 * gw + cx0[x], a1 = y0 * gw + cx1[x];
+      final b0 = y1 * gw + cx0[x], b1 = y1 * gw + cx1[x];
+      final res = [0, 0, 0];
+      for (var c = 0; c < 3; c++) {
+        final g = bg[c];
+        final b = (g[a0] * (1 - tx) + g[a1] * tx) * (1 - ty) + (g[b0] * (1 - tx) + g[b1] * tx) * ty;
+        var v = src[i + c] * 255 / (b < 40 ? 40 : b);
+        if (v > 255) v = 255;
+        res[c] = lut[v.round()];
+      }
+      if (gray) {
+        final l = (res[0] * 54 + res[1] * 183 + res[2] * 19) >> 8;
+        res[0] = res[1] = res[2] = l;
+      }
+      out[i] = res[0];
+      out[i + 1] = res[1];
+      out[i + 2] = res[2];
+      out[i + 3] = 255;
+    }
+  }
+
+  // حدة خفيفة (Unsharp) تحسّن النص المهتز شوية
+  const k = 0.35;
+  final cp = Uint8List.fromList(out);
+  final row = w * 4;
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = (y * w + x) * 4;
+      for (var c = 0; c < 3; c++) {
+        final j = i + c;
+        final v = cp[j] * (1 + 4 * k) - k * (cp[j - 4] + cp[j + 4] + cp[j - row] + cp[j + row]);
+        out[j] = v < 0 ? 0 : (v > 255 ? 255 : v.round());
+      }
+    }
+  }
+  return out;
+}
+
+/// بتطبّق فلتر الإيصال على ui.Image وبترجّع صورة جديدة (الأصلية مبتتمسحش).
+Future<ui.Image> cleanUiImage(ui.Image img, {bool gray = false}) async {
+  final w = img.width, h = img.height;
+  final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+  if (bd == null) throw Exception('تعذر قراءة الصورة');
+  final rgba = await compute(_cleanJob, <String, dynamic>{
+    'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+    'w': w,
+    'h': h,
+    'gray': gray,
+  });
+  final comp = Completer<ui.Image>();
+  ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
+  return comp.future;
+}
+
 Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
   if (f == ScanFilter.original) return bytes;
   try {
     final img = await decodeImage(bytes);
     final w = img.width, h = img.height;
-    final rec = ui.PictureRecorder();
-    final c = Canvas(rec);
-    c.drawImage(img, Offset.zero, Paint()..colorFilter = ColorFilter.matrix(_matrix(f)));
-    final out = await rec.endRecording().toImage(w, h);
+    ui.Image out;
+    if (f == ScanFilter.receipt) {
+      out = await cleanUiImage(img);
+    } else {
+      final rec = ui.PictureRecorder();
+      final c = Canvas(rec);
+      c.drawImage(img, Offset.zero, Paint()..colorFilter = ColorFilter.matrix(_matrix(f)));
+      out = await rec.endRecording().toImage(w, h);
+    }
     final bd = await out.toByteData(format: ui.ImageByteFormat.png);
     img.dispose();
     out.dispose();
@@ -345,8 +507,55 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
       quality: await Store.jpegQuality(),
       format: CompressFormat.jpeg,
     );
-  } catch (e, st) { AppLog.e('applyFilter', e, st);
+  } catch (e, st) {
+    AppLog.e('applyFilter', e, st);
     return bytes; // لو الفلتر فشل (ذاكرة) نكمل بالصورة الأصلية
+  }
+}
+
+/// فحص سريع بعد التصوير: بيرجّع رسالة تحذير أو null لو الصورة تمام.
+/// الأرقام بتتكتب في السجل (quality var / p90) عشان تضبط الحدود حسب موبايلات الموظفين.
+Future<String?> qualityWarning(String path) async {
+  try {
+    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 800);
+    final w = img.width, h = img.height;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    img.dispose();
+    if (bd == null || w < 16 || h < 16) return null;
+    final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+    final lum = Float32List(w * h);
+    final hist = List<int>.filled(256, 0);
+    for (var i = 0; i < w * h; i++) {
+      final l = (px[i * 4] * 54 + px[i * 4 + 1] * 183 + px[i * 4 + 2] * 19) >> 8;
+      lum[i] = l.toDouble();
+      hist[l]++;
+    }
+    var acc = 0, p90 = 255;
+    for (var t = 0; t < 256; t++) {
+      acc += hist[t];
+      if (acc >= w * h * 0.9) {
+        p90 = t;
+        break;
+      }
+    }
+    var s = 0.0, s2 = 0.0, n = 0;
+    for (var y = 1; y < h - 1; y++) {
+      for (var x = 1; x < w - 1; x++) {
+        final i = y * w + x;
+        final v = 4 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
+        s += v;
+        s2 += v * v;
+        n++;
+      }
+    }
+    final varL = n == 0 ? 999.0 : s2 / n - (s / n) * (s / n);
+    AppLog.i('quality var=${varL.toStringAsFixed(1)} p90=$p90');
+    if (p90 < 130) return 'الإضاءة ضعيفة، صوّر في مكان أنور';
+    if (varL < 25) return 'الصورة شكلها مهزوزة، ثبّت إيدك وصوّر تاني لو الكلام مش واضح';
+    return null;
+  } catch (e, st) {
+    AppLog.e('qualityWarning', e, st);
+    return null;
   }
 }
 
@@ -354,7 +563,8 @@ Future<bool> _decodesOk(Uint8List b) async {
   try {
     final s = await imageSize(b);
     return s.w > 0 && s.h > 0;
-  } catch (e, st) { AppLog.e('_decodesOk', e, st);
+  } catch (e, st) {
+    AppLog.e('_decodesOk', e, st);
     return false;
   }
 }
@@ -375,7 +585,9 @@ Future<String> persistImage(String src, String name,
       format: CompressFormat.jpeg,
       keepExif: false,
     );
-  } catch (e, st) { AppLog.e('persistImage', e, st);}
+  } catch (e, st) {
+    AppLog.e('persistImage', e, st);
+  }
   if (bytes != null && !await _decodesOk(bytes)) bytes = null;
   if (bytes == null) {
     try {
@@ -391,7 +603,9 @@ Future<String> persistImage(String src, String name,
         quality: await Store.jpegQuality(),
         format: CompressFormat.jpeg,
       );
-    } catch (e, st) { AppLog.e('persistImage', e, st);}
+    } catch (e, st) {
+      AppLog.e('persistImage', e, st);
+    }
   }
   if (bytes == null || !await _decodesOk(bytes)) {
     throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
@@ -492,34 +706,57 @@ Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
   return Tag(bd!.buffer.asUint8List(), cw, ch);
 }
 
-/// صورة الباتش + الورقة فوقها في المكان اللي الموظف اختاره (ضغط واحد بس في الآخر).
+/// ورقة الباتش بحجم الشريط. w = عرض الصورة بالبكسل.
+Future<Tag> batchBandTag(Session s, double w) async {
+  final r = await receiptTag(1000, s, batch: true);
+  return receiptTag(1000 * (w * kBatchTagW) / r.w, s, batch: true);
+}
+
+/// صورة الباتش + الورقة. layout 0/1: شريط أبيض فوق/تحت (الصورة كاملة من غير تغطية)،
+/// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
 Future<Uint8List> composeBatch(String path, Session s) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src; // من غير ورقة
+  final layout = await Store.batchLayout();
   final sz = await imageSize(src);
-  final mode = await Store.perfMode();
-  final maxSide = getMaxSide(mode);
+  final maxSide = getMaxSide(await Store.perfMode());
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final w = img.width.toDouble();
   final h = img.height.toDouble();
-  final ref = await receiptTag(1000, s, batch: true);
-  final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref), ref, h / w);
-  final tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
+  final Tag tag;
+  final Offset tagAt, imgAt;
+  final double outH;
+  if (layout == 2) {
+    final ref = await receiptTag(1000, s, batch: true);
+    final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref), ref, h / w);
+    tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
+    tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
+    imgAt = Offset.zero;
+    outH = h;
+  } else {
+    tag = await batchBandTag(s, w);
+    final pad = w * kBandPad;
+    final band = tag.h + pad * 2;
+    tagAt = Offset((w - tag.w) / 2, layout == 0 ? pad : h + pad);
+    imgAt = Offset(0, layout == 0 ? band : 0);
+    outH = h + band;
+  }
   final tImg = await decodeImage(tag.png);
   final rec = ui.PictureRecorder();
-  final c = Canvas(rec, Rect.fromLTWH(0, 0, w, h));
-  c.drawImage(img, Offset.zero, Paint());
-  c.drawImage(tImg, Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2), Paint());
-  final out = await rec.endRecording().toImage(img.width, img.height);
+  final c = Canvas(rec, Rect.fromLTWH(0, 0, w, outH));
+  c.drawRect(Rect.fromLTWH(0, 0, w, outH), Paint()..color = Colors.white);
+  c.drawImage(img, imgAt, Paint());
+  c.drawImage(tImg, tagAt, Paint());
+  final iw = img.width, oh = outH.ceil();
+  final out = await rec.endRecording().toImage(iw, oh);
   final bd = await out.toByteData(format: ui.ImageByteFormat.png);
-  final iw = img.width, ih = img.height;
   img.dispose();
   tImg.dispose();
   out.dispose();
   return FlutterImageCompress.compressWithList(
     bd!.buffer.asUint8List(),
     minWidth: iw,
-    minHeight: ih,
+    minHeight: oh,
     quality: await Store.jpegQuality(),
     format: CompressFormat.jpeg,
   );
@@ -553,11 +790,11 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
         build: (_) => pw.Column(children: [
           if (!hide)
             pw.Container(
-            width: pageW,
-            height: bandH,
-            alignment: pw.Alignment.center,
-            child: pw.Image(tagImg, width: tw, height: th),
-          ),
+              width: pageW,
+              height: bandH,
+              alignment: pw.Alignment.center,
+              child: pw.Image(tagImg, width: tw, height: th),
+            ),
           pw.Image(image, width: pageW, height: imgH),
         ]),
       ));
@@ -604,11 +841,13 @@ class Store {
       await p.remove('pos:$path');
       await p.remove('edit:$path');
       await p.remove('notag:$path');
-    } catch (e, st) { AppLog.e('del', e, st);}
+    } catch (e, st) {
+      AppLog.e('del', e, st);
+    }
   }
 
   // --- إعدادات الموظف ---
-  
+
   static Future<PerfMode> perfMode() async {
     final i = (await _p).getInt('perfMode') ?? 1;
     return PerfMode.values[i.clamp(0, 2)];
@@ -650,7 +889,7 @@ class Store {
   }
 
   static Future<ScanFilter> filter() async {
-    final i = (await _p).getInt('filter') ?? 0;
+    final i = (await _p).getInt('filter') ?? ScanFilter.receipt.index;
     return ScanFilter.values[i.clamp(0, ScanFilter.values.length - 1)];
   }
 
@@ -658,6 +897,10 @@ class Store {
 
   static Future<bool> continuous() async => (await _p).getBool('continuous') ?? true;
   static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
+
+  /// شكل ورقة الباتش: 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
+  static Future<int> batchLayout() async => ((await _p).getInt('batchLayout') ?? 0).clamp(0, 2);
+  static Future<void> setBatchLayout(int v) async => (await _p).setInt('batchLayout', v);
 
   // --- مكان وحجم الورقة ---
   static Future<TagPos?> pos(String path) async =>
@@ -927,7 +1170,8 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
     }
     final x = await picker.pickImage(source: src, maxWidth: 2000, imageQuality: 85);
     return x == null ? [] : [x.path];
-  } catch (e, st) { AppLog.e('simplePick', e, st);
+  } catch (e, st) {
+    AppLog.e('simplePick', e, st);
     if (context.mounted) snack(context, 'تعذر فتح الكاميرا أو المعرض');
     return [];
   }
@@ -937,7 +1181,9 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
 Future<void> markPickTarget(String t) async {
   try {
     await (await SharedPreferences.getInstance()).setString('pickTarget', t);
-  } catch (e, st) { AppLog.e('markPickTarget', e, st);}
+  } catch (e, st) {
+    AppLog.e('markPickTarget', e, st);
+  }
 }
 
 Future<void> stashLostPick() async {
@@ -949,7 +1195,9 @@ Future<void> stashLostPick() async {
     final f = await File(r.file!.path)
         .copy('${d.path}/${DateTime.now().microsecondsSinceEpoch}.jpg');
     await (await SharedPreferences.getInstance()).setString('lostPick', f.path);
-  } catch (e, st) { AppLog.e('stashLostPick', e, st);}
+  } catch (e, st) {
+    AppLog.e('stashLostPick', e, st);
+  }
 }
 
 /// بترجّع مسار الصورة الضايعة لو كانت تابعة للشاشة دي (مرة واحدة بس).
@@ -960,7 +1208,8 @@ Future<String?> takeLostPick(String target) async {
     if (path == null || p.getString('pickTarget') != target) return null;
     await p.remove('lostPick');
     return await File(path).exists() ? path : null;
-  } catch (e, st) { AppLog.e('takeLostPick', e, st);
+  } catch (e, st) {
+    AppLog.e('takeLostPick', e, st);
     return null;
   }
 }
@@ -1038,7 +1287,9 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
     try {
       (await SharedPreferences.getInstance())
           .setInt('scannerFailedAt', DateTime.now().millisecondsSinceEpoch);
-    } catch (e, st) { AppLog.e('scanImages.prefs', e, st);}
+    } catch (e, st) {
+      AppLog.e('scanImages.prefs', e, st);
+    }
     if (!context.mounted) return [];
     await showDialog<void>(
       context: context,
@@ -1159,11 +1410,11 @@ class TaggedImage extends StatelessWidget {
           img,
           if (showTag)
             Positioned(
-              left: pos.cx * cw - dw / 2,
-              top: pos.cy * cw - dh / 2,
-              width: dw,
-              height: dh,
-              child: t),
+                left: pos.cx * cw - dw / 2,
+                top: pos.cy * cw - dh / 2,
+                width: dw,
+                height: dh,
+                child: t),
         ]);
         return Center(
             child: ch != null
@@ -1230,32 +1481,34 @@ class ReceiptPreview extends StatelessWidget {
   final Tag tag;
   final int cacheWidth;
   final bool showTag;
+  final bool bottom; // الشريط تحت الصورة بدل فوقها
   const ReceiptPreview(
       {super.key,
       required this.path,
       required this.tag,
       this.cacheWidth = kMaxSide,
-      this.showTag = true});
+      this.showTag = true,
+      this.bottom = false});
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
         final cw = cons.maxWidth;
-        return Column(mainAxisSize: MainAxisSize.min, children: [
-          if (showTag)
-          Container(
+        final band = Container(
+          width: cw,
+          color: Colors.white,
+          padding: EdgeInsets.symmetric(vertical: cw * kBandPad),
+          alignment: Alignment.center,
+          child: Image.memory(tag.png,
+              width: cw * tag.w / 1000, height: cw * tag.h / 1000, fit: BoxFit.fill),
+        );
+        final pic = Image.file(File(path),
             width: cw,
-            color: Colors.white,
-            padding: EdgeInsets.symmetric(vertical: cw * kBandPad),
-            alignment: Alignment.center,
-            child: Image.memory(tag.png,
-                width: cw * tag.w / 1000, height: cw * tag.h / 1000, fit: BoxFit.fill),
-          ),
-          Image.file(File(path),
-              width: cw,
-              fit: BoxFit.fitWidth,
-              cacheWidth: cacheWidth,
-              errorBuilder: (_, __, ___) =>
-                  const SizedBox(height: 120, child: Center(child: Text('تعذر عرض الصورة')))),
-        ]);
+            fit: BoxFit.fitWidth,
+            cacheWidth: cacheWidth,
+            errorBuilder: (_, __, ___) =>
+                const SizedBox(height: 120, child: Center(child: Text('تعذر عرض الصورة'))));
+        return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: bottom ? [pic, if (showTag) band] : [if (showTag) band, pic]);
       });
 }
 
@@ -1306,7 +1559,9 @@ Future<void> main() async {
     }
     final t = sp.getInt('scannerFailedAt') ?? 0;
     _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
-  } catch (e, st) { AppLog.e('main', e, st);}
+  } catch (e, st) {
+    AppLog.e('main', e, st);
+  }
   await stashLostPick();
   String? resume;
   try {
@@ -1576,7 +1831,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await requestAllPermissions();
     try {
       await Store.cleanup();
-    } catch (e, st) { AppLog.e('_init', e, st);}
+    } catch (e, st) {
+      AppLog.e('_init', e, st);
+    }
     await _reload();
   }
 
@@ -1617,21 +1874,30 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                     subtitle: const Text('أسرع أداء للأجهزة القديمة، يستهلك رامات أقل ويعطل المؤثرات الثقيلة.'),
                     value: PerfMode.lite,
                     groupValue: mode,
-                    onChanged: (v) { setS(() => mode = v!); Store.setPerfMode(v!); },
+                    onChanged: (v) {
+                      setS(() => mode = v!);
+                      Store.setPerfMode(v!);
+                    },
                   ),
                   RadioListTile<PerfMode>(
                     title: const Text('الوضع المتوازن (Balanced)'),
                     subtitle: const Text('أداء جيد مع جودة ممتازة (الوضع الافتراضي).'),
                     value: PerfMode.balanced,
                     groupValue: mode,
-                    onChanged: (v) { setS(() => mode = v!); Store.setPerfMode(v!); },
+                    onChanged: (v) {
+                      setS(() => mode = v!);
+                      Store.setPerfMode(v!);
+                    },
                   ),
                   RadioListTile<PerfMode>(
                     title: const Text('الوضع الاحترافي (Pro)'),
                     subtitle: const Text('أعلى جودة تصوير ومعالجة (للأجهزة القوية فقط).'),
                     value: PerfMode.pro,
                     groupValue: mode,
-                    onChanged: (v) { setS(() => mode = v!); Store.setPerfMode(v!); },
+                    onChanged: (v) {
+                      setS(() => mode = v!);
+                      Store.setPerfMode(v!);
+                    },
                   ),
                   const Divider(),
                   const Padding(
@@ -1647,7 +1913,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                       subtitle: Text(o.$3),
                       value: o.$1,
                       groupValue: scan,
-                      onChanged: (v) { setS(() => scan = v!); Store.setScanSetting(v!); },
+                      onChanged: (v) {
+                        setS(() => scan = v!);
+                        Store.setScanSetting(v!);
+                      },
                     ),
                   const Divider(),
                   const Padding(
@@ -1663,7 +1932,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                       subtitle: Text(o.$3),
                       value: o.$1,
                       groupValue: qual,
-                      onChanged: (v) { setS(() => qual = v!); Store.setQualitySetting(v!); },
+                      onChanged: (v) {
+                        setS(() => qual = v!);
+                        Store.setQualitySetting(v!);
+                      },
                     ),
                 ],
               ),
@@ -1671,10 +1943,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             actions: [
               TextButton(
                   onPressed: () => AppLog.share(ctx), child: const Text('إرسال سجل الأخطاء')),
-              TextButton(onPressed: () {
-                Navigator.pop(c);
-                _reload();
-              }, child: const Text('إغلاق'))
+              TextButton(
+                  onPressed: () {
+                    Navigator.pop(c);
+                    _reload();
+                  },
+                  child: const Text('إغلاق'))
             ],
           ),
         ),
@@ -1841,10 +2115,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             ),
           ),
           child: DefaultTextStyle(
-            style: TextStyle(color: Colors.white, fontSize: 16),
+            style: const TextStyle(color: Colors.white, fontSize: 16),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
-                Icon(Icons.person, color: Colors.white),
+                const Icon(Icons.person, color: Colors.white),
                 const SizedBox(width: 8),
                 Expanded(
                     child: Text(s.name,
@@ -1852,13 +2126,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               ]),
               const SizedBox(height: 8),
               Row(children: [
-                Icon(Icons.location_on_outlined, color: Colors.white),
+                const Icon(Icons.location_on_outlined, color: Colors.white),
                 const SizedBox(width: 8),
                 Expanded(child: Text(unitLine)),
               ]),
               const SizedBox(height: 8),
               Row(children: [
-                Icon(Icons.calendar_today, color: Colors.white, size: 20),
+                const Icon(Icons.calendar_today, color: Colors.white, size: 20),
                 const SizedBox(width: 8),
                 Text(s.date,
                     textDirection: TextDirection.ltr,
@@ -1881,7 +2155,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         const SizedBox(height: 14),
         Row(children: [
           Expanded(
-              child: _big(Icons.receipt_long, 'الباتش', () => _open(BatchScreen(session: s, fresh: true)))),
+              child: _big(Icons.receipt_long, 'الباتش',
+                  () => _open(BatchScreen(session: s, fresh: true)))),
           const SizedBox(width: 12),
           Expanded(
               child: _big(
@@ -1976,6 +2251,8 @@ class BatchScreen extends StatefulWidget {
 class _BatchScreenState extends State<BatchScreen> {
   String? img;
   Tag? tag;
+  Tag? bandTag;
+  int layout = 0; // 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
   TagPos? pos;
   double? aspect;
   bool busy = false;
@@ -1994,12 +2271,18 @@ class _BatchScreenState extends State<BatchScreen> {
     await Store.setNoTag(path, hide);
   }
 
+  Future<void> _setLayout(int v) async {
+    setState(() => layout = v);
+    await Store.setBatchLayout(v);
+  }
+
   Future<void> _init() async {
     final lost = await takeLostPick('batch');
     if (lost != null && mounted) {
       try {
-        final path =
-            await persistImage(lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
+        final path = await persistImage(
+            lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
+            filter: ScanFilter.receipt);
         await Store.setBatchImg(path);
         await _show(path);
         if (mounted && img != null) await _edit();
@@ -2025,10 +2308,14 @@ class _BatchScreenState extends State<BatchScreen> {
       final p = fitTagPos(p0, t, a);
       if (p.cx != p0.cx || p.cy != p0.cy) await Store.savePos(path, p, true);
       final nt = await Store.noTag(path);
+      final lay = await Store.batchLayout();
+      final bt = await batchBandTag(widget.session, 1000);
       if (!mounted) return;
       setState(() {
         noTag = nt;
         tag = t;
+        bandTag = bt;
+        layout = lay;
         img = path;
         aspect = a;
         pos = p;
@@ -2052,10 +2339,13 @@ class _BatchScreenState extends State<BatchScreen> {
     }
     setState(() => busy = true);
     try {
-      final path =
-          await persistImage(r.first, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      final path = await persistImage(
+          r.first, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
+          filter: ScanFilter.receipt);
       await Store.setBatchImg(path);
       await _show(path);
+      final warn = await qualityWarning(path);
+      if (warn != null && mounted) snack(context, warn);
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
@@ -2103,18 +2393,23 @@ class _BatchScreenState extends State<BatchScreen> {
     XFile? x;
     await markPickTarget('batch');
     try {
-      x = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 90);
-    } catch (e, st) { AppLog.e('_gallery', e, st);
+      x = await ImagePicker()
+          .pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 90);
+    } catch (e, st) {
+      AppLog.e('_gallery', e, st);
       if (mounted) snack(context, 'تعذر فتح المعرض');
       return;
     }
     if (x == null || !mounted) return;
     setState(() => busy = true);
     try {
-      final path =
-          await persistImage(x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      final path = await persistImage(
+          x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
+          filter: ScanFilter.receipt);
       await Store.setBatchImg(path);
       await _show(path);
+      final warn = await qualityWarning(path);
+      if (warn != null && mounted) snack(context, warn);
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
@@ -2128,8 +2423,7 @@ class _BatchScreenState extends State<BatchScreen> {
     final cur = img;
     if (cur == null) return;
     final out = await Navigator.push<String>(
-        context,
-        MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_')));
+        context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_')));
     if (out == null || !mounted) return;
     setState(() => busy = true);
     try {
@@ -2159,7 +2453,7 @@ class _BatchScreenState extends State<BatchScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final ready = img != null && tag != null && pos != null && aspect != null;
+    final ready = img != null && tag != null && pos != null && aspect != null && bandTag != null;
     return Scaffold(
       appBar: AppBar(title: const Text('الباتش')),
       body: !ready
@@ -2168,13 +2462,27 @@ class _BatchScreenState extends State<BatchScreen> {
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.all(8),
-                  child: TaggedImage(
-                      path: img!,
-                      tag: tag!,
-                      pos: pos!,
-                      aspect: aspect,
-                      showTag: !noTag,
-                      onChanged: noTag ? null : _set),
+                  child: layout == 2
+                      ? TaggedImage(
+                          path: img!,
+                          tag: tag!,
+                          pos: pos!,
+                          aspect: aspect,
+                          showTag: !noTag,
+                          onChanged: noTag ? null : _set)
+                      : Center(
+                          child: FittedBox(
+                            fit: BoxFit.contain,
+                            child: SizedBox(
+                              width: 1000,
+                              child: ReceiptPreview(
+                                  path: img!,
+                                  tag: bandTag!,
+                                  bottom: layout == 1,
+                                  showTag: !noTag),
+                            ),
+                          ),
+                        ),
                 ),
               ),
               SwitchListTile(
@@ -2185,27 +2493,46 @@ class _BatchScreenState extends State<BatchScreen> {
                 value: !noTag,
                 onChanged: busy ? null : (v) => _toggleTag(!v),
               ),
-              const Text('اسحب الورقة لتحريكها، وبإصبعين لتكبيرها أو تصغيرها',
-                  style: TextStyle(fontSize: 12, color: Colors.grey)),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Row(children: [
-                  const Icon(Icons.format_size),
-                  Expanded(
-                    child: Slider(
-                      value: pos!.s.clamp(0.1, 0.98).toDouble(),
-                      min: 0.1,
-                      max: 0.98,
-                      onChanged: noTag ? null : (v) => _set(pos!.copyWith(s: v)),
-                    ),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<int>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment(value: 0, label: Text('شريط فوق')),
+                      ButtonSegment(value: 1, label: Text('شريط تحت')),
+                      ButtonSegment(value: 2, label: Text('فوق الصورة')),
+                    ],
+                    selected: {layout},
+                    onSelectionChanged: (busy || noTag) ? null : (v) => _setLayout(v.first),
                   ),
-                  IconButton(
-                    tooltip: 'المكان الأصلي',
-                    icon: const Icon(Icons.restart_alt),
-                    onPressed: noTag ? null : () => _set(TagPos.initial(tag!)),
-                  ),
-                ]),
+                ),
               ),
+              if (layout == 2) ...[
+                const SizedBox(height: 4),
+                const Text('اسحب الورقة لتحريكها، وبإصبعين لتكبيرها أو تصغيرها',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Row(children: [
+                    const Icon(Icons.format_size),
+                    Expanded(
+                      child: Slider(
+                        value: pos!.s.clamp(0.1, 0.98).toDouble(),
+                        min: 0.1,
+                        max: 0.98,
+                        onChanged: noTag ? null : (v) => _set(pos!.copyWith(s: v)),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'المكان الأصلي',
+                      icon: const Icon(Icons.restart_alt),
+                      onPressed: noTag ? null : () => _set(TagPos.initial(tag!)),
+                    ),
+                  ]),
+                ),
+              ],
               SafeArea(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
@@ -2310,7 +2637,8 @@ class EditParams {
         contrast: ((m['c'] as num?) ?? 0).toDouble(),
         brightness: ((m['b'] as num?) ?? 0).toDouble(),
       );
-    } catch (e, st) { AppLog.e('EditParams.decode', e, st);
+    } catch (e, st) {
+      AppLog.e('EditParams.decode', e, st);
       return null;
     }
   }
@@ -2614,7 +2942,8 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
       pt(best[3], -1.5, 1.5),
     ];
     return _quadConvex(q) ? q : null;
-  } catch (e, st) { AppLog.e('_detectDocQuadSimple', e, st);
+  } catch (e, st) {
+    AppLog.e('_detectDocQuadSimple', e, st);
     return null;
   }
 }
@@ -2649,6 +2978,10 @@ class _EditorPageState extends State<EditorPage> {
   bool busy = false;
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
   int _viewGen = 0;
+  ui.Image? cleaned; // نسخة منضّفة للمعاينة لما الفلتر = إيصال
+  int _cleanGen = 0;
+
+  ui.Image get _shown => (filter == ScanFilter.receipt && cleaned != null) ? cleaned! : view!;
 
   @override
   void initState() {
@@ -2659,7 +2992,26 @@ class _EditorPageState extends State<EditorPage> {
   @override
   void dispose() {
     view?.dispose();
+    cleaned?.dispose();
     super.dispose();
+  }
+
+  Future<void> _makeClean() async {
+    final v = view;
+    if (v == null) return;
+    final gen = ++_cleanGen;
+    try {
+      final c = await cleanUiImage(v);
+      if (!mounted || gen != _cleanGen || view != v) {
+        c.dispose();
+        return;
+      }
+      final old = cleaned;
+      setState(() => cleaned = c);
+      WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
+    } catch (e, st) {
+      AppLog.e('_makeClean', e, st);
+    }
   }
 
   Future<void> _loadView() async {
@@ -2672,9 +3024,18 @@ class _EditorPageState extends State<EditorPage> {
         return;
       }
       final old = view;
-      setState(() => view = r);
-      WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
-    } catch (e, st) { AppLog.e('_loadView', e, st);
+      final oldClean = cleaned;
+      setState(() {
+        view = r;
+        cleaned = null;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        old?.dispose();
+        oldClean?.dispose();
+      });
+      if (filter == ScanFilter.receipt) _makeClean();
+    } catch (e, st) {
+      AppLog.e('_loadView', e, st);
       if (mounted) {
         snack(context, 'تعذر فتح الصورة');
         Navigator.pop(context);
@@ -2706,7 +3067,8 @@ class _EditorPageState extends State<EditorPage> {
       AppLog.i('editor view loaded');
       WidgetsBinding.instance.addPostFrameCallback((_) => AppLog.i('editor first frame'));
       if (mounted && e == null && _lastScanManual) await _auto(silent: true);
-    } catch (e, st) { AppLog.e('_init', e, st);
+    } catch (e, st) {
+      AppLog.e('_init', e, st);
       if (mounted) {
         snack(context, 'تعذر فتح الصورة');
         Navigator.pop(context);
@@ -2783,7 +3145,7 @@ class _EditorPageState extends State<EditorPage> {
       ? SizedBox(width: w, height: h)
       : CustomPaint(
           size: Size(w, h),
-          painter: _ViewPainter(view!, Size(w, h), angle * math.pi / 180,
+          painter: _ViewPainter(_shown, Size(w, h), angle * math.pi / 180,
               editMatrix(filter, contrast, brightness)),
         );
 
@@ -2808,7 +3170,7 @@ class _EditorPageState extends State<EditorPage> {
               if (view != null)
                 CustomPaint(
                   size: const Size(d, d),
-                  painter: _ViewPainter(view!, s, angle * math.pi / 180,
+                  painter: _ViewPainter(_shown, s, angle * math.pi / 180,
                       editMatrix(filter, contrast, brightness),
                       focus: f, zoom: z),
                 ),
@@ -2872,7 +3234,7 @@ class _EditorPageState extends State<EditorPage> {
       oh *= k;
       final w = math.max(8, ow.round()), h = math.max(8, oh.round());
       AppLog.i('apply warp ${w}x$h safe=$safe');
-      final rgba = await compute(_warpJob, <String, dynamic>{
+      var rgba = await compute(_warpJob, <String, dynamic>{
         'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
         'sw': rw,
         'sh': rh,
@@ -2883,6 +3245,15 @@ class _EditorPageState extends State<EditorPage> {
         'm': editMatrix(filter, contrast, brightness),
       });
       AppLog.i('apply warp done');
+      if (filter == ScanFilter.receipt) {
+        rgba = await compute(_cleanJob, <String, dynamic>{
+          'src': rgba,
+          'w': w,
+          'h': h,
+          'gray': false,
+        });
+        AppLog.i('apply clean done');
+      }
       final comp = Completer<ui.Image>();
       ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
       final outImg = await comp.future;
@@ -3013,10 +3384,16 @@ class _EditorPageState extends State<EditorPage> {
               segments: const [
                 ButtonSegment(value: ScanFilter.original, label: Text('أصلي')),
                 ButtonSegment(value: ScanFilter.enhance, label: Text('تحسين')),
-                ButtonSegment(value: ScanFilter.bw, label: Text('أبيض وأسود')),
+                ButtonSegment(value: ScanFilter.bw, label: Text('أ/س')),
+                ButtonSegment(value: ScanFilter.receipt, label: Text('إيصال')),
               ],
               selected: {filter},
-              onSelectionChanged: busy ? null : (v) => setState(() => filter = v.first),
+              onSelectionChanged: busy
+                  ? null
+                  : (v) {
+                      setState(() => filter = v.first);
+                      if (v.first == ScanFilter.receipt && cleaned == null) _makeClean();
+                    },
             ),
           ),
           Row(children: [
@@ -3062,7 +3439,8 @@ class _EditorPageState extends State<EditorPage> {
           TextButton.icon(
             onPressed: (busy || aspect == null) ? null : _apply,
             icon: busy
-                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                ? const SizedBox(
+                    width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                 : const Icon(Icons.check),
             label: const Text('تم'),
           ),
@@ -3121,7 +3499,8 @@ class _EditorPageState extends State<EditorPage> {
                       showSelectedIcon: false,
                       segments: const [
                         ButtonSegment(value: 0, icon: Icon(Icons.crop), label: Text('قص')),
-                        ButtonSegment(value: 1, icon: Icon(Icons.rotate_right), label: Text('تدوير')),
+                        ButtonSegment(
+                            value: 1, icon: Icon(Icons.rotate_right), label: Text('تدوير')),
                         ButtonSegment(value: 2, icon: Icon(Icons.tune), label: Text('ألوان')),
                       ],
                       selected: {tab},
@@ -3232,7 +3611,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   bool busy = false;
   bool loaded = false;
   bool continuous = true;
-  ScanFilter filter = ScanFilter.original;
+  ScanFilter filter = ScanFilter.receipt;
   String? progress;
   final Set<String> noTags = {}; // إيصالات من غير ورقة
 
@@ -3342,6 +3721,10 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       }
       built = null;
       HapticFeedback.lightImpact();
+      if (imgs.isNotEmpty) {
+        final warn = await qualityWarning(imgs.last);
+        if (warn != null && mounted) snack(context, warn);
+      }
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
@@ -3465,8 +3848,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             CircleAvatar(
                 radius: 14,
                 backgroundColor: cs.primary,
-                child: Text('${i + 1}',
-                    style: TextStyle(color: cs.onPrimary, fontSize: 13))),
+                child: Text('${i + 1}', style: TextStyle(color: cs.onPrimary, fontSize: 13))),
             const SizedBox(width: 10),
             // المصغّرة = الناتج النهائي: شريط أبيض بعرض الصورة والورقة في منتصفه فوق الإيصال
             ClipRRect(
@@ -3505,8 +3887,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                 onPressed: busy ? null : () => _remove(i)),
             ReorderableDragStartListener(
                 index: i,
-                child: const Padding(
-                    padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle))),
+                child:
+                    const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle))),
           ]),
         ),
       ),
@@ -3545,7 +3927,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                   segments: const [
                     ButtonSegment(value: ScanFilter.original, label: Text('أصلي')),
                     ButtonSegment(value: ScanFilter.enhance, label: Text('تحسين')),
-                    ButtonSegment(value: ScanFilter.bw, label: Text('أبيض وأسود')),
+                    ButtonSegment(value: ScanFilter.bw, label: Text('أ/س')),
+                    ButtonSegment(value: ScanFilter.receipt, label: Text('إيصال')),
                   ],
                   selected: {filter},
                   onSelectionChanged: busy
