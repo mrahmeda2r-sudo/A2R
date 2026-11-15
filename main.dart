@@ -221,27 +221,76 @@ Future<Uint8List> _shrink(String path, {int width = 1280, int quality = 60}) asy
   return File(path).readAsBytes();
 }
 
-/// دمج الشريط (الاسم/الوحدة/المبنى/التاريخ) فوق صورة الباتش في صورة JPEG واحدة.
+/// أول صف فيه كتابة من فوق + لون الورقة، عشان الورقة تتحط في المساحة البيضا اللي فوق الشعار.
+Future<({int ink, Color paper})> topMargin(ui.Image img) async {
+  final w = img.width;
+  final h = img.height;
+  final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+  if (bd == null) return (ink: 0, paper: Colors.white);
+  final px = bd.buffer.asUint8List();
+  final limit = (h * 0.45).floor();
+  final x0 = (w * 0.05).floor();
+  final x1 = (w * 0.95).floor();
+  const step = 3;
+  var ink = limit;
+  for (var y = 0; y < limit; y++) {
+    var dark = 0;
+    var n = 0;
+    for (var x = x0; x < x1; x += step) {
+      final i = (y * w + x) * 4;
+      final lum = (px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) ~/ 1000;
+      n++;
+      if (lum < 150) dark++;
+    }
+    if (dark > n * 0.01) {
+      ink = y;
+      break;
+    }
+  }
+  var paper = Colors.white;
+  if (ink > 8) {
+    final y = ink ~/ 2;
+    var r = 0, g = 0, b = 0, n = 0;
+    for (var x = x0; x < x1; x += step) {
+      final i = (y * w + x) * 4;
+      r += px[i];
+      g += px[i + 1];
+      b += px[i + 2];
+      n++;
+    }
+    if (n > 0) paper = Color.fromARGB(255, r ~/ n, g ~/ n, b ~/ n);
+  }
+  return (ink: ink, paper: paper);
+}
+
+/// دمج الورقة (الاسم/الوحدة+المبنى/التاريخ) في المساحة البيضا فوق الباتش بخط كبير.
+/// لو المساحة البيضا أكبر من اللازم بتتقص، ولو أصغر بتتزود من فوق. مفيش حاجة من الكتابة بتتغطى.
 Future<Uint8List> composeBatch(String path, Session s) async {
   final bytes = await _shrink(path, width: 1400, quality: 80);
   final img = await decodeImage(bytes);
   final w = img.width.toDouble();
   final h = img.height.toDouble();
-  final strip = await batchStrip(w, s);
-  final sImg = await decodeImage(strip.png);
-  final total = sImg.height.toDouble() + h;
+  final tag = await batchTag(w, s);
+  final tImg = await decodeImage(tag.png);
+  final m = await topMargin(img);
+  final gap = w * 0.02; // مسافة بين الورقة وأول سطر في الباتش
+  final padTop = w * 0.02; // مسافة فوق الورقة
+  final cropTop = (m.ink - gap).clamp(0.0, h * 0.45).toDouble(); // الزيادة البيضا اللي بتتقص
+  final band = padTop + tag.h + gap;
+  final total = band + (h - cropTop);
   final rec = ui.PictureRecorder();
   final c = Canvas(rec, Rect.fromLTWH(0, 0, w, total));
-  c.drawImage(sImg, Offset.zero, Paint());
-  c.drawImage(img, Offset(0, sImg.height.toDouble()), Paint());
+  c.drawRect(Rect.fromLTWH(0, 0, w, total), Paint()..color = m.paper);
+  c.drawImageRect(
+      img, Rect.fromLTWH(0, cropTop, w, h - cropTop), Rect.fromLTWH(0, band, w, h - cropTop), Paint());
+  c.drawImage(tImg, Offset((w - tag.w) / 2, padTop), Paint());
   final out = await rec.endRecording().toImage(w.toInt(), total.ceil());
   final bd = await out.toByteData(format: ui.ImageByteFormat.png);
   img.dispose();
-  sImg.dispose();
+  tImg.dispose();
   out.dispose();
-  final png = bd!.buffer.asUint8List();
   final jpg = await FlutterImageCompress.compressWithList(
-    png,
+    bd!.buffer.asUint8List(),
     minWidth: 4000,
     minHeight: 6000,
     quality: 80,
@@ -258,6 +307,49 @@ class Tag {
   final Uint8List png;
   final double w, h;
   Tag(this.png, this.w, this.h);
+}
+
+// ===== ورقة الباتش (في المساحة البيضا فوق الشعار) =====
+const kBatchFont = 0.09; // حجم الخط = تقريباً حجم شعار البنك (نسبة من عرض الصورة)
+
+/// 3 أسطر زي الكتابة اليدوي: الاسم / الوحدة - المبنى / التاريخ. الخط بيصغر لوحده لو السطر عريض.
+Future<Tag> batchTag(double w, Session s) async {
+  final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
+  final texts = [s.name, unitLine, s.date];
+  final dirs = [TextDirection.rtl, TextDirection.rtl, TextDirection.ltr];
+  final maxTextW = w * 0.9;
+  var fs = w * kBatchFont;
+  late List<TextPainter> lines;
+  for (var i = 0; i < 6; i++) {
+    lines = [for (var k = 0; k < 3; k++) _tp(texts[k], fs, dirs[k])];
+    final widest = lines.map((l) => l.width).reduce((a, b) => a > b ? a : b);
+    if (widest <= maxTextW) break;
+    fs *= maxTextW / widest * 0.98;
+  }
+  final pad = fs * 0.45;
+  final gap = fs * 0.1;
+  final textW = lines.map((l) => l.width).reduce((a, b) => a > b ? a : b);
+  final cw = (textW + pad * 2).clamp(0.0, w * 0.96).toDouble();
+  final ch = lines.fold<double>(0, (a, l) => a + l.height) + gap * 2 + pad * 2;
+  final rec = ui.PictureRecorder();
+  final c = Canvas(rec, Rect.fromLTWH(0, 0, cw, ch));
+  final rr = RRect.fromRectAndRadius(Rect.fromLTWH(0, 0, cw, ch), Radius.circular(fs * 0.4));
+  c.drawRRect(rr, Paint()..color = Colors.white);
+  c.drawRRect(
+      rr,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = w * 0.005
+        ..color = Colors.black);
+  var y = pad;
+  for (final l in lines) {
+    l.paint(c, Offset((cw - l.width) / 2, y));
+    y += l.height + gap;
+  }
+  final img = await rec.endRecording().toImage(cw.ceil(), ch.ceil());
+  final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+  img.dispose();
+  return Tag(bd!.buffer.asUint8List(), cw, ch);
 }
 
 /// الورقة الصغيرة: سطر (الاسم | الوحدة - المبنى) وسطر (TID | التاريخ)
@@ -647,7 +739,9 @@ class ReceiptPreview extends StatelessWidget {
   final String path;
   final Tag? tag;
   final int? cacheWidth;
-  const ReceiptPreview({super.key, required this.path, this.tag, this.cacheWidth});
+  final double top; // بُعد الورقة عن أعلى الصورة (نسبة من العرض)
+  const ReceiptPreview(
+      {super.key, required this.path, this.tag, this.cacheWidth, this.top = kTagTop});
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
         final cw = cons.maxWidth;
@@ -655,7 +749,7 @@ class ReceiptPreview extends StatelessWidget {
           Image.file(File(path), width: double.infinity, fit: BoxFit.fitWidth, cacheWidth: cacheWidth),
           if (tag != null)
             Positioned(
-              top: cw * kTagTop,
+              top: cw * top,
               left: 0,
               right: 0,
               child: Center(child: Image.memory(tag!.png, width: cw * tag!.w / 1000)),
@@ -670,13 +764,79 @@ void snack(BuildContext context, String m) =>
 // ===== التطبيق =====
 void main() => runApp(const A2RApp());
 
+// ===== الشكل =====
+const kBrand = Color(0xFF0B5FA5);
+const kBrandDark = Color(0xFF083E70);
+const kInk = Color(0xFF1B2733);
+
+InputDecoration fieldDec(String label, IconData icon) => InputDecoration(
+      labelText: label,
+      prefixIcon: Icon(icon, color: kBrand),
+      filled: true,
+      fillColor: Colors.white,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+      enabledBorder:
+          OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide(color: Colors.blueGrey.shade100)),
+      focusedBorder:
+          OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: const BorderSide(color: kBrand, width: 2)),
+    );
+
+/// شعار A2R بخلفية متدرجة فوق شاشة الدخول.
+class BrandHeader extends StatelessWidget {
+  const BrandHeader({super.key});
+  @override
+  Widget build(BuildContext context) => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 26),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+              begin: Alignment.topRight, end: Alignment.bottomLeft, colors: [kBrand, kBrandDark]),
+          borderRadius: BorderRadius.circular(26),
+          boxShadow: [BoxShadow(color: kBrand.withAlpha(70), blurRadius: 18, offset: const Offset(0, 8))],
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(color: Colors.white.withAlpha(40), shape: BoxShape.circle),
+            child: const Icon(Icons.receipt_long, color: Colors.white, size: 34),
+          ),
+          const SizedBox(height: 10),
+          const Text('A2R',
+              style: TextStyle(
+                  fontSize: 46, fontWeight: FontWeight.w900, letterSpacing: 6, color: Colors.white, height: 1.1)),
+          const SizedBox(height: 4),
+          Text('تجميع إيصالات الدفع', style: TextStyle(fontSize: 14, color: Colors.white.withAlpha(210))),
+        ]),
+      );
+}
+
 class A2RApp extends StatelessWidget {
   const A2RApp({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'A2R',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(colorSchemeSeed: const Color(0xFF0B5FA5), useMaterial3: true),
+        theme: ThemeData(
+          useMaterial3: true,
+          colorScheme: ColorScheme.fromSeed(seedColor: kBrand),
+          scaffoldBackgroundColor: const Color(0xFFF2F6FB),
+          filledButtonTheme: FilledButtonThemeData(
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(0, 52),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+          ),
+          outlinedButtonTheme: OutlinedButtonThemeData(
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size(0, 52),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
         builder: (c, w) => Directionality(textDirection: TextDirection.rtl, child: w!),
         home: const LoginScreen(),
       );
@@ -741,14 +901,13 @@ class _LoginScreenState extends State<LoginScreen> {
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(children: [
-            const SizedBox(height: 16),
-            const Text('A2R',
-                style: TextStyle(fontSize: 56, fontWeight: FontWeight.w900, letterSpacing: 4)),
-            const SizedBox(height: 48),
+            const SizedBox(height: 8),
+            const BrandHeader(),
+            const SizedBox(height: 28),
             DropdownButtonFormField<String>(
               value: name,
               isExpanded: true,
-              decoration: const InputDecoration(labelText: 'الاسم', border: OutlineInputBorder()),
+              decoration: fieldDec('الاسم', Icons.person_outline),
               items: kNames.map((n) => DropdownMenuItem(value: n, child: Text(n))).toList(),
               onChanged: (v) => setState(() => name = v),
             ),
@@ -756,7 +915,7 @@ class _LoginScreenState extends State<LoginScreen> {
             DropdownButtonFormField<Unit>(
               value: unit,
               isExpanded: true,
-              decoration: const InputDecoration(labelText: 'الوحدة', border: OutlineInputBorder()),
+              decoration: fieldDec('الوحدة', Icons.store_mall_directory_outlined),
               items: kUnits.map((u) => DropdownMenuItem(value: u, child: Text(u.name))).toList(),
               onChanged: (v) => setState(() {
                 unit = v;
@@ -769,7 +928,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 key: ValueKey(unit!.name),
                 value: building,
                 isExpanded: true,
-                decoration: const InputDecoration(labelText: 'المبنى', border: OutlineInputBorder()),
+                decoration: fieldDec('المبنى', Icons.apartment),
                 items: unit!.buildings
                     .map((b) => DropdownMenuItem(value: b, child: Text(b)))
                     .toList(),
@@ -913,32 +1072,41 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await _reload();
   }
 
-  Widget _big(IconData icon, String label, bool done, VoidCallback onTap) => SizedBox(
+  Widget _big(IconData icon, String label, bool done, VoidCallback onTap,
+          {Color color = kBrand}) =>
+      SizedBox(
         height: 150,
-        child: FilledButton(
-          style: FilledButton.styleFrom(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-              padding: const EdgeInsets.all(8)),
-          onPressed: onTap,
-          child: SizedBox.expand(
+        child: Material(
+          color: Colors.white,
+          elevation: 3,
+          shadowColor: color.withAlpha(90),
+          borderRadius: BorderRadius.circular(24),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(24),
+            onTap: onTap,
             child: Stack(children: [
               Center(
                 child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(icon, size: 46),
-                  const SizedBox(height: 8),
+                  Container(
+                    width: 70,
+                    height: 70,
+                    decoration: BoxDecoration(color: color.withAlpha(30), shape: BoxShape.circle),
+                    child: Icon(icon, size: 36, color: color),
+                  ),
+                  const SizedBox(height: 12),
                   Text(label,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800, color: kInk)),
                 ]),
               ),
               if (done)
                 const Positioned(
-                  top: 2,
-                  left: 2,
+                  top: 10,
+                  left: 10,
                   child: CircleAvatar(
-                      radius: 14,
+                      radius: 13,
                       backgroundColor: Colors.green,
-                      child: Icon(Icons.check, color: Colors.white, size: 20)),
+                      child: Icon(Icons.check, color: Colors.white, size: 18)),
                 ),
             ]),
           ),
@@ -953,13 +1121,28 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final bi = batchImg;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('A2R', style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2)),
+        centerTitle: true,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        title: const Text('A2R',
+            style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 4, color: kBrandDark)),
       ),
       body: ListView(padding: const EdgeInsets.all(16), children: [
         if (busy) const LinearProgressIndicator(),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(14),
+        Container(
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(
+                begin: Alignment.topRight, end: Alignment.bottomLeft, colors: [kBrand, kBrandDark]),
+            borderRadius: BorderRadius.circular(22),
+            boxShadow: [BoxShadow(color: kBrand.withAlpha(70), blurRadius: 16, offset: const Offset(0, 6))],
+          ),
+          child: DefaultTextStyle.merge(
+            style: const TextStyle(color: Colors.white),
+            child: IconTheme(
+            data: const IconThemeData(color: Colors.white),
+            child: Padding(
+            padding: const EdgeInsets.all(16),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
                 const Icon(Icons.person),
@@ -984,11 +1167,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 const SizedBox(width: 8),
                 const Expanded(
                     child: Text('(تاريخ التليفون - اتأكد إنه صح)',
-                        style: TextStyle(fontSize: 12, color: Colors.grey))),
+                        style: TextStyle(fontSize: 12, color: Colors.white70))),
               ]),
               Align(
                 alignment: AlignmentDirectional.centerEnd,
                 child: TextButton.icon(
+                  style: TextButton.styleFrom(foregroundColor: Colors.white),
                   onPressed: () => Navigator.pop(context),
                   icon: const Icon(Icons.switch_account),
                   label: const Text('تغيير الحساب'),
@@ -996,8 +1180,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               ),
             ]),
           ),
+          ),
+          ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 18),
         Row(children: [
           Expanded(
               child: _big(Icons.receipt_long, 'الباتش', batchSent,
@@ -1005,7 +1191,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           const SizedBox(width: 12),
           Expanded(
               child: _big(Icons.payments, 'إيصالات الدفع', receiptsSent,
-                  () => _open(ReceiptsScreen(session: s)))),
+                  () => _open(ReceiptsScreen(session: s)),
+                  color: const Color(0xFF00897B))),
         ]),
         if (draft.isNotEmpty || pf != null || bi != null) ...[
           const SizedBox(height: 24),
@@ -1086,7 +1273,7 @@ class BatchScreen extends StatefulWidget {
 
 class _BatchScreenState extends State<BatchScreen> {
   String? img;
-  Rendered? strip;
+  Uint8List? composed; // الصورة النهائية زي ما هتتبعت
   bool busy = false;
 
   @override
@@ -1100,11 +1287,11 @@ class _BatchScreenState extends State<BatchScreen> {
     final cur = await Store.batchImg();
     if (!mounted) return;
     if (cur != null) {
-      final st = await batchStrip(1000, widget.session);
+      final st = await composeBatch(cur, widget.session);
       if (!mounted) return;
       setState(() {
         img = cur;
-        strip = st;
+        composed = st;
       });
     } else {
       _capture();
@@ -1122,11 +1309,11 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(r.first, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
       await Store.setBatchImg(path); // بتمسح القديمة
-      final st = await batchStrip(1000, widget.session);
+      final st = await composeBatch(path, widget.session);
       if (!mounted) return;
       setState(() {
         img = path;
-        strip = st;
+        composed = st;
       });
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: $e');
@@ -1147,14 +1334,12 @@ class _BatchScreenState extends State<BatchScreen> {
     }
   }
 
-  Widget _content({int? cacheWidth}) => Column(mainAxisSize: MainAxisSize.min, children: [
-        Image.memory(strip!.png, width: double.infinity, fit: BoxFit.fitWidth),
-        Image.file(File(img!), width: double.infinity, fit: BoxFit.fitWidth, cacheWidth: cacheWidth),
-      ]);
+  Widget _content({int? cacheWidth}) =>
+      Image.memory(composed!, width: double.infinity, fit: BoxFit.fitWidth);
 
   @override
   Widget build(BuildContext context) {
-    final ready = img != null && strip != null;
+    final ready = img != null && composed != null;
     return Scaffold(
       appBar: AppBar(title: const Text('الباتش')),
       body: !ready
