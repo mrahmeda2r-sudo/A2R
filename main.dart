@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:document_scan/document_scan.dart' as ds;
 import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1973,9 +1974,24 @@ Uint8List _warpJob(Map<String, dynamic> a) {
   return out;
 }
 
-/// كشف تقريبي لحدود الورقة (بيفترض إن الورقة أفتح أو أغمق من الخلفية بشكل واضح).
-/// بيرجّع TL,TR,BR,BL كنسب، أو null لو مقدرش يحدد.
+/// كشف حدود الورقة: أول حاجة المحرك الأصلي (OpenCV) من حزمة document_scan، أوفلاين ومن غير Play Services،
+/// ولو فشل أو رجّع null بنرجع للكشف البسيط تحت. بيرجّع TL,TR,BR,BL كنسب، أو null.
 Future<List<Offset>?> detectDocQuad(String path) async {
+  try {
+    final c = await ds.DocumentDetector().detect(ds.ScanInput.file(path));
+    if (c != null) {
+      final q = [
+        for (final p in c.toList())
+          Offset(p.x.clamp(0.0, 1.0).toDouble(), p.y.clamp(0.0, 1.0).toDouble())
+      ];
+      if (q.length == 4 && _quadConvex(q)) return q;
+    }
+  } catch (_) {}
+  return _detectDocQuadSimple(path);
+}
+
+/// كشف تقريبي بسيط (بيفترض إن الورقة أفتح أو أغمق من الخلفية بشكل واضح).
+Future<List<Offset>?> _detectDocQuadSimple(String path) async {
   try {
     final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 128);
     final w = img.width, h = img.height;
@@ -2180,6 +2196,7 @@ class _EditorPageState extends State<EditorPage> {
         }
       });
       await _loadView();
+      if (mounted && e == null && _scannerFailed) await _auto(silent: true);
     } catch (_) {
       if (mounted) {
         snack(context, 'تعذر فتح الصورة');
@@ -2294,13 +2311,13 @@ class _EditorPageState extends State<EditorPage> {
     );
   }
 
-  Future<void> _auto() async {
+  Future<void> _auto({bool silent = false}) async {
     setState(() => busy = true);
     try {
       final q = await detectDocQuad(src!);
       if (!mounted) return;
       if (q == null) {
-        snack(context, 'مقدرتش أحدد حدود الورقة تلقائياً، حددها بإيدك');
+        if (!silent) snack(context, 'مقدرتش أحدد حدود الورقة تلقائياً، حددها بإيدك');
       } else {
         var r = q;
         for (var i = 0; i < turns; i++) {
