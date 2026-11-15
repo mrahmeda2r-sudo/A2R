@@ -120,7 +120,7 @@ class Unit {
   /// اسم الوحدة للملفات: بدون همزات/أقواس، والمسافات نقط
   String get slug => name
       .replaceAll(RegExp('[أإآ]'), 'ا')
-      .replaceAll(RegExp(r'[()]'), ' ')
+      .replaceAll(RegExp(r'[()\\/:*?"<>|]'), ' ')
       .trim()
       .split(RegExp(r'[\s.]+'))
       .join('.');
@@ -446,7 +446,9 @@ class TagPos {
     if (p.length != 3) return null;
     final a = double.tryParse(p[0]), b = double.tryParse(p[1]), c = double.tryParse(p[2]);
     if (a == null || b == null || c == null) return null;
-    return TagPos(a, b, c);
+    if (!a.isFinite || !b.isFinite || !c.isFinite) return null;
+    return TagPos(a.clamp(0.0, 1.0).toDouble(), b.clamp(0.0, 10.0).toDouble(),
+        c.clamp(0.1, 0.98).toDouble());
   }
 }
 
@@ -782,7 +784,16 @@ class Store {
     keep.addAll(keep.map(baseOf).toList());
     await for (final e in (await dir()).list()) {
       if (working > 0) return;
-      if (e is File && !keep.contains(e.path)) await del(e.path);
+      if (e is File && !keep.contains(e.path)) {
+        try {
+          if (DateTime.now().difference(e.lastModifiedSync()) < const Duration(minutes: 2)) {
+            continue;
+          }
+        } catch (_) {
+          continue;
+        }
+        await del(e.path);
+      }
     }
   }
 }
@@ -906,7 +917,20 @@ Future<List<String>> _manualPick(BuildContext context, {bool multi = false}) asy
   return r;
 }
 
+bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
+
 Future<List<String>> scanImages(BuildContext context, int limit,
+    {ScannerMode mode = ScannerMode.full}) async {
+  if (_scanBusy) return [];
+  _scanBusy = true;
+  try {
+    return await _scanImagesImpl(context, limit, mode: mode);
+  } finally {
+    _scanBusy = false;
+  }
+}
+
+Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
     {ScannerMode mode = ScannerMode.full}) async {
   _lastScanManual = false;
   if (!await ensureCamera(context)) return [];
@@ -953,13 +977,25 @@ Future<List<String>> scanImages(BuildContext context, int limit,
 }
 
 /// قايمة المشاركة العادية: الموظف يختار واتساب أو أي تطبيق.
+bool _shareBusy = false;
+
 Future<bool> shareFiles(BuildContext context, List<String> paths) async {
-  final r = await Share.shareXFiles(paths.map((p) => XFile(p)).toList());
-  if (r.status == ShareResultStatus.success) return true;
-  if (r.status == ShareResultStatus.dismissed) return false;
-  if (!context.mounted) return false;
-  return askYesNo(context, 'تم الإرسال؟', 'لو بعت الملف فعلاً اضغط "تم".',
-      yes: 'تم', no: 'لا');
+  if (_shareBusy) return false;
+  _shareBusy = true;
+  try {
+    final r = await Share.shareXFiles(paths.map((p) => XFile(p)).toList());
+    if (r.status == ShareResultStatus.success) return true;
+    if (r.status == ShareResultStatus.dismissed) return false;
+    if (!context.mounted) return false;
+    return await askYesNo(context, 'تم الإرسال؟', 'لو بعت الملف فعلاً اضغط "تم".',
+        yes: 'تم', no: 'لا');
+  } catch (e, st) {
+    AppLog.e('shareFiles', e, st);
+    if (context.mounted) snack(context, 'تعذر فتح قائمة المشاركة');
+    return false;
+  } finally {
+    _shareBusy = false;
+  }
 }
 
 Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
@@ -1175,7 +1211,15 @@ Future<void> main() async {
     _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
   } catch (e, st) { AppLog.e('main', e, st);}
   await stashLostPick();
-  runApp(const A2RApp());
+  String? resume;
+  try {
+    final sp = await SharedPreferences.getInstance();
+    final lp = sp.getString('lostPick');
+    if (lp != null && File(lp).existsSync()) resume = sp.getString('pickTarget');
+  } catch (e, st) {
+    AppLog.e('main.resume', e, st);
+  }
+  runApp(A2RApp(resumeTarget: resume));
 }
 
 ThemeData _theme(Brightness b) => ThemeData(
@@ -1191,7 +1235,8 @@ ThemeData _theme(Brightness b) => ThemeData(
     );
 
 class A2RApp extends StatelessWidget {
-  const A2RApp({super.key});
+  final String? resumeTarget;
+  const A2RApp({super.key, this.resumeTarget});
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'A2R',
@@ -1203,12 +1248,13 @@ class A2RApp extends StatelessWidget {
         supportedLocales: const [Locale('ar'), Locale('en')],
         localizationsDelegates: GlobalMaterialLocalizations.delegates,
         builder: (c, w) => Directionality(textDirection: TextDirection.rtl, child: w!),
-        home: const LoginScreen(),
+        home: LoginScreen(resumeTarget: resumeTarget),
       );
 }
 
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  final String? resumeTarget; // 'batch' أو 'receipts' لو التطبيق اتقفل أثناء التصوير
+  const LoginScreen({super.key, this.resumeTarget});
   @override
   State<LoginScreen> createState() => _LoginScreenState();
 }
@@ -1233,6 +1279,25 @@ class _LoginScreenState extends State<LoginScreen> {
       unitName = nz(p.getString('unit'));
       building = nz(p.getString('building'));
     });
+    final rt = widget.resumeTarget;
+    if (rt != null && _ready) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _resume(rt);
+      });
+    }
+  }
+
+  /// أندرويد قفل التطبيق وهو في الكاميرا (رامات قليلة): نرجّع الموظف لنفس الشاشة بدل شاشة الدخول.
+  void _resume(String target) {
+    final u = _unit;
+    final n = _name;
+    if (u == null || n == null) return;
+    final b = _needsBuilding ? _building : (u.buildings.length == 1 ? u.buildings.first : null);
+    final s = Session(n, u, b);
+    final nav = Navigator.of(context);
+    nav.push(MaterialPageRoute(builder: (_) => MainScreen(session: s)));
+    nav.push(MaterialPageRoute(
+        builder: (_) => target == 'batch' ? BatchScreen(session: s) : ReceiptsScreen(session: s)));
   }
 
   Future<void> _save() async {
@@ -1256,14 +1321,19 @@ class _LoginScreenState extends State<LoginScreen> {
       (_needsBuilding && _unit!.buildings.contains(building)) ? building : null;
   bool get _ready => _name != null && _unit != null && (!_needsBuilding || _building != null);
 
+  bool _starting = false;
+
   void _start() {
+    if (_starting) return;
+    _starting = true;
     final u = _unit!;
     final b = _needsBuilding ? _building : (u.buildings.length == 1 ? u.buildings.first : null);
     name = _name;
     building = _building;
     _save();
     Navigator.push(
-        context, MaterialPageRoute(builder: (_) => MainScreen(session: Session(name!, u, b))));
+            context, MaterialPageRoute(builder: (_) => MainScreen(session: Session(name!, u, b))))
+        .then((_) => _starting = false);
   }
 
   @override
@@ -1481,8 +1551,16 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     );
   }
 
+  bool _opening = false;
+
   Future<void> _open(Widget screen) async {
-    await Navigator.push(context, MaterialPageRoute(builder: (_) => screen));
+    if (_opening) return;
+    _opening = true;
+    try {
+      await Navigator.push(context, MaterialPageRoute(builder: (_) => screen));
+    } finally {
+      _opening = false;
+    }
     _reload();
   }
 
@@ -1515,9 +1593,14 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _openPdf() async {
     final f = pdf;
     if (f == null) return;
-    final r = await OpenFilex.open(f.file.path);
-    if (r.type != ResultType.done && mounted) {
-      snack(context, 'مفيش تطبيق يفتح ملفات PDF على التليفون');
+    try {
+      final r = await OpenFilex.open(f.file.path);
+      if (r.type != ResultType.done && mounted) {
+        snack(context, 'مفيش تطبيق يفتح ملفات PDF على التليفون');
+      }
+    } catch (e, st) {
+      AppLog.e('_openPdf', e, st);
+      if (mounted) snack(context, 'تعذر فتح الملف');
     }
   }
 
@@ -1837,9 +1920,38 @@ class _BatchScreenState extends State<BatchScreen> {
     if (mounted && _lastScanManual && img != null) await _edit();
   }
 
+  Timer? _saveT;
+
   void _set(TagPos p) {
     setState(() => pos = p);
-    Store.savePos(img!, p, true);
+    _saveT?.cancel();
+    final path = img;
+    if (path == null) return;
+    _saveT = Timer(const Duration(milliseconds: 400), () {
+      Store.savePos(path, p, true).catchError((Object e, StackTrace st) {
+        AppLog.e('savePos', e, st);
+      });
+    });
+  }
+
+  Future<void> _flushPos() async {
+    final t = _saveT;
+    if (t != null && t.isActive) {
+      t.cancel();
+      final path = img, p = pos;
+      if (path != null && p != null) await Store.savePos(path, p, true);
+    }
+  }
+
+  @override
+  void dispose() {
+    final t = _saveT;
+    if (t != null && t.isActive) {
+      t.cancel();
+      final path = img, p = pos;
+      if (path != null && p != null) Store.savePos(path, p, true);
+    }
+    super.dispose();
   }
 
   /// معرض: يختار صورة، وبعدين شاشة القص (تعديل) تفتح لوحدها.
@@ -1889,6 +2001,7 @@ class _BatchScreenState extends State<BatchScreen> {
   Future<void> _send() async {
     setState(() => busy = true);
     try {
+      await _flushPos();
       final ok = await sendBatchFile(context, widget.session, img!);
       if (ok) HapticFeedback.mediumImpact();
       if (ok && mounted) Navigator.pop(context);
@@ -2183,7 +2296,9 @@ Future<List<Offset>?> detectDocQuad(String path) async {
         AppLog.e('detectDocQuad.smallCopy', e, st);
       }
       AppLog.i('native detect start');
-      final c = await ds.DocumentDetector().detect(ds.ScanInput.file(input));
+      final c = await ds.DocumentDetector()
+          .detect(ds.ScanInput.file(input))
+          .timeout(const Duration(seconds: 20));
       AppLog.i('native detect done');
       if (c != null) {
         final q = [
