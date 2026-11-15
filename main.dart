@@ -249,27 +249,84 @@ Future<Uint8List> composeBatch(String path, Session s) async {
   return jpg;
 }
 
-/// PDF إيصالات فقط: كل صفحة = الورقة الصغيرة + صورة الإيصال.
+// ===== ورقة الإيصال (فوق الصورة) =====
+const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة) - زوّد/قلّل الرقم لو عايز
+const kTagTop = 0.03; // بُعد الورقة عن أعلى الصورة (نسبة من عرض الصورة)
+
+class Tag {
+  final Uint8List png;
+  final double w, h;
+  Tag(this.png, this.w, this.h);
+}
+
+/// الورقة الصغيرة: سطر (الاسم | الوحدة - المبنى) وسطر (TID | التاريخ)
+Future<Tag> receiptTag(double w, Session s) async {
+  final fs = w * kTagFont;
+  final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
+  final l1 = _tp('${s.name}  |  $unitLine', fs, TextDirection.rtl);
+  final l2 = _tp('${_isoLtr('TID: ${s.unit.tid}')}  |  ${_isoLtr(s.date)}', fs, TextDirection.rtl);
+  final pad = fs * 0.6;
+  final gap = fs * 0.25;
+  final textW = l1.width > l2.width ? l1.width : l2.width;
+  final cw = (textW + pad * 2).clamp(0.0, w * 0.96).toDouble();
+  final ch = l1.height + l2.height + gap + pad * 2;
+  final rec = ui.PictureRecorder();
+  final c = Canvas(rec, Rect.fromLTWH(0, 0, cw, ch));
+  final rr = RRect.fromRectAndRadius(Rect.fromLTWH(0, 0, cw, ch), Radius.circular(fs * 0.5));
+  c.drawRRect(rr, Paint()..color = Colors.white);
+  c.drawRRect(
+      rr,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = w * 0.004
+        ..color = Colors.black);
+  l1.paint(c, Offset((cw - l1.width) / 2, pad));
+  l2.paint(c, Offset((cw - l2.width) / 2, pad + l1.height + gap));
+  final img = await rec.endRecording().toImage(cw.ceil(), ch.ceil());
+  final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+  img.dispose();
+  return Tag(bd!.buffer.asUint8List(), cw, ch);
+}
+
+/// صورة الإيصال + الورقة مرسومة فوقها (في النص من فوق).
+Future<({Uint8List bytes, double ratio})> composeReceipt(String path, Session s) async {
+  final bytes = await _shrink(path, width: 1280, quality: 70);
+  final img = await decodeImage(bytes);
+  final w = img.width.toDouble();
+  final h = img.height.toDouble();
+  final tag = await receiptTag(w, s);
+  final tImg = await decodeImage(tag.png);
+  final rec = ui.PictureRecorder();
+  final c = Canvas(rec, Rect.fromLTWH(0, 0, w, h));
+  c.drawImage(img, Offset.zero, Paint());
+  c.drawImage(tImg, Offset((w - tag.w) / 2, w * kTagTop), Paint());
+  final out = await rec.endRecording().toImage(w.toInt(), h.toInt());
+  final bd = await out.toByteData(format: ui.ImageByteFormat.png);
+  img.dispose();
+  tImg.dispose();
+  out.dispose();
+  final jpg = await FlutterImageCompress.compressWithList(
+    bd!.buffer.asUint8List(),
+    minWidth: 4000,
+    minHeight: 6000,
+    quality: 65,
+    format: CompressFormat.jpeg,
+  );
+  return (bytes: jpg, ratio: h / w);
+}
+
+/// PDF إيصالات فقط: كل صفحة = صورة الإيصال وعليها الورقة من فوق.
 Future<File> buildReceiptsPdf(Session s, List<String> receipts) async {
   final doc = pw.Document();
   const pageW = 595.0;
   // صفحة واحدة في كل مرة عشان الذاكرة (تليفونات ضعيفة)
   for (final path in receipts) {
-    final bytes = await _shrink(path, quality: 60);
-    final img = await decodeImage(bytes);
-    final w = img.width.toDouble();
-    final h = img.height.toDouble();
-    img.dispose();
-    final label = await receiptLabel(w, s);
-    final labelH = pageW * label.ratio;
-    final imgH = pageW * h / w;
+    final r = await composeReceipt(path, s);
+    final pageH = pageW * r.ratio;
     doc.addPage(pw.Page(
-      pageFormat: PdfPageFormat(pageW, labelH + imgH),
+      pageFormat: PdfPageFormat(pageW, pageH),
       margin: pw.EdgeInsets.zero,
-      build: (_) => pw.Column(children: [
-        pw.Image(pw.MemoryImage(label.png), width: pageW, height: labelH),
-        pw.Image(pw.MemoryImage(bytes), width: pageW, height: imgH),
-      ]),
+      build: (_) => pw.Image(pw.MemoryImage(r.bytes), width: pageW, height: pageH),
     ));
   }
   final dir = await Store.dir();
@@ -477,6 +534,17 @@ Future<List<String>> simplePick(BuildContext context) async {
       ScaffoldMessenger.of(context)
           .showSnackBar(const SnackBar(content: Text('تعذر فتح الكاميرا أو المعرض')));
     }
+    return [];
+  }
+}
+
+/// اختيار مجموعة صور من المعرض (بترتيب الاختيار).
+Future<List<String>> pickGalleryMulti(BuildContext context) async {
+  try {
+    final xs = await ImagePicker().pickMultiImage(maxWidth: 2000, imageQuality: 85);
+    return xs.map((e) => e.path).toList();
+  } catch (_) {
+    if (context.mounted) snack(context, 'تعذر فتح المعرض');
     return [];
   }
 }
@@ -1011,7 +1079,7 @@ class ReceiptsScreen extends StatefulWidget {
 
 class _ReceiptsScreenState extends State<ReceiptsScreen> {
   List<String> imgs = [];
-  Rendered? label;
+  Tag? tag;
   File? built; // PDF اتعمل من الصور الحالية
   bool busy = false;
   bool loaded = false;
@@ -1024,11 +1092,11 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   Future<void> _load() async {
     final d = await Store.draft();
-    final l = await receiptLabel(1000, widget.session);
+    final l = await receiptTag(1000, widget.session);
     if (!mounted) return;
     setState(() {
       imgs = d;
-      label = l;
+      tag = l;
       loaded = true;
     });
     if (d.isEmpty) _add();
@@ -1037,6 +1105,10 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   Future<void> _add() async {
     final r = await scanImages(context, 1);
     if (r.isEmpty || !mounted) return;
+    await _saveAll(r);
+  }
+
+  Future<void> _saveAll(List<String> r) async {
     setState(() => busy = true);
     try {
       for (final p in r) {
@@ -1050,6 +1122,12 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     } finally {
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  Future<void> _addGallery() async {
+    final r = await pickGalleryMulti(context);
+    if (r.isEmpty || !mounted) return;
+    await _saveAll(r);
   }
 
   Future<void> _remove(int i) async {
@@ -1104,41 +1182,60 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                       separatorBuilder: (_, __) => const SizedBox(height: 12),
                       itemBuilder: (_, i) => Container(
                         decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
-                        child: Stack(children: [
-                          Column(children: [
-                            if (label != null)
-                              Image.memory(label!.png, width: double.infinity, fit: BoxFit.fitWidth),
+                        child: LayoutBuilder(builder: (ctx, cons) {
+                          final cw = cons.maxWidth;
+                          return Stack(children: [
                             Image.file(File(imgs[i]),
                                 width: double.infinity, fit: BoxFit.fitWidth, cacheWidth: 900),
-                          ]),
-                          Positioned(
-                            top: 6,
-                            left: 6,
-                            child: GestureDetector(
-                              onTap: busy ? null : () => _remove(i),
-                              child: const CircleAvatar(
-                                  radius: 16,
-                                  backgroundColor: Colors.red,
-                                  child: Icon(Icons.close, size: 20, color: Colors.white)),
+                            if (tag != null)
+                              Positioned(
+                                top: cw * kTagTop,
+                                left: 0,
+                                right: 0,
+                                child: Center(
+                                    child: Image.memory(tag!.png, width: cw * tag!.w / 1000)),
+                              ),
+                            Positioned(
+                              top: 6,
+                              left: 6,
+                              child: GestureDetector(
+                                onTap: busy ? null : () => _remove(i),
+                                child: const CircleAvatar(
+                                    radius: 16,
+                                    backgroundColor: Colors.red,
+                                    child: Icon(Icons.close, size: 20, color: Colors.white)),
+                              ),
                             ),
-                          ),
-                        ]),
+                          ]);
+                        }),
                       ),
                     ),
         ),
         SafeArea(
           child: Padding(
             padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-            child: Row(children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: busy ? null : _add,
-                  icon: const Icon(Icons.add_a_photo),
-                  label: const Text('إضافة صورة'),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Row(children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: busy ? null : _add,
+                    icon: const Icon(Icons.add_a_photo),
+                    label: const Text('تصوير'),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: busy ? null : _addGallery,
+                    icon: const Icon(Icons.photo_library),
+                    label: const Text('من المعرض'),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                height: 48,
                 child: FilledButton.icon(
                   onPressed: (busy || imgs.isEmpty) ? null : (built == null ? _create : _send),
                   icon: busy
