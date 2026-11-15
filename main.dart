@@ -23,11 +23,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 //  إعدادات عامة
 // =====================================================================
 
-/// رابط ملف البيانات على GitHub (data.json). غيّر YOUR_USER و YOUR_REPO.
-/// لازم الريبو يكون Public عشان الرابط يشتغل من غير تسجيل دخول.
-/// تقدر كمان تمرره وقت البناء: --dart-define=DATA_URL=...
-const kDataUrl = String.fromEnvironment('DATA_URL',
-    defaultValue: 'https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/data.json');
+/// الأسماء والوحدات بتتبني جوه التطبيق من ملف data.xlsx وقت البناء (assets/data.json).
 const kVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
 
 const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
@@ -142,8 +138,8 @@ const _defUnits = <Unit>[
   Unit(25, 'خدمات مصر', '50383700'),
 ];
 
-/// البيانات الحالية: بتبدأ بالمدمجة، وبعدين المحفوظة من آخر تحديث، وبعدين بتتحدث من GitHub.
-/// لو الإنترنت مش موجود أو الملف فيه غلط، التطبيق يكمل بآخر بيانات سليمة.
+/// البيانات الحالية: بتبدأ بالمدمجة وبعدين بتتحمّل من ملف الإكسل (assets/data.json).
+/// لو الملف فيه غلط، التطبيق يكمل بالبيانات المدمجة.
 class AppData {
   static List<String> names = List.of(_defNames);
   static List<Unit> units = List.of(_defUnits);
@@ -171,36 +167,12 @@ class AppData {
     }
   }
 
-  static Future<void> loadCached() async {
+  /// بيحمّل البيانات من ملف الإكسل اللي اتحوّل وقت البناء. لو فيه مشكلة بيكمل بالبيانات المدمجة.
+  static Future<void> load() async {
     try {
-      final p = await SharedPreferences.getInstance();
-      final raw = p.getString('dataJson');
-      if (raw != null && _apply(raw)) status.value = 'بيانات محفوظة';
+      final raw = await rootBundle.loadString('assets/data.json');
+      if (_apply(raw)) status.value = 'بيانات من ملف الإكسل';
     } catch (_) {}
-  }
-
-  /// بترجع true لو اتحدثت بنجاح.
-  static Future<bool> refresh() async {
-    if (kDataUrl.contains('YOUR_USER')) return false;
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
-    try {
-      final req = await client.getUrl(Uri.parse(kDataUrl)).timeout(const Duration(seconds: 8));
-      final res = await req.close().timeout(const Duration(seconds: 10));
-      if (res.statusCode != 200) return false;
-      final raw = await res.transform(utf8.decoder).join().timeout(const Duration(seconds: 10));
-      if (!_apply(raw)) {
-        status.value = 'ملف البيانات فيه خطأ - مستخدم آخر نسخة سليمة';
-        return false;
-      }
-      final p = await SharedPreferences.getInstance();
-      await p.setString('dataJson', raw);
-      status.value = 'تم تحديث البيانات';
-      return true;
-    } catch (_) {
-      return false;
-    } finally {
-      client.close(force: true);
-    }
   }
 }
 
@@ -814,6 +786,38 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
   }
 }
 
+/// لو أندرويد قفل التطبيق وهو في الكاميرا (رامات قليلة)، الصورة بتترجع هنا بعد ما التطبيق يفتح تاني.
+Future<void> markPickTarget(String t) async {
+  try {
+    await (await SharedPreferences.getInstance()).setString('pickTarget', t);
+  } catch (_) {}
+}
+
+Future<void> stashLostPick() async {
+  try {
+    final r = await ImagePicker().retrieveLostData();
+    if (r.isEmpty || r.file == null) return;
+    final d = Directory('${(await Store.dir()).path}/lost');
+    await d.create(recursive: true);
+    final f = await File(r.file!.path)
+        .copy('${d.path}/${DateTime.now().microsecondsSinceEpoch}.jpg');
+    await (await SharedPreferences.getInstance()).setString('lostPick', f.path);
+  } catch (_) {}
+}
+
+/// بترجّع مسار الصورة الضايعة لو كانت تابعة للشاشة دي (مرة واحدة بس).
+Future<String?> takeLostPick(String target) async {
+  try {
+    final p = await SharedPreferences.getInstance();
+    final path = p.getString('lostPick');
+    if (path == null || p.getString('pickTarget') != target) return null;
+    await p.remove('lostPick');
+    return await File(path).exists() ? path : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 /// كل التصوير (كاميرا أو معرض) بيعدي على ماسح المستندات (قص).
 /// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية تلقائياً.
 bool _scannerFailed = false; // فشل الماسح في الجلسة دي (بيتصفّر لما التطبيق يتقفل)
@@ -837,6 +841,7 @@ Future<List<String>> scanImages(BuildContext context, int limit,
       (await SharedPreferences.getInstance())
           .setInt('scannerFailedAt', DateTime.now().millisecondsSinceEpoch);
     } catch (_) {}
+    if (!context.mounted) return [];
     await showDialog<void>(
       context: context,
       builder: (c) => Directionality(
@@ -1058,14 +1063,14 @@ Widget appLogo({double height = 36}) => Image.asset(
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await AppData.loadCached();
+  await AppData.load();
   try {
     final sp = await SharedPreferences.getInstance();
     final t = sp.getInt('scannerFailedAt') ?? 0;
     _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
   } catch (_) {}
+  await stashLostPick();
   runApp(const A2RApp());
-  unawaited(AppData.refresh());
 }
 
 ThemeData _theme(Brightness b) => ThemeData(
@@ -1104,7 +1109,6 @@ class _LoginScreenState extends State<LoginScreen> {
   String? name;
   String? unitName;
   String? building;
-  bool refreshing = false;
 
   @override
   void initState() {
@@ -1152,14 +1156,6 @@ class _LoginScreenState extends State<LoginScreen> {
     _save();
     Navigator.push(
         context, MaterialPageRoute(builder: (_) => MainScreen(session: Session(name!, u, b))));
-  }
-
-  Future<void> _refresh() async {
-    setState(() => refreshing = true);
-    final ok = await AppData.refresh();
-    if (!mounted) return;
-    setState(() => refreshing = false);
-    snack(context, ok ? 'تم تحديث البيانات' : 'مقدرتش أحدّث، هكمل بآخر بيانات محفوظة');
   }
 
   @override
@@ -1251,17 +1247,6 @@ class _LoginScreenState extends State<LoginScreen> {
                         Flexible(
                             child: Text('$st  •  v$kVersion',
                                 style: const TextStyle(fontSize: 12, color: Colors.grey))),
-                        const SizedBox(width: 4),
-                        refreshing
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2))
-                            : IconButton(
-                                tooltip: 'تحديث البيانات',
-                                visualDensity: VisualDensity.compact,
-                                icon: const Icon(Icons.refresh, size: 20),
-                                onPressed: _refresh),
                       ],
                     ),
                   ),
@@ -1623,6 +1608,19 @@ class _BatchScreenState extends State<BatchScreen> {
   }
 
   Future<void> _init() async {
+    final lost = await takeLostPick('batch');
+    if (lost != null && mounted) {
+      try {
+        final path =
+            await persistImage(lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
+        await Store.setBatchImg(path);
+        await _show(path);
+        if (mounted && img != null) await _edit();
+        return;
+      } catch (e) {
+        if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+      }
+    }
     final cur = await Store.batchImg();
     if (!mounted) return;
     if (cur != null) {
@@ -1653,6 +1651,8 @@ class _BatchScreenState extends State<BatchScreen> {
   }
 
   Future<void> _capture() async {
+    await markPickTarget('batch');
+    if (!mounted) return;
     final r = await scanImages(context, 1);
     if (!mounted) return;
     if (r.isEmpty) {
@@ -1681,6 +1681,7 @@ class _BatchScreenState extends State<BatchScreen> {
   /// معرض: يختار صورة، وبعدين شاشة القص (تعديل) تفتح لوحدها.
   Future<void> _gallery() async {
     XFile? x;
+    await markPickTarget('batch');
     try {
       x = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 90);
     } catch (_) {
@@ -2763,12 +2764,20 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       continuous = co;
       loaded = true;
     });
+    final lost = await takeLostPick('receipts');
+    if (lost != null && mounted) {
+      await _saveAll([lost]);
+      if (mounted && imgs.isNotEmpty) await _edit(imgs.length - 1);
+      return;
+    }
     if (d.isEmpty) _add();
   }
 
   /// تصوير متتالي: صوّر → قص → يرجع يفتح الكاميرا تاني لحد ما الموظف يقفل الماسح.
   Future<void> _add() async {
     do {
+      await markPickTarget('receipts');
+      if (!mounted) break;
       final r = await scanImages(context, 1, mode: kReceiptScanMode);
       if (r.isEmpty || !mounted) break;
       await _saveAll(r);
@@ -2781,6 +2790,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   }
 
   Future<void> _addGallery() async {
+    await markPickTarget('receipts');
+    if (!mounted) return;
     final r = await scanImages(context, 100, mode: kReceiptScanMode);
     if (r.isEmpty || !mounted) return;
     final start = imgs.length;
