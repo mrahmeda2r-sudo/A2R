@@ -713,6 +713,79 @@ Future<Tag> batchBandTag(Session s, double w) async {
   return receiptTag(1000 * (w * k) / r.w, s, batch: true);
 }
 
+/// تركيب الباتش بيتم كله على الـ CPU (Isolate) من غير رسم GPU، لأن الرسم الكبير على GPU
+/// كان بيطلّع صورة مشوّهة (ألوان وبلاطات) على الموبايلات الضعيفة.
+Uint8List _composeJob(Map<String, dynamic> a) {
+  final img = a['img'] as Uint8List;
+  final iw = a['iw'] as int, ih = a['ih'] as int;
+  final tag = a['tag'] as Uint8List;
+  final tw = a['tw'] as int, th = a['th'] as int;
+  final ow = a['ow'] as int, oh = a['oh'] as int;
+  final ix = a['ix'] as int, iy = a['iy'] as int;
+  final tx = a['tx'] as int, ty = a['ty'] as int;
+  final out = Uint8List(ow * oh * 4)..fillRange(0, ow * oh * 4, 255);
+  final sx0 = math.max(0, -ix), sx1 = math.min(iw, ow - ix);
+  if (sx1 > sx0) {
+    for (var y = 0; y < ih; y++) {
+      final dy = y + iy;
+      if (dy < 0 || dy >= oh) continue;
+      out.setRange((dy * ow + ix + sx0) * 4, (dy * ow + ix + sx1) * 4, img, (y * iw + sx0) * 4);
+    }
+  }
+  for (var y = 0; y < th; y++) {
+    final dy = y + ty;
+    if (dy < 0 || dy >= oh) continue;
+    for (var x = 0; x < tw; x++) {
+      final dx = x + tx;
+      if (dx < 0 || dx >= ow) continue;
+      final si = (y * tw + x) * 4, di = (dy * ow + dx) * 4;
+      final al = tag[si + 3];
+      if (al == 0) continue;
+      if (al == 255) {
+        out[di] = tag[si];
+        out[di + 1] = tag[si + 1];
+        out[di + 2] = tag[si + 2];
+      } else {
+        // الألوان من rawRgba بتيجي premultiplied
+        final k = 1 - al / 255;
+        for (var c = 0; c < 3; c++) {
+          final v = tag[si + c] + out[di + c] * k;
+          out[di + c] = v > 255 ? 255 : v.round();
+        }
+      }
+      out[di + 3] = 255;
+    }
+  }
+  return out;
+}
+
+/// متوسط السطوع (عينات) لفحص إن الصورة النهائية مش مشوّهة.
+double _meanLum(Uint8List px, int w, int h) {
+  final n = w * h;
+  final step = math.max(1, n ~/ 20000) | 1;
+  var sum = 0.0, cnt = 0;
+  for (var i = 0; i < n; i += step) {
+    final j = i * 4;
+    sum += (px[j] * 54 + px[j + 1] * 183 + px[j + 2] * 19) >> 8;
+    cnt++;
+  }
+  return cnt == 0 ? 0.0 : sum / cnt;
+}
+
+Future<double?> _jpegMeanLum(Uint8List jpg) async {
+  try {
+    final img = await decodeImage(jpg, maxWidth: 96);
+    final w = img.width, h = img.height;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    img.dispose();
+    if (bd == null) return null;
+    return _meanLum(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes), w, h);
+  } catch (e, st) {
+    AppLog.e('_jpegMeanLum', e, st);
+    return null;
+  }
+}
+
 /// صورة الباتش + الورقة. layout 0/1: شريط أبيض فوق/تحت (الصورة كاملة من غير تغطية)،
 /// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
 Future<Uint8List> composeBatch(String path, Session s) async {
@@ -722,45 +795,71 @@ Future<Uint8List> composeBatch(String path, Session s) async {
   final sz = await imageSize(src);
   final maxSide = getMaxSide(await Store.perfMode());
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
-  final w = img.width.toDouble();
-  final h = img.height.toDouble();
+  final iw = img.width, ih = img.height;
+  final w = iw.toDouble(), h = ih.toDouble();
   final Tag tag;
-  final Offset tagAt, imgAt;
-  final double outH;
+  final Offset tagAt;
+  int imgY = 0;
+  final int oh;
   if (layout == 2) {
     final ref = await receiptTag(1000, s, batch: true);
     final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref), ref, h / w);
     tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
     tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
-    imgAt = Offset.zero;
-    outH = h;
+    oh = ih;
   } else {
     tag = await batchBandTag(s, w);
     final pad = w * kBandPad;
     final band = tag.h + pad * 2;
     tagAt = Offset((w - tag.w) / 2, layout == 0 ? pad : h + pad);
-    imgAt = Offset(0, layout == 0 ? band : 0);
-    outH = h + band;
+    imgY = layout == 0 ? band.ceil() : 0;
+    oh = ih + band.ceil();
   }
   final tImg = await decodeImage(tag.png);
-  final rec = ui.PictureRecorder();
-  final c = Canvas(rec, Rect.fromLTWH(0, 0, w, outH));
-  c.drawRect(Rect.fromLTWH(0, 0, w, outH), Paint()..color = Colors.white);
-  c.drawImage(img, imgAt, Paint());
-  c.drawImage(tImg, tagAt, Paint());
-  final iw = img.width, oh = outH.ceil();
-  final out = await rec.endRecording().toImage(iw, oh);
-  final bd = await out.toByteData(format: ui.ImageByteFormat.png);
+  final tw = tImg.width, th = tImg.height;
+  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
   img.dispose();
   tImg.dispose();
-  out.dispose();
-  return FlutterImageCompress.compressWithList(
-    bd!.buffer.asUint8List(),
-    minWidth: iw,
-    minHeight: oh,
-    quality: await Store.jpegQuality(),
-    format: CompressFormat.jpeg,
-  );
+  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
+  final rgba = await compute(_composeJob, <String, dynamic>{
+    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
+    'iw': iw,
+    'ih': ih,
+    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
+    'tw': tw,
+    'th': th,
+    'ow': iw,
+    'oh': oh,
+    'ix': 0,
+    'iy': imgY,
+    'tx': tagAt.dx.round(),
+    'ty': tagAt.dy.round(),
+  });
+  final comp = Completer<ui.Image>();
+  ui.decodeImageFromPixels(rgba, iw, oh, ui.PixelFormat.rgba8888, comp.complete);
+  final outImg = await comp.future;
+  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
+  outImg.dispose();
+  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
+  final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
+  final q = await Store.jpegQuality();
+  final want = _meanLum(rgba, iw, oh);
+  // أول محاولة بالأبعاد الكاملة، ولو الناتج مشوّه نجرّب أبعاد أصغر، ولو برضه مشوّه منبعتش صورة بايظة
+  for (final k in const [1.0, 0.75]) {
+    final jpg = await FlutterImageCompress.compressWithList(
+      png,
+      minWidth: (iw * k).round(),
+      minHeight: (oh * k).round(),
+      quality: q,
+      format: CompressFormat.jpeg,
+    );
+    final got = await _jpegMeanLum(jpg);
+    AppLog.i('compose ${iw}x$oh k=$k ${jpg.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} '
+        'got=${got?.toStringAsFixed(0)}');
+    if (got != null && (got - want).abs() < 25) return jpg;
+  }
+  throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
 }
 
 /// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال الأصلية (JPEG بيتحط في الـ PDF زي ما هو
