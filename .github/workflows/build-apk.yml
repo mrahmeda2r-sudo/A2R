@@ -41,6 +41,12 @@ jobs:
           sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*.*/minSdk = 21/' android/app/build.gradle.kts
           grep -n "minSdk" android/app/build.gradle.kts
 
+      - name: Skip lint tasks (lint crashes on image_picker)
+        run: |
+          mkdir -p ~/.gradle
+          echo "allprojects { tasks.configureEach { t -> if (t.name.startsWith('lint')) { t.enabled = false } } }" > ~/.gradle/init.gradle
+          cat ~/.gradle/init.gradle
+
       - run: flutter build apk --release --target-platform android-arm,android-arm64
 
       - name: Rename APK
