@@ -28,7 +28,7 @@ jobs:
         run: flutter create --platforms=android --project-name a2r --org com.a2r .
 
       - name: Add packages
-        run: flutter pub add google_mlkit_document_scanner:^0.4.0 pdf:^3.11.0 path_provider:^2.1.0 share_plus:^10.0.0 shared_preferences:^2.2.0 flutter_image_compress:^2.3.0 image_picker:^1.1.0 permission_handler:^11.3.1
+        run: flutter pub add google_mlkit_document_scanner:^0.4.0 pdf:^3.11.0 path_provider:^2.1.0 share_plus:^10.0.0 shared_preferences:^2.2.0 flutter_image_compress:^2.3.0 image_picker:^1.1.0 permission_handler:^11.3.1 open_filex:^4.5.0
 
       - name: Move main.dart into lib
         run: mv -f main.dart lib/
