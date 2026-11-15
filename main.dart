@@ -708,8 +708,9 @@ Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
 
 /// ورقة الباتش بحجم الشريط. w = عرض الصورة بالبكسل.
 Future<Tag> batchBandTag(Session s, double w) async {
+  final k = await Store.bandScale();
   final r = await receiptTag(1000, s, batch: true);
-  return receiptTag(1000 * (w * kBatchTagW) / r.w, s, batch: true);
+  return receiptTag(1000 * (w * k) / r.w, s, batch: true);
 }
 
 /// صورة الباتش + الورقة. layout 0/1: شريط أبيض فوق/تحت (الصورة كاملة من غير تغطية)،
@@ -901,6 +902,11 @@ class Store {
   /// شكل ورقة الباتش: 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
   static Future<int> batchLayout() async => ((await _p).getInt('batchLayout') ?? 0).clamp(0, 2);
   static Future<void> setBatchLayout(int v) async => (await _p).setInt('batchLayout', v);
+
+  /// حجم الورقة في وضع الشريط (نسبة من عرض الصورة)
+  static Future<double> bandScale() async =>
+      ((await _p).getDouble('bandScale') ?? kBatchTagW).clamp(0.3, 1.0).toDouble();
+  static Future<void> setBandScale(double v) async => (await _p).setDouble('bandScale', v);
 
   // --- مكان وحجم الورقة ---
   static Future<TagPos?> pos(String path) async =>
@@ -1457,20 +1463,51 @@ class _TagDragState extends State<_TagDrag> {
       );
 }
 
-class ZoomPage extends StatelessWidget {
+class ZoomPage extends StatefulWidget {
   final Widget child;
   const ZoomPage({super.key, required this.child});
+  @override
+  State<ZoomPage> createState() => _ZoomPageState();
+}
+
+class _ZoomPageState extends State<ZoomPage> {
+  final _tc = TransformationController();
+  Offset _tap = Offset.zero;
+  static const _zoom = 2.5;
+
+  @override
+  void dispose() {
+    _tc.dispose();
+    super.dispose();
+  }
+
+  /// نقرتين: لو متكبرة ترجع للحجم الطبيعي، ولو طبيعية تكبّر عند مكان النقر.
+  void _toggle() {
+    if (_tc.value.getMaxScaleOnAxis() > 1.05) {
+      _tc.value = Matrix4.identity();
+    } else {
+      final tx = -_tap.dx * (_zoom - 1), ty = -_tap.dy * (_zoom - 1);
+      _tc.value = Matrix4(_zoom, 0, 0, 0, 0, _zoom, 0, 0, 0, 0, 1, 0, tx, ty, 0, 1);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final w = MediaQuery.of(context).size.width;
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white),
-      body: InteractiveViewer(
-        constrained: false,
-        minScale: 0.5,
-        maxScale: 6,
-        child: SizedBox(width: w, child: child),
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onDoubleTapDown: (d) => _tap = d.localPosition,
+        onDoubleTap: _toggle,
+        child: InteractiveViewer(
+          transformationController: _tc,
+          constrained: false,
+          minScale: 1,
+          maxScale: 6,
+          child: SizedBox(width: w, child: widget.child),
+        ),
       ),
     );
   }
@@ -2253,6 +2290,8 @@ class _BatchScreenState extends State<BatchScreen> {
   Tag? tag;
   Tag? bandTag;
   int layout = 0; // 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
+  double bandScale = kBatchTagW; // حجم الورقة في وضع الشريط
+  int _bandGen = 0;
   TagPos? pos;
   double? aspect;
   bool busy = false;
@@ -2269,6 +2308,15 @@ class _BatchScreenState extends State<BatchScreen> {
     if (path == null) return;
     setState(() => noTag = hide);
     await Store.setNoTag(path, hide);
+  }
+
+  Future<void> _setBand(double v) async {
+    setState(() => bandScale = v);
+    final gen = ++_bandGen;
+    await Store.setBandScale(v);
+    final bt = await batchBandTag(widget.session, 1000);
+    if (!mounted || gen != _bandGen) return;
+    setState(() => bandTag = bt);
   }
 
   Future<void> _setLayout(int v) async {
@@ -2310,8 +2358,10 @@ class _BatchScreenState extends State<BatchScreen> {
       final nt = await Store.noTag(path);
       final lay = await Store.batchLayout();
       final bt = await batchBandTag(widget.session, 1000);
+      final bsc = await Store.bandScale();
       if (!mounted) return;
       setState(() {
+        bandScale = bsc;
         noTag = nt;
         tag = t;
         bandTag = bt;
@@ -2509,6 +2559,26 @@ class _BatchScreenState extends State<BatchScreen> {
                   ),
                 ),
               ),
+              if (layout != 2)
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Row(children: [
+                    const Icon(Icons.format_size),
+                    Expanded(
+                      child: Slider(
+                        value: bandScale.clamp(0.3, 1.0).toDouble(),
+                        min: 0.3,
+                        max: 1.0,
+                        onChanged: noTag ? null : _setBand,
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'الحجم الأصلي',
+                      icon: const Icon(Icons.restart_alt),
+                      onPressed: noTag ? null : () => _setBand(kBatchTagW),
+                    ),
+                  ]),
+                ),
               if (layout == 2) ...[
                 const SizedBox(height: 4),
                 const Text('اسحب الورقة لتحريكها، وبإصبعين لتكبيرها أو تصغيرها',
