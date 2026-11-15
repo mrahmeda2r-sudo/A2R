@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
@@ -241,18 +242,48 @@ Future<double> imageAspect(String path) async {
   return s.h / s.w;
 }
 
-List<double> _matrix(ScanFilter f) {
-  if (f == ScanFilter.enhance) {
-    const c = 1.3;
-    const t = 255 * (0.5 - 0.5 * c) + 10;
-    return [c, 0, 0, 0, t, 0, c, 0, 0, t, 0, 0, c, 0, t, 0, 0, 0, 1, 0];
+/// مصفوفة الألوان النهائية: الفلتر الأساسي + تباين وسطوع (نفس المصفوفة للمعاينة وللحفظ).
+List<double> editMatrix(ScanFilter f, double contrast, double brightness) {
+  late List<List<double>> w;
+  late double t0;
+  switch (f) {
+    case ScanFilter.original:
+      w = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+      ];
+      t0 = 0;
+      break;
+    case ScanFilter.enhance:
+      const c = 1.3;
+      w = [
+        [c, 0.0, 0.0],
+        [0.0, c, 0.0],
+        [0.0, 0.0, c],
+      ];
+      t0 = 127.5 * (1 - c) + 10;
+      break;
+    case ScanFilter.bw:
+      // أبيض وأسود عالي التباين (مناسب للإيصالات الحرارية الباهتة)
+      const c = 1.7;
+      const r = 0.2126 * c, g = 0.7152 * c, b = 0.0722 * c;
+      w = [
+        [r, g, b],
+        [r, g, b],
+        [r, g, b],
+      ];
+      t0 = 127.5 * (1 - c) + 40;
+      break;
   }
-  // أبيض وأسود عالي التباين (مناسب للإيصالات الحرارية الباهتة)
-  const c = 1.7;
-  const t = 255 * (0.5 - 0.5 * c) + 40;
-  const r = 0.2126 * c, g = 0.7152 * c, b = 0.0722 * c;
-  return [r, g, b, 0, t, r, g, b, 0, t, r, g, b, 0, t, 0, 0, 0, 1, 0];
+  final k = 1 + contrast;
+  final t = k * (t0 - 127.5) + 127.5 + brightness * 100;
+  return [
+    for (final row in w) ...[k * row[0], k * row[1], k * row[2], 0.0, t],
+  ];
 }
+
+List<double> _matrix(ScanFilter f) => editMatrix(f, 0, 0);
 
 Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
   if (f == ScanFilter.original) return bytes;
@@ -322,8 +353,13 @@ Future<String> persistImage(String src, String name,
   if (bytes == null || !await _decodesOk(bytes)) {
     throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
   }
-  bytes = await applyFilter(bytes, filter);
   final f = File('${(await Store.dir()).path}/$name');
+  if (filter != ScanFilter.original) {
+    // نسخة من غير فلتر عشان التعديل بعد كده يبقى ممكن يرجّع الأصلي
+    await File(Store.baseOf(f.path)).writeAsBytes(bytes, flush: true);
+    await Store.setEdit(f.path, EditParams(filter: filter));
+  }
+  bytes = await applyFilter(bytes, filter);
   await f.writeAsBytes(bytes, flush: true);
   return f.path;
 }
@@ -504,7 +540,11 @@ class Store {
     try {
       final f = File(path);
       if (await f.exists()) await f.delete();
-      await (await _p).remove('pos:$path');
+      final bf = File(baseOf(path));
+      if (await bf.exists()) await bf.delete();
+      final p = await _p;
+      await p.remove('pos:$path');
+      await p.remove('edit:$path');
     } catch (_) {}
   }
 
@@ -595,6 +635,28 @@ class Store {
     await (await _p).setStringList('draft', []);
   }
 
+  // --- نسخة الصورة الأصلية + إعدادات التعديل (تعديل غير مدمّر) ---
+  static String baseOf(String path) => path.replaceFirst(RegExp(r'\.jpg$'), '_base.jpg');
+
+  static Future<EditParams?> editOf(String path) async =>
+      EditParams.decode((await _p).getString('edit:$path'));
+
+  static Future<void> setEdit(String path, EditParams e) async =>
+      (await _p).setString('edit:$path', e.encode());
+
+  /// بعد تعديل إيصال: الصورة الجديدة تاخد مكان القديمة في نفس الترتيب.
+  static Future<void> replaceInDraft(String old, String neu) async {
+    final l = await draft();
+    final i = l.indexOf(old);
+    if (i < 0) {
+      l.add(neu);
+    } else {
+      l[i] = neu;
+    }
+    await (await _p).setStringList('draft', l);
+    await del(old);
+  }
+
   // --- ملف الـ PDF (يفضل 24 ساعة) ---
   static Future<({File file, DateTime time})?> pdf() async {
     final p = await _p;
@@ -665,6 +727,7 @@ class Store {
     if (bi != null) keep.add(bi);
     final pdfPath = (await pdf())?.file.path;
     if (pdfPath != null) keep.add(pdfPath);
+    keep.addAll(keep.map(baseOf).toList());
     await for (final e in (await dir()).list()) {
       if (working > 0) return;
       if (e is File && !keep.contains(e.path)) await del(e.path);
@@ -1605,12 +1668,13 @@ class _BatchScreenState extends State<BatchScreen> {
     if (mounted && img != null) await _edit();
   }
 
-  /// تعديل: قص بأربع نقط وتدوير للصورة الحالية.
+  /// تعديل: قص بزوايا حرة وتدوير وفلاتر للصورة الحالية.
   Future<void> _edit() async {
     final cur = img;
     if (cur == null) return;
     final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => CropPage(path: cur)));
+        context,
+        MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_')));
     if (out == null || !mounted) return;
     setState(() => busy = true);
     try {
@@ -1725,115 +1789,565 @@ class _BatchScreenState extends State<BatchScreen> {
 }
 
 // =====================================================================
-//  شاشة تعديل الصورة (قص + تدوير)
+//  شاشة التعديل: قص بزوايا حرة + تدوير + فلاتر (للباتش والإيصالات)
 // =====================================================================
 
-/// بترجّع مسار الصورة الجديدة بعد القص، أو null لو الموظف رجع من غير تأكيد.
-class CropPage extends StatefulWidget {
-  final String path;
-  const CropPage({super.key, required this.path});
-  @override
-  State<CropPage> createState() => _CropPageState();
+/// إعدادات التعديل المحفوظة لكل صورة (عشان إعادة التعديل تبدأ من الأصل).
+class EditParams {
+  final List<Offset>? quad; // TL,TR,BR,BL كنسب من الصورة بعد التدوير
+  final int turns; // لفّات 90 درجة مع عقارب الساعة
+  final double angle; // تدوير دقيق بالدرجات
+  final ScanFilter filter;
+  final double contrast; // -0.5 .. 1
+  final double brightness; // -1 .. 1
+  const EditParams({
+    this.quad,
+    this.turns = 0,
+    this.angle = 0,
+    this.filter = ScanFilter.original,
+    this.contrast = 0,
+    this.brightness = 0,
+  });
+
+  String encode() => jsonEncode({
+        if (quad != null)
+          'q': [
+            for (final p in quad!) ...[p.dx, p.dy]
+          ],
+        't': turns,
+        'a': angle,
+        'f': filter.index,
+        'c': contrast,
+        'b': brightness,
+      });
+
+  static EditParams? decode(String? s) {
+    if (s == null) return null;
+    try {
+      final m = jsonDecode(s) as Map<String, dynamic>;
+      List<Offset>? q;
+      final raw = m['q'];
+      if (raw is List && raw.length == 8) {
+        final d = raw.map((e) => (e as num).toDouble()).toList();
+        q = [for (var i = 0; i < 8; i += 2) Offset(d[i], d[i + 1])];
+      }
+      final fi = ((m['f'] as num?) ?? 0).toInt().clamp(0, ScanFilter.values.length - 1).toInt();
+      return EditParams(
+        quad: q,
+        turns: ((m['t'] as num?) ?? 0).toInt() % 4,
+        angle: ((m['a'] as num?) ?? 0).toDouble(),
+        filter: ScanFilter.values[fi],
+        contrast: ((m['c'] as num?) ?? 0).toDouble(),
+        brightness: ((m['b'] as num?) ?? 0).toDouble(),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
 }
 
-class _CropPageState extends State<CropPage> {
-  static const _full = Rect.fromLTRB(0.02, 0.02, 0.98, 0.98);
-  double? aspect; // ارتفاع/عرض الصورة الأصلية
-  int turns = 0; // عدد اللفّات 90 درجة مع عقارب الساعة
-  Rect crop = _full; // نسب من الصورة بعد التدوير
-  int drag = -1; // 0..3 = الزوايا، 4 = تحريك المربع كله
+/// الرباعي لازم يكون محدّب وبنفس ترتيب TL,TR,BR,BL (من غير تقاطع أو قلب).
+bool _quadConvex(List<Offset> q) {
+  for (var i = 0; i < 4; i++) {
+    final a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
+    final cr = (b.dx - a.dx) * (c.dy - b.dy) - (b.dy - a.dy) * (c.dx - b.dx);
+    if (cr <= 1e-6) return false;
+  }
+  return true;
+}
+
+List<Offset> _turnCw(List<Offset> q) {
+  Offset m(Offset p) => Offset(1 - p.dy, p.dx);
+  return [m(q[3]), m(q[0]), m(q[1]), m(q[2])];
+}
+
+List<Offset> _turnCcw(List<Offset> q) {
+  Offset m(Offset p) => Offset(p.dy, 1 - p.dx);
+  return [m(q[1]), m(q[2]), m(q[3]), m(q[0])];
+}
+
+/// تحويل المربع (0..1) إلى الرباعي (Homography) بدقة المنظور.
+/// الناتج: [a, b, c, d, e, f, g, h] حيث x=(a*u+b*v+c)/(g*u+h*v+1).
+List<double> _homography(List<Offset> p) {
+  final x0 = p[0].dx, y0 = p[0].dy, x1 = p[1].dx, y1 = p[1].dy;
+  final x2 = p[2].dx, y2 = p[2].dy, x3 = p[3].dx, y3 = p[3].dy;
+  final dx1 = x1 - x2, dx2 = x3 - x2, dy1 = y1 - y2, dy2 = y3 - y2;
+  final sx = x0 - x1 + x2 - x3, sy = y0 - y1 + y2 - y3;
+  var g = 0.0, h = 0.0;
+  if (sx.abs() > 1e-9 || sy.abs() > 1e-9) {
+    final den = dx1 * dy2 - dx2 * dy1;
+    g = (sx * dy2 - dx2 * sy) / den;
+    h = (dx1 * sy - sx * dy1) / den;
+  }
+  return [x1 - x0 + g * x1, x3 - x0 + h * x3, x0, y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h];
+}
+
+/// الصورة بعد تدوير 90 درجة (turns مرة مع عقارب الساعة).
+Future<ui.Image> _rotatedImage(String path, int turns) async {
+  final src = await decodeImage(await File(path).readAsBytes());
+  if (turns % 4 == 0) return src;
+  final sw = src.width.toDouble(), sh = src.height.toDouble();
+  final rw = turns.isOdd ? sh : sw, rh = turns.isOdd ? sw : sh;
+  final rec = ui.PictureRecorder();
+  final c = Canvas(rec, Rect.fromLTWH(0, 0, rw, rh));
+  switch (turns % 4) {
+    case 1:
+      c.translate(rw, 0);
+      c.rotate(math.pi / 2);
+      break;
+    case 2:
+      c.translate(rw, rh);
+      c.rotate(math.pi);
+      break;
+    case 3:
+      c.translate(0, rh);
+      c.rotate(-math.pi / 2);
+      break;
+  }
+  c.drawImage(src, Offset.zero, Paint());
+  final out = await rec.endRecording().toImage(rw.round(), rh.round());
+  src.dispose();
+  return out;
+}
+
+/// بيشتغل في Isolate: تحويل المنظور + التدوير الدقيق + الألوان، بيرجّع RGBA.
+Uint8List _warpJob(Map<String, dynamic> a) {
+  final src = a['src'] as Uint8List;
+  final sw = a['sw'] as int, sh = a['sh'] as int;
+  final ow = a['ow'] as int, oh = a['oh'] as int;
+  final theta = a['theta'] as double;
+  final hm = (a['h'] as List).cast<double>();
+  final m = (a['m'] as List).cast<double>();
+  final out = Uint8List(ow * oh * 4);
+  final cx = sw / 2, cy = sh / 2;
+  final cs = math.cos(theta), sn = math.sin(theta);
+  final ha = hm[0], hb = hm[1], hc = hm[2], hd = hm[3], he = hm[4], hf = hm[5], hg = hm[6], hh = hm[7];
+  double clamp255(double v) => v < 0 ? 0 : (v > 255 ? 255 : v);
+  for (var j = 0; j < oh; j++) {
+    final v = oh > 1 ? j / (oh - 1) : 0.0;
+    for (var i = 0; i < ow; i++) {
+      final u = ow > 1 ? i / (ow - 1) : 0.0;
+      final den = hg * u + hh * v + 1;
+      final X = (ha * u + hb * v + hc) / den;
+      final Y = (hd * u + he * v + hf) / den;
+      final dx = X - cx, dy = Y - cy;
+      final sx = cx + cs * dx + sn * dy;
+      final sy = cy - sn * dx + cs * dy;
+      var r = 255.0, g = 255.0, b = 255.0;
+      if (sx >= 0 && sy >= 0 && sx <= sw - 1 && sy <= sh - 1) {
+        final x0 = sx.floor(), y0 = sy.floor();
+        final x1 = x0 + 1 < sw ? x0 + 1 : x0;
+        final y1 = y0 + 1 < sh ? y0 + 1 : y0;
+        final fx = sx - x0, fy = sy - y0;
+        final i00 = (y0 * sw + x0) * 4, i10 = (y0 * sw + x1) * 4;
+        final i01 = (y1 * sw + x0) * 4, i11 = (y1 * sw + x1) * 4;
+        final w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy);
+        final w01 = (1 - fx) * fy, w11 = fx * fy;
+        r = src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11;
+        g = src[i00 + 1] * w00 + src[i10 + 1] * w10 + src[i01 + 1] * w01 + src[i11 + 1] * w11;
+        b = src[i00 + 2] * w00 + src[i10 + 2] * w10 + src[i01 + 2] * w01 + src[i11 + 2] * w11;
+      }
+      final o = (j * ow + i) * 4;
+      out[o] = clamp255(m[0] * r + m[1] * g + m[2] * b + m[4]).round();
+      out[o + 1] = clamp255(m[5] * r + m[6] * g + m[7] * b + m[9]).round();
+      out[o + 2] = clamp255(m[10] * r + m[11] * g + m[12] * b + m[14]).round();
+      out[o + 3] = 255;
+    }
+  }
+  return out;
+}
+
+/// كشف تقريبي لحدود الورقة (بيفترض إن الورقة أفتح أو أغمق من الخلفية بشكل واضح).
+/// بيرجّع TL,TR,BR,BL كنسب، أو null لو مقدرش يحدد.
+Future<List<Offset>?> detectDocQuad(String path) async {
+  try {
+    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 128);
+    final w = img.width, h = img.height;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    img.dispose();
+    if (bd == null || w < 8 || h < 8) return null;
+    final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+    final n = w * h;
+    final lum = List<int>.filled(n, 0);
+    final hist = List<int>.filled(256, 0);
+    for (var i = 0; i < n; i++) {
+      final y = (px[i * 4] * 54 + px[i * 4 + 1] * 183 + px[i * 4 + 2] * 19) >> 8;
+      lum[i] = y;
+      hist[y]++;
+    }
+    // Otsu
+    var sum = 0.0;
+    for (var t = 0; t < 256; t++) {
+      sum += t * hist[t];
+    }
+    var sumB = 0.0, wB = 0.0, bestV = -1.0;
+    var thr = 128;
+    for (var t = 0; t < 256; t++) {
+      wB += hist[t];
+      if (wB == 0) continue;
+      final wF = n - wB;
+      if (wF == 0) break;
+      sumB += t * hist[t];
+      final mB = sumB / wB, mF = (sum - sumB) / wF;
+      final v = wB * wF * (mB - mF) * (mB - mF);
+      if (v > bestV) {
+        bestV = v;
+        thr = t;
+      }
+    }
+    List<bool> maskOf(bool bright) =>
+        List<bool>.generate(n, (i) => bright ? lum[i] > thr : lum[i] <= thr);
+    bool onBorder(int i) {
+      final x = i % w, y = i ~/ w;
+      return x <= 2 || y <= 2 || x >= w - 3 || y >= h - 3;
+    }
+
+    double borderFrac(List<bool> m) {
+      var c = 0, t = 0;
+      for (var i = 0; i < n; i++) {
+        if (!onBorder(i)) continue;
+        t++;
+        if (m[i]) c++;
+      }
+      return t == 0 ? 1 : c / t;
+    }
+
+    var mask = maskOf(true);
+    final inv = maskOf(false);
+    // الورقة هي اللي ما بتلزقش في حدود الصورة
+    if (borderFrac(inv) < borderFrac(mask)) mask = inv;
+    // تآكل بسيط لتنضيف النقط الصغيرة
+    final er = List<bool>.filled(n, false);
+    for (var y = 1; y < h - 1; y++) {
+      for (var x = 1; x < w - 1; x++) {
+        final i = y * w + x;
+        er[i] = mask[i] && mask[i - 1] && mask[i + 1] && mask[i - w] && mask[i + w];
+      }
+    }
+    // أكبر مكوّن متصل
+    final seen = List<bool>.filled(n, false);
+    final queue = List<int>.filled(n, 0);
+    var bestSize = 0;
+    List<int>? best;
+    for (var s0 = 0; s0 < n; s0++) {
+      if (!er[s0] || seen[s0]) continue;
+      var head = 0, tail = 0;
+      queue[tail++] = s0;
+      seen[s0] = true;
+      var tl = s0, tr = s0, br = s0, bl = s0;
+      while (head < tail) {
+        final i = queue[head++];
+        final x = i % w, y = i ~/ w;
+        if (x + y < tl % w + tl ~/ w) tl = i;
+        if (x + y > br % w + br ~/ w) br = i;
+        if (x - y > tr % w - tr ~/ w) tr = i;
+        if (x - y < bl % w - bl ~/ w) bl = i;
+        if (x > 0 && er[i - 1] && !seen[i - 1]) {
+          seen[i - 1] = true;
+          queue[tail++] = i - 1;
+        }
+        if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
+          seen[i + 1] = true;
+          queue[tail++] = i + 1;
+        }
+        if (y > 0 && er[i - w] && !seen[i - w]) {
+          seen[i - w] = true;
+          queue[tail++] = i - w;
+        }
+        if (y < h - 1 && er[i + w] && !seen[i + w]) {
+          seen[i + w] = true;
+          queue[tail++] = i + w;
+        }
+      }
+      if (tail > bestSize) {
+        bestSize = tail;
+        best = [tl, tr, br, bl];
+      }
+    }
+    if (best == null || bestSize < n * 0.12) return null;
+    Offset pt(int i, double ex, double ey) => Offset(
+          (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
+          (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
+        );
+    final q = [
+      pt(best[0], -1.5, -1.5),
+      pt(best[1], 1.5, -1.5),
+      pt(best[2], 1.5, 1.5),
+      pt(best[3], -1.5, 1.5),
+    ];
+    return _quadConvex(q) ? q : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// بترجّع مسار الصورة الجديدة بعد التعديل، أو null لو الموظف رجع من غير تأكيد.
+/// التعديل دايماً بيبدأ من النسخة الأصلية، فتقدر تكبّر القص أو ترجّع الفلتر في أي وقت.
+class EditorPage extends StatefulWidget {
+  final String path;
+  final String prefix; // 'batch_' أو 'r_'
+  const EditorPage({super.key, required this.path, this.prefix = 'r_'});
+  @override
+  State<EditorPage> createState() => _EditorPageState();
+}
+
+class _EditorPageState extends State<EditorPage> {
+  static const _full = [
+    Offset(0.02, 0.02),
+    Offset(0.98, 0.02),
+    Offset(0.98, 0.98),
+    Offset(0.02, 0.98),
+  ];
+  String? src; // النسخة الأصلية لو موجودة
+  double? aspect; // ارتفاع/عرض الصورة الأصلية (قبل التدوير)
+  int turns = 0;
+  double angle = 0;
+  List<Offset> quad = List.of(_full);
+  ScanFilter filter = ScanFilter.original;
+  double contrast = 0;
+  double brightness = 0;
+  int tab = 0; // 0 قص، 1 تدوير، 2 ألوان
+  int drag = -1; // 0..3 زوايا، 4..7 حواف، 8 تحريك الكل
   bool busy = false;
 
   @override
   void initState() {
     super.initState();
-    imageAspect(widget.path).then((a) {
-      if (mounted) setState(() => aspect = a);
-    }).catchError((_) {
-      if (mounted) Navigator.pop(context);
-    });
+    _init();
   }
 
-  void _start(Offset p, Size size) {
-    final r = Rect.fromLTRB(crop.left * size.width, crop.top * size.height,
-        crop.right * size.width, crop.bottom * size.height);
-    final corners = [r.topLeft, r.topRight, r.bottomRight, r.bottomLeft];
+  Future<void> _init() async {
+    try {
+      final base = File(Store.baseOf(widget.path));
+      final s = await base.exists() ? base.path : widget.path;
+      final a = await imageAspect(s);
+      final e = await Store.editOf(widget.path);
+      if (!mounted) return;
+      setState(() {
+        src = s;
+        aspect = a;
+        if (e != null) {
+          turns = e.turns;
+          angle = e.angle;
+          filter = e.filter;
+          contrast = e.contrast;
+          brightness = e.brightness;
+          if (e.quad != null && _quadConvex(e.quad!)) quad = List.of(e.quad!);
+        }
+      });
+    } catch (_) {
+      if (mounted) {
+        snack(context, 'تعذر فتح الصورة');
+        Navigator.pop(context);
+      }
+    }
+  }
+
+  // ---------- اللمس ----------
+
+  void _down(Offset p, Size s) {
+    final pts = [for (final q in quad) Offset(q.dx * s.width, q.dy * s.height)];
     var best = -1;
     var bd = 44.0;
     for (var i = 0; i < 4; i++) {
-      final d = (corners[i] - p).distance;
+      final d = (pts[i] - p).distance;
       if (d < bd) {
         bd = d;
         best = i;
       }
     }
-    drag = best != -1 ? best : (r.contains(p) ? 4 : -1);
+    if (best == -1) {
+      bd = 34.0;
+      for (var i = 0; i < 4; i++) {
+        final d = ((pts[i] + pts[(i + 1) % 4]) / 2 - p).distance;
+        if (d < bd) {
+          bd = d;
+          best = 4 + i;
+        }
+      }
+    }
+    if (best == -1 && _inside(p, pts)) best = 8;
+    setState(() => drag = best);
   }
 
-  void _update(Offset delta, Size size) {
-    if (drag < 0) return;
-    final dx = delta.dx / size.width, dy = delta.dy / size.height;
-    var l = crop.left, t = crop.top, r = crop.right, b = crop.bottom;
-    const m = 0.08;
-    if (drag == 4) {
-      final w = r - l, h = b - t;
-      final nl = (l + dx).clamp(0.0, 1.0 - w).toDouble();
-      final nt = (t + dy).clamp(0.0, 1.0 - h).toDouble();
-      l = nl;
-      r = nl + w;
-      t = nt;
-      b = nt + h;
-    } else {
-      if (drag == 0 || drag == 3) l = (l + dx).clamp(0.0, r - m).toDouble();
-      if (drag == 1 || drag == 2) r = (r + dx).clamp(l + m, 1.0).toDouble();
-      if (drag == 0 || drag == 1) t = (t + dy).clamp(0.0, b - m).toDouble();
-      if (drag == 2 || drag == 3) b = (b + dy).clamp(t + m, 1.0).toDouble();
+  bool _inside(Offset p, List<Offset> v) {
+    var c = false;
+    for (var i = 0, j = v.length - 1; i < v.length; j = i++) {
+      if (((v[i].dy > p.dy) != (v[j].dy > p.dy)) &&
+          (p.dx < (v[j].dx - v[i].dx) * (p.dy - v[i].dy) / (v[j].dy - v[i].dy) + v[i].dx)) {
+        c = !c;
+      }
     }
-    setState(() => crop = Rect.fromLTRB(l, t, r, b));
+    return c;
+  }
+
+  void _move(Offset delta, Size s) {
+    if (drag < 0) return;
+    final idx = drag < 4
+        ? <int>[drag]
+        : drag < 8
+            ? <int>[drag - 4, (drag - 3) % 4]
+            : <int>[0, 1, 2, 3];
+    var dx = delta.dx / s.width, dy = delta.dy / s.height;
+    for (final i in idx) {
+      dx = dx.clamp(-quad[i].dx, 1 - quad[i].dx).toDouble();
+      dy = dy.clamp(-quad[i].dy, 1 - quad[i].dy).toDouble();
+    }
+    final q = List.of(quad);
+    for (final i in idx) {
+      q[i] = q[i] + Offset(dx, dy);
+    }
+    setState(() => quad = q);
+  }
+
+  Offset? _focus(Size s) {
+    if (drag < 0 || drag > 7) return null;
+    final n = drag < 4 ? quad[drag] : (quad[drag - 4] + quad[(drag - 3) % 4]) / 2;
+    return Offset(n.dx * s.width, n.dy * s.height);
+  }
+
+  // ---------- العرض ----------
+
+  Widget _img(double w, double h) => SizedBox(
+        width: w,
+        height: h,
+        child: ColorFiltered(
+          colorFilter: ColorFilter.matrix(editMatrix(filter, contrast, brightness)),
+          child: Container(
+            color: Colors.white,
+            child: ClipRect(
+              child: Transform.rotate(
+                angle: angle * math.pi / 180,
+                child: RotatedBox(
+                  quarterTurns: turns,
+                  child: Image.file(File(src!), fit: BoxFit.fill, gaplessPlayback: true),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+  /// عدسة مكبّرة بتظهر فوق صورة الإصبع وقت سحب الزاوية.
+  Widget _loupe(Offset f, Size s) {
+    const d = 112.0, z = 2.6;
+    final left = f.dx < s.width / 2 ? s.width - d - 6 : 6.0;
+    return Positioned(
+      left: left,
+      top: 6,
+      width: d,
+      height: d,
+      child: IgnorePointer(
+        child: Container(
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 3),
+            boxShadow: const [BoxShadow(blurRadius: 6, color: Colors.black45)],
+          ),
+          child: ClipOval(
+            child: Stack(children: [
+              Positioned(
+                left: d / 2 - f.dx * z,
+                top: d / 2 - f.dy * z,
+                width: s.width * z,
+                height: s.height * z,
+                child: _img(s.width * z, s.height * z),
+              ),
+              const Center(child: Icon(Icons.add, size: 22, color: Colors.redAccent)),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _auto() async {
+    setState(() => busy = true);
+    try {
+      final q = await detectDocQuad(src!);
+      if (!mounted) return;
+      if (q == null) {
+        snack(context, 'مقدرتش أحدد حدود الورقة تلقائياً، حددها بإيدك');
+      } else {
+        var r = q;
+        for (var i = 0; i < turns; i++) {
+          r = _turnCw(r);
+        }
+        setState(() {
+          quad = r;
+          angle = 0;
+        });
+      }
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
   }
 
   Future<void> _apply() async {
+    if (!_quadConvex(quad)) {
+      snack(context, 'حدود القص متداخلة، عدّل الزوايا');
+      return;
+    }
     setState(() => busy = true);
     Store.working++;
     try {
-      final src = await decodeImage(await File(widget.path).readAsBytes());
-      final sw = src.width.toDouble(), sh = src.height.toDouble();
-      final rw = turns.isOdd ? sh : sw, rh = turns.isOdd ? sw : sh;
-      final cw = (crop.width * rw).round(), ch = (crop.height * rh).round();
-      if (cw < 8 || ch < 8) throw Exception('المنطقة المقصوصة صغيرة جداً');
-      final rec = ui.PictureRecorder();
-      final c = Canvas(rec, Rect.fromLTWH(0, 0, cw.toDouble(), ch.toDouble()));
-      c.translate(-crop.left * rw, -crop.top * rh);
-      switch (turns % 4) {
-        case 1:
-          c.translate(rw, 0);
-          c.rotate(math.pi / 2);
-          break;
-        case 2:
-          c.translate(rw, rh);
-          c.rotate(math.pi);
-          break;
-        case 3:
-          c.translate(0, rh);
-          c.rotate(-math.pi / 2);
-          break;
-      }
-      c.drawImage(src, Offset.zero, Paint());
-      final out = await rec.endRecording().toImage(cw, ch);
-      final bd = await out.toByteData(format: ui.ImageByteFormat.png);
-      src.dispose();
-      out.dispose();
+      final r = await _rotatedImage(src!, turns);
+      final rw = r.width, rh = r.height;
+      final bd = await r.toByteData(format: ui.ImageByteFormat.rawRgba);
+      r.dispose();
+      if (bd == null) throw Exception('تعذر قراءة الصورة');
+      final pts = [for (final q in quad) Offset(q.dx * rw, q.dy * rh)];
+      final topW = (pts[1] - pts[0]).distance, botW = (pts[2] - pts[3]).distance;
+      final leftH = (pts[3] - pts[0]).distance, rightH = (pts[2] - pts[1]).distance;
+      var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
+      final k = math.min(1.0, kMaxSide / math.max(ow, oh));
+      ow *= k;
+      oh *= k;
+      final w = math.max(8, ow.round()), h = math.max(8, oh.round());
+      final rgba = await compute(_warpJob, <String, dynamic>{
+        'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+        'sw': rw,
+        'sh': rh,
+        'ow': w,
+        'oh': h,
+        'theta': angle * math.pi / 180,
+        'h': _homography(pts),
+        'm': editMatrix(filter, contrast, brightness),
+      });
+      final comp = Completer<ui.Image>();
+      ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
+      final outImg = await comp.future;
+      final png = await outImg.toByteData(format: ui.ImageByteFormat.png);
+      outImg.dispose();
+      if (png == null) throw Exception('تعذر حفظ الصورة');
       final jpg = await FlutterImageCompress.compressWithList(
-        bd!.buffer.asUint8List(),
-        minWidth: cw,
-        minHeight: ch,
+        png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
+        minWidth: w,
+        minHeight: h,
         quality: 82,
         format: CompressFormat.jpeg,
       );
-      final f = File(
-          '${(await Store.dir()).path}/batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
-      await f.writeAsBytes(jpg, flush: true);
-      if (mounted) Navigator.pop(context, f.path);
+      final dir = (await Store.dir()).path;
+      final nf = File('$dir/${widget.prefix}${DateTime.now().microsecondsSinceEpoch}.jpg');
+      await nf.writeAsBytes(jpg, flush: true);
+      // النسخة الأصلية بتنتقل للصورة الجديدة (أو بتتعمل أول مرة من الصورة الحالية)
+      final oldBase = File(Store.baseOf(widget.path));
+      final newBase = Store.baseOf(nf.path);
+      if (await oldBase.exists()) {
+        await oldBase.rename(newBase);
+      } else {
+        await File(widget.path).copy(newBase);
+      }
+      await Store.setEdit(
+          nf.path,
+          EditParams(
+              quad: quad,
+              turns: turns,
+              angle: angle,
+              filter: filter,
+              contrast: contrast,
+              brightness: brightness));
+      if (mounted) Navigator.pop(context, nf.path);
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
@@ -1842,16 +2356,146 @@ class _CropPageState extends State<CropPage> {
     }
   }
 
+  // ---------- لوحات التحكم ----------
+
+  Widget _panel() {
+    switch (tab) {
+      case 0:
+        return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          const Text('اسحب الزوايا أو منتصف الحواف، واسحب جوه الإطار لتحريكه',
+              textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: Colors.grey)),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: busy ? null : _auto,
+                icon: const Icon(Icons.auto_fix_high),
+                label: const Text('تلقائي'),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: busy ? null : () => setState(() => quad = List.of(_full)),
+                icon: const Icon(Icons.crop_free),
+                label: const Text('الصورة كلها'),
+              ),
+            ),
+          ]),
+        ]);
+      case 1:
+        return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            IconButton.filledTonal(
+              tooltip: 'لفّ يسار',
+              icon: const Icon(Icons.rotate_left),
+              onPressed: busy
+                  ? null
+                  : () => setState(() {
+                        turns = (turns + 3) % 4;
+                        quad = _turnCcw(quad);
+                      }),
+            ),
+            const SizedBox(width: 16),
+            IconButton.filledTonal(
+              tooltip: 'لفّ يمين',
+              icon: const Icon(Icons.rotate_right),
+              onPressed: busy
+                  ? null
+                  : () => setState(() {
+                        turns = (turns + 1) % 4;
+                        quad = _turnCw(quad);
+                      }),
+            ),
+          ]),
+          Row(children: [
+            const Icon(Icons.straighten),
+            Expanded(
+              child: Slider(
+                value: angle,
+                min: -20,
+                max: 20,
+                divisions: 80,
+                label: '${angle.toStringAsFixed(1)}°',
+                onChanged: busy ? null : (v) => setState(() => angle = v),
+              ),
+            ),
+            TextButton(
+              onPressed: (busy || angle == 0) ? null : () => setState(() => angle = 0),
+              child: const Text('0°'),
+            ),
+          ]),
+        ]);
+      default:
+        return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<ScanFilter>(
+              showSelectedIcon: false,
+              segments: const [
+                ButtonSegment(value: ScanFilter.original, label: Text('أصلي')),
+                ButtonSegment(value: ScanFilter.enhance, label: Text('تحسين')),
+                ButtonSegment(value: ScanFilter.bw, label: Text('أبيض وأسود')),
+              ],
+              selected: {filter},
+              onSelectionChanged: busy ? null : (v) => setState(() => filter = v.first),
+            ),
+          ),
+          Row(children: [
+            const Icon(Icons.brightness_6, size: 20),
+            Expanded(
+              child: Slider(
+                value: brightness,
+                min: -1,
+                max: 1,
+                onChanged: busy ? null : (v) => setState(() => brightness = v),
+              ),
+            ),
+            const Icon(Icons.contrast, size: 20),
+            Expanded(
+              child: Slider(
+                value: contrast,
+                min: -0.5,
+                max: 1,
+                onChanged: busy ? null : (v) => setState(() => contrast = v),
+              ),
+            ),
+            IconButton(
+              tooltip: 'إعادة ضبط',
+              icon: const Icon(Icons.restart_alt),
+              onPressed: busy
+                  ? null
+                  : () => setState(() {
+                        brightness = 0;
+                        contrast = 0;
+                      }),
+            ),
+          ]),
+        ]);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('تعديل الصورة')),
+      appBar: AppBar(
+        title: const Text('تعديل الصورة'),
+        actions: [
+          TextButton.icon(
+            onPressed: (busy || aspect == null) ? null : _apply,
+            icon: busy
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.check),
+            label: const Text('تم'),
+          ),
+        ],
+      ),
       body: aspect == null
           ? const Center(child: CircularProgressIndicator())
           : Column(children: [
               Expanded(
                 child: Padding(
-                  padding: const EdgeInsets.all(12),
+                  padding: const EdgeInsets.all(14),
                   child: LayoutBuilder(builder: (ctx, cons) {
                     final asp = turns.isOdd ? 1 / aspect! : aspect!;
                     var w = cons.maxWidth, h = w * asp;
@@ -1860,23 +2504,21 @@ class _CropPageState extends State<CropPage> {
                       w = h / asp;
                     }
                     final size = Size(w, h);
+                    final focus = _focus(size);
                     return Center(
                       child: SizedBox(
                         width: w,
                         height: h,
                         child: GestureDetector(
                           behavior: HitTestBehavior.opaque,
-                          onPanStart: (d) => _start(d.localPosition, size),
-                          onPanUpdate: (d) => _update(d.delta, size),
-                          onPanEnd: (_) => drag = -1,
-                          child: Stack(children: [
-                            Positioned.fill(
-                              child: RotatedBox(
-                                quarterTurns: turns,
-                                child: Image.file(File(widget.path), fit: BoxFit.fill),
-                              ),
-                            ),
-                            Positioned.fill(child: CustomPaint(painter: _CropPainter(crop))),
+                          onPanDown: (d) => _down(d.localPosition, size),
+                          onPanUpdate: (d) => _move(d.delta, size),
+                          onPanEnd: (_) => setState(() => drag = -1),
+                          onPanCancel: () => setState(() => drag = -1),
+                          child: Stack(clipBehavior: Clip.none, children: [
+                            _img(w, h),
+                            Positioned.fill(child: CustomPaint(painter: _QuadPainter(quad))),
+                            if (focus != null) _loupe(focus, size),
                           ]),
                         ),
                       ),
@@ -1884,41 +2526,30 @@ class _CropPageState extends State<CropPage> {
                   }),
                 ),
               ),
-              const Text('اسحب النقط في الأركان لتحديد حدود الباتش، واسحب جوه المربع لتحريكه',
-                  style: TextStyle(fontSize: 12, color: Colors.grey)),
-              SafeArea(
+              SizedBox(
+                height: 112,
                 child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-                  child: Row(children: [
-                    IconButton.filledTonal(
-                      tooltip: 'تدوير',
-                      icon: const Icon(Icons.rotate_right),
-                      onPressed: busy
-                          ? null
-                          : () => setState(() {
-                                turns = (turns + 1) % 4;
-                                crop = _full;
-                              }),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: _panel(),
+                ),
+              ),
+              SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: SegmentedButton<int>(
+                      showSelectedIcon: false,
+                      segments: const [
+                        ButtonSegment(value: 0, icon: Icon(Icons.crop), label: Text('قص')),
+                        ButtonSegment(value: 1, icon: Icon(Icons.rotate_right), label: Text('تدوير')),
+                        ButtonSegment(value: 2, icon: Icon(Icons.tune), label: Text('ألوان')),
+                      ],
+                      selected: {tab},
+                      onSelectionChanged: (v) => setState(() => tab = v.first),
                     ),
-                    const SizedBox(width: 8),
-                    TextButton(
-                      onPressed: busy ? null : () => setState(() => crop = _full),
-                      child: const Text('إعادة ضبط'),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: FilledButton.icon(
-                        onPressed: busy ? null : _apply,
-                        icon: busy
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.check),
-                        label: const Text('تم'),
-                      ),
-                    ),
-                  ]),
+                  ),
                 ),
               ),
             ]),
@@ -1926,20 +2557,19 @@ class _CropPageState extends State<CropPage> {
   }
 }
 
-class _CropPainter extends CustomPainter {
-  final Rect r;
-  _CropPainter(this.r);
+class _QuadPainter extends CustomPainter {
+  final List<Offset> q;
+  _QuadPainter(this.q);
 
   @override
-  void paint(Canvas canvas, Size size) {
-    final rect = Rect.fromLTRB(
-        r.left * size.width, r.top * size.height, r.right * size.width, r.bottom * size.height);
+  void paint(Canvas canvas, Size s) {
+    final pts = [for (final p in q) Offset(p.dx * s.width, p.dy * s.height)];
+    final poly = Path()..addPolygon(pts, true);
     canvas.drawPath(
-        Path.combine(PathOperation.difference, Path()..addRect(Offset.zero & size),
-            Path()..addRect(rect)),
+        Path.combine(PathOperation.difference, Path()..addRect(Offset.zero & s), poly),
         Paint()..color = Colors.black54);
-    canvas.drawRect(
-        rect,
+    canvas.drawPath(
+        poly,
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2
@@ -1949,14 +2579,19 @@ class _CropPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2
       ..color = const Color(0xFF0B5FA5);
-    for (final p in [rect.topLeft, rect.topRight, rect.bottomRight, rect.bottomLeft]) {
+    for (var i = 0; i < 4; i++) {
+      final m = (pts[i] + pts[(i + 1) % 4]) / 2;
+      canvas.drawCircle(m, 7, fill);
+      canvas.drawCircle(m, 7, ring);
+    }
+    for (final p in pts) {
       canvas.drawCircle(p, 11, fill);
       canvas.drawCircle(p, 11, ring);
     }
   }
 
   @override
-  bool shouldRepaint(_CropPainter o) => o.r != r;
+  bool shouldRepaint(_QuadPainter o) => o.q != q;
 }
 
 // =====================================================================
@@ -2106,6 +2741,24 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
+  /// تعديل إيصال بعد التصوير (قص، تدوير، فلتر) من النسخة الأصلية.
+  Future<void> _edit(int i) async {
+    final old = imgs[i];
+    final out = await Navigator.push<String>(
+        context, MaterialPageRoute(builder: (_) => EditorPage(path: old, prefix: 'r_')));
+    if (out == null || !mounted) return;
+    try {
+      await Store.replaceInDraft(old, out);
+      if (!mounted) return;
+      setState(() {
+        imgs[i] = out;
+        built = null;
+      });
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    }
+  }
+
   Widget _item(int i) {
     final path = imgs[i];
     final cs = Theme.of(context).colorScheme;
@@ -2139,6 +2792,10 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             ),
             const SizedBox(width: 12),
             const Expanded(child: Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey))),
+            IconButton(
+                tooltip: 'تعديل',
+                icon: const Icon(Icons.tune),
+                onPressed: busy ? null : () => _edit(i)),
             IconButton(
                 tooltip: 'مسح',
                 icon: const Icon(Icons.delete_outline, color: Colors.red),
