@@ -815,10 +815,13 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
 
 /// كل التصوير (كاميرا أو معرض) بيعدي على ماسح المستندات (قص).
 /// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية تلقائياً.
+bool _scannerFailed = false; // فشل الماسح في الجلسة دي (بيتصفّر لما التطبيق يتقفل)
+
 Future<List<String>> scanImages(BuildContext context, int limit,
     {ScannerMode mode = ScannerMode.full}) async {
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
+  if (_scannerFailed) return simplePick(context, multi: limit > 1);
   final scanner = DocumentScanner(
     options: DocumentScannerOptions(mode: mode, pageLimit: limit, isGalleryImport: true),
   );
@@ -828,7 +831,10 @@ Future<List<String>> scanImages(BuildContext context, int limit,
   } catch (e) {
     if (e.toString().toLowerCase().contains('cancel')) return [];
     if (!context.mounted) return [];
-    snack(context, 'الماسح مش شغال على الموبايل ده، هنفتح الكاميرا العادية');
+    _scannerFailed = true;
+    final why = e.toString().replaceAll('\n', ' ');
+    snack(context,
+        'الماسح مش شغال على الموبايل ده (${why.length > 80 ? why.substring(0, 80) : why})، هنفتح الكاميرا العادية وبعدها شاشة القص');
     return simplePick(context, multi: limit > 1);
   } finally {
     scanner.close();
@@ -1639,6 +1645,7 @@ class _BatchScreenState extends State<BatchScreen> {
     } finally {
       if (mounted) setState(() => busy = false);
     }
+    if (mounted && _scannerFailed && img != null) await _edit();
   }
 
   void _set(TagPos p) {
@@ -1884,9 +1891,8 @@ List<double> _homography(List<Offset> p) {
   return [x1 - x0 + g * x1, x3 - x0 + h * x3, x0, y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h];
 }
 
-/// الصورة بعد تدوير 90 درجة (turns مرة مع عقارب الساعة).
-Future<ui.Image> _rotatedImage(String path, int turns) async {
-  final src = await decodeImage(await File(path).readAsBytes());
+/// تدوير صورة 90 درجة (turns مرة مع عقارب الساعة). لو turns=0 بترجّع نفس الصورة.
+Future<ui.Image> _rotateUi(ui.Image src, int turns) async {
   if (turns % 4 == 0) return src;
   final sw = src.width.toDouble(), sh = src.height.toDouble();
   final rw = turns.isOdd ? sh : sw, rh = turns.isOdd ? sw : sh;
@@ -1910,6 +1916,14 @@ Future<ui.Image> _rotatedImage(String path, int turns) async {
   final out = await rec.endRecording().toImage(rw.round(), rh.round());
   src.dispose();
   return out;
+}
+
+/// الصورة بعد التدوير بدقة محدودة (kMaxSide) عشان الذاكرة.
+Future<ui.Image> _rotatedImage(String path, int turns) async {
+  final bytes = await File(path).readAsBytes();
+  final sz = await imageSize(bytes);
+  final src = await decodeImage(bytes, maxWidth: sz.w > kMaxSide ? kMaxSide : null);
+  return _rotateUi(src, turns);
 }
 
 /// بيشتغل في Isolate: تحويل المنظور + التدوير الدقيق + الألوان، بيرجّع RGBA.
@@ -2111,11 +2125,39 @@ class _EditorPageState extends State<EditorPage> {
   int tab = 0; // 0 قص، 1 تدوير، 2 ألوان
   int drag = -1; // 0..3 زوايا، 4..7 حواف، 8 تحريك الكل
   bool busy = false;
+  ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
+  int _viewGen = 0;
 
   @override
   void initState() {
     super.initState();
     _init();
+  }
+
+  @override
+  void dispose() {
+    view?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadView() async {
+    final gen = ++_viewGen;
+    try {
+      final img = await decodeImage(await File(src!).readAsBytes(), maxWidth: 1000);
+      final r = await _rotateUi(img, turns);
+      if (!mounted || gen != _viewGen) {
+        r.dispose();
+        return;
+      }
+      final old = view;
+      setState(() => view = r);
+      WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
+    } catch (_) {
+      if (mounted) {
+        snack(context, 'تعذر فتح الصورة');
+        Navigator.pop(context);
+      }
+    }
   }
 
   Future<void> _init() async {
@@ -2137,6 +2179,7 @@ class _EditorPageState extends State<EditorPage> {
           if (e.quad != null && _quadConvex(e.quad!)) quad = List.of(e.quad!);
         }
       });
+      await _loadView();
     } catch (_) {
       if (mounted) {
         snack(context, 'تعذر فتح الصورة');
@@ -2210,27 +2253,15 @@ class _EditorPageState extends State<EditorPage> {
 
   // ---------- العرض ----------
 
-  Widget _img(double w, double h) => SizedBox(
-        width: w,
-        height: h,
-        child: ColorFiltered(
-          colorFilter: ColorFilter.matrix(editMatrix(filter, contrast, brightness)),
-          child: Container(
-            color: Colors.white,
-            child: ClipRect(
-              child: Transform.rotate(
-                angle: angle * math.pi / 180,
-                child: RotatedBox(
-                  quarterTurns: turns,
-                  child: Image.file(File(src!), fit: BoxFit.fill, gaplessPlayback: true),
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
+  Widget _img(double w, double h) => view == null
+      ? SizedBox(width: w, height: h)
+      : CustomPaint(
+          size: Size(w, h),
+          painter: _ViewPainter(view!, Size(w, h), angle * math.pi / 180,
+              editMatrix(filter, contrast, brightness)),
+        );
 
-  /// عدسة مكبّرة بتظهر فوق صورة الإصبع وقت سحب الزاوية.
+  /// عدسة مكبّرة بتظهر فوق الإصبع وقت سحب الزاوية.
   Widget _loupe(Offset f, Size s) {
     const d = 112.0, z = 2.6;
     final left = f.dx < s.width / 2 ? s.width - d - 6 : 6.0;
@@ -2248,13 +2279,13 @@ class _EditorPageState extends State<EditorPage> {
           ),
           child: ClipOval(
             child: Stack(children: [
-              Positioned(
-                left: d / 2 - f.dx * z,
-                top: d / 2 - f.dy * z,
-                width: s.width * z,
-                height: s.height * z,
-                child: _img(s.width * z, s.height * z),
-              ),
+              if (view != null)
+                CustomPaint(
+                  size: const Size(d, d),
+                  painter: _ViewPainter(view!, s, angle * math.pi / 180,
+                      editMatrix(filter, contrast, brightness),
+                      focus: f, zoom: z),
+                ),
               const Center(child: Icon(Icons.add, size: 22, color: Colors.redAccent)),
             ]),
           ),
@@ -2396,6 +2427,7 @@ class _EditorPageState extends State<EditorPage> {
                   : () => setState(() {
                         turns = (turns + 3) % 4;
                         quad = _turnCcw(quad);
+                        _loadView();
                       }),
             ),
             const SizedBox(width: 16),
@@ -2407,6 +2439,7 @@ class _EditorPageState extends State<EditorPage> {
                   : () => setState(() {
                         turns = (turns + 1) % 4;
                         quad = _turnCw(quad);
+                        _loadView();
                       }),
             ),
           ]),
@@ -2492,7 +2525,7 @@ class _EditorPageState extends State<EditorPage> {
           ),
         ],
       ),
-      body: aspect == null
+      body: (aspect == null || view == null)
           ? const Center(child: CircularProgressIndicator())
           : Column(children: [
               Expanded(
@@ -2557,6 +2590,48 @@ class _EditorPageState extends State<EditorPage> {
             ]),
     );
   }
+}
+
+/// بيرسم الصورة (تدوير دقيق + ألوان) من غير ColorFiltered ولا Image.file، فالذاكرة قليلة.
+/// لو focus موجود بيرسم عدسة مكبّرة حوالين النقطة دي.
+class _ViewPainter extends CustomPainter {
+  final ui.Image img;
+  final Size box;
+  final double angle; // راديان
+  final List<double> m;
+  final Offset? focus;
+  final double zoom;
+  _ViewPainter(this.img, this.box, this.angle, this.m, {this.focus, this.zoom = 1});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.save();
+    if (focus != null) {
+      canvas.translate(size.width / 2 - focus!.dx * zoom, size.height / 2 - focus!.dy * zoom);
+      canvas.scale(zoom);
+    }
+    final r = Offset.zero & box;
+    canvas.clipRect(r);
+    canvas.drawRect(
+        r,
+        Paint()
+          ..color = Colors.white
+          ..colorFilter = ColorFilter.matrix(m));
+    canvas.translate(box.width / 2, box.height / 2);
+    canvas.rotate(angle);
+    canvas.translate(-box.width / 2, -box.height / 2);
+    canvas.drawImageRect(
+        img,
+        Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
+        r,
+        Paint()
+          ..colorFilter = ColorFilter.matrix(m)
+          ..filterQuality = FilterQuality.medium);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_ViewPainter o) => true;
 }
 
 class _QuadPainter extends CustomPainter {
@@ -2657,6 +2732,10 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       if (r.isEmpty || !mounted) break;
       await _saveAll(r);
       if (!mounted) break;
+      if (_scannerFailed && r.length == 1 && imgs.isNotEmpty) {
+        await _edit(imgs.length - 1);
+        if (!mounted) break;
+      }
     } while (continuous);
   }
 
