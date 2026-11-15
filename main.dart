@@ -951,6 +951,10 @@ class Store {
 
   static Future<void> afterBatchSent() async {
     await clearBatchImg();
+    final p = await _p;
+    for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
+      await p.remove(k);
+    }
     await setFlag('batch');
   }
 
@@ -1324,11 +1328,15 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
 /// قايمة المشاركة العادية: الموظف يختار واتساب أو أي تطبيق.
 bool _shareBusy = false;
 
-Future<bool> shareFiles(BuildContext context, List<String> paths) async {
+Future<bool> shareFiles(BuildContext context, List<String> paths, {String? text}) async {
   if (_shareBusy) return false;
   _shareBusy = true;
   try {
-    final r = await Share.shareXFiles(paths.map((p) => XFile(p)).toList());
+    if (text != null) await Clipboard.setData(ClipboardData(text: text));
+    final r = await Share.shareXFiles(paths.map((p) => XFile(p)).toList(), text: text);
+    if (text != null && context.mounted) {
+      snack(context, 'الوصف اتنسخ، لو مظهرش في الواتساب الصقه');
+    }
     if (r.status == ShareResultStatus.success) return true;
     if (r.status == ShareResultStatus.dismissed) return false;
     if (!context.mounted) return false;
@@ -1343,7 +1351,140 @@ Future<bool> shareFiles(BuildContext context, List<String> paths) async {
   }
 }
 
+// =====================================================================
+//  وصف الباتش (واتساب)
+// =====================================================================
+
+class BatchInfo {
+  final String count, piasters, collected, total;
+  const BatchInfo(this.count, this.piasters, this.collected, this.total);
+}
+
+/// أرقام عربية/فارسية ← إنجليزي، وفاصلة عشرية موحّدة
+String _digits(String s) {
+  const ar = '٠١٢٣٤٥٦٧٨٩', fa = '۰۱۲۳۴۵۶۷۸۹';
+  final b = StringBuffer();
+  for (final ch in s.trim().split('')) {
+    final i = ar.indexOf(ch), j = fa.indexOf(ch);
+    b.write(i >= 0 ? i : (j >= 0 ? j : ch));
+  }
+  var t = b.toString().replaceAll(' ', '').replaceAll('٫', '.').replaceAll('،', ',');
+  t = t.contains(',') && t.contains('.') ? t.replaceAll(',', '') : t.replaceAll(',', '.');
+  return t;
+}
+
+String batchCaption(Session s, BatchInfo i) => [
+      'الاسم: ${s.name}',
+      'الوحده : ${s.unit.name}',
+      if (s.building != null) 'اسم المبني : ${s.building}',
+      'عدد المعاملات : ${i.count}',
+      'عدد القروش الفاصله: ${i.piasters}',
+      'عدد المعاملات المجمعه : ${i.collected}',
+      'الاجمالي: ${i.total}',
+    ].join('\n');
+
+Future<BatchInfo?> askBatchInfo(BuildContext context) async {
+  final p = await SharedPreferences.getInstance();
+  final init = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
+      p.getString('bi_col') ?? '', p.getString('bi_total') ?? '');
+  if (!context.mounted) return null;
+  final r = await showModalBottomSheet<BatchInfo>(
+    context: context,
+    isScrollControlled: true,
+    builder: (c) =>
+        Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init)),
+  );
+  if (r != null) {
+    await p.setString('bi_count', r.count);
+    await p.setString('bi_pi', r.piasters);
+    await p.setString('bi_col', r.collected);
+    await p.setString('bi_total', r.total);
+  }
+  return r;
+}
+
+class _BatchInfoSheet extends StatefulWidget {
+  final BatchInfo init;
+  const _BatchInfoSheet({required this.init});
+  @override
+  State<_BatchInfoSheet> createState() => _BatchInfoSheetState();
+}
+
+class _BatchInfoSheetState extends State<_BatchInfoSheet> {
+  late final c1 = TextEditingController(text: widget.init.count);
+  late final c2 = TextEditingController(text: widget.init.piasters);
+  late final c3 = TextEditingController(text: widget.init.collected);
+  late final c4 = TextEditingController(text: widget.init.total);
+  String? err;
+
+  @override
+  void dispose() {
+    c1.dispose();
+    c2.dispose();
+    c3.dispose();
+    c4.dispose();
+    super.dispose();
+  }
+
+  void _ok() {
+    final count = _digits(c1.text), pi = _digits(c2.text);
+    final col = _digits(c3.text), tot = _digits(c4.text);
+    bool isInt(String s) => RegExp(r'^\d+$').hasMatch(s);
+    if (!isInt(count)) return setState(() => err = 'اكتب عدد المعاملات (أرقام بس)');
+    if (pi.isNotEmpty && !isInt(pi)) {
+      return setState(() => err = 'عدد القروش الفاصلة لازم يكون رقم');
+    }
+    if (col.isNotEmpty && !isInt(col)) {
+      return setState(() => err = 'عدد المعاملات المجمعة لازم يكون رقم');
+    }
+    final t = double.tryParse(tot);
+    if (t == null || t < 0) return setState(() => err = 'اكتب الإجمالي صح (مثال 28107.19)');
+    Navigator.pop(
+        context,
+        BatchInfo('${int.parse(count)}', pi.isEmpty ? '0' : '${int.parse(pi)}',
+            col.isEmpty ? '0' : '${int.parse(col)}', t.toStringAsFixed(2)));
+  }
+
+  Widget _f(TextEditingController c, String label, {bool dec = false}) => Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: TextField(
+          controller: c,
+          keyboardType: TextInputType.numberWithOptions(decimal: dec),
+          decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + MediaQuery.of(context).viewInsets.bottom),
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text('بيانات الباتش',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            _f(c1, 'عدد المعاملات'),
+            _f(c2, 'عدد القروش الفاصلة'),
+            _f(c3, 'عدد المعاملات المجمعة'),
+            _f(c4, 'الإجمالي', dec: true),
+            if (err != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(err!, style: const TextStyle(color: Colors.red)),
+              ),
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
+            ),
+          ]),
+        ),
+      );
+}
+
 Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
+  final info = await askBatchInfo(context);
+  if (info == null || !context.mounted) return false;
+  final caption = batchCaption(s, info);
   Store.working++;
   File out;
   try {
@@ -1354,7 +1495,7 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
     Store.working--;
   }
   if (!context.mounted) return false;
-  final ok = await shareFiles(context, [out.path]);
+  final ok = await shareFiles(context, [out.path], text: caption);
   if (ok) await Store.afterBatchSent();
   return ok;
 }
