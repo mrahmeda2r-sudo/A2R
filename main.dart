@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:google_mlkit_document_scanner/google_mlkit_document_scanner.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:pdf/pdf.dart';
@@ -359,7 +360,39 @@ class Store {
     } catch (_) {}
   }
 
+  // --- صورة الباتش اللي لسه متبعتتش ---
+  static Future<String?> batchImg() async {
+    final v = (await _p).getString('batchImg');
+    if (v == null || !File(v).existsSync()) return null;
+    return v;
+  }
+
+  static Future<void> setBatchImg(String path) async {
+    final p = await _p;
+    final old = p.getString('batchImg');
+    if (old != null && old != path) await del(old);
+    await p.setString('batchImg', path);
+  }
+
+  static Future<void> clearBatchImg() async {
+    final p = await _p;
+    final old = p.getString('batchImg');
+    if (old != null) await del(old);
+    await p.remove('batchImg');
+  }
+
+  static Future<void> afterBatchSent() async {
+    await clearBatchImg();
+    await setFlag('batch');
+  }
+
   // --- صور الإيصالات اللي لسه متبعتتش ---
+  static Future<void> setDraft(List<String> l) async =>
+      (await _p).setStringList('draft', l);
+
+  static Future<List<String>> pdfImgs() async =>
+      (await _p).getStringList('pdfImgs') ?? [];
+
   static Future<List<String>> draft() async {
     final l = (await _p).getStringList('draft') ?? [];
     return l.where((e) => File(e).existsSync()).toList();
@@ -451,6 +484,8 @@ class Store {
   /// مسح أي ملفات مؤقتة مش تابعة لصور مسودة أو PDF شغّال.
   static Future<void> cleanup() async {
     final keep = <String>{...await draft()};
+    final bi = await batchImg();
+    if (bi != null) keep.add(bi);
     final pdfPath = (await pdf())?.file.path;
     if (pdfPath != null) keep.add(pdfPath);
     await for (final e in (await dir()).list()) {
@@ -509,7 +544,7 @@ Future<bool> ensureCamera(BuildContext context) async {
   return false;
 }
 
-Future<List<String>> simplePick(BuildContext context) async {
+Future<List<String>> simplePick(BuildContext context, {bool multi = false}) async {
   final src = await showModalBottomSheet<ImageSource>(
     context: context,
     builder: (c) => SafeArea(
@@ -527,39 +562,30 @@ Future<List<String>> simplePick(BuildContext context) async {
   );
   if (src == null) return [];
   try {
-    final x = await ImagePicker().pickImage(source: src, maxWidth: 2000, imageQuality: 85);
+    final picker = ImagePicker();
+    if (src == ImageSource.gallery && multi) {
+      final xs = await picker.pickMultiImage(maxWidth: 2000, imageQuality: 85);
+      return xs.map((e) => e.path).toList();
+    }
+    final x = await picker.pickImage(source: src, maxWidth: 2000, imageQuality: 85);
     return x == null ? [] : [x.path];
   } catch (_) {
-    if (context.mounted) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('تعذر فتح الكاميرا أو المعرض')));
-    }
+    if (context.mounted) snack(context, 'تعذر فتح الكاميرا أو المعرض');
     return [];
   }
 }
 
-/// اختيار مجموعة صور من المعرض (بترتيب الاختيار).
-Future<List<String>> pickGalleryMulti(BuildContext context) async {
-  try {
-    final xs = await ImagePicker().pickMultiImage(maxWidth: 2000, imageQuality: 85);
-    return xs.map((e) => e.path).toList();
-  } catch (_) {
-    if (context.mounted) snack(context, 'تعذر فتح المعرض');
-    return [];
-  }
-}
-
-/// تصوير صورة واحدة (ماسح مستندات بقص وتحسين، ولو مش شغال على الموبايل بيتحول للكاميرا العادية تلقائياً).
+/// كل التصوير (كاميرا أو معرض) بيعدي على ماسح المستندات (قص وتحسين).
+/// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية تلقائياً.
+/// داخل الماسح فيه أيقونة المعرض لاستيراد صور (لحد [limit] صورة).
 Future<List<String>> scanImages(BuildContext context, int limit) async {
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
-  final p = await SharedPreferences.getInstance();
-  if (p.getBool('simple') ?? false) return simplePick(context);
   final scanner = DocumentScanner(
     options: DocumentScannerOptions(
       mode: ScannerMode.full,
       pageLimit: limit,
-      isGalleryImport: true, // الصور من المعرض بتعدي على الماسح زي الكاميرا
+      isGalleryImport: true,
     ),
   );
   try {
@@ -568,9 +594,8 @@ Future<List<String>> scanImages(BuildContext context, int limit) async {
   } catch (e) {
     if (e.toString().toLowerCase().contains('cancel')) return [];
     if (!context.mounted) return [];
-    ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('الماسح مش شغال على الموبايل ده، هنفتح الكاميرا العادية')));
-    return simplePick(context);
+    snack(context, 'الماسح مش شغال على الموبايل ده، هنفتح الكاميرا العادية');
+    return simplePick(context, multi: limit > 1);
   } finally {
     scanner.close();
   }
@@ -584,6 +609,59 @@ Future<bool> shareFiles(BuildContext context, List<String> paths) async {
   if (!context.mounted) return false;
   return askYesNo(context, 'تم الإرسال؟', 'لو بعت الملف فعلاً اضغط "تم".',
       yes: 'تم', no: 'لا');
+}
+
+/// تجهيز صورة الباتش (مع الشريط) باسم رقم الوحدة وإرسالها.
+Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
+  final bytes = await composeBatch(img, s);
+  final out = File('${(await Store.dir()).path}/${s.batchName}.jpg');
+  await out.writeAsBytes(bytes);
+  if (!context.mounted) return false;
+  final ok = await shareFiles(context, [out.path]);
+  if (ok) await Store.afterBatchSent();
+  return ok;
+}
+
+/// عرض ملء الشاشة بتكبير بالأصابع.
+class ZoomPage extends StatelessWidget {
+  final Widget child;
+  const ZoomPage({super.key, required this.child});
+  @override
+  Widget build(BuildContext context) {
+    final w = MediaQuery.of(context).size.width;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white),
+      body: InteractiveViewer(
+        constrained: false,
+        minScale: 0.5,
+        maxScale: 6,
+        child: SizedBox(width: w, child: child),
+      ),
+    );
+  }
+}
+
+/// صورة إيصال والورقة فوقها (نفس شكل الـ PDF).
+class ReceiptPreview extends StatelessWidget {
+  final String path;
+  final Tag? tag;
+  final int? cacheWidth;
+  const ReceiptPreview({super.key, required this.path, this.tag, this.cacheWidth});
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
+        final cw = cons.maxWidth;
+        return Stack(children: [
+          Image.file(File(path), width: double.infinity, fit: BoxFit.fitWidth, cacheWidth: cacheWidth),
+          if (tag != null)
+            Positioned(
+              top: cw * kTagTop,
+              left: 0,
+              right: 0,
+              child: Center(child: Image.memory(tag!.png, width: cw * tag!.w / 1000)),
+            ),
+        ]);
+      });
 }
 
 void snack(BuildContext context, String m) =>
@@ -724,10 +802,11 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   List<String> draft = [];
+  String? batchImg;
   ({File file, DateTime time})? pdf;
   bool batchSent = false;
   bool receiptsSent = false;
-  bool simple = false;
+  bool busy = false;
 
   @override
   void initState() {
@@ -748,8 +827,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _init() async {
-    final p = await SharedPreferences.getInstance();
-    if (mounted) setState(() => simple = p.getBool('simple') ?? false);
     await requestAllPermissions();
     await Store.cleanup();
     await _reload();
@@ -758,28 +835,54 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _reload() async {
     final d = await Store.draft();
     final f = await Store.pdf();
+    final bi = await Store.batchImg();
     final b = await Store.flag('batch');
     final r = await Store.flag('receipts');
     if (!mounted) return;
     setState(() {
       draft = d;
       pdf = f;
+      batchImg = bi;
       batchSent = b;
       receiptsSent = r;
     });
   }
 
-  Future<void> _toggleSimple() async {
-    setState(() => simple = !simple);
-    final p = await SharedPreferences.getInstance();
-    await p.setBool('simple', simple);
-    if (!mounted) return;
-    snack(context, simple ? 'الوضع البسيط: كاميرا أو معرض عادي بدون قص' : 'وضع الماسح: قص وتحسين تلقائي');
-  }
-
   Future<void> _open(Widget screen) async {
     await Navigator.push(context, MaterialPageRoute(builder: (_) => screen));
     _reload();
+  }
+
+  Future<void> _sendBatch() async {
+    final b = batchImg;
+    if (b == null) return;
+    setState(() => busy = true);
+    try {
+      final ok = await sendBatchFile(context, widget.session, b);
+      if (ok) await _reload();
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _trashBatch() async {
+    if (!await askYesNo(context, 'مسح صورة الباتش؟', 'الصورة هتتمسح من التطبيق.',
+        yes: 'امسح', no: 'إلغاء')) {
+      return;
+    }
+    await Store.clearBatchImg();
+    await _reload();
+  }
+
+  Future<void> _openPdf() async {
+    final f = pdf;
+    if (f == null) return;
+    final r = await OpenFilex.open(f.file.path);
+    if (r.type != ResultType.done && mounted) {
+      snack(context, 'مفيش تطبيق يفتح ملفات PDF على التليفون');
+    }
   }
 
   Future<void> _sendPdf() async {
@@ -847,18 +950,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final s = widget.session;
     final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
     final pf = pdf;
+    final bi = batchImg;
     return Scaffold(
       appBar: AppBar(
         title: const Text('A2R', style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2)),
-        actions: [
-          IconButton(
-            tooltip: simple ? 'الوضع البسيط (اضغط للماسح)' : 'وضع الماسح (اضغط للوضع البسيط)',
-            icon: Icon(simple ? Icons.photo_camera : Icons.document_scanner),
-            onPressed: _toggleSimple,
-          ),
-        ],
       ),
       body: ListView(padding: const EdgeInsets.all(16), children: [
+        if (busy) const LinearProgressIndicator(),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(14),
@@ -909,17 +1007,42 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               child: _big(Icons.payments, 'إيصالات الدفع', receiptsSent,
                   () => _open(ReceiptsScreen(session: s)))),
         ]),
-        if (draft.isNotEmpty || pf != null) ...[
+        if (draft.isNotEmpty || pf != null || bi != null) ...[
           const SizedBox(height: 24),
-          const Text('ملفات إيصالات الدفع',
+          const Text('ملفاتي (لسه متبعتتش)',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
+          if (bi != null)
+            Card(
+              child: ListTile(
+                leading: ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Image.file(File(bi), width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
+                ),
+                title: Text('الباتش - ${s.batchName}.jpg'),
+                subtitle: const Text('اضغط للمعاينة'),
+                onTap: () => _open(BatchScreen(session: s)),
+                trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                  IconButton(
+                      tooltip: 'إرسال',
+                      icon: const Icon(Icons.send),
+                      onPressed: busy ? null : _sendBatch),
+                  IconButton(
+                      tooltip: 'مسح',
+                      icon: const Icon(Icons.delete, color: Colors.red),
+                      onPressed: busy ? null : _trashBatch),
+                ]),
+              ),
+            ),
           if (draft.isNotEmpty)
             Card(
               child: ListTile(
-                leading: const Icon(Icons.photo_library, size: 32),
-                title: Text('صور قيد التصوير (${draft.length})'),
-                subtitle: const Text('اضغط عشان تكمل التصوير'),
+                leading: ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Image.file(File(draft.first), width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
+                ),
+                title: Text('إيصالات الدفع (${draft.length} صورة)'),
+                subtitle: const Text('اضغط للمعاينة أو لتكمل التصوير'),
                 onTap: () => _open(ReceiptsScreen(session: s)),
                 trailing: IconButton(
                     tooltip: 'مسح',
@@ -930,10 +1053,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           if (pf != null)
             Card(
               child: ListTile(
-                leading: const Icon(Icons.picture_as_pdf, size: 32, color: Colors.red),
+                leading: const Icon(Icons.picture_as_pdf, size: 36, color: Colors.red),
                 title: Text(pf.file.path.split('/').last, maxLines: 2, overflow: TextOverflow.ellipsis),
                 subtitle: Text(
-                    'يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
+                    'اضغط لفتحه - يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
+                onTap: _openPdf,
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
                       tooltip: 'إرسال',
@@ -968,7 +1092,23 @@ class _BatchScreenState extends State<BatchScreen> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _capture());
+    _init();
+  }
+
+  /// لو فيه صورة باتش محفوظة بنعرضها للمعاينة، وإلا بنفتح الماسح.
+  Future<void> _init() async {
+    final cur = await Store.batchImg();
+    if (!mounted) return;
+    if (cur != null) {
+      final st = await batchStrip(1000, widget.session);
+      if (!mounted) return;
+      setState(() {
+        img = cur;
+        strip = st;
+      });
+    } else {
+      _capture();
+    }
   }
 
   Future<void> _capture() async {
@@ -981,8 +1121,8 @@ class _BatchScreenState extends State<BatchScreen> {
     setState(() => busy = true);
     try {
       final path = await persistImage(r.first, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      await Store.setBatchImg(path); // بتمسح القديمة
       final st = await batchStrip(1000, widget.session);
-      if (img != null) await Store.del(img!);
       if (!mounted) return;
       setState(() {
         img = path;
@@ -998,23 +1138,19 @@ class _BatchScreenState extends State<BatchScreen> {
   Future<void> _send() async {
     setState(() => busy = true);
     try {
-      final bytes = await composeBatch(img!, widget.session);
-      final out = File('${(await Store.dir()).path}/${widget.session.batchName}.jpg');
-      await out.writeAsBytes(bytes);
-      if (!mounted) return;
-      final ok = await shareFiles(context, [out.path]);
-      if (ok) {
-        await Store.setFlag('batch');
-        await Store.del(out.path);
-        await Store.del(img!);
-        if (mounted) Navigator.pop(context);
-      }
+      final ok = await sendBatchFile(context, widget.session, img!);
+      if (ok && mounted) Navigator.pop(context);
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: $e');
     } finally {
       if (mounted) setState(() => busy = false);
     }
   }
+
+  Widget _content({int? cacheWidth}) => Column(mainAxisSize: MainAxisSize.min, children: [
+        Image.memory(strip!.png, width: double.infinity, fit: BoxFit.fitWidth),
+        Image.file(File(img!), width: double.infinity, fit: BoxFit.fitWidth, cacheWidth: cacheWidth),
+      ]);
 
   @override
   Widget build(BuildContext context) {
@@ -1027,15 +1163,20 @@ class _BatchScreenState extends State<BatchScreen> {
               Expanded(
                 child: SingleChildScrollView(
                   padding: const EdgeInsets.all(12),
-                  child: Container(
-                    decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
-                    child: Column(children: [
-                      Image.memory(strip!.png, width: double.infinity, fit: BoxFit.fitWidth),
-                      Image.file(File(img!),
-                          width: double.infinity, fit: BoxFit.fitWidth, cacheWidth: 1000),
-                    ]),
+                  child: GestureDetector(
+                    onTap: () => Navigator.push(
+                        context, MaterialPageRoute(builder: (_) => ZoomPage(child: _content()))),
+                    child: Container(
+                      decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
+                      child: _content(cacheWidth: 1000),
+                    ),
                   ),
                 ),
+              ),
+              const Padding(
+                padding: EdgeInsets.only(bottom: 4),
+                child: Text('اضغط على الصورة لتكبيرها',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
               ),
               SafeArea(
                 child: Padding(
@@ -1080,7 +1221,7 @@ class ReceiptsScreen extends StatefulWidget {
 class _ReceiptsScreenState extends State<ReceiptsScreen> {
   List<String> imgs = [];
   Tag? tag;
-  File? built; // PDF اتعمل من الصور الحالية
+  File? built; // PDF اتعمل من نفس الصور الحالية
   bool busy = false;
   bool loaded = false;
 
@@ -1092,18 +1233,37 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   Future<void> _load() async {
     final d = await Store.draft();
-    final l = await receiptTag(1000, widget.session);
+    final t = await receiptTag(1000, widget.session);
+    final f = await Store.pdf();
+    final used = await Store.pdfImgs();
+    File? b;
+    if (f != null && d.isNotEmpty && used.length == d.length) {
+      var same = true;
+      for (var i = 0; i < d.length; i++) {
+        if (d[i] != used[i]) same = false;
+      }
+      if (same) b = f.file;
+    }
     if (!mounted) return;
     setState(() {
       imgs = d;
-      tag = l;
+      tag = t;
+      built = b;
       loaded = true;
     });
     if (d.isEmpty) _add();
   }
 
+  /// تصوير صورة واحدة بالماسح.
   Future<void> _add() async {
     final r = await scanImages(context, 1);
+    if (r.isEmpty || !mounted) return;
+    await _saveAll(r);
+  }
+
+  /// صور من المعرض (بالماسح كمان، لحد 100 صورة).
+  Future<void> _addGallery() async {
+    final r = await scanImages(context, 100);
     if (r.isEmpty || !mounted) return;
     await _saveAll(r);
   }
@@ -1124,12 +1284,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
-  Future<void> _addGallery() async {
-    final r = await pickGalleryMulti(context);
-    if (r.isEmpty || !mounted) return;
-    await _saveAll(r);
-  }
-
   Future<void> _remove(int i) async {
     if (!await askYesNo(context, 'مسح الصورة؟', 'الصورة دي هتتمسح.', yes: 'امسح', no: 'إلغاء')) {
       return;
@@ -1140,6 +1294,17 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       imgs.removeAt(i);
       built = null;
     });
+  }
+
+  Future<void> _move(int i, int delta) async {
+    final j = i + delta;
+    if (j < 0 || j >= imgs.length) return;
+    setState(() {
+      final x = imgs.removeAt(i);
+      imgs.insert(j, x);
+      built = null;
+    });
+    await Store.setDraft(imgs);
   }
 
   Future<void> _create() async {
@@ -1163,6 +1328,46 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
+  Widget _mini(IconData icon, VoidCallback? onTap, {Color color = Colors.black54}) => GestureDetector(
+        onTap: onTap,
+        child: CircleAvatar(
+            radius: 16, backgroundColor: color, child: Icon(icon, size: 20, color: Colors.white)),
+      );
+
+  Widget _item(int i) => Container(
+        decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
+        child: Stack(children: [
+          GestureDetector(
+            onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (_) => ZoomPage(child: ReceiptPreview(path: imgs[i], tag: tag)))),
+            child: ReceiptPreview(path: imgs[i], tag: tag, cacheWidth: 900),
+          ),
+          Positioned(
+              top: 6,
+              left: 6,
+              child: _mini(Icons.close, busy ? null : () => _remove(i), color: Colors.red)),
+          Positioned(
+            top: 6,
+            right: 6,
+            child: Row(children: [
+              if (i > 0) _mini(Icons.arrow_upward, busy ? null : () => _move(i, -1)),
+              const SizedBox(width: 4),
+              if (i < imgs.length - 1) _mini(Icons.arrow_downward, busy ? null : () => _move(i, 1)),
+            ]),
+          ),
+          Positioned(
+            bottom: 6,
+            left: 6,
+            child: CircleAvatar(
+                radius: 14,
+                backgroundColor: Colors.black54,
+                child: Text('${i + 1}', style: const TextStyle(color: Colors.white, fontSize: 13))),
+          ),
+        ]),
+      );
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1180,35 +1385,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                       padding: const EdgeInsets.all(12),
                       itemCount: imgs.length,
                       separatorBuilder: (_, __) => const SizedBox(height: 12),
-                      itemBuilder: (_, i) => Container(
-                        decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
-                        child: LayoutBuilder(builder: (ctx, cons) {
-                          final cw = cons.maxWidth;
-                          return Stack(children: [
-                            Image.file(File(imgs[i]),
-                                width: double.infinity, fit: BoxFit.fitWidth, cacheWidth: 900),
-                            if (tag != null)
-                              Positioned(
-                                top: cw * kTagTop,
-                                left: 0,
-                                right: 0,
-                                child: Center(
-                                    child: Image.memory(tag!.png, width: cw * tag!.w / 1000)),
-                              ),
-                            Positioned(
-                              top: 6,
-                              left: 6,
-                              child: GestureDetector(
-                                onTap: busy ? null : () => _remove(i),
-                                child: const CircleAvatar(
-                                    radius: 16,
-                                    backgroundColor: Colors.red,
-                                    child: Icon(Icons.close, size: 20, color: Colors.white)),
-                              ),
-                            ),
-                          ]);
-                        }),
-                      ),
+                      itemBuilder: (_, i) => _item(i),
                     ),
         ),
         SafeArea(
