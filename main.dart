@@ -32,6 +32,9 @@ const kBandPad = 0.02; // المسافة البيضاء حوالين الورق�
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
 enum PerfMode { lite, balanced, pro }
 
+/// الدقة الافتراضية لمعاينة الإيصال (نفس وضع balanced).
+const kMaxSide = 1400;
+
 int getMaxSide(PerfMode mode) {
   switch (mode) {
     case PerfMode.lite:
