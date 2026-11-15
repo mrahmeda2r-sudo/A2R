@@ -12,23 +12,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
       - uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.50.0'
           channel: stable
           cache: true
 
       - name: Generate android platform
         run: flutter create --platforms=android --project-name a2r --org com.a2r .
 
-      - name: Add packages
-        run: flutter pub add google_mlkit_document_scanner:^0.4.0 pdf:^3.11.0 path_provider:^2.1.0 share_plus:^10.0.0 shared_preferences:^2.2.0 flutter_image_compress:^2.3.0 image_picker:^1.1.0 permission_handler:^11.3.1 open_filex:^4.5.0 document_scan:^0.5.0
+      - name: Add packages (pinned)
+        run: |
+          flutter pub add google_mlkit_document_scanner:0.4.1 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 document_scan:0.5.0
+          flutter pub add flutter_localizations --sdk=flutter
 
       - name: Build app data from data.xlsx
         run: |
@@ -92,18 +95,19 @@ jobs:
       - name: Move main.dart into lib
         run: mv -f main.dart lib/
 
+      - name: Analyze code (fail fast on errors)
+        run: flutter analyze lib --no-fatal-infos --no-fatal-warnings
+
       - name: App label
         run: sed -i 's/android:label="[^"]*"/android:label="A2R"/' android/app/src/main/AndroidManifest.xml
 
-      - name: Camera and storage permissions
+      - name: Camera permission
         run: |
           python3 - <<'PY'
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p, encoding='utf-8').read()
           perms = (
               '<uses-permission android:name="android.permission.CAMERA"/>\n'
-              '    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>\n'
-              '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n'
               '    <uses-feature android:name="android.hardware.camera" android:required="false"/>\n'
               '    '
           )
@@ -137,6 +141,17 @@ jobs:
           mkdir -p ~/.gradle
           echo "allprojects { tasks.configureEach { t -> if (t.name.startsWith('lint')) { t.enabled = false } } }" > ~/.gradle/init.gradle
           cat ~/.gradle/init.gradle
+
+      - name: Cache Gradle and NDK
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            /usr/local/lib/android/sdk/ndk
+          key: gradle-ndk-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
+          restore-keys: |
+            gradle-ndk-${{ runner.os }}-
 
       - name: Build APK
         run: >
