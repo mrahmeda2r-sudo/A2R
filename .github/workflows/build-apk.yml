@@ -117,6 +117,8 @@ jobs:
           else:
               s = s.replace('<application', '<queries>' + intent + '</queries>\n    <application', 1)
           s = s.replace('<application', perms + '<application', 1)
+          # رامات أكبر للتطبيق: ضغط الصور الكبيرة كان بيخلّص الذاكرة ويقفل التطبيق
+          s = s.replace('<application', '<application android:largeHeap="true"', 1)
           open(p, 'w', encoding='utf-8').write(s)
           print(s)
           PY
