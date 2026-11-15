@@ -1161,6 +1161,11 @@ Future<void> main() async {
   await AppData.load();
   try {
     final sp = await SharedPreferences.getInstance();
+    if (sp.getBool('apply_guard') == true) {
+      await sp.setBool('apply_safe', true);
+      await sp.setBool('apply_guard', false);
+      AppLog.i('التطبيق اتقفل أثناء حفظ التعديل، اتفعّل الوضع الآمن (دقة أقل)');
+    }
     if (sp.getBool('det_guard') == true) {
       await sp.setBool('det_off', true);
       await sp.setBool('det_guard', false);
@@ -2426,6 +2431,7 @@ class _EditorPageState extends State<EditorPage> {
       });
       await _loadView();
       AppLog.i('editor view loaded');
+      WidgetsBinding.instance.addPostFrameCallback((_) => AppLog.i('editor first frame'));
       if (mounted && e == null && _lastScanManual) await _auto(silent: true);
     } catch (e, st) { AppLog.e('_init', e, st);
       if (mounted) {
@@ -2570,9 +2576,14 @@ class _EditorPageState extends State<EditorPage> {
     }
     setState(() => busy = true);
     Store.working++;
+    final sp = await SharedPreferences.getInstance();
     try {
+      // علامة: لو التطبيق اتقفل جوه "تم"، في التشغيل الجاي بنشغّل وضع آمن بدقة أقل
+      await sp.setBool('apply_guard', true);
+      AppLog.i('apply start turns=$turns angle=${angle.toStringAsFixed(1)} filter=${filter.name}');
       final r = await _rotatedImage(src!, turns);
       final rw = r.width, rh = r.height;
+      AppLog.i('apply decoded ${rw}x$rh');
       final bd = await r.toByteData(format: ui.ImageByteFormat.rawRgba);
       r.dispose();
       if (bd == null) throw Exception('تعذر قراءة الصورة');
@@ -2581,11 +2592,13 @@ class _EditorPageState extends State<EditorPage> {
       final leftH = (pts[3] - pts[0]).distance, rightH = (pts[2] - pts[1]).distance;
       var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
       final mode = await Store.perfMode();
-      final maxSide = getMaxSide(mode);
+      final safe = sp.getBool('apply_safe') ?? false;
+      final maxSide = safe ? math.min(900, getMaxSide(mode)) : getMaxSide(mode);
       final k = math.min(1.0, maxSide / math.max(ow, oh));
       ow *= k;
       oh *= k;
       final w = math.max(8, ow.round()), h = math.max(8, oh.round());
+      AppLog.i('apply warp ${w}x$h safe=$safe');
       final rgba = await compute(_warpJob, <String, dynamic>{
         'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
         'sw': rw,
@@ -2596,12 +2609,14 @@ class _EditorPageState extends State<EditorPage> {
         'h': _homography(pts),
         'm': editMatrix(filter, contrast, brightness),
       });
+      AppLog.i('apply warp done');
       final comp = Completer<ui.Image>();
       ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
       final outImg = await comp.future;
       final png = await outImg.toByteData(format: ui.ImageByteFormat.png);
       outImg.dispose();
       if (png == null) throw Exception('تعذر حفظ الصورة');
+      AppLog.i('apply png ${png.lengthInBytes ~/ 1024}KB');
       final jpg = await FlutterImageCompress.compressWithList(
         png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
         minWidth: w,
@@ -2612,6 +2627,7 @@ class _EditorPageState extends State<EditorPage> {
       final dir = (await Store.dir()).path;
       final nf = File('$dir/${widget.prefix}${DateTime.now().microsecondsSinceEpoch}.jpg');
       await nf.writeAsBytes(jpg, flush: true);
+      AppLog.i('apply jpg ${jpg.length ~/ 1024}KB saved');
       // النسخة الأصلية بتنتقل للصورة الجديدة (أو بتتعمل أول مرة من الصورة الحالية)
       final oldBase = File(Store.baseOf(widget.path));
       final newBase = Store.baseOf(nf.path);
@@ -2629,10 +2645,15 @@ class _EditorPageState extends State<EditorPage> {
               filter: filter,
               contrast: contrast,
               brightness: brightness));
+      AppLog.i('apply done');
       if (mounted) Navigator.pop(context, nf.path);
-    } catch (e) {
+    } catch (e, st) {
+      AppLog.e('editor._apply', e, st);
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
+      try {
+        await sp.setBool('apply_guard', false);
+      } catch (_) {}
       Store.working--;
       if (mounted) setState(() => busy = false);
     }
