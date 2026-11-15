@@ -953,6 +953,63 @@ Future<Uint8List> composeBatch(String path, Session s) async {
   throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
 }
 
+/// صورة الإيصال النهائية للمشاركة: نفس صفحة الـ PDF (شريط أبيض فيه الورقة فوق الإيصال).
+/// من غير ورقة (إخفاء الورقة) بترجع الصورة زي ما هي.
+Future<Uint8List> composeReceiptImage(String path, Session s) async {
+  final src = await File(path).readAsBytes();
+  if (await Store.noTag(path)) return src;
+  final sz = await imageSize(src);
+  final maxSide = getMaxSide(await Store.perfMode());
+  final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
+  final iw = img.width, ih = img.height;
+  final tag = await receiptTag(iw.toDouble(), s);
+  final pad = iw * kBandPad;
+  final band = (tag.h + pad * 2).ceil();
+  final oh = ih + band;
+  final tImg = await decodeImage(tag.png);
+  final tw = tImg.width, th = tImg.height;
+  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
+  img.dispose();
+  tImg.dispose();
+  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
+  final rgba = await compute(_composeJob, <String, dynamic>{
+    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
+    'iw': iw,
+    'ih': ih,
+    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
+    'tw': tw,
+    'th': th,
+    'ow': iw,
+    'oh': oh,
+    'ix': 0,
+    'iy': band,
+    'tx': ((iw - tag.w) / 2).round(),
+    'ty': pad.round(),
+  });
+  final comp = Completer<ui.Image>();
+  ui.decodeImageFromPixels(rgba, iw, oh, ui.PixelFormat.rgba8888, comp.complete);
+  final outImg = await comp.future;
+  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
+  outImg.dispose();
+  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
+  final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
+  final q = await Store.jpegQuality();
+  final want = _meanLum(rgba, iw, oh);
+  for (final k in const [1.0, 0.75]) {
+    final jpg = await FlutterImageCompress.compressWithList(
+      png,
+      minWidth: (iw * k).round(),
+      minHeight: (oh * k).round(),
+      quality: q,
+      format: CompressFormat.jpeg,
+    );
+    final got = await _jpegMeanLum(jpg);
+    if (got != null && (got - want).abs() < 25) return jpg;
+  }
+  throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
+}
+
 /// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال الأصلية (JPEG بيتحط في الـ PDF زي ما هو
 /// من غير إعادة رسم ولا إعادة ضغط، فالجودة أحسن والذاكرة أقل بكتير).
 Future<File> buildReceiptsPdf(Session s, List<String> receipts,
@@ -1090,7 +1147,7 @@ class Store {
   static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
 
   /// فتح شاشة الفلاتر والقص بعد كل صورة (تصوير أو معرض)
-  static Future<bool> autoEdit() async => (await _p).getBool('autoEdit') ?? true;
+  static Future<bool> autoEdit() async => (await _p).getBool('autoEdit') ?? false;
   static Future<void> setAutoEdit(bool v) async => (await _p).setBool('autoEdit', v);
 
   /// شكل ورقة الباتش: 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
@@ -2404,12 +2461,27 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _sendPdf() async {
     final f = pdf;
     if (f == null) return;
-    final ok = await shareFiles(context, [f.file.path]);
-    if (ok) {
-      HapticFeedback.mediumImpact();
-      await Store.afterPdfSent();
-      await _reload();
+    final used = <String>[];
+    for (final x in await Store.pdfImgs()) {
+      if (await File(x).exists()) used.add(x);
     }
+    if (!mounted) return;
+    if (used.isEmpty) {
+      // مفيش صور نعرضها: مشاركة الـ PDF مباشرة زي الأول
+      final ok = await shareFiles(context, [f.file.path]);
+      if (ok) {
+        HapticFeedback.mediumImpact();
+        await Store.afterPdfSent();
+        await _reload();
+      }
+      return;
+    }
+    await Navigator.push<bool>(
+        context,
+        MaterialPageRoute(
+            builder: (_) =>
+                PdfResultScreen(session: widget.session, pdf: f.file, imgs: used)));
+    if (mounted) await _reload();
   }
 
   Future<void> _trashPdf() async {
@@ -3389,6 +3461,7 @@ class _EditorPageState extends State<EditorPage> {
   late int tab = widget.initialTab; // 0 قص، 1 تدوير، 2 ألوان
   int drag = -1; // 0..3 زوايا، 4..7 حواف، 8 تحريك الكل
   bool busy = false;
+  bool _quadTouched = false; // الموظف حدد الإطار بنفسه: القص التلقائي المتأخر ميلمسوش
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
   int _viewGen = 0;
   ui.Image? cleaned; // نسخة منضّفة للمعاينة لما الفلتر = إيصال
@@ -3513,6 +3586,7 @@ class _EditorPageState extends State<EditorPage> {
       }
     }
     if (best == -1 && _inside(p, pts)) best = 8;
+    if (best != -1) _quadTouched = true;
     setState(() => drag = best);
   }
 
@@ -3596,10 +3670,12 @@ class _EditorPageState extends State<EditorPage> {
   }
 
   Future<void> _auto({bool silent = false}) async {
+    if (!silent) _quadTouched = false;
     setState(() => busy = true);
     try {
       final q = await detectDocQuad(src!);
       if (!mounted) return;
+      if (silent && _quadTouched) return;
       if (q == null) {
         if (!silent) snack(context, 'مقدرتش أحدد حدود الورقة تلقائياً، حددها بإيدك');
       } else {
@@ -3736,7 +3812,16 @@ class _EditorPageState extends State<EditorPage> {
             const SizedBox(width: 8),
             Expanded(
               child: OutlinedButton.icon(
-                onPressed: busy ? null : () => setState(() => quad = List.of(_full)),
+                onPressed: busy
+                    ? null
+                    : () {
+                        HapticFeedback.selectionClick();
+                        setState(() {
+                          _quadTouched = true;
+                          angle = 0;
+                          quad = List.of(_full);
+                        });
+                      },
                 icon: const Icon(Icons.crop_free),
                 label: const Text('الصورة كلها'),
               ),
@@ -4007,6 +4092,189 @@ class _QuadPainter extends CustomPainter {
 }
 
 // =====================================================================
+//  معاينة ملف الـ PDF بعد إنشائه (كل الصفحات) + مشاركة PDF / صور
+// =====================================================================
+
+class PdfResultScreen extends StatefulWidget {
+  final Session session;
+  final File pdf;
+  final List<String> imgs; // نفس ترتيب صفحات الـ PDF
+  const PdfResultScreen({super.key, required this.session, required this.pdf, required this.imgs});
+  @override
+  State<PdfResultScreen> createState() => _PdfResultScreenState();
+}
+
+class _PdfResultScreenState extends State<PdfResultScreen> {
+  Tag? tag;
+  final Set<String> noTags = {};
+  bool busy = false;
+  bool shared = false; // اتبعت PDF أو الصور فعلاً
+  String? progress;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final t = await receiptTag(1000, widget.session);
+      final nts = <String>{};
+      for (final x in widget.imgs) {
+        if (await Store.noTag(x)) nts.add(x);
+      }
+      if (!mounted) return;
+      setState(() {
+        tag = t;
+        noTags
+          ..clear()
+          ..addAll(nts);
+      });
+    } catch (e, st) {
+      AppLog.e('PdfResultScreen._load', e, st);
+      if (mounted) snack(context, 'تعذر تجهيز المعاينة');
+    }
+  }
+
+  void _markShared() {
+    HapticFeedback.mediumImpact();
+    if (!mounted) return;
+    setState(() => shared = true);
+    snack(context, 'اتبعت ✓ اضغط "تم" لما تخلص');
+  }
+
+  Future<void> _sharePdf() async {
+    if (busy) return;
+    final ok = await shareFiles(context, [widget.pdf.path]);
+    if (ok) _markShared();
+  }
+
+  Future<void> _shareImages() async {
+    if (busy) return;
+    final n = widget.imgs.length;
+    setState(() {
+      busy = true;
+      progress = '0/$n';
+    });
+    final files = <String>[];
+    try {
+      final dir = await getTemporaryDirectory();
+      for (var i = 0; i < n; i++) {
+        final bytes = await composeReceiptImage(widget.imgs[i], widget.session);
+        final f = File('${dir.path}/${widget.session.pdfName}_${i + 1}.jpg');
+        await f.writeAsBytes(bytes, flush: true);
+        files.add(f.path);
+        if (mounted) setState(() => progress = '${i + 1}/$n');
+      }
+    } catch (e, st) {
+      AppLog.e('PdfResultScreen._shareImages', e, st);
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+      files.clear();
+    } finally {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          progress = null;
+        });
+      }
+    }
+    if (files.isEmpty || !mounted) return;
+    final ok = await shareFiles(context, files);
+    if (ok) _markShared();
+  }
+
+  Future<void> _done() async {
+    await Store.afterPdfSent();
+    if (mounted) Navigator.pop(context, true);
+  }
+
+  Widget _page(int i) {
+    final path = widget.imgs[i];
+    final show = !noTags.contains(path);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 4),
+          child: Text('صفحة ${i + 1} من ${widget.imgs.length}',
+              style: const TextStyle(color: Colors.grey, fontSize: 12)),
+        ),
+        GestureDetector(
+          onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => ZoomPage(
+                      child: ReceiptPreview(path: path, tag: tag!, showTag: show)))),
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              border: Border.all(color: Colors.black26),
+              boxShadow: const [BoxShadow(blurRadius: 4, color: Colors.black12)],
+            ),
+            child: ReceiptPreview(path: path, tag: tag!, cacheWidth: 900, showTag: show),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final n = widget.imgs.length;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('معاينة الملف ($n صفحة)'),
+        actions: [
+          if (shared)
+            TextButton.icon(
+              onPressed: busy ? null : _done,
+              icon: const Icon(Icons.check),
+              label: const Text('تم'),
+            ),
+        ],
+      ),
+      body: Column(children: [
+        Expanded(
+          child: tag == null
+              ? const Center(child: CircularProgressIndicator())
+              : ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: n,
+                  itemBuilder: (_, i) => _page(i),
+                ),
+        ),
+        SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+            child: Row(children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: busy ? null : _sharePdf,
+                  icon: const Icon(Icons.picture_as_pdf),
+                  label: const Text('مشاركة PDF'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: busy ? null : _shareImages,
+                  icon: busy
+                      ? const SizedBox(
+                          width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.image),
+                  label: Text(progress != null ? 'تجهيز $progress' : 'مشاركة صور'),
+                ),
+              ),
+            ]),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// =====================================================================
 //  شاشة إيصالات الدفع
 // =====================================================================
 
@@ -4087,7 +4355,36 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       if (mounted && imgs.isNotEmpty) await _edit(imgs.length - 1, tab: 2);
       return;
     }
-    if (d.isEmpty) _add();
+    if (d.isEmpty && mounted) await _chooseSource();
+  }
+
+  /// أول ما تفتح إيصالات الدفع وهي فاضية: اختار كاميرا ولا معرض.
+  Future<void> _chooseSource() async {
+    final c = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.add_a_photo),
+            title: const Text('كاميرا'),
+            onTap: () => Navigator.pop(ctx, 'camera'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.photo_library),
+            title: const Text('معرض'),
+            onTap: () => Navigator.pop(ctx, 'gallery'),
+          ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    if (!mounted) return;
+    if (c == 'camera') {
+      await _add();
+    } else if (c == 'gallery') {
+      await _addGallery();
+    }
   }
 
   /// تصوير متتالي: صوّر → قص → يرجع يفتح الكاميرا تاني لحد ما الموظف يقفل الماسح.
@@ -4222,13 +4519,22 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
+  /// ضغطة واحدة: يجهّز الـ PDF وبعدها يفتح شاشة المعاينة (مشاركة PDF / مشاركة صور).
+  Future<void> _createAndSend() async {
+    await _create();
+    if (!mounted || built == null) return;
+    await _send();
+  }
+
   Future<void> _send() async {
-    final ok = await shareFiles(context, [built!.path]);
-    if (ok) {
-      HapticFeedback.mediumImpact();
-      await Store.afterPdfSent();
-      if (mounted) Navigator.pop(context);
-    }
+    final f = built;
+    if (f == null) return;
+    final done = await Navigator.push<bool>(
+        context,
+        MaterialPageRoute(
+            builder: (_) =>
+                PdfResultScreen(session: widget.session, pdf: f, imgs: List.of(imgs))));
+    if (done == true && mounted) Navigator.pop(context);
   }
 
   /// تعديل إيصال بعد التصوير (قص، تدوير، فلتر) من النسخة الأصلية.
@@ -4394,14 +4700,14 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                 width: double.infinity,
                 height: 50,
                 child: FilledButton.icon(
-                  onPressed: (busy || imgs.isEmpty) ? null : (built == null ? _create : _send),
+                  onPressed: (busy || imgs.isEmpty) ? null : (built == null ? _createAndSend : _send),
                   icon: busy
                       ? const SizedBox(
                           width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                      : Icon(built == null ? Icons.picture_as_pdf : Icons.send),
+                      : Icon(built == null ? Icons.picture_as_pdf : Icons.visibility),
                   label: Text(progress != null
                       ? 'جارى التجهيز $progress'
-                      : (built == null ? 'إنشاء PDF' : 'إرسال')),
+                      : (built == null ? 'إنشاء ومعاينة PDF' : 'معاينة ومشاركة')),
                 ),
               ),
             ]),
