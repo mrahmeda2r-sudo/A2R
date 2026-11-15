@@ -63,13 +63,24 @@ jobs:
           sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*.*/minSdk = 21/' android/app/build.gradle.kts
           grep -n "minSdk" android/app/build.gradle.kts
 
+      - name: App icon and splash screen
+        run: |
+          python3 -m pip install --break-system-packages pillow
+          python3 make_icons.py
+
       - name: Skip lint tasks (lint crashes on image_picker)
         run: |
           mkdir -p ~/.gradle
           echo "allprojects { tasks.configureEach { t -> if (t.name.startsWith('lint')) { t.enabled = false } } }" > ~/.gradle/init.gradle
           cat ~/.gradle/init.gradle
 
-      - run: flutter build apk --release --target-platform android-arm,android-arm64
+      - name: Build APK
+        run: >
+          flutter build apk --release
+          --target-platform android-arm,android-arm64
+          --build-name=1.${{ github.run_number }}
+          --build-number=${{ github.run_number }}
+          --dart-define=APP_VERSION=1.${{ github.run_number }}
 
       - name: Rename APK
         run: cp build/app/outputs/flutter-apk/app-release.apk A2R.apk
