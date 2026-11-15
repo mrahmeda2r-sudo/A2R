@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -434,6 +435,14 @@ String _dayKey() {
   return '${n.year}-${n.month}-${n.day}';
 }
 
+class SendEntry {
+  final DateTime time;
+  final String kind; // batch | receipts
+  final String file;
+  final int pages;
+  SendEntry(this.time, this.kind, this.file, this.pages);
+}
+
 class Store {
   static const pdfLife = Duration(hours: 24);
   static Future<SharedPreferences> get _p => SharedPreferences.getInstance();
@@ -473,9 +482,10 @@ class Store {
     await p.remove('batchImg');
   }
 
-  static Future<void> afterBatchSent() async {
+  static Future<void> afterBatchSent(String fileName) async {
     await clearBatchImg();
     await setFlag('batch');
+    await addLog('batch', fileName, 1);
   }
 
   // --- صور الإيصالات اللي لسه متبعتتش ---
@@ -500,6 +510,19 @@ class Store {
     final l = await draft();
     l.remove(path);
     await del(path);
+    await (await _p).setStringList('draft', l);
+  }
+
+  /// استبدال صورة في المسودة بصورة تانية في نفس المكان.
+  static Future<void> replaceInDraft(String old, String neu) async {
+    final l = await draft();
+    final i = l.indexOf(old);
+    if (i >= 0) {
+      l[i] = neu;
+    } else {
+      l.add(neu);
+    }
+    if (old != neu) await del(old);
     await (await _p).setStringList('draft', l);
   }
 
@@ -547,6 +570,8 @@ class Store {
   static Future<void> afterPdfSent() async {
     final p = await _p;
     final used = p.getStringList('pdfImgs') ?? [];
+    final pdfPath = p.getString('pdfPath');
+    await addLog('receipts', pdfPath == null ? 'PDF' : pdfPath.split('/').last, used.length);
     final left = await draft();
     for (final u in used) {
       await del(u);
@@ -555,6 +580,42 @@ class Store {
     await p.setStringList('draft', left);
     await p.remove('pdfImgs');
     await setFlag('receipts');
+  }
+
+  // --- سجل الإرسال (آخر 7 أيام) ---
+  static const logDays = 7;
+
+  static Future<void> addLog(String kind, String file, int pages) async {
+    final p = await _p;
+    final l = p.getStringList('sendLog') ?? [];
+    l.add(jsonEncode({
+      't': DateTime.now().millisecondsSinceEpoch,
+      'k': kind,
+      'f': file,
+      'n': pages,
+    }));
+    await p.setStringList('sendLog', l);
+  }
+
+  /// بيرجّع السجل (الأحدث الأول) وبيمسح اللي أقدم من 7 أيام.
+  static Future<List<SendEntry>> log() async {
+    final p = await _p;
+    final cutoff = DateTime.now().subtract(const Duration(days: logDays)).millisecondsSinceEpoch;
+    final keep = <String>[];
+    final out = <SendEntry>[];
+    for (final raw in p.getStringList('sendLog') ?? const <String>[]) {
+      try {
+        final m = jsonDecode(raw) as Map<String, dynamic>;
+        final t = m['t'] as int;
+        if (t < cutoff) continue;
+        keep.add(raw);
+        out.add(SendEntry(DateTime.fromMillisecondsSinceEpoch(t), m['k'] as String,
+            m['f'] as String, (m['n'] as int?) ?? 1));
+      } catch (_) {}
+    }
+    await p.setStringList('sendLog', keep);
+    out.sort((a, b) => b.time.compareTo(a.time));
+    return out;
   }
 
   // --- علامة ✓ (بتتصفّر كل يوم جديد) ---
@@ -710,7 +771,7 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
   await out.writeAsBytes(bytes);
   if (!context.mounted) return false;
   final ok = await shareFiles(context, [out.path]);
-  if (ok) await Store.afterBatchSent();
+  if (ok) await Store.afterBatchSent('${s.batchName}.jpg');
   return ok;
 }
 
@@ -768,6 +829,10 @@ void main() => runApp(const A2RApp());
 const kBrand = Color(0xFF0B5FA5);
 const kBrandDark = Color(0xFF083E70);
 const kInk = Color(0xFF1B2733);
+
+/// رقم الإصدار (بيتحط أوتوماتيك من GitHub وقت البناء، مثال: 1.12)
+const kVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'تجريبي');
+String get kVersionLabel => 'الإصدار $kVersion';
 
 InputDecoration fieldDec(String label, IconData icon) => InputDecoration(
       labelText: label,
@@ -944,6 +1009,9 @@ class _LoginScreenState extends State<LoginScreen> {
                 child: const Text('ابدأ', style: TextStyle(fontSize: 20)),
               ),
             ),
+            const SizedBox(height: 10),
+            Text(kVersionLabel,
+                style: TextStyle(fontSize: 12, color: Colors.blueGrey.shade400)),
           ]),
         ),
       ),
@@ -1127,6 +1195,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         scrolledUnderElevation: 0,
         title: const Text('A2R',
             style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 4, color: kBrandDark)),
+        actions: [
+          IconButton(
+            tooltip: 'سجل الإرسال',
+            icon: const Icon(Icons.history, color: kBrandDark),
+            onPressed: () => _open(const SendLogScreen()),
+          ),
+        ],
       ),
       body: ListView(padding: const EdgeInsets.all(16), children: [
         if (busy) const LinearProgressIndicator(),
@@ -1258,7 +1333,95 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               ),
             ),
         ],
+        const SizedBox(height: 28),
+        Center(
+          child: Text('A2R - $kVersionLabel',
+              style: TextStyle(fontSize: 12, color: Colors.blueGrey.shade400)),
+        ),
+        const SizedBox(height: 8),
       ]),
+    );
+  }
+}
+
+// ===== سجل الإرسال =====
+String _hm(DateTime t) {
+  final h = t.hour % 12 == 0 ? 12 : t.hour % 12;
+  return '$h:${t.minute.toString().padLeft(2, '0')} ${t.hour < 12 ? 'ص' : 'م'}';
+}
+
+String _dayTitle(DateTime t) {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final d = DateTime(t.year, t.month, t.day);
+  final diff = today.difference(d).inDays;
+  final date = '${t.day}/${t.month}/${t.year}';
+  if (diff == 0) return 'النهاردة - $date';
+  if (diff == 1) return 'امبارح - $date';
+  return date;
+}
+
+class SendLogScreen extends StatefulWidget {
+  const SendLogScreen({super.key});
+  @override
+  State<SendLogScreen> createState() => _SendLogScreenState();
+}
+
+class _SendLogScreenState extends State<SendLogScreen> {
+  List<SendEntry>? items;
+
+  @override
+  void initState() {
+    super.initState();
+    Store.log().then((l) {
+      if (mounted) setState(() => items = l);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l = items;
+    final children = <Widget>[];
+    String? lastDay;
+    for (final e in l ?? const <SendEntry>[]) {
+      final day = _dayTitle(e.time);
+      if (day != lastDay) {
+        lastDay = day;
+        children.add(Padding(
+          padding: const EdgeInsets.fromLTRB(4, 16, 4, 6),
+          child: Text(day, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: kBrandDark)),
+        ));
+      }
+      final isBatch = e.kind == 'batch';
+      children.add(Card(
+        child: ListTile(
+          leading: CircleAvatar(
+            backgroundColor: (isBatch ? kBrand : const Color(0xFF00897B)).withAlpha(30),
+            child: Icon(isBatch ? Icons.receipt_long : Icons.payments,
+                color: isBatch ? kBrand : const Color(0xFF00897B)),
+          ),
+          title: Text(isBatch ? 'الباتش' : 'إيصالات الدفع (${e.pages} صفحة)',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          subtitle: Text(e.file, maxLines: 2, overflow: TextOverflow.ellipsis),
+          trailing: Text(_hm(e.time), style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+        ),
+      ));
+    }
+    return Scaffold(
+      appBar: AppBar(title: const Text('سجل الإرسال')),
+      body: l == null
+          ? const Center(child: CircularProgressIndicator())
+          : l.isEmpty
+              ? const Center(child: Text('مفيش حاجة اتبعتت في آخر 7 أيام', style: TextStyle(fontSize: 16)))
+              : ListView(padding: const EdgeInsets.all(12), children: [
+                  ...children,
+                  const SizedBox(height: 16),
+                  Center(
+                    child: Text('السجل بيحتفظ بآخر 7 أيام بس',
+                        style: TextStyle(fontSize: 12, color: Colors.blueGrey.shade400)),
+                  ),
+                  const SizedBox(height: 8),
+                ]),
     );
   }
 }
@@ -1492,6 +1655,60 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     await Store.setDraft(imgs);
   }
 
+  /// تدوير الصفحة 90 درجة (في اتجاه عقارب الساعة).
+  Future<void> _rotate(int i) async {
+    final old = imgs[i];
+    setState(() => busy = true);
+    try {
+      final out = await FlutterImageCompress.compressWithFile(
+        old,
+        minWidth: 4000,
+        minHeight: 4000,
+        quality: 80,
+        rotate: 90,
+        format: CompressFormat.jpeg,
+        keepExif: false,
+      );
+      if (out == null) throw 'تعذر تدوير الصورة';
+      // اسم جديد عشان الصورة القديمة متفضلش في الكاش
+      final f = File('${(await Store.dir()).path}/r_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      await f.writeAsBytes(out);
+      await Store.replaceInDraft(old, f.path);
+      if (!mounted) return;
+      setState(() {
+        final k = imgs.indexOf(old);
+        if (k >= 0) imgs[k] = f.path;
+        built = null;
+      });
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  /// استبدال صفحة واحدة بصورة جديدة (من غير ما تتمسح وتتصور من الأول).
+  Future<void> _replace(int i) async {
+    final old = imgs[i];
+    final r = await scanImages(context, 1);
+    if (r.isEmpty || !mounted) return;
+    setState(() => busy = true);
+    try {
+      final saved = await persistImage(r.first, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      await Store.replaceInDraft(old, saved);
+      if (!mounted) return;
+      setState(() {
+        final k = imgs.indexOf(old);
+        if (k >= 0) imgs[k] = saved;
+        built = null;
+      });
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   Future<void> _create() async {
     setState(() => busy = true);
     try {
@@ -1519,6 +1736,21 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             radius: 16, backgroundColor: color, child: Icon(icon, size: 20, color: Colors.white)),
       );
 
+  Widget _pill(IconData icon, String label, VoidCallback? onTap) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+              color: onTap == null ? Colors.black26 : Colors.black54,
+              borderRadius: BorderRadius.circular(20)),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, size: 18, color: Colors.white),
+            const SizedBox(width: 4),
+            Text(label, style: const TextStyle(color: Colors.white, fontSize: 13)),
+          ]),
+        ),
+      );
+
   Widget _item(int i) => Container(
         decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
         child: Stack(children: [
@@ -1540,6 +1772,15 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
               if (i > 0) _mini(Icons.arrow_upward, busy ? null : () => _move(i, -1)),
               const SizedBox(width: 4),
               if (i < imgs.length - 1) _mini(Icons.arrow_downward, busy ? null : () => _move(i, 1)),
+            ]),
+          ),
+          Positioned(
+            bottom: 6,
+            right: 6,
+            child: Row(children: [
+              _pill(Icons.rotate_right, 'تدوير', busy ? null : () => _rotate(i)),
+              const SizedBox(width: 6),
+              _pill(Icons.camera_alt, 'استبدال', busy ? null : () => _replace(i)),
             ]),
           ),
           Positioned(
