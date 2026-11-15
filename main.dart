@@ -45,6 +45,12 @@ class Session {
     return '${n.day.toString().padLeft(2, '0')}/${n.month.toString().padLeft(2, '0')}/${n.year}';
   }
 
+  /// تاريخ مختصر للورقة: يوم/شهر بس (من غير سنة)
+  String get shortDate {
+    final n = DateTime.now();
+    return '${n.day.toString().padLeft(2, '0')}/${n.month.toString().padLeft(2, '0')}';
+  }
+
   /// مثال: 8.المنتزه.1.يوم.14.11  (اليوم.الشهر من تاريخ الموبايل بدون أصفار)
   String get pdfName {
     final n = DateTime.now();
@@ -274,8 +280,8 @@ Future<Uint8List> composeBatch(String path, Session s) async {
   final tag = await batchTag(w, s);
   final tImg = await decodeImage(tag.png);
   final m = await topMargin(img);
-  final gap = w * 0.02; // مسافة بين الورقة وأول سطر في الباتش
-  final padTop = w * 0.02; // مسافة فوق الورقة
+  final gap = w * 0.015; // مسافة بين الورقة وأول سطر في الباتش
+  final padTop = w * 0.012; // مسافة فوق الورقة
   final cropTop = (m.ink - gap).clamp(0.0, h * 0.45).toDouble(); // الزيادة البيضا اللي بتتقص
   final band = padTop + tag.h + gap;
   final total = band + (h - cropTop);
@@ -301,7 +307,7 @@ Future<Uint8List> composeBatch(String path, Session s) async {
 }
 
 // ===== ورقة الإيصال (فوق الصورة) =====
-const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة) - زوّد/قلّل الرقم لو عايز
+const kTagFont = 0.042; // حجم خط الورقة (نسبة من عرض الصورة) - زوّد/قلّل الرقم لو عايز
 const kTagTop = 0.03; // بُعد الورقة عن أعلى الصورة (نسبة من عرض الصورة)
 
 class Tag {
@@ -311,27 +317,24 @@ class Tag {
 }
 
 // ===== ورقة الباتش (في المساحة البيضا فوق الشعار) =====
-const kBatchFont = 0.09; // حجم الخط = تقريباً حجم شعار البنك (نسبة من عرض الصورة)
+const kBatchFont = 0.05; // حجم خط ورقة الباتش (نسبة من عرض الصورة) - صغّر/كبّر الرقم لو عايز
 
-/// 3 أسطر زي الكتابة اليدوي: الاسم / الوحدة - المبنى / التاريخ. الخط بيصغر لوحده لو السطر عريض.
-Future<Tag> batchTag(double w, Session s) async {
-  final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
-  final texts = [s.name, unitLine, s.date];
-  final dirs = [TextDirection.rtl, TextDirection.rtl, TextDirection.ltr];
+/// ورقة من سطرين. الخط بيصغر لوحده لو السطر عريض.
+Future<Tag> _makeTag(double w, List<String> texts, double fontFrac, double strokeFrac) async {
   final maxTextW = w * 0.9;
-  var fs = w * kBatchFont;
+  var fs = w * fontFrac;
   late List<TextPainter> lines;
   for (var i = 0; i < 6; i++) {
-    lines = [for (var k = 0; k < 3; k++) _tp(texts[k], fs, dirs[k])];
+    lines = [for (final t in texts) _tp(t, fs, TextDirection.rtl)];
     final widest = lines.map((l) => l.width).reduce((a, b) => a > b ? a : b);
     if (widest <= maxTextW) break;
     fs *= maxTextW / widest * 0.98;
   }
-  final pad = fs * 0.45;
-  final gap = fs * 0.1;
+  final pad = fs * 0.4;
+  final gap = fs * 0.12;
   final textW = lines.map((l) => l.width).reduce((a, b) => a > b ? a : b);
   final cw = (textW + pad * 2).clamp(0.0, w * 0.96).toDouble();
-  final ch = lines.fold<double>(0, (a, l) => a + l.height) + gap * 2 + pad * 2;
+  final ch = lines.fold<double>(0, (a, l) => a + l.height) + gap * (lines.length - 1) + pad * 2;
   final rec = ui.PictureRecorder();
   final c = Canvas(rec, Rect.fromLTWH(0, 0, cw, ch));
   final rr = RRect.fromRectAndRadius(Rect.fromLTWH(0, 0, cw, ch), Radius.circular(fs * 0.4));
@@ -340,7 +343,7 @@ Future<Tag> batchTag(double w, Session s) async {
       rr,
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = w * 0.005
+        ..strokeWidth = w * strokeFrac
         ..color = Colors.black);
   var y = pad;
   for (final l in lines) {
@@ -353,33 +356,31 @@ Future<Tag> batchTag(double w, Session s) async {
   return Tag(bd!.buffer.asUint8List(), cw, ch);
 }
 
-/// الورقة الصغيرة: سطر (الاسم | الوحدة - المبنى) وسطر (TID | التاريخ)
-Future<Tag> receiptTag(double w, Session s) async {
-  final fs = w * kTagFont;
-  final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
-  final l1 = _tp('${s.name}  |  $unitLine', fs, TextDirection.rtl);
-  final l2 = _tp('${_isoLtr('TID: ${s.unit.tid}')}  |  ${_isoLtr(s.date)}', fs, TextDirection.rtl);
-  final pad = fs * 0.6;
-  final gap = fs * 0.25;
-  final textW = l1.width > l2.width ? l1.width : l2.width;
-  final cw = (textW + pad * 2).clamp(0.0, w * 0.96).toDouble();
-  final ch = l1.height + l2.height + gap + pad * 2;
-  final rec = ui.PictureRecorder();
-  final c = Canvas(rec, Rect.fromLTWH(0, 0, cw, ch));
-  final rr = RRect.fromRectAndRadius(Rect.fromLTWH(0, 0, cw, ch), Radius.circular(fs * 0.5));
-  c.drawRRect(rr, Paint()..color = Colors.white);
-  c.drawRRect(
-      rr,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = w * 0.004
-        ..color = Colors.black);
-  l1.paint(c, Offset((cw - l1.width) / 2, pad));
-  l2.paint(c, Offset((cw - l2.width) / 2, pad + l1.height + gap));
-  final img = await rec.endRecording().toImage(cw.ceil(), ch.ceil());
-  final bd = await img.toByteData(format: ui.ImageByteFormat.png);
-  img.dispose();
-  return Tag(bd!.buffer.asUint8List(), cw, ch);
+/// ورقة الباتش:  الاسم - الوحدة  /  المبنى - التاريخ (يوم/شهر)
+Future<Tag> batchTag(double w, Session s) {
+  final d = _isoLtr(s.shortDate);
+  return _makeTag(
+      w,
+      [
+        '${s.name} - ${s.unit.name}',
+        s.building == null ? d : '${s.building} - $d',
+      ],
+      kBatchFont,
+      0.004);
+}
+
+/// ورقة الإيصال: نفس الشكل + رقم TID في آخر السطر التاني.
+Future<Tag> receiptTag(double w, Session s) {
+  final d = _isoLtr(s.shortDate);
+  final tid = _isoLtr('TID: ${s.unit.tid}');
+  return _makeTag(
+      w,
+      [
+        '${s.name} - ${s.unit.name}',
+        s.building == null ? '$d - $tid' : '${s.building} - $d - $tid',
+      ],
+      kTagFont,
+      0.004);
 }
 
 /// صورة الإيصال + الورقة مرسومة فوقها (في النص من فوق).
@@ -480,6 +481,10 @@ class Store {
     final old = p.getString('batchImg');
     if (old != null) await del(old);
     await p.remove('batchImg');
+    final cp = p.getString('batchCompPath');
+    if (cp != null) await del(cp);
+    await p.remove('batchCompPath');
+    await p.remove('batchCompSig');
   }
 
   static Future<void> afterBatchSent(String fileName) async {
@@ -639,12 +644,62 @@ class Store {
     final keep = <String>{...await draft()};
     final bi = await batchImg();
     if (bi != null) keep.add(bi);
+    final cp = (await _p).getString('batchCompPath');
+    if (cp != null) keep.add(cp);
     final pdfPath = (await pdf())?.file.path;
     if (pdfPath != null) keep.add(pdfPath);
     await for (final e in (await dir()).list()) {
       if (e is File && !keep.contains(e.path)) await del(e.path);
     }
   }
+}
+
+/// بيتأكد إن الصورة مش سودا بالكامل (حصل مرة بعد الخروج والرجوع).
+Future<bool> _looksBlack(Uint8List jpg) async {
+  try {
+    final img = await decodeImage(jpg);
+    final w = img.width;
+    final h = img.height;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    img.dispose();
+    if (bd == null) return false;
+    final px = bd.buffer.asUint8List();
+    var sum = 0;
+    var n = 0;
+    for (var y = 0; y < h; y += 40) {
+      for (var x = 0; x < w; x += 40) {
+        final i = (y * w + x) * 4;
+        sum += px[i] + px[i + 1] + px[i + 2];
+        n += 3;
+      }
+    }
+    return n > 0 && sum / n < 10;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// صورة الباتش النهائية (بالورقة). بتتحفظ ومبتتعملش تاني لو مفيش حاجة اتغيرت،
+/// وبتتفحص عشان متطلعش سودا؛ لو طلعت سودا بتتعاد لحد 3 مرات.
+Future<Uint8List> batchComposed(String img, Session s) async {
+  final p = await SharedPreferences.getInstance();
+  final sig = '$img|${s.name}|${s.unit.name}|${s.building}|${s.shortDate}';
+  final cp = p.getString('batchCompPath');
+  if (cp != null && p.getString('batchCompSig') == sig && File(cp).existsSync()) {
+    return File(cp).readAsBytes();
+  }
+  Uint8List? out;
+  for (var i = 0; i < 3 && out == null; i++) {
+    final b = await composeBatch(img, s);
+    if (!await _looksBlack(b)) out = b;
+  }
+  if (out == null) throw 'تعذر تجهيز صورة الباتش، جرّب تصوّرها تاني';
+  final f = File('${(await Store.dir()).path}/bc_${DateTime.now().microsecondsSinceEpoch}.jpg');
+  await f.writeAsBytes(out);
+  if (cp != null && cp != f.path) await Store.del(cp);
+  await p.setString('batchCompPath', f.path);
+  await p.setString('batchCompSig', sig);
+  return out;
 }
 
 /// نسخ الصورة من مكان الماسح المؤقت لمكان ثابت (مضغوطة).
@@ -728,17 +783,231 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
   }
 }
 
-/// كل التصوير (كاميرا أو معرض) بيعدي على ماسح المستندات (قص وتحسين).
-/// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية تلقائياً.
-/// داخل الماسح فيه أيقونة المعرض لاستيراد صور (لحد [limit] صورة).
+// ===== أوضاع الماسح =====
+enum ScanKind { full, filter, base, camera }
+
+String scanTitle(ScanKind k) => switch (k) {
+      ScanKind.full => 'ماسح كامل',
+      ScanKind.filter => 'ماسح بفلاتر',
+      ScanKind.base => 'ماسح أساسي',
+      ScanKind.camera => 'كاميرا عادية + تحسين',
+    };
+
+String scanDesc(ScanKind k) => switch (k) {
+      ScanKind.full => 'قص + تحسين + تنظيف الصورة من الأصابع والبقع (الأفضل)',
+      ScanKind.filter => 'قص + فلاتر (أبيض وأسود وتحسين)',
+      ScanKind.base => 'قص وتدوير بس بدون تعديل على الصورة (أسرع)',
+      ScanKind.camera => 'تصوير عادي والتطبيق بيقص ويحسّن لوحده',
+    };
+
+Future<ScanKind> loadScanKind() async {
+  final i = (await SharedPreferences.getInstance()).getInt('scanKind') ?? 0;
+  return ScanKind.values[i.clamp(0, ScanKind.values.length - 1).toInt()];
+}
+
+/// قايمة اختيار وضع الماسح (بتتحفظ).
+Future<void> chooseScanKind(BuildContext context) async {
+  final cur = await loadScanKind();
+  if (!context.mounted) return;
+  final r = await showModalBottomSheet<ScanKind>(
+    context: context,
+    builder: (c) => SafeArea(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        const Padding(
+          padding: EdgeInsets.all(16),
+          child: Text('وضع الماسح', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        ),
+        for (final k in ScanKind.values)
+          ListTile(
+            leading: Icon(k == cur ? Icons.radio_button_checked : Icons.radio_button_off, color: kBrand),
+            title: Text(scanTitle(k), style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text(scanDesc(k)),
+            onTap: () => Navigator.pop(c, k),
+          ),
+        const SizedBox(height: 8),
+      ]),
+    ),
+  );
+  if (r == null) return;
+  await (await SharedPreferences.getInstance()).setInt('scanKind', r.index);
+  if (context.mounted) snack(context, 'وضع الماسح: ${scanTitle(r)}');
+}
+
+/// ماسح بسيط للصور اللي مش جاية من الماسح (المعرض / الكاميرا العادية):
+/// قص حوالين الورقة الفاتحة + رفع التباين. لو القص مش واضح بيسيب الصورة كاملة.
+Future<String> autoScan(String src) async {
+  try {
+    final bytes = await _shrink(src, width: 1600, quality: 85);
+    final img = await decodeImage(bytes);
+    final w = img.width;
+    final h = img.height;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (bd == null) {
+      img.dispose();
+      return src;
+    }
+    final px = bd.buffer.asUint8List();
+    const step = 4;
+    final gw = w ~/ step;
+    final gh = h ~/ step;
+    final lum = Uint8List(gw * gh);
+    final hist = List<int>.filled(256, 0);
+    for (var gy = 0; gy < gh; gy++) {
+      for (var gx = 0; gx < gw; gx++) {
+        final i = ((gy * step) * w + gx * step) * 4;
+        final l = (px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) ~/ 1000;
+        lum[gy * gw + gx] = l;
+        hist[l]++;
+      }
+    }
+    int pct(double f) {
+      final target = (gw * gh * f).round();
+      var acc = 0;
+      for (var v = 0; v < 256; v++) {
+        acc += hist[v];
+        if (acc >= target) return v;
+      }
+      return 255;
+    }
+
+    final black = pct(0.02);
+    final white = pct(0.90);
+    if (white - black < 60) {
+      img.dispose();
+      return src; // صورة غامقة/باهتة، مش هنلعب فيها
+    }
+    // حدود الورقة الفاتحة
+    final t = black + ((white - black) * 0.6).round();
+    final rowB = List<int>.filled(gh, 0);
+    final colB = List<int>.filled(gw, 0);
+    for (var gy = 0; gy < gh; gy++) {
+      for (var gx = 0; gx < gw; gx++) {
+        if (lum[gy * gw + gx] > t) {
+          rowB[gy]++;
+          colB[gx]++;
+        }
+      }
+    }
+    int firstOver(List<int> a, double lim) {
+      for (var i = 0; i < a.length; i++) {
+        if (a[i] > lim) return i;
+      }
+      return -1;
+    }
+
+    int lastOver(List<int> a, double lim) {
+      for (var i = a.length - 1; i >= 0; i--) {
+        if (a[i] > lim) return i;
+      }
+      return -1;
+    }
+
+    final top = firstOver(rowB, gw * 0.3);
+    final bottom = lastOver(rowB, gw * 0.3);
+    final left = firstOver(colB, gh * 0.3);
+    final right = lastOver(colB, gh * 0.3);
+    var sx = 0.0, sy = 0.0, sw = w.toDouble(), sh = h.toDouble();
+    if (top >= 0 && bottom > top && left >= 0 && right > left) {
+      final frac = ((right - left + 1) * (bottom - top + 1)) / (gw * gh);
+      if (frac >= 0.35 && frac <= 0.97) {
+        final px0 = w * 0.015, py0 = h * 0.015;
+        sx = (left * step - px0).clamp(0.0, w.toDouble()).toDouble();
+        sy = (top * step - py0).clamp(0.0, h.toDouble()).toDouble();
+        final ex = ((right + 1) * step + px0).clamp(0.0, w.toDouble()).toDouble();
+        final ey = ((bottom + 1) * step + py0).clamp(0.0, h.toDouble()).toDouble();
+        sw = ex - sx;
+        sh = ey - sy;
+      }
+    }
+    // رفع التباين: الأسود الحقيقي يبقى أسود والورقة تبقى بيضا
+    final sc = 255 / (white - black);
+    final off = -black * sc;
+    final rec = ui.PictureRecorder();
+    final c = Canvas(rec, Rect.fromLTWH(0, 0, sw, sh));
+    c.drawImageRect(
+      img,
+      Rect.fromLTWH(sx, sy, sw, sh),
+      Rect.fromLTWH(0, 0, sw, sh),
+      Paint()
+        ..filterQuality = FilterQuality.medium
+        ..colorFilter = ColorFilter.matrix(<double>[
+          sc, 0, 0, 0, off, //
+          0, sc, 0, 0, off, //
+          0, 0, sc, 0, off, //
+          0, 0, 0, 1, 0,
+        ]),
+    );
+    final out = await rec.endRecording().toImage(sw.ceil(), sh.ceil());
+    final png = await out.toByteData(format: ui.ImageByteFormat.png);
+    img.dispose();
+    out.dispose();
+    if (png == null) return src;
+    final jpg = await FlutterImageCompress.compressWithList(
+      png.buffer.asUint8List(),
+      minWidth: 4000,
+      minHeight: 6000,
+      quality: 85,
+      format: CompressFormat.jpeg,
+    );
+    final f = File('${(await Store.dir()).path}/g_${DateTime.now().microsecondsSinceEpoch}.jpg');
+    await f.writeAsBytes(jpg);
+    return f.path;
+  } catch (_) {
+    return src;
+  }
+}
+
+/// تصوير بالكاميرا العادية ثم تحسين تلقائي.
+Future<List<String>> _cameraThenEnhance(BuildContext context) async {
+  try {
+    final x = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 2000, imageQuality: 85);
+    if (x == null) return [];
+    return [await autoScan(x.path)];
+  } catch (_) {
+    if (context.mounted) snack(context, 'تعذر فتح الكاميرا');
+    return [];
+  }
+}
+
+/// صور من المعرض: كل صورة بتعدي على الماسح البسيط (قص + تحسين).
+Future<List<String>> pickGalleryScanned(BuildContext context, {bool multi = true}) async {
+  try {
+    final picker = ImagePicker();
+    List<String> paths;
+    if (multi) {
+      final xs = await picker.pickMultiImage(maxWidth: 2000, imageQuality: 85);
+      paths = xs.map((e) => e.path).toList();
+    } else {
+      final x = await picker.pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 85);
+      paths = x == null ? <String>[] : [x.path];
+    }
+    final out = <String>[];
+    for (final p in paths) {
+      out.add(await autoScan(p));
+    }
+    return out;
+  } catch (_) {
+    if (context.mounted) snack(context, 'تعذر فتح المعرض');
+    return [];
+  }
+}
+
+/// التصوير بالكاميرا حسب وضع الماسح المختار (قص وتحسين).
+/// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية + تحسين تلقائي.
 Future<List<String>> scanImages(BuildContext context, int limit) async {
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
+  final kind = await loadScanKind();
+  if (kind == ScanKind.camera) return _cameraThenEnhance(context);
   final scanner = DocumentScanner(
     options: DocumentScannerOptions(
-      mode: ScannerMode.full,
+      mode: switch (kind) {
+        ScanKind.full => ScannerMode.full,
+        ScanKind.filter => ScannerMode.filter,
+        _ => ScannerMode.base,
+      },
       pageLimit: limit,
-      isGalleryImport: true,
+      isGalleryImport: false,
     ),
   );
   try {
@@ -748,7 +1017,7 @@ Future<List<String>> scanImages(BuildContext context, int limit) async {
     if (e.toString().toLowerCase().contains('cancel')) return [];
     if (!context.mounted) return [];
     snack(context, 'الماسح مش شغال على الموبايل ده، هنفتح الكاميرا العادية');
-    return simplePick(context, multi: limit > 1);
+    return _cameraThenEnhance(context);
   } finally {
     scanner.close();
   }
@@ -766,7 +1035,7 @@ Future<bool> shareFiles(BuildContext context, List<String> paths) async {
 
 /// تجهيز صورة الباتش (مع الشريط) باسم رقم الوحدة وإرسالها.
 Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
-  final bytes = await composeBatch(img, s);
+  final bytes = await batchComposed(img, s);
   final out = File('${(await Store.dir()).path}/${s.batchName}.jpg');
   await out.writeAsBytes(bytes);
   if (!context.mounted) return false;
@@ -1450,12 +1719,18 @@ class _BatchScreenState extends State<BatchScreen> {
     final cur = await Store.batchImg();
     if (!mounted) return;
     if (cur != null) {
-      final st = await composeBatch(cur, widget.session);
-      if (!mounted) return;
-      setState(() {
-        img = cur;
-        composed = st;
-      });
+      try {
+        final st = await batchComposed(cur, widget.session);
+        if (!mounted) return;
+        setState(() {
+          img = cur;
+          composed = st;
+        });
+      } catch (e) {
+        if (!mounted) return;
+        snack(context, 'حصل خطأ: $e');
+        Navigator.pop(context);
+      }
     } else {
       _capture();
     }
@@ -1468,11 +1743,27 @@ class _BatchScreenState extends State<BatchScreen> {
       if (img == null) Navigator.pop(context);
       return;
     }
+    await _useImage(r.first);
+  }
+
+  Future<void> _gallery() async {
+    setState(() => busy = true);
+    var r = <String>[];
+    try {
+      r = await pickGalleryScanned(context, multi: false);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+    if (r.isEmpty || !mounted) return;
+    await _useImage(r.first);
+  }
+
+  Future<void> _useImage(String src) async {
     setState(() => busy = true);
     try {
-      final path = await persistImage(r.first, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      final path = await persistImage(src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg');
       await Store.setBatchImg(path); // بتمسح القديمة
-      final st = await composeBatch(path, widget.session);
+      final st = await batchComposed(path, widget.session);
       if (!mounted) return;
       setState(() {
         img = path;
@@ -1504,7 +1795,13 @@ class _BatchScreenState extends State<BatchScreen> {
   Widget build(BuildContext context) {
     final ready = img != null && composed != null;
     return Scaffold(
-      appBar: AppBar(title: const Text('الباتش')),
+      appBar: AppBar(title: const Text('الباتش'), actions: [
+        IconButton(
+          tooltip: 'وضع الماسح',
+          icon: const Icon(Icons.document_scanner_outlined),
+          onPressed: () => chooseScanKind(context),
+        ),
+      ]),
       body: !ready
           ? const Center(child: CircularProgressIndicator())
           : Column(children: [
@@ -1529,16 +1826,28 @@ class _BatchScreenState extends State<BatchScreen> {
               SafeArea(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-                  child: Row(children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: busy ? null : _capture,
-                        icon: const Icon(Icons.refresh),
-                        label: const Text('إعادة تصوير'),
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Row(children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: busy ? null : _capture,
+                          icon: const Icon(Icons.add_a_photo),
+                          label: const Text('إعادة تصوير'),
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: busy ? null : _gallery,
+                          icon: const Icon(Icons.photo_library),
+                          label: const Text('من المعرض'),
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 48,
                       child: FilledButton.icon(
                         onPressed: busy ? null : _send,
                         icon: busy
@@ -1609,9 +1918,15 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     await _saveAll(r);
   }
 
-  /// صور من المعرض (بالماسح كمان، لحد 100 صورة).
+  /// صور من المعرض (كل صورة بتتقص وتتحسّن تلقائي).
   Future<void> _addGallery() async {
-    final r = await scanImages(context, 100);
+    setState(() => busy = true);
+    var r = <String>[];
+    try {
+      r = await pickGalleryScanned(context);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
     if (r.isEmpty || !mounted) return;
     await _saveAll(r);
   }
@@ -1797,7 +2112,13 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text('إيصالات الدفع (${imgs.length})')),
+      appBar: AppBar(title: Text('إيصالات الدفع (${imgs.length})'), actions: [
+        IconButton(
+          tooltip: 'وضع الماسح',
+          icon: const Icon(Icons.document_scanner_outlined),
+          onPressed: () => chooseScanKind(context),
+        ),
+      ]),
       body: Column(children: [
         Expanded(
           child: !loaded
