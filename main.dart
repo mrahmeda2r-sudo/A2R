@@ -30,7 +30,18 @@ const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الص�
 const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
-const kMaxSide = 1400; // أقصى عرض للصورة المحفوظة (يخلي التطبيق خفيف على التليفونات الضعيفة)
+enum PerfMode { lite, balanced, pro }
+
+int getMaxSide(PerfMode mode) {
+  switch (mode) {
+    case PerfMode.lite:
+      return 800;
+    case PerfMode.balanced:
+      return 1400;
+    case PerfMode.pro:
+      return 2400;
+  }
+}
 
 // =====================================================================
 //  البيانات (افتراضية مدمجة + تحديث من GitHub)
@@ -295,13 +306,15 @@ Future<bool> _decodesOk(Uint8List b) async {
 /// وبعدها بيتطبق الفلتر لو الموظف اختاره.
 Future<String> persistImage(String src, String name,
     {ScanFilter filter = ScanFilter.original}) async {
+  final mode = await Store.perfMode();
+  final maxSide = getMaxSide(mode);
   Uint8List? bytes;
   try {
     bytes = await FlutterImageCompress.compressWithFile(
       src,
-      minWidth: kMaxSide,
-      minHeight: kMaxSide,
-      quality: 82,
+      minWidth: maxSide,
+      minHeight: maxSide,
+      quality: mode == PerfMode.pro ? 90 : 82,
       format: CompressFormat.jpeg,
       keepExif: false,
     );
@@ -310,7 +323,7 @@ Future<String> persistImage(String src, String name,
   if (bytes == null) {
     try {
       final raw = await File(src).readAsBytes();
-      final img = await decodeImage(raw, maxWidth: kMaxSide);
+      final img = await decodeImage(raw, maxWidth: maxSide);
       final bd = await img.toByteData(format: ui.ImageByteFormat.png);
       final w = img.width, h = img.height;
       img.dispose();
@@ -318,7 +331,7 @@ Future<String> persistImage(String src, String name,
         bd!.buffer.asUint8List(),
         minWidth: w,
         minHeight: h,
-        quality: 82,
+        quality: mode == PerfMode.pro ? 90 : 82,
         format: CompressFormat.jpeg,
       );
     } catch (_) {}
@@ -416,7 +429,9 @@ Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
 Future<Uint8List> composeBatch(String path, Session s) async {
   final src = await File(path).readAsBytes();
   final sz = await imageSize(src);
-  final img = await decodeImage(src, maxWidth: sz.w > kMaxSide ? kMaxSide : null);
+  final mode = await Store.perfMode();
+  final maxSide = getMaxSide(mode);
+  final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final w = img.width.toDouble();
   final h = img.height.toDouble();
   final ref = await receiptTag(1000, s, batch: true);
@@ -522,6 +537,14 @@ class Store {
   }
 
   // --- إعدادات الموظف ---
+  
+  static Future<PerfMode> perfMode() async {
+    final i = (await _p).getInt('perfMode') ?? 1;
+    return PerfMode.values[i.clamp(0, 2)];
+  }
+
+  static Future<void> setPerfMode(PerfMode m) async => (await _p).setInt('perfMode', m.index);
+
   static Future<ScanFilter> filter() async {
     final i = (await _p).getInt('filter') ?? 0;
     return ScanFilter.values[i.clamp(0, ScanFilter.values.length - 1)];
@@ -826,9 +849,10 @@ Future<List<String>> scanImages(BuildContext context, int limit,
     {ScannerMode mode = ScannerMode.full}) async {
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
-  if (_scannerFailed) return simplePick(context, multi: limit > 1);
+  final perf = await Store.perfMode();
+  if (_scannerFailed || perf == PerfMode.lite) return simplePick(context, multi: limit > 1);
   final scanner = DocumentScanner(
-    options: DocumentScannerOptions(mode: mode, pageLimit: limit, isGalleryImport: true),
+    options: DocumentScannerOptions(mode: perf == PerfMode.pro ? ScannerMode.full : mode, pageLimit: limit, isGalleryImport: true),
   );
   try {
     final r = await scanner.scanDocument();
@@ -940,9 +964,9 @@ class TaggedImage extends StatelessWidget {
             const Center(child: Text('تعذر عرض الصورة'));
         final img = ch != null
             ? Image.file(File(path),
-                width: cw, height: ch, fit: BoxFit.fill, cacheWidth: kMaxSide, errorBuilder: err)
+                width: cw, height: ch, fit: BoxFit.fill, cacheWidth: 1000, errorBuilder: err)
             : Image.file(File(path),
-                width: cw, fit: BoxFit.fitWidth, cacheWidth: kMaxSide, errorBuilder: err);
+                width: cw, fit: BoxFit.fitWidth, cacheWidth: 1000, errorBuilder: err);
         final stack = Stack(clipBehavior: Clip.hardEdge, children: [
           img,
           Positioned(
@@ -1321,6 +1345,56 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     });
   }
 
+  Future<void> _showSettings() async {
+    var mode = await Store.perfMode();
+    if (!mounted) return;
+    await showDialog(
+      context: context,
+      builder: (c) => StatefulBuilder(
+        builder: (ctx, setS) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: AlertDialog(
+            title: const Text('إعدادات الأداء والكاميرا'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  RadioListTile<PerfMode>(
+                    title: const Text('الوضع الاقتصادي (Lite)'),
+                    subtitle: const Text('أسرع أداء للأجهزة القديمة، يستهلك رامات أقل ويعطل المؤثرات الثقيلة.'),
+                    value: PerfMode.lite,
+                    groupValue: mode,
+                    onChanged: (v) { setS(() => mode = v!); Store.setPerfMode(v!); },
+                  ),
+                  RadioListTile<PerfMode>(
+                    title: const Text('الوضع المتوازن (Balanced)'),
+                    subtitle: const Text('أداء جيد مع جودة ممتازة (الوضع الافتراضي).'),
+                    value: PerfMode.balanced,
+                    groupValue: mode,
+                    onChanged: (v) { setS(() => mode = v!); Store.setPerfMode(v!); },
+                  ),
+                  RadioListTile<PerfMode>(
+                    title: const Text('الوضع الاحترافي (Pro)'),
+                    subtitle: const Text('أعلى جودة تصوير ومعالجة (للأجهزة القوية فقط).'),
+                    value: PerfMode.pro,
+                    groupValue: mode,
+                    onChanged: (v) { setS(() => mode = v!); Store.setPerfMode(v!); },
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () {
+                Navigator.pop(c);
+                _reload();
+              }, child: const Text('إغلاق'))
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Future<void> _open(Widget screen) async {
     await Navigator.push(context, MaterialPageRoute(builder: (_) => screen));
     _reload();
@@ -1444,6 +1518,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         title: appLogo(height: 30),
         centerTitle: true,
         actions: [
+          IconButton(
+              tooltip: 'إعدادات الأداء',
+              icon: const Icon(Icons.settings),
+              onPressed: _showSettings),
           IconButton(
               tooltip: 'تغيير الحساب',
               icon: const Icon(Icons.switch_account),
@@ -1946,9 +2024,11 @@ Future<ui.Image> _rotateUi(ui.Image src, int turns) async {
 
 /// الصورة بعد التدوير بدقة محدودة (kMaxSide) عشان الذاكرة.
 Future<ui.Image> _rotatedImage(String path, int turns) async {
+  final mode = await Store.perfMode();
+  final maxSide = getMaxSide(mode);
   final bytes = await File(path).readAsBytes();
   final sz = await imageSize(bytes);
-  final src = await decodeImage(bytes, maxWidth: sz.w > kMaxSide ? kMaxSide : null);
+  final src = await decodeImage(bytes, maxWidth: sz.w > maxSide ? maxSide : null);
   return _rotateUi(src, turns);
 }
 
@@ -2002,16 +2082,19 @@ Uint8List _warpJob(Map<String, dynamic> a) {
 /// كشف حدود الورقة: أول حاجة المحرك الأصلي (OpenCV) من حزمة document_scan، أوفلاين ومن غير Play Services،
 /// ولو فشل أو رجّع null بنرجع للكشف البسيط تحت. بيرجّع TL,TR,BR,BL كنسب، أو null.
 Future<List<Offset>?> detectDocQuad(String path) async {
-  try {
-    final c = await ds.DocumentDetector().detect(ds.ScanInput.file(path));
-    if (c != null) {
-      final q = [
-        for (final p in c.toList())
-          Offset(p.x.clamp(0.0, 1.0).toDouble(), p.y.clamp(0.0, 1.0).toDouble())
-      ];
-      if (q.length == 4 && _quadConvex(q)) return q;
-    }
-  } catch (_) {}
+  final mode = await Store.perfMode();
+  if (mode != PerfMode.lite) {
+    try {
+      final c = await ds.DocumentDetector().detect(ds.ScanInput.file(path));
+      if (c != null) {
+        final q = [
+          for (final p in c.toList())
+            Offset(p.x.clamp(0.0, 1.0).toDouble(), p.y.clamp(0.0, 1.0).toDouble())
+        ];
+        if (q.length == 4 && _quadConvex(q)) return q;
+      }
+    } catch (_) {}
+  }
   return _detectDocQuadSimple(path);
 }
 
@@ -2375,7 +2458,9 @@ class _EditorPageState extends State<EditorPage> {
       final topW = (pts[1] - pts[0]).distance, botW = (pts[2] - pts[3]).distance;
       final leftH = (pts[3] - pts[0]).distance, rightH = (pts[2] - pts[1]).distance;
       var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
-      final k = math.min(1.0, kMaxSide / math.max(ow, oh));
+      final mode = await Store.perfMode();
+      final maxSide = getMaxSide(mode);
+      final k = math.min(1.0, maxSide / math.max(ow, oh));
       ow *= k;
       oh *= k;
       final w = math.max(8, ow.round()), h = math.max(8, oh.round());
