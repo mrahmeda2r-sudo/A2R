@@ -984,7 +984,9 @@ class ZoomPage extends StatelessWidget {
 class ReceiptPreview extends StatelessWidget {
   final String path;
   final Tag tag;
-  const ReceiptPreview({super.key, required this.path, required this.tag});
+  final int cacheWidth;
+  const ReceiptPreview(
+      {super.key, required this.path, required this.tag, this.cacheWidth = kMaxSide});
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
         final cw = cons.maxWidth;
@@ -1000,7 +1002,7 @@ class ReceiptPreview extends StatelessWidget {
           Image.file(File(path),
               width: cw,
               fit: BoxFit.fitWidth,
-              cacheWidth: kMaxSide,
+              cacheWidth: cacheWidth,
               errorBuilder: (_, __, ___) =>
                   const SizedBox(height: 120, child: Center(child: Text('تعذر عرض الصورة')))),
         ]);
@@ -2780,15 +2782,22 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                 child: Text('${i + 1}',
                     style: TextStyle(color: cs.onPrimary, fontSize: 13))),
             const SizedBox(width: 10),
+            // المصغّرة = الناتج النهائي: شريط أبيض بعرض الصورة والورقة في منتصفه فوق الإيصال
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: Image.file(File(path),
-                  width: 72,
-                  height: 72,
+              child: Container(
+                width: 96,
+                height: 128,
+                decoration: BoxDecoration(border: Border.all(color: Colors.black12)),
+                child: FittedBox(
                   fit: BoxFit.cover,
-                  cacheWidth: 220,
-                  errorBuilder: (_, __, ___) =>
-                      const SizedBox(width: 72, height: 72, child: Icon(Icons.broken_image))),
+                  alignment: Alignment.topCenter,
+                  clipBehavior: Clip.hardEdge,
+                  child: SizedBox(
+                      width: 300,
+                      child: ReceiptPreview(path: path, tag: tag!, cacheWidth: 300)),
+                ),
+              ),
             ),
             const SizedBox(width: 12),
             const Expanded(child: Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey))),
