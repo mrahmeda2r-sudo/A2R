@@ -320,6 +320,7 @@ List<double> editMatrix(ScanFilter f, double contrast, double brightness) {
   final t = k * (t0 - 127.5) + 127.5 + brightness * 100;
   return [
     for (final row in w) ...[k * row[0], k * row[1], k * row[2], 0.0, t],
+    0.0, 0.0, 0.0, 1.0, 0.0, // صف الشفافية: ColorFilter.matrix لازم 20 رقم وإلا التطبيق يقفل
   ];
 }
 
@@ -1750,7 +1751,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         const SizedBox(height: 14),
         Row(children: [
           Expanded(
-              child: _big(Icons.receipt_long, 'الباتش', () => _open(BatchScreen(session: s)))),
+              child: _big(Icons.receipt_long, 'الباتش', () => _open(BatchScreen(session: s, fresh: true)))),
           const SizedBox(width: 12),
           Expanded(
               child: _big(
@@ -1836,7 +1837,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
 class BatchScreen extends StatefulWidget {
   final Session session;
-  const BatchScreen({super.key, required this.session});
+  final bool fresh; // true = تصوير باتش جديد (من غير ما نفتح القديم)
+  const BatchScreen({super.key, required this.session, this.fresh = false});
   @override
   State<BatchScreen> createState() => _BatchScreenState();
 }
@@ -1870,7 +1872,7 @@ class _BatchScreenState extends State<BatchScreen> {
     }
     final cur = await Store.batchImg();
     if (!mounted) return;
-    if (cur != null) {
+    if (cur != null && !widget.fresh) {
       await _show(cur);
     } else {
       _capture();
