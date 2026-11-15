@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
@@ -783,69 +784,178 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
   }
 }
 
-// ===== أوضاع الماسح =====
-enum ScanKind { full, filter, base, camera }
+// ===== مصادر الصور =====
+enum CaptureSource { smart, camera, gallery }
 
-String scanTitle(ScanKind k) => switch (k) {
-      ScanKind.full => 'ماسح كامل',
-      ScanKind.filter => 'ماسح بفلاتر',
-      ScanKind.base => 'ماسح أساسي',
-      ScanKind.camera => 'كاميرا عادية + تحسين',
-    };
-
-String scanDesc(ScanKind k) => switch (k) {
-      ScanKind.full => 'قص + تحسين + تنظيف الصورة من الأصابع والبقع (الأفضل)',
-      ScanKind.filter => 'قص + فلاتر (أبيض وأسود وتحسين)',
-      ScanKind.base => 'قص وتدوير بس بدون تعديل على الصورة (أسرع)',
-      ScanKind.camera => 'تصوير عادي والتطبيق بيقص ويحسّن لوحده',
-    };
-
-Future<ScanKind> loadScanKind() async {
-  final i = (await SharedPreferences.getInstance()).getInt('scanKind') ?? 0;
-  return ScanKind.values[i.clamp(0, ScanKind.values.length - 1).toInt()];
+/// الماسح الذكي (ماسح جوجل): قص تلقائي + فلاتر. لو مش شغال بيتحول للكاميرا العادية + المحرر.
+Future<List<String>> scanImages(BuildContext context, int limit) async {
+  if (!await ensureCamera(context)) return [];
+  if (!context.mounted) return [];
+  final scanner = DocumentScanner(
+    options: DocumentScannerOptions(
+      mode: ScannerMode.full,
+      pageLimit: limit,
+      isGalleryImport: false,
+    ),
+  );
+  try {
+    final r = await scanner.scanDocument();
+    return List<String>.from(r.images ?? const []);
+  } catch (e) {
+    if (e.toString().toLowerCase().contains('cancel')) return [];
+    if (!context.mounted) return [];
+    snack(context, 'الماسح الذكي مش شغال على الموبايل ده، هنفتح الكاميرا العادية');
+    return cameraFlow(context);
+  } finally {
+    scanner.close();
+  }
 }
 
-/// قايمة اختيار وضع الماسح (بتتحفظ).
-Future<void> chooseScanKind(BuildContext context) async {
-  final cur = await loadScanKind();
-  if (!context.mounted) return;
-  final r = await showModalBottomSheet<ScanKind>(
+/// كاميرا عادية ثم المحرر (قص حر + فلاتر).
+Future<List<String>> cameraFlow(BuildContext context) async {
+  if (!await ensureCamera(context)) return [];
+  if (!context.mounted) return [];
+  try {
+    final x = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 2400, imageQuality: 90);
+    if (x == null || !context.mounted) return [];
+    final e = await editImage(context, x.path);
+    return e == null ? [] : [e];
+  } catch (_) {
+    if (context.mounted) snack(context, 'تعذر فتح الكاميرا');
+    return [];
+  }
+}
+
+/// صور من المعرض: كل صورة بتفتح في المحرر (قص حر + فلاتر + تدوير).
+Future<List<String>> galleryFlow(BuildContext context, {bool multi = true}) async {
+  try {
+    final picker = ImagePicker();
+    List<String> paths;
+    if (multi) {
+      final xs = await picker.pickMultiImage(maxWidth: 2400, imageQuality: 90);
+      paths = xs.map((e) => e.path).toList();
+    } else {
+      final x = await picker.pickImage(source: ImageSource.gallery, maxWidth: 2400, imageQuality: 90);
+      paths = x == null ? <String>[] : [x.path];
+    }
+    final out = <String>[];
+    for (var i = 0; i < paths.length; i++) {
+      if (!context.mounted) break;
+      final e = await editImage(context, paths[i],
+          title: paths.length > 1 ? 'صورة ${i + 1} من ${paths.length}' : null);
+      if (e != null) out.add(e);
+    }
+    return out;
+  } catch (_) {
+    if (context.mounted) snack(context, 'تعذر فتح المعرض');
+    return [];
+  }
+}
+
+/// بيسأل: ماسح ذكي / كاميرا عادية / معرض، وبيكمل على الاختيار.
+Future<List<String>> captureFlow(BuildContext context,
+    {required bool multi, bool allowGallery = true}) async {
+  final src = await showModalBottomSheet<CaptureSource>(
     context: context,
     builder: (c) => SafeArea(
       child: Column(mainAxisSize: MainAxisSize.min, children: [
         const Padding(
           padding: EdgeInsets.all(16),
-          child: Text('وضع الماسح', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          child: Text('اختار طريقة التصوير', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
         ),
-        for (final k in ScanKind.values)
+        ListTile(
+          leading: const Icon(Icons.document_scanner, color: kBrand),
+          title: const Text('الماسح الذكي (كاميرا)', style: TextStyle(fontWeight: FontWeight.bold)),
+          subtitle: const Text('بيقص الورقة تلقائي وفيه فلاتر وتنظيف'),
+          onTap: () => Navigator.pop(c, CaptureSource.smart),
+        ),
+        ListTile(
+          leading: const Icon(Icons.photo_camera, color: kBrand),
+          title: const Text('كاميرا عادية', style: TextStyle(fontWeight: FontWeight.bold)),
+          subtitle: const Text('صوّر وبعدين اقص وظبط الصورة بنفسك'),
+          onTap: () => Navigator.pop(c, CaptureSource.camera),
+        ),
+        if (allowGallery)
           ListTile(
-            leading: Icon(k == cur ? Icons.radio_button_checked : Icons.radio_button_off, color: kBrand),
-            title: Text(scanTitle(k), style: const TextStyle(fontWeight: FontWeight.bold)),
-            subtitle: Text(scanDesc(k)),
-            onTap: () => Navigator.pop(c, k),
+            leading: const Icon(Icons.photo_library, color: kBrand),
+            title: const Text('المعرض', style: TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: const Text('اختار صورة واقص وظبط الصورة بنفسك'),
+            onTap: () => Navigator.pop(c, CaptureSource.gallery),
           ),
         const SizedBox(height: 8),
       ]),
     ),
   );
-  if (r == null) return;
-  await (await SharedPreferences.getInstance()).setInt('scanKind', r.index);
-  if (context.mounted) snack(context, 'وضع الماسح: ${scanTitle(r)}');
+  if (src == null || !context.mounted) return [];
+  switch (src) {
+    case CaptureSource.smart:
+      return scanImages(context, multi ? 10 : 1);
+    case CaptureSource.camera:
+      return cameraFlow(context);
+    case CaptureSource.gallery:
+      return galleryFlow(context, multi: multi);
+  }
 }
 
-/// ماسح بسيط للصور اللي مش جاية من الماسح (المعرض / الكاميرا العادية):
-/// قص حوالين الورقة الفاتحة + رفع التباين. لو القص مش واضح بيسيب الصورة كاملة.
-Future<String> autoScan(String src) async {
+// ===== محرر الصورة: قص حر من كل الاتجاهات + فلاتر + تدوير =====
+enum EditFilter { original, auto, bw, gray, vivid }
+
+String filterName(EditFilter f) => switch (f) {
+      EditFilter.original => 'الأصل',
+      EditFilter.auto => 'تحسين تلقائي',
+      EditFilter.bw => 'أبيض وأسود',
+      EditFilter.gray => 'رمادي',
+      EditFilter.vivid => 'ألوان زاهية',
+    };
+
+List<double> filterMatrix(EditFilter f, int black, int white) {
+  final sc = 255 / (white - black);
+  final off = -black * sc;
+  const r = 0.299, g = 0.587, b = 0.114;
+  switch (f) {
+    case EditFilter.original:
+      return <double>[1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0];
+    case EditFilter.auto:
+      return <double>[sc, 0, 0, 0, off, 0, sc, 0, 0, off, 0, 0, sc, 0, off, 0, 0, 0, 1, 0];
+    case EditFilter.gray:
+      {
+        final row = <double>[r * sc, g * sc, b * sc, 0, off];
+        return <double>[...row, ...row, ...row, 0, 0, 0, 1, 0];
+      }
+    case EditFilter.bw:
+      {
+        const k = 2.6, pivot = 165.0;
+        final row = <double>[r * sc * k, g * sc * k, b * sc * k, 0, (off - pivot) * k + pivot];
+        return <double>[...row, ...row, ...row, 0, 0, 0, 1, 0];
+      }
+    case EditFilter.vivid:
+      {
+        const sat = 1.6;
+        final a = r * (1 - sat), bb = g * (1 - sat), c = b * (1 - sat);
+        return <double>[
+          (a + sat) * sc, bb * sc, c * sc, 0, off, //
+          a * sc, (bb + sat) * sc, c * sc, 0, off, //
+          a * sc, bb * sc, (c + sat) * sc, 0, off, //
+          0, 0, 0, 1, 0,
+        ];
+      }
+  }
+}
+
+class DocInfo {
+  final Rect crop; // نسب 0..1
+  final int black, white;
+  DocInfo(this.crop, this.black, this.white);
+}
+
+/// بيحلل الصورة: حدود الورقة الفاتحة (اقتراح للقص) + نقطتي الأسود والأبيض للتحسين التلقائي.
+Future<DocInfo> analyzeDoc(ui.Image img) async {
+  const full = Rect.fromLTRB(0, 0, 1, 1);
   try {
-    final bytes = await _shrink(src, width: 1600, quality: 85);
-    final img = await decodeImage(bytes);
     final w = img.width;
     final h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-    if (bd == null) {
-      img.dispose();
-      return src;
-    }
+    if (bd == null) return DocInfo(full, 0, 255);
     final px = bd.buffer.asUint8List();
     const step = 4;
     final gw = w ~/ step;
@@ -872,11 +982,7 @@ Future<String> autoScan(String src) async {
 
     final black = pct(0.02);
     final white = pct(0.90);
-    if (white - black < 60) {
-      img.dispose();
-      return src; // صورة غامقة/باهتة، مش هنلعب فيها
-    }
-    // حدود الورقة الفاتحة
+    if (white - black < 60) return DocInfo(full, 0, 255);
     final t = black + ((white - black) * 0.6).round();
     final rowB = List<int>.filled(gh, 0);
     final colB = List<int>.filled(gw, 0);
@@ -906,120 +1012,348 @@ Future<String> autoScan(String src) async {
     final bottom = lastOver(rowB, gw * 0.3);
     final left = firstOver(colB, gh * 0.3);
     final right = lastOver(colB, gh * 0.3);
-    var sx = 0.0, sy = 0.0, sw = w.toDouble(), sh = h.toDouble();
+    var crop = full;
     if (top >= 0 && bottom > top && left >= 0 && right > left) {
       final frac = ((right - left + 1) * (bottom - top + 1)) / (gw * gh);
       if (frac >= 0.35 && frac <= 0.97) {
-        final px0 = w * 0.015, py0 = h * 0.015;
-        sx = (left * step - px0).clamp(0.0, w.toDouble()).toDouble();
-        sy = (top * step - py0).clamp(0.0, h.toDouble()).toDouble();
-        final ex = ((right + 1) * step + px0).clamp(0.0, w.toDouble()).toDouble();
-        final ey = ((bottom + 1) * step + py0).clamp(0.0, h.toDouble()).toDouble();
-        sw = ex - sx;
-        sh = ey - sy;
+        const pad = 0.015;
+        crop = Rect.fromLTRB(
+          (left * step / w - pad).clamp(0.0, 1.0).toDouble(),
+          (top * step / h - pad).clamp(0.0, 1.0).toDouble(),
+          (((right + 1) * step) / w + pad).clamp(0.0, 1.0).toDouble(),
+          (((bottom + 1) * step) / h + pad).clamp(0.0, 1.0).toDouble(),
+        );
       }
     }
-    // رفع التباين: الأسود الحقيقي يبقى أسود والورقة تبقى بيضا
-    final sc = 255 / (white - black);
-    final off = -black * sc;
-    final rec = ui.PictureRecorder();
-    final c = Canvas(rec, Rect.fromLTWH(0, 0, sw, sh));
-    c.drawImageRect(
+    return DocInfo(crop, black, white);
+  } catch (_) {
+    return DocInfo(full, 0, 255);
+  }
+}
+
+/// بيفتح المحرر ويرجّع مسار الصورة بعد التعديل (أو null لو اتلغى/اتخطى).
+Future<String?> editImage(BuildContext context, String src, {String? title}) =>
+    Navigator.push<String>(
+      context,
+      MaterialPageRoute(fullscreenDialog: true, builder: (_) => ScanEditorPage(path: src, title: title)),
+    );
+
+class _CropPainter extends CustomPainter {
+  final ui.Image img;
+  final Rect disp; // مكان الصورة على الشاشة
+  final Rect crop; // نسب 0..1
+  final List<double> matrix;
+  _CropPainter(this.img, this.disp, this.crop, this.matrix);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawImageRect(
       img,
-      Rect.fromLTWH(sx, sy, sw, sh),
-      Rect.fromLTWH(0, 0, sw, sh),
+      Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
+      disp,
       Paint()
         ..filterQuality = FilterQuality.medium
-        ..colorFilter = ColorFilter.matrix(<double>[
-          sc, 0, 0, 0, off, //
-          0, sc, 0, 0, off, //
-          0, 0, sc, 0, off, //
-          0, 0, 0, 1, 0,
-        ]),
+        ..colorFilter = ColorFilter.matrix(matrix),
     );
-    final out = await rec.endRecording().toImage(sw.ceil(), sh.ceil());
-    final png = await out.toByteData(format: ui.ImageByteFormat.png);
-    img.dispose();
-    out.dispose();
-    if (png == null) return src;
-    final jpg = await FlutterImageCompress.compressWithList(
-      png.buffer.asUint8List(),
-      minWidth: 4000,
-      minHeight: 6000,
-      quality: 85,
-      format: CompressFormat.jpeg,
-    );
-    final f = File('${(await Store.dir()).path}/g_${DateTime.now().microsecondsSinceEpoch}.jpg');
-    await f.writeAsBytes(jpg);
-    return f.path;
-  } catch (_) {
-    return src;
+    final r = Rect.fromLTRB(disp.left + crop.left * disp.width, disp.top + crop.top * disp.height,
+        disp.left + crop.right * disp.width, disp.top + crop.bottom * disp.height);
+    final dim = Path()
+      ..addRect(disp)
+      ..addRect(r)
+      ..fillType = PathFillType.evenOdd;
+    canvas.drawPath(dim, Paint()..color = Colors.black54);
+    final line = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..color = Colors.white;
+    canvas.drawRect(r, line);
+    final grid = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.8
+      ..color = Colors.white38;
+    for (var i = 1; i < 3; i++) {
+      canvas.drawLine(Offset(r.left + r.width * i / 3, r.top), Offset(r.left + r.width * i / 3, r.bottom), grid);
+      canvas.drawLine(Offset(r.left, r.top + r.height * i / 3), Offset(r.right, r.top + r.height * i / 3), grid);
+    }
+    final fill = Paint()..color = kBrand;
+    final ring = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..color = Colors.white;
+    final pts = <Offset>[
+      r.topLeft, r.topRight, r.bottomLeft, r.bottomRight,
+      Offset(r.center.dx, r.top), Offset(r.center.dx, r.bottom),
+      Offset(r.left, r.center.dy), Offset(r.right, r.center.dy),
+    ];
+    for (var i = 0; i < pts.length; i++) {
+      canvas.drawCircle(pts[i], i < 4 ? 11 : 8, fill);
+      canvas.drawCircle(pts[i], i < 4 ? 11 : 8, ring);
+    }
   }
+
+  @override
+  bool shouldRepaint(covariant _CropPainter old) => true;
 }
 
-/// تصوير بالكاميرا العادية ثم تحسين تلقائي.
-Future<List<String>> _cameraThenEnhance(BuildContext context) async {
-  try {
-    final x = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 2000, imageQuality: 85);
-    if (x == null) return [];
-    return [await autoScan(x.path)];
-  } catch (_) {
-    if (context.mounted) snack(context, 'تعذر فتح الكاميرا');
-    return [];
-  }
+class ScanEditorPage extends StatefulWidget {
+  final String path;
+  final String? title;
+  const ScanEditorPage({super.key, required this.path, this.title});
+  @override
+  State<ScanEditorPage> createState() => _ScanEditorPageState();
 }
 
-/// صور من المعرض: كل صورة بتعدي على الماسح البسيط (قص + تحسين).
-Future<List<String>> pickGalleryScanned(BuildContext context, {bool multi = true}) async {
-  try {
-    final picker = ImagePicker();
-    List<String> paths;
-    if (multi) {
-      final xs = await picker.pickMultiImage(maxWidth: 2000, imageQuality: 85);
-      paths = xs.map((e) => e.path).toList();
+class _ScanEditorPageState extends State<ScanEditorPage> {
+  ui.Image? img;
+  Rect crop = const Rect.fromLTRB(0, 0, 1, 1);
+  int black = 0, white = 255;
+  EditFilter filter = EditFilter.auto;
+  bool saving = false;
+  String? error;
+  int _grab = 0; // 1 يسار، 2 فوق، 4 يمين، 8 تحت، 16 تحريك الإطار كله
+  Rect _disp = Rect.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    img?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final bytes = await _shrink(widget.path, width: 1600, quality: 90);
+      final im = await decodeImage(bytes);
+      final info = await analyzeDoc(im);
+      final p = await SharedPreferences.getInstance();
+      final fi = (p.getInt('editFilter') ?? EditFilter.auto.index)
+          .clamp(0, EditFilter.values.length - 1)
+          .toInt();
+      if (!mounted) {
+        im.dispose();
+        return;
+      }
+      setState(() {
+        img = im;
+        crop = info.crop;
+        black = info.black;
+        white = info.white;
+        filter = EditFilter.values[fi];
+      });
+    } catch (e) {
+      if (mounted) setState(() => error = '$e');
+    }
+  }
+
+  Future<void> _rotate(bool cw) async {
+    final im = img;
+    if (im == null) return;
+    final w = im.width.toDouble();
+    final h = im.height.toDouble();
+    final rec = ui.PictureRecorder();
+    final c = Canvas(rec, Rect.fromLTWH(0, 0, h, w));
+    if (cw) {
+      c.translate(h, 0);
+      c.rotate(math.pi / 2);
     } else {
-      final x = await picker.pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 85);
-      paths = x == null ? <String>[] : [x.path];
+      c.translate(0, w);
+      c.rotate(-math.pi / 2);
     }
-    final out = <String>[];
-    for (final p in paths) {
-      out.add(await autoScan(p));
+    c.drawImage(im, Offset.zero, Paint());
+    final out = await rec.endRecording().toImage(h.toInt(), w.toInt());
+    if (!mounted) {
+      out.dispose();
+      return;
     }
-    return out;
-  } catch (_) {
-    if (context.mounted) snack(context, 'تعذر فتح المعرض');
-    return [];
+    final k = crop;
+    setState(() {
+      img = out;
+      crop = cw
+          ? Rect.fromLTRB(1 - k.bottom, k.left, 1 - k.top, k.right)
+          : Rect.fromLTRB(k.top, 1 - k.right, k.bottom, 1 - k.left);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => im.dispose());
   }
-}
 
-/// التصوير بالكاميرا حسب وضع الماسح المختار (قص وتحسين).
-/// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية + تحسين تلقائي.
-Future<List<String>> scanImages(BuildContext context, int limit) async {
-  if (!await ensureCamera(context)) return [];
-  if (!context.mounted) return [];
-  final kind = await loadScanKind();
-  if (kind == ScanKind.camera) return _cameraThenEnhance(context);
-  final scanner = DocumentScanner(
-    options: DocumentScannerOptions(
-      mode: switch (kind) {
-        ScanKind.full => ScannerMode.full,
-        ScanKind.filter => ScannerMode.filter,
-        _ => ScannerMode.base,
-      },
-      pageLimit: limit,
-      isGalleryImport: false,
-    ),
-  );
-  try {
-    final r = await scanner.scanDocument();
-    return List<String>.from(r.images ?? const []);
-  } catch (e) {
-    if (e.toString().toLowerCase().contains('cancel')) return [];
-    if (!context.mounted) return [];
-    snack(context, 'الماسح مش شغال على الموبايل ده، هنفتح الكاميرا العادية');
-    return _cameraThenEnhance(context);
-  } finally {
-    scanner.close();
+  void _panStart(Offset pos) {
+    final d = _disp;
+    final r = Rect.fromLTRB(d.left + crop.left * d.width, d.top + crop.top * d.height,
+        d.left + crop.right * d.width, d.top + crop.bottom * d.height);
+    const hit = 36.0;
+    final inY = pos.dy > r.top - hit && pos.dy < r.bottom + hit;
+    final inX = pos.dx > r.left - hit && pos.dx < r.right + hit;
+    var g = 0;
+    final dl = (pos.dx - r.left).abs(), dr = (pos.dx - r.right).abs();
+    final dt = (pos.dy - r.top).abs(), db = (pos.dy - r.bottom).abs();
+    if (inY && dl < hit && dl <= dr) g |= 1;
+    if (inY && dr < hit && dr < dl) g |= 4;
+    if (inX && dt < hit && dt <= db) g |= 2;
+    if (inX && db < hit && db < dt) g |= 8;
+    if (g == 0 && r.contains(pos)) g = 16;
+    _grab = g;
+  }
+
+  void _panUpdate(Offset delta) {
+    if (_grab == 0 || _disp.width == 0) return;
+    final dx = delta.dx / _disp.width;
+    final dy = delta.dy / _disp.height;
+    var l = crop.left, t = crop.top, r = crop.right, b = crop.bottom;
+    const minS = 0.08;
+    if (_grab == 16) {
+      final w = r - l, h = b - t;
+      l = (l + dx).clamp(0.0, 1.0 - w).toDouble();
+      t = (t + dy).clamp(0.0, 1.0 - h).toDouble();
+      r = l + w;
+      b = t + h;
+    } else {
+      if (_grab & 1 != 0) l = (l + dx).clamp(0.0, r - minS).toDouble();
+      if (_grab & 4 != 0) r = (r + dx).clamp(l + minS, 1.0).toDouble();
+      if (_grab & 2 != 0) t = (t + dy).clamp(0.0, b - minS).toDouble();
+      if (_grab & 8 != 0) b = (b + dy).clamp(t + minS, 1.0).toDouble();
+    }
+    setState(() => crop = Rect.fromLTRB(l, t, r, b));
+  }
+
+  Future<void> _done() async {
+    final im = img;
+    if (im == null) return;
+    setState(() => saving = true);
+    try {
+      final sx = crop.left * im.width;
+      final sy = crop.top * im.height;
+      final sw = crop.width * im.width;
+      final sh = crop.height * im.height;
+      final rec = ui.PictureRecorder();
+      final c = Canvas(rec, Rect.fromLTWH(0, 0, sw, sh));
+      c.drawImageRect(
+        im,
+        Rect.fromLTWH(sx, sy, sw, sh),
+        Rect.fromLTWH(0, 0, sw, sh),
+        Paint()
+          ..filterQuality = FilterQuality.medium
+          ..colorFilter = ColorFilter.matrix(filterMatrix(filter, black, white)),
+      );
+      final out = await rec.endRecording().toImage(math.max(1, sw.ceil()), math.max(1, sh.ceil()));
+      final png = await out.toByteData(format: ui.ImageByteFormat.png);
+      out.dispose();
+      if (png == null) throw 'تعذر حفظ الصورة';
+      final jpg = await FlutterImageCompress.compressWithList(
+        png.buffer.asUint8List(),
+        minWidth: 4000,
+        minHeight: 6000,
+        quality: 85,
+        format: CompressFormat.jpeg,
+      );
+      final f = File('${(await Store.dir()).path}/e_${DateTime.now().microsecondsSinceEpoch}.jpg');
+      await f.writeAsBytes(jpg);
+      await (await SharedPreferences.getInstance()).setInt('editFilter', filter.index);
+      if (mounted) Navigator.pop(context, f.path);
+    } catch (e) {
+      if (mounted) {
+        setState(() => saving = false);
+        snack(context, 'حصل خطأ: $e');
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final im = img;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        leading: IconButton(
+            tooltip: 'تخطي',
+            icon: const Icon(Icons.close),
+            onPressed: saving ? null : () => Navigator.pop(context)),
+        title: Text(widget.title ?? 'تعديل الصورة', style: const TextStyle(fontSize: 16)),
+        actions: [
+          TextButton(
+            onPressed: (saving || im == null) ? null : _done,
+            child: saving
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Text('تم', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+      body: error != null
+          ? Center(child: Text('حصل خطأ: $error', style: const TextStyle(color: Colors.white)))
+          : im == null
+              ? const Center(child: CircularProgressIndicator())
+              : Column(children: [
+                  Expanded(
+                    child: LayoutBuilder(builder: (ctx, cons) {
+                      const m = 20.0;
+                      final sc = math.min((cons.maxWidth - 2 * m) / im.width, (cons.maxHeight - 2 * m) / im.height);
+                      final dw = im.width * sc, dh = im.height * sc;
+                      _disp = Rect.fromLTWH((cons.maxWidth - dw) / 2, (cons.maxHeight - dh) / 2, dw, dh);
+                      return GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onPanStart: (d) => _panStart(d.localPosition),
+                        onPanUpdate: (d) => _panUpdate(d.delta),
+                        onPanEnd: (_) => _grab = 0,
+                        child: CustomPaint(
+                          size: Size.infinite,
+                          painter: _CropPainter(im, _disp, crop, filterMatrix(filter, black, white)),
+                        ),
+                      );
+                    }),
+                  ),
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 4),
+                    child: Text('اسحب الدواير أو الجوانب للقص من أي اتجاه',
+                        style: TextStyle(color: Colors.white54, fontSize: 12)),
+                  ),
+                  SizedBox(
+                    height: 50,
+                    child: ListView(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      children: [
+                        for (final f in EditFilter.values)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+                            child: ChoiceChip(
+                              label: Text(filterName(f)),
+                              selected: filter == f,
+                              onSelected: saving ? null : (_) => setState(() => filter = f),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  SafeArea(
+                    top: false,
+                    child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                      IconButton(
+                          tooltip: 'تدوير لليسار',
+                          color: Colors.white,
+                          iconSize: 30,
+                          onPressed: saving ? null : () => _rotate(false),
+                          icon: const Icon(Icons.rotate_left)),
+                      TextButton.icon(
+                        style: TextButton.styleFrom(foregroundColor: Colors.white),
+                        onPressed: saving ? null : () => setState(() => crop = const Rect.fromLTRB(0, 0, 1, 1)),
+                        icon: const Icon(Icons.crop_free),
+                        label: const Text('الصورة كلها'),
+                      ),
+                      IconButton(
+                          tooltip: 'تدوير لليمين',
+                          color: Colors.white,
+                          iconSize: 30,
+                          onPressed: saving ? null : () => _rotate(true),
+                          icon: const Icon(Icons.rotate_right)),
+                    ]),
+                  ),
+                ]),
+    );
   }
 }
 
@@ -1732,12 +2066,13 @@ class _BatchScreenState extends State<BatchScreen> {
         Navigator.pop(context);
       }
     } else {
-      _capture();
+      _capture(all: true);
     }
   }
 
-  Future<void> _capture() async {
-    final r = await scanImages(context, 1);
+  /// all=true: ماسح ذكي / كاميرا / معرض (أول ما تفتح الشاشة). غير كده: الكاميرا بس.
+  Future<void> _capture({bool all = false}) async {
+    final r = await captureFlow(context, multi: false, allowGallery: all);
     if (!mounted) return;
     if (r.isEmpty) {
       if (img == null) Navigator.pop(context);
@@ -1747,15 +2082,18 @@ class _BatchScreenState extends State<BatchScreen> {
   }
 
   Future<void> _gallery() async {
-    setState(() => busy = true);
-    var r = <String>[];
-    try {
-      r = await pickGalleryScanned(context, multi: false);
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
+    final r = await galleryFlow(context, multi: false);
     if (r.isEmpty || !mounted) return;
     await _useImage(r.first);
+  }
+
+  /// قص/فلاتر/تدوير لصورة الباتش الحالية.
+  Future<void> _edit() async {
+    final cur = img;
+    if (cur == null) return;
+    final e = await editImage(context, cur, title: 'تعديل صورة الباتش');
+    if (e == null || !mounted) return;
+    await _useImage(e);
   }
 
   Future<void> _useImage(String src) async {
@@ -1795,13 +2133,7 @@ class _BatchScreenState extends State<BatchScreen> {
   Widget build(BuildContext context) {
     final ready = img != null && composed != null;
     return Scaffold(
-      appBar: AppBar(title: const Text('الباتش'), actions: [
-        IconButton(
-          tooltip: 'وضع الماسح',
-          icon: const Icon(Icons.document_scanner_outlined),
-          onPressed: () => chooseScanKind(context),
-        ),
-      ]),
+      appBar: AppBar(title: const Text('الباتش')),
       body: !ready
           ? const Center(child: CircularProgressIndicator())
           : Column(children: [
@@ -1832,15 +2164,23 @@ class _BatchScreenState extends State<BatchScreen> {
                         child: OutlinedButton.icon(
                           onPressed: busy ? null : _capture,
                           icon: const Icon(Icons.add_a_photo),
-                          label: const Text('إعادة تصوير'),
+                          label: const Text('تصوير'),
                         ),
                       ),
-                      const SizedBox(width: 12),
+                      const SizedBox(width: 8),
                       Expanded(
                         child: OutlinedButton.icon(
                           onPressed: busy ? null : _gallery,
                           icon: const Icon(Icons.photo_library),
-                          label: const Text('من المعرض'),
+                          label: const Text('معرض'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: busy ? null : _edit,
+                          icon: const Icon(Icons.crop),
+                          label: const Text('تعديل'),
                         ),
                       ),
                     ]),
@@ -1908,25 +2248,19 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       built = b;
       loaded = true;
     });
-    if (d.isEmpty) _add();
+    if (d.isEmpty) _add(all: true);
   }
 
-  /// تصوير صورة واحدة بالماسح.
-  Future<void> _add() async {
-    final r = await scanImages(context, 1);
+  /// تصوير: ماسح ذكي أو كاميرا (all=true بتضيف المعرض كمان).
+  Future<void> _add({bool all = false}) async {
+    final r = await captureFlow(context, multi: true, allowGallery: all);
     if (r.isEmpty || !mounted) return;
     await _saveAll(r);
   }
 
-  /// صور من المعرض (كل صورة بتتقص وتتحسّن تلقائي).
+  /// صور من المعرض: كل صورة بتفتح في المحرر.
   Future<void> _addGallery() async {
-    setState(() => busy = true);
-    var r = <String>[];
-    try {
-      r = await pickGalleryScanned(context);
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
+    final r = await galleryFlow(context);
     if (r.isEmpty || !mounted) return;
     await _saveAll(r);
   }
@@ -2005,7 +2339,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   /// استبدال صفحة واحدة بصورة جديدة (من غير ما تتمسح وتتصور من الأول).
   Future<void> _replace(int i) async {
     final old = imgs[i];
-    final r = await scanImages(context, 1);
+    final r = await captureFlow(context, multi: false);
     if (r.isEmpty || !mounted) return;
     setState(() => busy = true);
     try {
@@ -2019,6 +2353,27 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       });
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  /// قص حر + فلاتر + تدوير لصفحة موجودة.
+  Future<void> _edit(int i) async {
+    final old = imgs[i];
+    final e = await editImage(context, old, title: 'تعديل صفحة ${i + 1}');
+    if (e == null || !mounted) return;
+    setState(() => busy = true);
+    try {
+      await Store.replaceInDraft(old, e);
+      if (!mounted) return;
+      setState(() {
+        final k = imgs.indexOf(old);
+        if (k >= 0) imgs[k] = e;
+        built = null;
+      });
+    } catch (err) {
+      if (mounted) snack(context, 'حصل خطأ: $err');
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -2093,6 +2448,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             bottom: 6,
             right: 6,
             child: Row(children: [
+              _pill(Icons.crop, 'تعديل', busy ? null : () => _edit(i)),
+              const SizedBox(width: 6),
               _pill(Icons.rotate_right, 'تدوير', busy ? null : () => _rotate(i)),
               const SizedBox(width: 6),
               _pill(Icons.camera_alt, 'استبدال', busy ? null : () => _replace(i)),
@@ -2112,13 +2469,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text('إيصالات الدفع (${imgs.length})'), actions: [
-        IconButton(
-          tooltip: 'وضع الماسح',
-          icon: const Icon(Icons.document_scanner_outlined),
-          onPressed: () => chooseScanKind(context),
-        ),
-      ]),
+      appBar: AppBar(title: Text('إيصالات الدفع (${imgs.length})')),
       body: Column(children: [
         Expanded(
           child: !loaded
