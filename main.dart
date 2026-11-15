@@ -262,6 +262,59 @@ String errText(Object e) {
   return s.startsWith('Exception: ') ? s.substring(11) : s;
 }
 
+/// بايتات ByteData بالظبط (من غير ما نسحب باقي الـ buffer لو الـ view مش كل الـ buffer).
+Uint8List _bytesOf(ByteData bd) => bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+
+Future<ui.Image> _imageFromRgba(Uint8List rgba, int w, int h) {
+  final c = Completer<ui.Image>();
+  ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, c.complete);
+  return c.future;
+}
+
+/// مصفوفة الألوان على الـ CPU (من غير رسم GPU) عشان الصورة متتشوهش.
+Uint8List _matrixJob(Map<String, dynamic> a) {
+  final src = a['src'] as Uint8List;
+  final m = (a['m'] as List).cast<double>();
+  final out = Uint8List(src.length);
+  double cl(double v) => v < 0 ? 0 : (v > 255 ? 255 : v);
+  for (var i = 0; i + 3 < src.length; i += 4) {
+    final r = src[i].toDouble(), g = src[i + 1].toDouble(), b = src[i + 2].toDouble();
+    out[i] = cl(m[0] * r + m[1] * g + m[2] * b + m[4]).round();
+    out[i + 1] = cl(m[5] * r + m[6] * g + m[7] * b + m[9]).round();
+    out[i + 2] = cl(m[10] * r + m[11] * g + m[12] * b + m[14]).round();
+    out[i + 3] = 255;
+  }
+  return out;
+}
+
+Uint8List _rotateJob(Map<String, dynamic> a) {
+  final src = a['src'] as Uint8List;
+  final w = a['w'] as int, h = a['h'] as int, t = a['t'] as int;
+  final ow = t.isOdd ? h : w, oh = t.isOdd ? w : h;
+  final out = Uint8List(ow * oh * 4);
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      var nx = 0, ny = 0;
+      if (t == 1) {
+        nx = h - 1 - y;
+        ny = x;
+      } else if (t == 2) {
+        nx = w - 1 - x;
+        ny = h - 1 - y;
+      } else {
+        nx = y;
+        ny = w - 1 - x;
+      }
+      final si = (y * w + x) * 4, di = (ny * ow + nx) * 4;
+      out[di] = src[si];
+      out[di + 1] = src[si + 1];
+      out[di + 2] = src[si + 2];
+      out[di + 3] = 255;
+    }
+  }
+  return out;
+}
+
 Future<ui.Image> decodeImage(Uint8List b, {int? maxWidth}) async {
   final c = await ui.instantiateImageCodec(b, targetWidth: maxWidth);
   final f = await c.getNextFrame();
@@ -492,16 +545,16 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
     if (f == ScanFilter.receipt) {
       out = await cleanUiImage(img);
     } else {
-      final rec = ui.PictureRecorder();
-      final c = Canvas(rec);
-      c.drawImage(img, Offset.zero, Paint()..colorFilter = ColorFilter.matrix(_matrix(f)));
-      out = await rec.endRecording().toImage(w, h);
+      final raw = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (raw == null) throw Exception('تعذر قراءة الصورة');
+      final rgba = await compute(_matrixJob, <String, dynamic>{'src': _bytesOf(raw), 'm': _matrix(f)});
+      out = await _imageFromRgba(rgba, w, h);
     }
     final bd = await out.toByteData(format: ui.ImageByteFormat.png);
     img.dispose();
     out.dispose();
     return await FlutterImageCompress.compressWithList(
-      bd!.buffer.asUint8List(),
+      _bytesOf(bd!),
       minWidth: w,
       minHeight: h,
       quality: await Store.jpegQuality(),
@@ -597,7 +650,7 @@ Future<String> persistImage(String src, String name,
       final w = img.width, h = img.height;
       img.dispose();
       bytes = await FlutterImageCompress.compressWithList(
-        bd!.buffer.asUint8List(),
+        _bytesOf(bd!),
         minWidth: w,
         minHeight: h,
         quality: await Store.jpegQuality(),
@@ -675,7 +728,45 @@ TagPos fitTagPos(TagPos p, Tag t, double aspect) {
   return p.copyWith(cx: cx, cy: cy);
 }
 
+/// فحص إن صورة الورقة سليمة: الورقة أبيض وأسود بس، فأي ألوان كتير أو غياب الأبيض = تشويه من الرسم.
+Future<bool> _tagLooksOk(Uint8List png) async {
+  try {
+    final img = await decodeImage(png);
+    final w = img.width, h = img.height;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    img.dispose();
+    if (bd == null) return false;
+    final px = _bytesOf(bd);
+    var total = 0, color = 0, white = 0;
+    for (var i = 0; i < w * h; i++) {
+      final j = i * 4;
+      if (px[j + 3] < 200) continue;
+      total++;
+      final r = px[j], g = px[j + 1], b = px[j + 2];
+      final mx = math.max(r, math.max(g, b)), mn = math.min(r, math.min(g, b));
+      if (mx - mn > 60) color++;
+      if (mn > 200) white++;
+    }
+    if (total == 0) return false;
+    return color / total < 0.005 && white / total > 0.15;
+  } catch (e, st) {
+    AppLog.e('_tagLooksOk', e, st);
+    return true;
+  }
+}
+
+/// بترسم الورقة وتتأكد إنها سليمة، ولو طلعت مشوّهة بتعيد الرسم (لحد 3 مرات).
 Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
+  late Tag t;
+  for (var i = 0; i < 3; i++) {
+    t = await _renderTag(w, s, batch: batch);
+    if (await _tagLooksOk(t.png)) return t;
+    AppLog.i('tag garbled, retry ${i + 1}');
+  }
+  return t;
+}
+
+Future<Tag> _renderTag(double w, Session s, {bool batch = false}) async {
   final fs = w * kTagFont;
   final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
   final l1 = _tp('${s.name}  |  $unitLine', fs, TextDirection.rtl);
@@ -703,7 +794,7 @@ Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
   final img = await rec.endRecording().toImage(cw.ceil(), ch.ceil());
   final bd = await img.toByteData(format: ui.ImageByteFormat.png);
   img.dispose();
-  return Tag(bd!.buffer.asUint8List(), cw, ch);
+  return Tag(_bytesOf(bd!), cw, ch);
 }
 
 /// ورقة الباتش بحجم الشريط. w = عرض الصورة بالبكسل.
@@ -997,6 +1088,10 @@ class Store {
 
   static Future<bool> continuous() async => (await _p).getBool('continuous') ?? true;
   static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
+
+  /// فتح شاشة الفلاتر والقص بعد كل صورة (تصوير أو معرض)
+  static Future<bool> autoEdit() async => (await _p).getBool('autoEdit') ?? true;
+  static Future<void> setAutoEdit(bool v) async => (await _p).setBool('autoEdit', v);
 
   /// شكل ورقة الباتش: 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
   static Future<int> batchLayout() async => ((await _p).getInt('batchLayout') ?? 0).clamp(0, 2);
@@ -1511,8 +1606,10 @@ class _BatchInfoSheet extends StatefulWidget {
 
 class _BatchInfoSheetState extends State<_BatchInfoSheet> {
   late final c1 = TextEditingController(text: widget.init.count);
-  late final c2 = TextEditingController(text: widget.init.piasters);
-  late final c3 = TextEditingController(text: widget.init.collected);
+  late final c2 =
+      TextEditingController(text: widget.init.piasters.isEmpty ? '0' : widget.init.piasters);
+  late final c3 =
+      TextEditingController(text: widget.init.collected.isEmpty ? '0' : widget.init.collected);
   late final c4 = TextEditingController(text: widget.init.total);
   String? err;
 
@@ -1544,10 +1641,15 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
             col.isEmpty ? '0' : '${int.parse(col)}', t.toStringAsFixed(2)));
   }
 
-  Widget _f(TextEditingController c, String label, {bool dec = false}) => Padding(
+  Widget _f(TextEditingController c, String label, {bool dec = false, bool selectAll = false}) =>
+      Padding(
         padding: const EdgeInsets.only(bottom: 12),
         child: TextField(
           controller: c,
+          // الخانة اللي قيمتها 0 تتحدد كلها أول ما تدوس عليها، فأي رقم بتكتبه يحل محل الصفر
+          onTap: selectAll
+              ? () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length)
+              : null,
           keyboardType: TextInputType.numberWithOptions(decimal: dec),
           decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
         ),
@@ -1562,8 +1664,8 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
             _f(c1, 'عدد المعاملات'),
-            _f(c2, 'عدد القروش الفاصلة'),
-            _f(c3, 'عدد المعاملات المجمعة'),
+            _f(c2, 'عدد القروش الفاصلة', selectAll: true),
+            _f(c3, 'عدد المعاملات المجمعة', selectAll: true),
             _f(c4, 'الإجمالي', dec: true),
             if (err != null)
               Padding(
@@ -2134,6 +2236,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     var mode = await Store.perfMode();
     var scan = await Store.scanSetting();
     var qual = await Store.qualitySetting();
+    var autoEdit = await Store.autoEdit();
     if (!mounted) return;
     await showDialog(
       context: context,
@@ -2214,6 +2317,18 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                         Store.setQualitySetting(v!);
                       },
                     ),
+                  const Divider(),
+                  SwitchListTile(
+                    dense: true,
+                    title: const Text('أوضاع الفلتر بعد كل صورة'),
+                    subtitle: const Text(
+                        'بعد التصوير أو الاختيار من المعرض تظهر شاشة (أصلي / تحسين / أ/س / إيصال) والقص'),
+                    value: autoEdit,
+                    onChanged: (v) {
+                      setS(() => autoEdit = v);
+                      Store.setAutoEdit(v);
+                    },
+                  ),
                 ],
               ),
             ),
@@ -2573,7 +2688,8 @@ class _BatchScreenState extends State<BatchScreen> {
             filter: ScanFilter.receipt);
         await Store.setBatchImg(path);
         await _show(path);
-        if (mounted && img != null) await _edit();
+        _lastScanManual = true;
+        if (mounted && img != null) await _edit(tab: 2);
         return;
       } catch (e) {
         if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
@@ -2641,7 +2757,7 @@ class _BatchScreenState extends State<BatchScreen> {
     } finally {
       if (mounted) setState(() => busy = false);
     }
-    if (mounted && _lastScanManual && img != null) await _edit();
+    if (mounted && img != null && (_lastScanManual || await Store.autoEdit())) await _edit(tab: 2);
   }
 
   Timer? _saveT;
@@ -2705,15 +2821,16 @@ class _BatchScreenState extends State<BatchScreen> {
     } finally {
       if (mounted) setState(() => busy = false);
     }
-    if (mounted && img != null) await _edit();
+    _lastScanManual = true; // صورة معرض من غير قص: القص التلقائي يشتغل
+    if (mounted && img != null) await _edit(tab: 2);
   }
 
   /// تعديل: قص بزوايا حرة وتدوير وفلاتر للصورة الحالية.
-  Future<void> _edit() async {
+  Future<void> _edit({int tab = 0}) async {
     final cur = img;
     if (cur == null) return;
     final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_')));
+        context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_', initialTab: tab)));
     if (out == null || !mounted) return;
     setState(() => busy = true);
     try {
@@ -2992,29 +3109,14 @@ List<double> _homography(List<Offset> p) {
 
 /// تدوير صورة 90 درجة (turns مرة مع عقارب الساعة). لو turns=0 بترجّع نفس الصورة.
 Future<ui.Image> _rotateUi(ui.Image src, int turns) async {
-  if (turns % 4 == 0) return src;
-  final sw = src.width.toDouble(), sh = src.height.toDouble();
-  final rw = turns.isOdd ? sh : sw, rh = turns.isOdd ? sw : sh;
-  final rec = ui.PictureRecorder();
-  final c = Canvas(rec, Rect.fromLTWH(0, 0, rw, rh));
-  switch (turns % 4) {
-    case 1:
-      c.translate(rw, 0);
-      c.rotate(math.pi / 2);
-      break;
-    case 2:
-      c.translate(rw, rh);
-      c.rotate(math.pi);
-      break;
-    case 3:
-      c.translate(0, rh);
-      c.rotate(-math.pi / 2);
-      break;
-  }
-  c.drawImage(src, Offset.zero, Paint());
-  final out = await rec.endRecording().toImage(rw.round(), rh.round());
+  final t = turns % 4;
+  if (t == 0) return src;
+  final w = src.width, h = src.height;
+  final bd = await src.toByteData(format: ui.ImageByteFormat.rawRgba);
+  if (bd == null) throw Exception('تعذر قراءة الصورة');
+  final rgba = await compute(_rotateJob, <String, dynamic>{'src': _bytesOf(bd), 'w': w, 'h': h, 't': t});
   src.dispose();
-  return out;
+  return _imageFromRgba(rgba, t.isOdd ? h : w, t.isOdd ? w : h);
 }
 
 /// الصورة بعد التدوير بدقة محدودة (kMaxSide) عشان الذاكرة.
@@ -3263,7 +3365,8 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
 class EditorPage extends StatefulWidget {
   final String path;
   final String prefix; // 'batch_' أو 'r_'
-  const EditorPage({super.key, required this.path, this.prefix = 'r_'});
+  final int initialTab; // 0 قص، 1 تدوير، 2 ألوان/فلاتر
+  const EditorPage({super.key, required this.path, this.prefix = 'r_', this.initialTab = 0});
   @override
   State<EditorPage> createState() => _EditorPageState();
 }
@@ -3283,7 +3386,7 @@ class _EditorPageState extends State<EditorPage> {
   ScanFilter filter = ScanFilter.original;
   double contrast = 0;
   double brightness = 0;
-  int tab = 0; // 0 قص، 1 تدوير، 2 ألوان
+  late int tab = widget.initialTab; // 0 قص، 1 تدوير، 2 ألوان
   int drag = -1; // 0..3 زوايا، 4..7 حواف، 8 تحريك الكل
   bool busy = false;
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
@@ -3376,7 +3479,7 @@ class _EditorPageState extends State<EditorPage> {
       await _loadView();
       AppLog.i('editor view loaded');
       WidgetsBinding.instance.addPostFrameCallback((_) => AppLog.i('editor first frame'));
-      if (mounted && e == null && _lastScanManual) await _auto(silent: true);
+      if (mounted && (e == null || e.quad == null) && _lastScanManual) await _auto(silent: true);
     } catch (e, st) {
       AppLog.e('_init', e, st);
       if (mounted) {
@@ -3980,7 +4083,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final lost = await takeLostPick('receipts');
     if (lost != null && mounted) {
       await _saveAll([lost]);
-      if (mounted && imgs.isNotEmpty) await _edit(imgs.length - 1);
+      _lastScanManual = true;
+      if (mounted && imgs.isNotEmpty) await _edit(imgs.length - 1, tab: 2);
       return;
     }
     if (d.isEmpty) _add();
@@ -3995,25 +4099,32 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       if (r.isEmpty || !mounted) break;
       await _saveAll(r);
       if (!mounted) break;
-      if (_lastScanManual && r.length == 1 && imgs.isNotEmpty) {
-        await _edit(imgs.length - 1);
+      if (r.length == 1 && imgs.isNotEmpty && (_lastScanManual || await Store.autoEdit())) {
+        await _edit(imgs.length - 1, tab: 2);
         if (!mounted) break;
       }
     } while (continuous);
   }
 
+  /// من المعرض: منتقي الصور بتاع النظام مباشرة وتقدر تحدد أكتر من صورة.
+  /// كل صورة بتتحفظ الأول، وبعدين شاشة التعديل بتفتح لكل واحدة (ارجع لتتخطاها وتفضل محفوظة).
   Future<void> _addGallery() async {
     await markPickTarget('receipts');
-    if (!mounted) return;
-    final r = await scanImages(context, 100, mode: kReceiptScanMode);
-    if (r.isEmpty || !mounted) return;
+    List<XFile> xs;
+    try {
+      xs = await ImagePicker().pickMultiImage(maxWidth: 2000, imageQuality: 90);
+    } catch (e, st) {
+      AppLog.e('_addGallery', e, st);
+      if (mounted) snack(context, 'تعذر فتح المعرض');
+      return;
+    }
+    if (xs.isEmpty || !mounted) return;
+    _lastScanManual = true; // صور من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
     final start = imgs.length;
-    await _saveAll(r);
-    if (_lastScanManual) {
-      for (var i = start; i < imgs.length; i++) {
-        if (!mounted) break;
-        await _edit(i);
-      }
+    await _saveAll(xs.map((e) => e.path).toList());
+    for (var i = start; i < imgs.length; i++) {
+      if (!mounted) break;
+      await _edit(i, tab: 2);
     }
   }
 
@@ -4121,10 +4232,10 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   }
 
   /// تعديل إيصال بعد التصوير (قص، تدوير، فلتر) من النسخة الأصلية.
-  Future<void> _edit(int i) async {
+  Future<void> _edit(int i, {int tab = 0}) async {
     final old = imgs[i];
     final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => EditorPage(path: old, prefix: 'r_')));
+        context, MaterialPageRoute(builder: (_) => EditorPage(path: old, prefix: 'r_', initialTab: tab)));
     if (out == null || !mounted) return;
     try {
       await Store.replaceInDraft(old, out);
