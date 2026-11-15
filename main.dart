@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:document_scan/document_scan.dart' as ds;
 import 'package:flutter/foundation.dart' show compute;
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
@@ -34,6 +35,58 @@ enum PerfMode { lite, balanced, pro }
 
 /// الدقة الافتراضية لمعاينة الإيصال (نفس وضع balanced).
 const kMaxSide = 1400;
+
+/// سجل أخطاء بسيط في ملف (في مجلد منفصل عن الصور فمبيتمسحش مع التنظيف).
+/// بيتبعت من زرار "إرسال سجل الأخطاء" في الإعدادات.
+class AppLog {
+  static File? _f;
+  static const _max = 200 * 1024;
+
+  static Future<void> init() async {
+    try {
+      final d = await getApplicationSupportDirectory();
+      _f = File('${d.path}/a2r_log.txt');
+    } catch (_) {}
+  }
+
+  static void e(String where, Object err, [StackTrace? st]) {
+    final top = (st?.toString() ?? '')
+        .split('\n')
+        .where((l) => l.trim().isNotEmpty)
+        .take(4)
+        .join('\n');
+    _write('[ERR] $where: $err${top.isEmpty ? '' : '\n$top'}');
+  }
+
+  /// علامة بتتكتب فورًا (متزامنة) عشان لو التطبيق اتقفل فجأة نعرف كان فين.
+  static void i(String msg) => _write('[INF] $msg');
+
+  static void _write(String line) {
+    final f = _f;
+    if (f == null) return;
+    try {
+      f.writeAsStringSync('${DateTime.now().toIso8601String()} v$kVersion $line\n',
+          mode: FileMode.append, flush: true);
+      if (f.lengthSync() > _max) {
+        final t = f.readAsStringSync();
+        f.writeAsStringSync(t.substring(t.length ~/ 2));
+      }
+    } catch (_) {}
+  }
+
+  static Future<void> share(BuildContext context) async {
+    final f = _f;
+    if (f == null || !f.existsSync() || f.lengthSync() == 0) {
+      snack(context, 'السجل فاضي');
+      return;
+    }
+    try {
+      await Share.shareXFiles([XFile(f.path)]);
+    } catch (_) {
+      if (context.mounted) snack(context, 'تعذر إرسال السجل');
+    }
+  }
+}
 
 int getMaxSide(PerfMode mode) {
   switch (mode) {
@@ -176,7 +229,7 @@ class AppData {
       units = u;
       rev.value++;
       return true;
-    } catch (_) {
+    } catch (e, st) { AppLog.e('_apply', e, st);
       return false;
     }
   }
@@ -186,7 +239,7 @@ class AppData {
     try {
       final raw = await rootBundle.loadString('assets/data.json');
       if (_apply(raw)) status.value = 'بيانات من ملف الإكسل';
-    } catch (_) {}
+    } catch (e, st) { AppLog.e('load', e, st);}
   }
 }
 
@@ -291,7 +344,7 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
       quality: 82,
       format: CompressFormat.jpeg,
     );
-  } catch (_) {
+  } catch (e, st) { AppLog.e('applyFilter', e, st);
     return bytes; // لو الفلتر فشل (ذاكرة) نكمل بالصورة الأصلية
   }
 }
@@ -300,7 +353,7 @@ Future<bool> _decodesOk(Uint8List b) async {
   try {
     final s = await imageSize(b);
     return s.w > 0 && s.h > 0;
-  } catch (_) {
+  } catch (e, st) { AppLog.e('_decodesOk', e, st);
     return false;
   }
 }
@@ -321,7 +374,7 @@ Future<String> persistImage(String src, String name,
       format: CompressFormat.jpeg,
       keepExif: false,
     );
-  } catch (_) {}
+  } catch (e, st) { AppLog.e('persistImage', e, st);}
   if (bytes != null && !await _decodesOk(bytes)) bytes = null;
   if (bytes == null) {
     try {
@@ -337,7 +390,7 @@ Future<String> persistImage(String src, String name,
         quality: mode == PerfMode.pro ? 90 : 82,
         format: CompressFormat.jpeg,
       );
-    } catch (_) {}
+    } catch (e, st) { AppLog.e('persistImage', e, st);}
   }
   if (bytes == null || !await _decodesOk(bytes)) {
     throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
@@ -536,7 +589,7 @@ class Store {
       final p = await _p;
       await p.remove('pos:$path');
       await p.remove('edit:$path');
-    } catch (_) {}
+    } catch (e, st) { AppLog.e('del', e, st);}
   }
 
   // --- إعدادات الموظف ---
@@ -757,15 +810,13 @@ Future<bool> askYesNo(BuildContext context, String title, String body,
   return r ?? false;
 }
 
-/// بيتطلب أول ما التطبيق يفتح عشان الموظف يشوف طلب الأذونات (الكاميرا والصور).
+/// بيتطلب أول ما التطبيق يفتح. الكاميرا بس: المعرض بيشتغل من منتقي الصور بتاع النظام من غير إذن.
 Future<void> requestAllPermissions() async {
   try {
     await Permission.camera.request();
-    final ph = await Permission.photos.request();
-    if (!ph.isGranted && !ph.isLimited) {
-      await Permission.storage.request();
-    }
-  } catch (_) {}
+  } catch (e, st) {
+    AppLog.e('requestAllPermissions', e, st);
+  }
 }
 
 Future<bool> ensureCamera(BuildContext context) async {
@@ -806,7 +857,7 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
     }
     final x = await picker.pickImage(source: src, maxWidth: 2000, imageQuality: 85);
     return x == null ? [] : [x.path];
-  } catch (_) {
+  } catch (e, st) { AppLog.e('simplePick', e, st);
     if (context.mounted) snack(context, 'تعذر فتح الكاميرا أو المعرض');
     return [];
   }
@@ -816,7 +867,7 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
 Future<void> markPickTarget(String t) async {
   try {
     await (await SharedPreferences.getInstance()).setString('pickTarget', t);
-  } catch (_) {}
+  } catch (e, st) { AppLog.e('markPickTarget', e, st);}
 }
 
 Future<void> stashLostPick() async {
@@ -828,7 +879,7 @@ Future<void> stashLostPick() async {
     final f = await File(r.file!.path)
         .copy('${d.path}/${DateTime.now().microsecondsSinceEpoch}.jpg');
     await (await SharedPreferences.getInstance()).setString('lostPick', f.path);
-  } catch (_) {}
+  } catch (e, st) { AppLog.e('stashLostPick', e, st);}
 }
 
 /// بترجّع مسار الصورة الضايعة لو كانت تابعة للشاشة دي (مرة واحدة بس).
@@ -839,21 +890,29 @@ Future<String?> takeLostPick(String target) async {
     if (path == null || p.getString('pickTarget') != target) return null;
     await p.remove('lostPick');
     return await File(path).exists() ? path : null;
-  } catch (_) {
+  } catch (e, st) { AppLog.e('takeLostPick', e, st);
     return null;
   }
 }
 
 /// كل التصوير (كاميرا أو معرض) بيعدي على ماسح المستندات (قص).
 /// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية تلقائياً.
+bool _lastScanManual = false; // آخر تصوير اتعمل بالكاميرا العادية (من غير ماسح ML Kit) فمحتاج شاشة القص
 bool _scannerFailed = false; // فشل الماسح في الجلسة دي (بيتصفّر لما التطبيق يتقفل)
+
+Future<List<String>> _manualPick(BuildContext context, {bool multi = false}) async {
+  final r = await simplePick(context, multi: multi);
+  _lastScanManual = r.isNotEmpty;
+  return r;
+}
 
 Future<List<String>> scanImages(BuildContext context, int limit,
     {ScannerMode mode = ScannerMode.full}) async {
+  _lastScanManual = false;
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
   final perf = await Store.perfMode();
-  if (_scannerFailed || perf == PerfMode.lite) return simplePick(context, multi: limit > 1);
+  if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1);
   final scanner = DocumentScanner(
     options: DocumentScannerOptions(mode: perf == PerfMode.pro ? ScannerMode.full : mode, pageLimit: limit, isGalleryImport: true),
   );
@@ -867,7 +926,7 @@ Future<List<String>> scanImages(BuildContext context, int limit,
     try {
       (await SharedPreferences.getInstance())
           .setInt('scannerFailedAt', DateTime.now().millisecondsSinceEpoch);
-    } catch (_) {}
+    } catch (e, st) { AppLog.e('scanImages.prefs', e, st);}
     if (!context.mounted) return [];
     await showDialog<void>(
       context: context,
@@ -887,7 +946,7 @@ Future<List<String>> scanImages(BuildContext context, int limit,
       ),
     );
     if (!context.mounted) return [];
-    return simplePick(context, multi: limit > 1);
+    return _manualPick(context, multi: limit > 1);
   } finally {
     scanner.close();
   }
@@ -1090,12 +1149,26 @@ Widget appLogo({double height = 36}) => Image.asset(
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await AppLog.init();
+  FlutterError.onError = (d) {
+    FlutterError.presentError(d);
+    AppLog.e('flutter', d.exception, d.stack);
+  };
+  ui.PlatformDispatcher.instance.onError = (err, st) {
+    AppLog.e('async', err, st);
+    return true;
+  };
   await AppData.load();
   try {
     final sp = await SharedPreferences.getInstance();
+    if (sp.getBool('det_guard') == true) {
+      await sp.setBool('det_off', true);
+      await sp.setBool('det_guard', false);
+      AppLog.i('الكشف الأصلي قفل التطبيق المرة اللي فاتت، اتوقف واتحوّل للكشف البسيط');
+    }
     final t = sp.getInt('scannerFailedAt') ?? 0;
     _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
-  } catch (_) {}
+  } catch (e, st) { AppLog.e('main', e, st);}
   await stashLostPick();
   runApp(const A2RApp());
 }
@@ -1121,6 +1194,9 @@ class A2RApp extends StatelessWidget {
         theme: _theme(Brightness.light),
         darkTheme: _theme(Brightness.dark),
         themeMode: ThemeMode.system,
+        locale: const Locale('ar'),
+        supportedLocales: const [Locale('ar'), Locale('en')],
+        localizationsDelegates: GlobalMaterialLocalizations.delegates,
         builder: (c, w) => Directionality(textDirection: TextDirection.rtl, child: w!),
         home: const LoginScreen(),
       );
@@ -1328,7 +1404,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await requestAllPermissions();
     try {
       await Store.cleanup();
-    } catch (_) {}
+    } catch (e, st) { AppLog.e('_init', e, st);}
     await _reload();
   }
 
@@ -1387,6 +1463,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               ),
             ),
             actions: [
+              TextButton(
+                  onPressed: () => AppLog.share(ctx), child: const Text('إرسال سجل الأخطاء')),
               TextButton(onPressed: () {
                 Navigator.pop(c);
                 _reload();
@@ -1751,7 +1829,7 @@ class _BatchScreenState extends State<BatchScreen> {
     } finally {
       if (mounted) setState(() => busy = false);
     }
-    if (mounted && _scannerFailed && img != null) await _edit();
+    if (mounted && _lastScanManual && img != null) await _edit();
   }
 
   void _set(TagPos p) {
@@ -1765,7 +1843,7 @@ class _BatchScreenState extends State<BatchScreen> {
     await markPickTarget('batch');
     try {
       x = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 90);
-    } catch (_) {
+    } catch (e, st) { AppLog.e('_gallery', e, st);
       if (mounted) snack(context, 'تعذر فتح المعرض');
       return;
     }
@@ -1956,7 +2034,7 @@ class EditParams {
         contrast: ((m['c'] as num?) ?? 0).toDouble(),
         brightness: ((m['b'] as num?) ?? 0).toDouble(),
       );
-    } catch (_) {
+    } catch (e, st) { AppLog.e('EditParams.decode', e, st);
       return null;
     }
   }
@@ -2086,9 +2164,22 @@ Uint8List _warpJob(Map<String, dynamic> a) {
 /// ولو فشل أو رجّع null بنرجع للكشف البسيط تحت. بيرجّع TL,TR,BR,BL كنسب، أو null.
 Future<List<Offset>?> detectDocQuad(String path) async {
   final mode = await Store.perfMode();
-  if (mode != PerfMode.lite) {
+  if (mode != PerfMode.lite && await _nativeDetectorAllowed()) {
+    final sp = await SharedPreferences.getInstance();
+    File? tmp;
     try {
-      final c = await ds.DocumentDetector().detect(ds.ScanInput.file(path));
+      // لو التطبيق اتقفل وإحنا جوه الكشف الأصلي، العلامة دي بتفضل true وفي التشغيل الجاي بنوقفه تلقائيًا
+      await sp.setBool('det_guard', true);
+      var input = path;
+      try {
+        tmp = await _smallCopy(path);
+        if (tmp != null) input = tmp.path;
+      } catch (e, st) {
+        AppLog.e('detectDocQuad.smallCopy', e, st);
+      }
+      AppLog.i('native detect start');
+      final c = await ds.DocumentDetector().detect(ds.ScanInput.file(input));
+      AppLog.i('native detect done');
       if (c != null) {
         final q = [
           for (final p in c.toList())
@@ -2096,9 +2187,35 @@ Future<List<Offset>?> detectDocQuad(String path) async {
         ];
         if (q.length == 4 && _quadConvex(q)) return q;
       }
-    } catch (_) {}
+    } catch (e, st) {
+      AppLog.e('detectDocQuad', e, st);
+    } finally {
+      try {
+        await sp.setBool('det_guard', false);
+        if (tmp != null && await tmp.exists()) await tmp.delete();
+      } catch (_) {}
+    }
   }
   return _detectDocQuadSimple(path);
+}
+
+Future<bool> _nativeDetectorAllowed() async {
+  try {
+    return !((await SharedPreferences.getInstance()).getBool('det_off') ?? false);
+  } catch (_) {
+    return true;
+  }
+}
+
+/// نسخة مصغّرة (حوالي 720px) من الصورة للكشف بس: الإحداثيات نسب فمفيش فرق، والذاكرة أقل بكتير.
+Future<File?> _smallCopy(String path) async {
+  final b = await FlutterImageCompress.compressWithFile(path,
+      minWidth: 720, minHeight: 720, quality: 80, format: CompressFormat.jpeg, keepExif: false);
+  if (b == null) return null;
+  final d = await getTemporaryDirectory();
+  final f = File('${d.path}/det_${DateTime.now().microsecondsSinceEpoch}.jpg');
+  await f.writeAsBytes(b, flush: true);
+  return f;
 }
 
 /// كشف تقريبي بسيط (بيفترض إن الورقة أفتح أو أغمق من الخلفية بشكل واضح).
@@ -2219,7 +2336,7 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
       pt(best[3], -1.5, 1.5),
     ];
     return _quadConvex(q) ? q : null;
-  } catch (_) {
+  } catch (e, st) { AppLog.e('_detectDocQuadSimple', e, st);
     return null;
   }
 }
@@ -2279,7 +2396,7 @@ class _EditorPageState extends State<EditorPage> {
       final old = view;
       setState(() => view = r);
       WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
-    } catch (_) {
+    } catch (e, st) { AppLog.e('_loadView', e, st);
       if (mounted) {
         snack(context, 'تعذر فتح الصورة');
         Navigator.pop(context);
@@ -2289,6 +2406,7 @@ class _EditorPageState extends State<EditorPage> {
 
   Future<void> _init() async {
     try {
+      AppLog.i('editor open');
       final base = File(Store.baseOf(widget.path));
       final s = await base.exists() ? base.path : widget.path;
       final a = await imageAspect(s);
@@ -2307,8 +2425,9 @@ class _EditorPageState extends State<EditorPage> {
         }
       });
       await _loadView();
-      if (mounted && e == null && _scannerFailed) await _auto(silent: true);
-    } catch (_) {
+      AppLog.i('editor view loaded');
+      if (mounted && e == null && _lastScanManual) await _auto(silent: true);
+    } catch (e, st) { AppLog.e('_init', e, st);
       if (mounted) {
         snack(context, 'تعذر فتح الصورة');
         Navigator.pop(context);
@@ -2870,7 +2989,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       if (r.isEmpty || !mounted) break;
       await _saveAll(r);
       if (!mounted) break;
-      if (_scannerFailed && r.length == 1 && imgs.isNotEmpty) {
+      if (_lastScanManual && r.length == 1 && imgs.isNotEmpty) {
         await _edit(imgs.length - 1);
         if (!mounted) break;
       }
@@ -2884,7 +3003,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (r.isEmpty || !mounted) return;
     final start = imgs.length;
     await _saveAll(r);
-    if (_scannerFailed) {
+    if (_lastScanManual) {
       for (var i = start; i < imgs.length; i++) {
         if (!mounted) break;
         await _edit(i);
