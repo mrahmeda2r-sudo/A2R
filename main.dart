@@ -1464,17 +1464,16 @@ class BrandHeader extends StatelessWidget {
           boxShadow: [BoxShadow(color: kBrand.withAlpha(70), blurRadius: 18, offset: const Offset(0, 8))],
         ),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 64,
-            height: 64,
-            decoration: BoxDecoration(color: Colors.white.withAlpha(40), shape: BoxShape.circle),
-            child: const Icon(Icons.receipt_long, color: Colors.white, size: 34),
+          Image.asset(
+            'assets/logo.png',
+            width: 200,
+            errorBuilder: (_, __, ___) => const Text('A2R',
+                style: TextStyle(
+                    fontSize: 46, fontWeight: FontWeight.w900, letterSpacing: 6, color: Colors.white, height: 1.1)),
           ),
           const SizedBox(height: 10),
-          const Text('A2R',
-              style: TextStyle(
-                  fontSize: 46, fontWeight: FontWeight.w900, letterSpacing: 6, color: Colors.white, height: 1.1)),
-          const SizedBox(height: 4),
+          Container(width: 48, height: 3, decoration: BoxDecoration(color: Colors.white38, borderRadius: BorderRadius.circular(2))),
+          const SizedBox(height: 10),
           Text('تجميع إيصالات الدفع', style: TextStyle(fontSize: 14, color: Colors.white.withAlpha(210))),
         ]),
       );
@@ -1571,7 +1570,10 @@ class _LoginScreenState extends State<LoginScreen> {
           child: Column(children: [
             const SizedBox(height: 8),
             const BrandHeader(),
-            const SizedBox(height: 28),
+            Expanded(
+              child: Center(
+                child: SingleChildScrollView(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
             DropdownButtonFormField<String>(
               value: name,
               isExpanded: true,
@@ -1603,7 +1605,10 @@ class _LoginScreenState extends State<LoginScreen> {
                 onChanged: (v) => setState(() => building = v),
               ),
             ],
-            const Spacer(),
+                  ]),
+                ),
+              ),
+            ),
             SizedBox(
               width: double.infinity,
               height: 56,
