@@ -833,9 +833,28 @@ Future<List<String>> scanImages(BuildContext context, int limit,
     if (e.toString().toLowerCase().contains('cancel')) return [];
     if (!context.mounted) return [];
     _scannerFailed = true;
-    final why = e.toString().replaceAll('\n', ' ');
-    snack(context,
-        'الماسح مش شغال على الموبايل ده (${why.length > 80 ? why.substring(0, 80) : why})، هنفتح الكاميرا العادية وبعدها شاشة القص');
+    try {
+      (await SharedPreferences.getInstance())
+          .setInt('scannerFailedAt', DateTime.now().millisecondsSinceEpoch);
+    } catch (_) {}
+    await showDialog<void>(
+      context: context,
+      builder: (c) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: const Text('الماسح مش شغال على الموبايل ده'),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('هنفتح الكاميرا العادية وبعدها شاشة القص. سبب المشكلة:'),
+              const SizedBox(height: 8),
+              SelectableText(e.toString(), textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12)),
+            ]),
+          ),
+          actions: [FilledButton(onPressed: () => Navigator.pop(c), child: const Text('تمام'))],
+        ),
+      ),
+    );
+    if (!context.mounted) return [];
     return simplePick(context, multi: limit > 1);
   } finally {
     scanner.close();
@@ -1040,6 +1059,11 @@ Widget appLogo({double height = 36}) => Image.asset(
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await AppData.loadCached();
+  try {
+    final sp = await SharedPreferences.getInstance();
+    final t = sp.getInt('scannerFailedAt') ?? 0;
+    _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
+  } catch (_) {}
   runApp(const A2RApp());
   unawaited(AppData.refresh());
 }
@@ -2759,7 +2783,14 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   Future<void> _addGallery() async {
     final r = await scanImages(context, 100, mode: kReceiptScanMode);
     if (r.isEmpty || !mounted) return;
+    final start = imgs.length;
     await _saveAll(r);
+    if (_scannerFailed) {
+      for (var i = start; i < imgs.length; i++) {
+        if (!mounted) break;
+        await _edit(i);
+      }
+    }
   }
 
   Future<void> _saveAll(List<String> r) async {
