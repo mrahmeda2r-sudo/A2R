@@ -2,7 +2,9 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:google_mlkit_document_scanner/google_mlkit_document_scanner.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -201,6 +203,22 @@ Future<Rendered> batchStrip(double w, Session s) async {
 }
 
 // ===== بناء الـ PDF =====
+/// تصغير وضغط الصورة (JPEG) عشان الـ PDF يطلع خفيف وميتقلش على التليفون.
+Future<Uint8List> _shrink(String path, {int width = 1280, int quality = 60}) async {
+  try {
+    final out = await FlutterImageCompress.compressWithFile(
+      path,
+      minWidth: width,
+      minHeight: width,
+      quality: quality,
+      format: CompressFormat.jpeg,
+      keepExif: false,
+    );
+    if (out != null) return out;
+  } catch (_) {}
+  return File(path).readAsBytes();
+}
+
 /// صور الإيصالات (كل صورة بورقتها الصغيرة) ثم صورة الباتش في الآخر بالشريط.
 Future<({File pdf, File batchImage})> buildPdf({
   required Session s,
@@ -209,9 +227,12 @@ Future<({File pdf, File batchImage})> buildPdf({
 }) async {
   final doc = pw.Document();
   const pageW = 595.0;
+  Uint8List? batchBytes;
 
+  // صفحة واحدة في كل مرة عشان الذاكرة (تليفونات ضعيفة)
   Future<void> addPage(String path, bool isBatch) async {
-    final bytes = await File(path).readAsBytes();
+    final bytes = await _shrink(path, quality: isBatch ? 70 : 60);
+    if (isBatch) batchBytes = bytes;
     final img = await decodeImage(bytes);
     final w = img.width.toDouble();
     final h = img.height.toDouble();
@@ -237,8 +258,9 @@ Future<({File pdf, File batchImage})> buildPdf({
   final dir = await getApplicationDocumentsDirectory();
   final file = File('${dir.path}/${s.pdfName}.pdf');
   await file.writeAsBytes(await doc.save());
-  // صورة الباتش الأصلية باسم رقم الوحدة (مثلا 2.jpg)
-  final batchImg = await File(batch).copy('${dir.path}/${s.batchName}.jpg');
+  // صورة الباتش (مضغوطة) باسم رقم الوحدة، مثلا 2.jpg
+  final batchImg = File('${dir.path}/${s.batchName}.jpg');
+  await batchImg.writeAsBytes(batchBytes!);
   return (pdf: file, batchImage: batchImg);
 }
 
@@ -379,22 +401,78 @@ class _ScanScreenState extends State<ScanScreen> {
   String? batch;
   bool busy = false;
 
+  bool simple = false; // الوضع البسيط: كاميرا/معرض عادي من غير الماسح
+
+  @override
+  void initState() {
+    super.initState();
+    SharedPreferences.getInstance().then((p) {
+      if (mounted) setState(() => simple = p.getBool('simple') ?? false);
+    });
+  }
+
+  Future<void> _toggleSimple() async {
+    setState(() => simple = !simple);
+    final p = await SharedPreferences.getInstance();
+    await p.setBool('simple', simple);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(simple
+            ? 'الوضع البسيط: كاميرا أو معرض عادي بدون قص'
+            : 'وضع الماسح: قص وتحسين تلقائي')));
+  }
+
   Future<List<String>> _scan(int limit) async {
+    if (simple) return _simplePick(limit > 1);
     final scanner = DocumentScanner(
       options: DocumentScannerOptions(
-        documentFormat: DocumentFormat.jpeg,
         mode: ScannerMode.full,
         pageLimit: limit,
-        isGalleryImport: false,
+        isGalleryImport: true, // الصور من المعرض بتعدي على الماسح زي الكاميرا
       ),
     );
     try {
       final r = await scanner.scanDocument();
       return List<String>.from(r.images ?? const []);
-    } catch (_) {
+    } catch (e) {
+      final m = e.toString();
+      if (mounted && !m.toLowerCase().contains('cancel')) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('الماسح مش شغال على الموبايل ده؟ جرّب الوضع البسيط (الأيقونة فوق)')));
+      }
       return [];
     } finally {
       scanner.close();
+    }
+  }
+
+  Future<List<String>> _simplePick(bool multi) async {
+    final src = await showModalBottomSheet<ImageSource>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: Wrap(children: [
+          ListTile(
+              leading: const Icon(Icons.photo_camera),
+              title: const Text('الكاميرا'),
+              onTap: () => Navigator.pop(c, ImageSource.camera)),
+          ListTile(
+              leading: const Icon(Icons.photo_library),
+              title: const Text('المعرض'),
+              onTap: () => Navigator.pop(c, ImageSource.gallery)),
+        ]),
+      ),
+    );
+    if (src == null) return [];
+    final picker = ImagePicker();
+    try {
+      if (src == ImageSource.gallery && multi) {
+        final xs = await picker.pickMultiImage(maxWidth: 2000, imageQuality: 85);
+        return xs.map((e) => e.path).toList();
+      }
+      final x = await picker.pickImage(source: src, maxWidth: 2000, imageQuality: 85);
+      return x == null ? [] : [x.path];
+    } catch (_) {
+      return [];
     }
   }
 
@@ -411,7 +489,7 @@ class _ScanScreenState extends State<ScanScreen> {
   Future<void> _export() async {
     setState(() => busy = true);
     try {
-      final f = await buildPdf(session: widget.session, receipts: receipts, batch: batch!);
+      final f = await buildPdf(s: widget.session, receipts: receipts, batch: batch!);
       await Share.shareXFiles([XFile(f.pdf.path), XFile(f.batchImage.path)]);
     } catch (e) {
       if (mounted) {
@@ -443,7 +521,16 @@ class _ScanScreenState extends State<ScanScreen> {
     final s = widget.session;
     final canExport = receipts.isNotEmpty && batch != null && !busy;
     return Scaffold(
-      appBar: AppBar(title: Text('${s.name} - ${s.unit.name}')),
+      appBar: AppBar(
+        title: Text('${s.name} - ${s.unit.name}'),
+        actions: [
+          IconButton(
+            tooltip: simple ? 'الوضع البسيط (اضغط للماسح)' : 'وضع الماسح (اضغط للوضع البسيط)',
+            icon: Icon(simple ? Icons.photo_camera : Icons.document_scanner),
+            onPressed: _toggleSimple,
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(children: [
