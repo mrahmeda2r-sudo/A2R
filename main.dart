@@ -2676,6 +2676,407 @@ class _LoginScreenState extends State<LoginScreen> {
 }
 
 // =====================================================================
+//  شاشة الإعدادات
+// =====================================================================
+
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({super.key});
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  PerfMode mode = PerfMode.balanced;
+  int scan = 0, qual = 1, pdfSz = 0, theme = 0;
+  bool autoEdit = false, trim = false, slow = false;
+  AppPalette palSel = AppPalette.gold;
+  bool loaded = false;
+
+  static const _perfOpts = <(PerfMode, String, String)>[
+    (PerfMode.lite, 'اقتصادي (Lite)', 'دقة أقل وبدون كشف حي، للتليفونات القديمة'),
+    (PerfMode.balanced, 'متوازن (Balanced)', 'الوضع الافتراضي'),
+    (PerfMode.pro, 'احترافي (Pro)', 'أعلى جودة، للتليفونات القوية بس'),
+  ];
+
+  // الإعدادات الجاهزة: (الأداء، وضع الماسح، الجودة، حجم الـ PDF)
+  static const _presets = <(PerfMode, int, int, int)>[
+    (PerfMode.lite, 1, 0, 1), // خفيف جداً
+    (PerfMode.balanced, 0, 1, 0), // متوازن
+    (PerfMode.pro, 0, 2, 0), // أعلى جودة
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final m = await Store.perfMode();
+    final sc = await Store.scanSetting();
+    final q = await Store.qualitySetting();
+    final ae = await Store.autoEdit();
+    final tr = await Store.trimMargins();
+    final pz = await Store.pdfSize();
+    final th = await Store.themeSetting();
+    final pl = await Store.paletteSetting();
+    var sl = false;
+    try {
+      sl = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      mode = m;
+      scan = sc;
+      qual = q;
+      autoEdit = ae;
+      trim = tr;
+      pdfSz = pz;
+      theme = th;
+      palSel = AppPalette.values[pl];
+      slow = sl;
+      loaded = true;
+    });
+  }
+
+  /// 0 خفيف جداً، 1 متوازن، 2 أعلى جودة، -1 مخصص
+  int get _preset {
+    for (var i = 0; i < _presets.length; i++) {
+      final p = _presets[i];
+      if (mode == p.$1 && scan == p.$2 && qual == p.$3 && pdfSz == p.$4) return i;
+    }
+    return -1;
+  }
+
+  Future<void> _setPreset(int i) async {
+    final p = _presets[i];
+    final pdfChanged = pdfSz != p.$4;
+    setState(() {
+      mode = p.$1;
+      scan = p.$2;
+      qual = p.$3;
+      pdfSz = p.$4;
+      if (i == 0) {
+        autoEdit = false;
+        trim = false;
+      }
+    });
+    await Store.setPerfMode(p.$1);
+    await Store.setScanSetting(p.$2);
+    await Store.setQualitySetting(p.$3);
+    await Store.setPdfSize(p.$4);
+    if (i == 0) {
+      await Store.setAutoEdit(false);
+      await Store.setTrimMargins(false);
+    }
+    if (pdfChanged) await Store.clearPdf();
+    if (i == 0 && mounted) snack(context, 'اتفعّل وضع التليفون الضعيف: أخف وأسرع بجودة أقل');
+  }
+
+  Future<void> _setMode(PerfMode v) async {
+    setState(() => mode = v);
+    await Store.setPerfMode(v);
+  }
+
+  Future<void> _setScan(int v) async {
+    setState(() => scan = v);
+    await Store.setScanSetting(v);
+  }
+
+  Future<void> _setQual(int v) async {
+    setState(() => qual = v);
+    await Store.setQualitySetting(v);
+  }
+
+  Future<void> _setPdf(int v) async {
+    setState(() => pdfSz = v);
+    await Store.setPdfSize(v);
+    await Store.clearPdf();
+  }
+
+  Future<void> _setTheme(int v) async {
+    setState(() => theme = v);
+    await Store.setThemeSetting(v);
+    appThemeMode.value = _themeOf(v);
+  }
+
+  Future<void> _setPalette(AppPalette v) async {
+    setState(() => palSel = v);
+    await Store.setPaletteSetting(v.index);
+    appPalette.value = v;
+  }
+
+  Future<void> _reset() async {
+    if (!await askYesNo(context, 'إعادة الضبط؟', 'كل الإعدادات هترجع للوضع الافتراضي.',
+        yes: 'إعادة ضبط', no: 'إلغاء')) {
+      return;
+    }
+    await _setPreset(1);
+    setState(() {
+      autoEdit = false;
+      trim = false;
+    });
+    await Store.setAutoEdit(false);
+    await Store.setTrimMargins(false);
+    await _setTheme(0);
+    await _setPalette(AppPalette.gold);
+    if (mounted) snack(context, 'اتعمل إعادة ضبط');
+  }
+
+  // ---------- عناصر ----------
+
+  Widget _sec(String t, {String? sub}) => Padding(
+        padding: const EdgeInsets.fromLTRB(4, 22, 4, 8),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(t, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: kAccent)),
+          if (sub != null)
+            Text(sub, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+        ]),
+      );
+
+  /// أيقونة التليفون الضعيف: تليفون وفوقه ورقة شجر (خفيف).
+  Widget _weakIcon() => SizedBox(
+        width: 32,
+        height: 32,
+        child: Stack(clipBehavior: Clip.none, children: [
+          Center(child: Icon(Icons.phone_android_rounded, size: 30, color: kAccent)),
+          Positioned(right: -3, bottom: -3, child: Icon(Icons.eco_rounded, size: 16, color: kAccent)),
+        ]),
+      );
+
+  Widget _presetCard(
+      {required Widget icon,
+      required String title,
+      required String sub,
+      required bool on,
+      required VoidCallback onTap}) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
+        color: on ? kAccent.withAlpha(28) : cs.surfaceContainerHigh,
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(18),
+          side: BorderSide(color: on ? kAccent : cs.outlineVariant, width: on ? 1.6 : 1),
+        ),
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Row(children: [
+              Container(
+                width: 52,
+                height: 52,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(shape: BoxShape.circle, color: kAccent.withAlpha(30)),
+                child: icon,
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 2),
+                  Text(sub, style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                ]),
+              ),
+              if (on) Icon(Icons.check_circle_rounded, color: kAccent),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _paletteRow() {
+    final cs = Theme.of(context).colorScheme;
+    return Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+      for (final pp in AppPalette.values)
+        InkResponse(
+          onTap: () => _setPalette(pp),
+          radius: 40,
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 50,
+              height: 50,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: kPalettes[pp]!.accent,
+                border: Border.all(color: pp == palSel ? cs.onSurface : Colors.transparent, width: 3),
+              ),
+              child: pp == palSel ? Icon(Icons.check_rounded, color: kPalettes[pp]!.onAccent) : null,
+            ),
+            const SizedBox(height: 6),
+            Text(kPalettes[pp]!.name, style: const TextStyle(fontSize: 12)),
+          ]),
+        ),
+    ]);
+  }
+
+  Widget _radioGroup<T>(List<(T, String, String)> opts, T cur, ValueChanged<T> on) => Column(children: [
+        for (final o in opts)
+          RadioListTile<T>(
+            dense: true,
+            title: Text(o.$2),
+            subtitle: Text(o.$3),
+            value: o.$1,
+            groupValue: cur,
+            onChanged: (v) => on(v as T),
+          ),
+      ]);
+
+  Widget _sub(String t) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 2),
+        child: Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: Text(t, style: const TextStyle(fontWeight: FontWeight.bold))),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final cur = _preset;
+    return Scaffold(
+      appBar: AppBar(title: const Text('الإعدادات')),
+      body: !loaded
+          ? const Center(child: CircularProgressIndicator())
+          : SafeArea(
+              child: ListView(padding: const EdgeInsets.fromLTRB(16, 0, 16, 24), children: [
+                if (slow && cur != 0)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 16),
+                    child: Card(
+                      shape: kCardShape,
+                      color: Colors.orange.withAlpha(30),
+                      child: ListTile(
+                        leading: const Icon(Icons.hourglass_bottom_rounded, color: Colors.orange),
+                        title: const Text('الكاميرا بطيئة على تليفونك؟'),
+                        subtitle: const Text('جرّب وضع التليفون الضعيف تحت'),
+                      ),
+                    ),
+                  ),
+                _sec('نمط الاستخدام', sub: 'اختار اللي يناسب تليفونك'),
+                _presetCard(
+                  icon: _weakIcon(),
+                  title: 'تليفون ضعيف جداً',
+                  sub: 'أقل إعدادات: أخف وأسرع وملفات صغيرة، بجودة أقل',
+                  on: cur == 0,
+                  onTap: () => _setPreset(0),
+                ),
+                _presetCard(
+                  icon: Icon(Icons.balance_rounded, size: 28, color: kAccent),
+                  title: 'متوازن',
+                  sub: 'الافتراضي: أداء كويس وجودة مناسبة',
+                  on: cur == 1,
+                  onTap: () => _setPreset(1),
+                ),
+                _presetCard(
+                  icon: Icon(Icons.diamond_rounded, size: 28, color: kAccent),
+                  title: 'أعلى جودة',
+                  sub: 'أوضح صورة وأكبر حجم، للتليفونات القوية',
+                  on: cur == 2,
+                  onTap: () => _setPreset(2),
+                ),
+                if (cur == -1)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 4),
+                    child: Text('إعداداتك الحالية مخصصة (من قسم متقدم)',
+                        style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  ),
+                _sec('المظهر'),
+                SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<int>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment(
+                          value: 0, label: Text('داكن'), icon: Icon(Icons.dark_mode_rounded)),
+                      ButtonSegment(
+                          value: 1, label: Text('النظام'), icon: Icon(Icons.brightness_auto_rounded)),
+                      ButtonSegment(
+                          value: 2, label: Text('فاتح'), icon: Icon(Icons.light_mode_rounded)),
+                    ],
+                    selected: {theme},
+                    onSelectionChanged: (v) => _setTheme(v.first),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _paletteRow(),
+                _sec('التصوير'),
+                Card(
+                  shape: kCardShape,
+                  child: Column(children: [
+                    SwitchListTile(
+                      title: const Text('أوضاع الفلتر بعد كل صورة'),
+                      subtitle: const Text('تظهر شاشة الفلاتر والقص بعد كل صورة'),
+                      value: autoEdit,
+                      onChanged: (v) {
+                        setState(() => autoEdit = v);
+                        Store.setAutoEdit(v);
+                      },
+                    ),
+                    SwitchListTile(
+                      title: const Text('قص الهوامش البيضاء تلقائياً'),
+                      subtitle: const Text('في فلاتر الإيصال: بيشيل البياض الفاضي حوالين الإيصال'),
+                      value: trim,
+                      onChanged: (v) {
+                        setState(() => trim = v);
+                        Store.setTrimMargins(v);
+                      },
+                    ),
+                  ]),
+                ),
+                _sec('متقدم'),
+                Card(
+                  shape: kCardShape,
+                  clipBehavior: Clip.antiAlias,
+                  child: ExpansionTile(
+                    shape: const Border(),
+                    collapsedShape: const Border(),
+                    leading: const Icon(Icons.tune_rounded),
+                    title: const Text('إعدادات متقدمة'),
+                    subtitle: const Text('الأداء ووضع الماسح وجودة الصورة وحجم الـ PDF'),
+                    children: [
+                      _sub('الأداء'),
+                      _radioGroup<PerfMode>(_perfOpts, mode, _setMode),
+                      const Divider(),
+                      _sub('وضع الماسح'),
+                      _radioGroup<int>(_scanOpts, scan, _setScan),
+                      const Divider(),
+                      _sub('جودة الصورة'),
+                      _radioGroup<int>(_qualOpts, qual, _setQual),
+                      const Divider(),
+                      _sub('حجم ملف الـ PDF'),
+                      _radioGroup<int>(const [
+                        (0, 'كما هو (أعلى جودة)', 'من غير ضغط إضافي'),
+                        (1, 'مضغوط (حجم أصغر)', 'أنسب للنت الضعيف، والكتابة الصغيرة ممكن تقل وضوحها'),
+                      ], pdfSz, _setPdf),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                OutlinedButton.icon(
+                  onPressed: () => AppLog.share(context),
+                  icon: const Icon(Icons.bug_report_rounded),
+                  label: const Text('إرسال سجل الأخطاء'),
+                ),
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  onPressed: _reset,
+                  icon: const Icon(Icons.restart_alt_rounded),
+                  label: const Text('إعادة الضبط للافتراضي'),
+                ),
+                const SizedBox(height: 8),
+                Center(
+                    child: Text('v$kVersion',
+                        style: const TextStyle(fontSize: 11, color: Colors.grey))),
+              ]),
+            ),
+    );
+  }
+}
+
+// =====================================================================
 //  الشاشة الرئيسية
 // =====================================================================
 
@@ -2739,205 +3140,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _showSettings() async {
-    var mode = await Store.perfMode();
-    var scan = await Store.scanSetting();
-    var qual = await Store.qualitySetting();
-    var autoEdit = await Store.autoEdit();
-    var trim = await Store.trimMargins();
-    var pdfSz = await Store.pdfSize();
-    var theme = await Store.themeSetting();
-    var palSel = AppPalette.values[await Store.paletteSetting()];
-    if (!mounted) return;
-    await showDialog(
-      context: context,
-      builder: (c) => StatefulBuilder(
-        builder: (ctx, setS) => Directionality(
-          textDirection: TextDirection.rtl,
-          child: AlertDialog(
-            title: const Text('إعدادات الأداء والكاميرا'),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    child: Align(
-                        alignment: AlignmentDirectional.centerStart,
-                        child: Text('المظهر', style: TextStyle(fontWeight: FontWeight.bold))),
-                  ),
-                  for (final o in const <(int, String)>[(0, 'داكن (الافتراضي)'), (1, 'زي النظام'), (2, 'فاتح')])
-                    RadioListTile<int>(
-                      dense: true,
-                      title: Text(o.$2),
-                      value: o.$1,
-                      groupValue: theme,
-                      onChanged: (v) {
-                        setS(() => theme = v!);
-                        Store.setThemeSetting(v!);
-                        appThemeMode.value = _themeOf(v);
-                      },
-                    ),
-                  const Divider(),
-                  const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    child: Align(
-                        alignment: AlignmentDirectional.centerStart,
-                        child: Text('اللون', style: TextStyle(fontWeight: FontWeight.bold))),
-                  ),
-                  for (final pp in AppPalette.values)
-                    RadioListTile<AppPalette>(
-                      dense: true,
-                      title: Text(kPalettes[pp]!.name),
-                      secondary: CircleAvatar(radius: 11, backgroundColor: kPalettes[pp]!.accent),
-                      value: pp,
-                      groupValue: palSel,
-                      onChanged: (v) {
-                        setS(() => palSel = v!);
-                        Store.setPaletteSetting(v!.index);
-                        appPalette.value = v;
-                        setState(() {});
-                      },
-                    ),
-                  const Divider(),
-                  RadioListTile<PerfMode>(
-                    title: const Text('الوضع الاقتصادي (Lite)'),
-                    subtitle: const Text('أسرع أداء للأجهزة القديمة، يستهلك رامات أقل ويعطل المؤثرات الثقيلة.'),
-                    value: PerfMode.lite,
-                    groupValue: mode,
-                    onChanged: (v) {
-                      setS(() => mode = v!);
-                      Store.setPerfMode(v!);
-                    },
-                  ),
-                  RadioListTile<PerfMode>(
-                    title: const Text('الوضع المتوازن (Balanced)'),
-                    subtitle: const Text('أداء جيد مع جودة ممتازة (الوضع الافتراضي).'),
-                    value: PerfMode.balanced,
-                    groupValue: mode,
-                    onChanged: (v) {
-                      setS(() => mode = v!);
-                      Store.setPerfMode(v!);
-                    },
-                  ),
-                  RadioListTile<PerfMode>(
-                    title: const Text('الوضع الاحترافي (Pro)'),
-                    subtitle: const Text('أعلى جودة تصوير ومعالجة (للأجهزة القوية فقط).'),
-                    value: PerfMode.pro,
-                    groupValue: mode,
-                    onChanged: (v) {
-                      setS(() => mode = v!);
-                      Store.setPerfMode(v!);
-                    },
-                  ),
-                  const Divider(),
-                  const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    child: Align(
-                        alignment: AlignmentDirectional.centerStart,
-                        child: Text('وضع الماسح', style: TextStyle(fontWeight: FontWeight.bold))),
-                  ),
-                  for (final o in _scanOpts)
-                    RadioListTile<int>(
-                      dense: true,
-                      title: Text(o.$2),
-                      subtitle: Text(o.$3),
-                      value: o.$1,
-                      groupValue: scan,
-                      onChanged: (v) {
-                        setS(() => scan = v!);
-                        Store.setScanSetting(v!);
-                      },
-                    ),
-                  const Divider(),
-                  const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    child: Align(
-                        alignment: AlignmentDirectional.centerStart,
-                        child: Text('جودة الصورة', style: TextStyle(fontWeight: FontWeight.bold))),
-                  ),
-                  for (final o in _qualOpts)
-                    RadioListTile<int>(
-                      dense: true,
-                      title: Text(o.$2),
-                      subtitle: Text(o.$3),
-                      value: o.$1,
-                      groupValue: qual,
-                      onChanged: (v) {
-                        setS(() => qual = v!);
-                        Store.setQualitySetting(v!);
-                      },
-                    ),
-                  const Divider(),
-                  SwitchListTile(
-                    dense: true,
-                    title: const Text('أوضاع الفلتر بعد كل صورة'),
-                    subtitle: const Text(
-                        'بعد التصوير أو الاختيار من المعرض تظهر شاشة (أصلي / تحسين / أ/س / إيصال) والقص'),
-                    value: autoEdit,
-                    onChanged: (v) {
-                      setS(() => autoEdit = v);
-                      Store.setAutoEdit(v);
-                    },
-                  ),
-                  SwitchListTile(
-                    dense: true,
-                    title: const Text('قص الهوامش البيضاء تلقائياً'),
-                    subtitle: const Text(
-                        'في فلاتر الإيصال: بيشيل البياض الفاضي حوالين الإيصال لما تضغط ✓ في التعديل'),
-                    value: trim,
-                    onChanged: (v) {
-                      setS(() => trim = v);
-                      Store.setTrimMargins(v);
-                    },
-                  ),
-                  const Divider(),
-                  const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    child: Align(
-                        alignment: AlignmentDirectional.centerStart,
-                        child: Text('حجم ملف الـ PDF', style: TextStyle(fontWeight: FontWeight.bold))),
-                  ),
-                  RadioListTile<int>(
-                    dense: true,
-                    title: const Text('كما هو (أعلى جودة)'),
-                    subtitle: const Text('الصور بتتحط في الـ PDF من غير أي ضغط إضافي'),
-                    value: 0,
-                    groupValue: pdfSz,
-                    onChanged: (v) {
-                      setS(() => pdfSz = v!);
-                      Store.setPdfSize(v!);
-                      Store.clearPdf();
-                    },
-                  ),
-                  RadioListTile<int>(
-                    dense: true,
-                    title: const Text('مضغوط (حجم أصغر)'),
-                    subtitle: const Text('أنسب للإرسال بالنت الضعيف، والكتابة الصغيرة ممكن تقل وضوحها شوية'),
-                    value: 1,
-                    groupValue: pdfSz,
-                    onChanged: (v) {
-                      setS(() => pdfSz = v!);
-                      Store.setPdfSize(v!);
-                      Store.clearPdf();
-                    },
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                  onPressed: () => AppLog.share(ctx), child: const Text('إرسال سجل الأخطاء')),
-              TextButton(
-                  onPressed: () {
-                    Navigator.pop(c);
-                    _reload();
-                  },
-                  child: const Text('إغلاق'))
-            ],
-          ),
-        ),
-      ),
-    );
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen()));
+    if (mounted) _reload();
   }
 
   bool _opening = false;
@@ -4703,7 +4907,8 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _loadView() async {
     final gen = ++_viewGen;
     try {
-      final img = await decodeImage(await File(src!).readAsBytes(), maxWidth: 1000);
+      final lite = await Store.perfMode() == PerfMode.lite;
+      final img = await decodeImage(await File(src!).readAsBytes(), maxWidth: lite ? 700 : 1000);
       final r = await _rotateUi(img, turns);
       if (!mounted || gen != _viewGen) {
         r.dispose();
