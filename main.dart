@@ -3712,6 +3712,7 @@ Uint8List _warpJob(Map<String, dynamic> a) {
 /// ولو فشل أو رجّع null بنرجع للكشف البسيط تحت. بيرجّع TL,TR,BR,BL كنسب، أو null.
 Future<List<Offset>?> detectDocQuad(String path) async {
   final mode = await Store.perfMode();
+  List<Offset>? native;
   if (mode != PerfMode.lite && await _nativeDetectorAllowed()) {
     final sp = await SharedPreferences.getInstance();
     File? tmp;
@@ -3735,7 +3736,7 @@ Future<List<Offset>?> detectDocQuad(String path) async {
           for (final p in c.toList())
             Offset(p.x.clamp(0.0, 1.0).toDouble(), p.y.clamp(0.0, 1.0).toDouble())
         ];
-        if (q.length == 4 && _quadConvex(q)) return q;
+        if (q.length == 4 && _quadConvex(q)) native = q;
       }
     } catch (e, st) {
       AppLog.e('detectDocQuad', e, st);
@@ -3746,7 +3747,23 @@ Future<List<Offset>?> detectDocQuad(String path) async {
       } catch (_) {}
     }
   }
-  return _detectDocQuadSimple(path);
+  final simple = await _detectDocQuadSimple(path);
+  if (native == null) return simple;
+  if (simple == null) return native;
+  // المحرك الأصلي أحياناً بيمسك جزء جوه الإيصال (منطقة الكتابة بس): لو الكشف البسيط
+  // لقى مساحة أكبر بوضوح (والأصلي جواه) نستخدم البسيط عشان القص يشمل الإيصال كامل.
+  final an = _quadArea(native), asimple = _quadArea(simple);
+  if (asimple < 0.97 && an < asimple * 0.85) return simple;
+  return native;
+}
+
+double _quadArea(List<Offset> q) {
+  var a = 0.0;
+  for (var i = 0; i < 4; i++) {
+    final p = q[i], n = q[(i + 1) % 4];
+    a += p.dx * n.dy - n.dx * p.dy;
+  }
+  return a.abs() / 2;
 }
 
 Future<bool> _nativeDetectorAllowed() async {
@@ -3768,128 +3785,229 @@ Future<File?> _smallCopy(String path) async {
   return f;
 }
 
-/// كشف تقريبي بسيط (بيفترض إن الورقة أفتح أو أغمق من الخلفية بشكل واضح).
+/// كشف تقريبي بسيط: الورقة أفتح وأقل تشبعاً بالألوان من الخلفية (خشب/مكتب).
 Future<List<Offset>?> _detectDocQuadSimple(String path) async {
   try {
-    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 128);
+    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 160);
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
     img.dispose();
     if (bd == null || w < 8 || h < 8) return null;
     final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
     final n = w * h;
-    final lum = List<int>.filled(n, 0);
-    final hist = List<int>.filled(256, 0);
+    final feat = Uint8List(n);
     for (var i = 0; i < n; i++) {
-      final y = (px[i * 4] * 54 + px[i * 4 + 1] * 183 + px[i * 4 + 2] * 19) >> 8;
-      lum[i] = y;
-      hist[y]++;
+      final r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+      final y = (r * 54 + g * 183 + b * 19) >> 8;
+      final chroma = math.max(r, math.max(g, b)) - math.min(r, math.min(g, b));
+      final v = y - 2 * chroma; // الخشب ملوّن فبيبقى أغمق، والورقة رمادية فبتفضل فاتحة
+      feat[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
-    // Otsu
-    var sum = 0.0;
-    for (var t = 0; t < 256; t++) {
-      sum += t * hist[t];
-    }
-    var sumB = 0.0, wB = 0.0, bestV = -1.0;
-    var thr = 128;
-    for (var t = 0; t < 256; t++) {
-      wB += hist[t];
-      if (wB == 0) continue;
-      final wF = n - wB;
-      if (wF == 0) break;
-      sumB += t * hist[t];
-      final mB = sumB / wB, mF = (sum - sumB) / wF;
-      final v = wB * wF * (mB - mF) * (mB - mF);
-      if (v > bestV) {
-        bestV = v;
-        thr = t;
-      }
-    }
-    List<bool> maskOf(bool bright) =>
-        List<bool>.generate(n, (i) => bright ? lum[i] > thr : lum[i] <= thr);
-    bool onBorder(int i) {
-      final x = i % w, y = i ~/ w;
-      return x <= 2 || y <= 2 || x >= w - 3 || y >= h - 3;
-    }
-
-    double borderFrac(List<bool> m) {
-      var c = 0, t = 0;
-      for (var i = 0; i < n; i++) {
-        if (!onBorder(i)) continue;
-        t++;
-        if (m[i]) c++;
-      }
-      return t == 0 ? 1 : c / t;
-    }
-
-    var mask = maskOf(true);
-    final inv = maskOf(false);
-    // الورقة هي اللي ما بتلزقش في حدود الصورة
-    if (borderFrac(inv) < borderFrac(mask)) mask = inv;
-    // تآكل بسيط لتنضيف النقط الصغيرة
-    final er = List<bool>.filled(n, false);
-    for (var y = 1; y < h - 1; y++) {
-      for (var x = 1; x < w - 1; x++) {
-        final i = y * w + x;
-        er[i] = mask[i] && mask[i - 1] && mask[i + 1] && mask[i - w] && mask[i + w];
-      }
-    }
-    // أكبر مكوّن متصل
-    final seen = List<bool>.filled(n, false);
-    final queue = List<int>.filled(n, 0);
-    var bestSize = 0;
-    List<int>? best;
-    for (var s0 = 0; s0 < n; s0++) {
-      if (!er[s0] || seen[s0]) continue;
-      var head = 0, tail = 0;
-      queue[tail++] = s0;
-      seen[s0] = true;
-      var tl = s0, tr = s0, br = s0, bl = s0;
-      while (head < tail) {
-        final i = queue[head++];
-        final x = i % w, y = i ~/ w;
-        if (x + y < tl % w + tl ~/ w) tl = i;
-        if (x + y > br % w + br ~/ w) br = i;
-        if (x - y > tr % w - tr ~/ w) tr = i;
-        if (x - y < bl % w - bl ~/ w) bl = i;
-        if (x > 0 && er[i - 1] && !seen[i - 1]) {
-          seen[i - 1] = true;
-          queue[tail++] = i - 1;
-        }
-        if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
-          seen[i + 1] = true;
-          queue[tail++] = i + 1;
-        }
-        if (y > 0 && er[i - w] && !seen[i - w]) {
-          seen[i - w] = true;
-          queue[tail++] = i - w;
-        }
-        if (y < h - 1 && er[i + w] && !seen[i + w]) {
-          seen[i + w] = true;
-          queue[tail++] = i + w;
-        }
-      }
-      if (tail > bestSize) {
-        bestSize = tail;
-        best = [tl, tr, br, bl];
-      }
-    }
-    if (best == null || bestSize < n * 0.12) return null;
-    Offset pt(int i, double ex, double ey) => Offset(
-          (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
-          (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
-        );
-    final q = [
-      pt(best[0], -1.5, -1.5),
-      pt(best[1], 1.5, -1.5),
-      pt(best[2], 1.5, 1.5),
-      pt(best[3], -1.5, 1.5),
-    ];
-    return _quadConvex(q) ? q : null;
+    return _quadFromFeature(feat, w, h);
   } catch (e, st) {
     AppLog.e('_detectDocQuadSimple', e, st);
     return null;
   }
+}
+
+/// الجزء المشترك بين كشف الصورة المصوّرة والكشف الحي من الكاميرا.
+/// feat: قيمة 0..255 لكل بكسل (الورقة غالباً أعلى من الخلفية). بيرجّع TL,TR,BR,BL كنسب.
+List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
+  final n = w * h;
+  final hist = List<int>.filled(256, 0);
+  for (var i = 0; i < n; i++) {
+    hist[feat[i]]++;
+  }
+  // Otsu
+  var sum = 0.0;
+  for (var t = 0; t < 256; t++) {
+    sum += t * hist[t];
+  }
+  var sumB = 0.0, wB = 0.0, bestV = -1.0;
+  var thr = 128;
+  for (var t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (wB == 0) continue;
+    final wF = n - wB;
+    if (wF == 0) break;
+    sumB += t * hist[t];
+    final mB = sumB / wB, mF = (sum - sumB) / wF;
+    final v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > bestV) {
+      bestV = v;
+      thr = t;
+    }
+  }
+  List<bool> maskOf(bool bright) =>
+      List<bool>.generate(n, (i) => bright ? feat[i] > thr : feat[i] <= thr);
+  bool onBorder(int i) {
+    final x = i % w, y = i ~/ w;
+    return x <= 2 || y <= 2 || x >= w - 3 || y >= h - 3;
+  }
+
+  double borderFrac(List<bool> m) {
+    var c = 0, t = 0;
+    for (var i = 0; i < n; i++) {
+      if (!onBorder(i)) continue;
+      t++;
+      if (m[i]) c++;
+    }
+    return t == 0 ? 1 : c / t;
+  }
+
+  var mask = maskOf(true);
+  final inv = maskOf(false);
+  // الورقة هي اللي ما بتلزقش في حدود الصورة
+  if (borderFrac(inv) < borderFrac(mask)) mask = inv;
+  // قفل الثقوب الصغيرة (الكتابة) ثم تآكل بسيط لتنضيف النقط الصغيرة
+  final dil = List<bool>.filled(n, false);
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = y * w + x;
+      dil[i] = mask[i] || mask[i - 1] || mask[i + 1] || mask[i - w] || mask[i + w];
+    }
+  }
+  final er = List<bool>.filled(n, false);
+  for (var y = 2; y < h - 2; y++) {
+    for (var x = 2; x < w - 2; x++) {
+      final i = y * w + x;
+      er[i] = dil[i] && dil[i - 1] && dil[i + 1] && dil[i - w] && dil[i + w] && mask[i];
+    }
+  }
+  // أكبر مكوّن متصل
+  final seen = List<bool>.filled(n, false);
+  final queue = List<int>.filled(n, 0);
+  var bestSize = 0;
+  List<int>? best;
+  for (var s0 = 0; s0 < n; s0++) {
+    if (!er[s0] || seen[s0]) continue;
+    var head = 0, tail = 0;
+    queue[tail++] = s0;
+    seen[s0] = true;
+    var tl = s0, tr = s0, br = s0, bl = s0;
+    while (head < tail) {
+      final i = queue[head++];
+      final x = i % w, y = i ~/ w;
+      if (x + y < tl % w + tl ~/ w) tl = i;
+      if (x + y > br % w + br ~/ w) br = i;
+      if (x - y > tr % w - tr ~/ w) tr = i;
+      if (x - y < bl % w - bl ~/ w) bl = i;
+      if (x > 0 && er[i - 1] && !seen[i - 1]) {
+        seen[i - 1] = true;
+        queue[tail++] = i - 1;
+      }
+      if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
+        seen[i + 1] = true;
+        queue[tail++] = i + 1;
+      }
+      if (y > 0 && er[i - w] && !seen[i - w]) {
+        seen[i - w] = true;
+        queue[tail++] = i - w;
+      }
+      if (y < h - 1 && er[i + w] && !seen[i + w]) {
+        seen[i + w] = true;
+        queue[tail++] = i + w;
+      }
+    }
+    if (tail > bestSize) {
+      bestSize = tail;
+      best = [tl, tr, br, bl];
+    }
+  }
+  if (best == null || bestSize < n * 0.08) return null;
+  Offset pt(int i, double ex, double ey) => Offset(
+        (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
+        (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
+      );
+  final q = [
+    pt(best[0], -1.5, -1.5),
+    pt(best[1], 1.5, -1.5),
+    pt(best[2], 1.5, 1.5),
+    pt(best[3], -1.5, 1.5),
+  ];
+  return _quadConvex(q) ? q : null;
+}
+
+/// كشف حي من إطار الكاميرا (YUV420): بيلف الإطار لوضع رأسي ويصغّره لشبكة صغيرة.
+List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
+  if (f.planes.length < 3) return null;
+  final W = f.width, H = f.height;
+  final swap = rot == 90 || rot == 270;
+  final upW = swap ? H : W, upH = swap ? W : H;
+  const gw = 96;
+  final gh = math.max(8, (gw * upH / upW).round());
+  final yp = f.planes[0], up = f.planes[1], vp = f.planes[2];
+  final ub = up.bytesPerPixel ?? 1, vb = vp.bytesPerPixel ?? 1;
+  final feat = Uint8List(gw * gh);
+  for (var gy = 0; gy < gh; gy++) {
+    final yu = (((gy + 0.5) * upH / gh).floor()).clamp(0, upH - 1);
+    for (var gx = 0; gx < gw; gx++) {
+      final xu = (((gx + 0.5) * upW / gw).floor()).clamp(0, upW - 1);
+      int sx, sy;
+      switch (rot) {
+        case 90:
+          sx = yu;
+          sy = H - 1 - xu;
+          break;
+        case 270:
+          sx = W - 1 - yu;
+          sy = xu;
+          break;
+        case 180:
+          sx = W - 1 - xu;
+          sy = H - 1 - yu;
+          break;
+        default:
+          sx = xu;
+          sy = yu;
+      }
+      final y = yp.bytes[sy * yp.bytesPerRow + sx];
+      final cx = sx >> 1, cy = sy >> 1;
+      final ci = cy * up.bytesPerRow + cx * ub;
+      final vi = cy * vp.bytesPerRow + cx * vb;
+      var chroma = 0;
+      if (ci < up.bytes.length && vi < vp.bytes.length) {
+        chroma = (up.bytes[ci] - 128).abs() + (vp.bytes[vi] - 128).abs();
+      }
+      final v = y - (chroma * 1.5).round();
+      feat[gy * gw + gx] = v < 0 ? 0 : (v > 255 ? 255 : v);
+    }
+  }
+  final q = _quadFromFeature(feat, gw, gh);
+  if (q == null || _quadArea(q) > 0.97) return null;
+  return q;
+}
+
+class _LiveQuadPainter extends CustomPainter {
+  final List<Offset> q;
+  const _LiveQuadPainter(this.q);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final pts = [for (final o in q) Offset(o.dx * size.width, o.dy * size.height)];
+    final path = Path()..addPolygon(pts, true);
+    const col = Color(0xFF1EC8A5);
+    canvas.drawPath(path, Paint()..color = col.withOpacity(0.18));
+    canvas.drawPath(
+        path,
+        Paint()
+          ..color = col
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3
+          ..strokeJoin = StrokeJoin.round);
+    for (final p in pts) {
+      canvas.drawCircle(p, 6, Paint()..color = Colors.white);
+      canvas.drawCircle(
+          p,
+          6,
+          Paint()
+            ..color = col
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _LiveQuadPainter old) => old.q != q;
 }
 
 /// بترجّع مسار الصورة الجديدة بعد التعديل، أو null لو الموظف رجع من غير تأكيد.
@@ -5442,6 +5560,9 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   String? _thumb;
   double _minZoom = 1, _maxZoom = 1, _zoom = 1, _zoom0 = 1;
   Offset? _focusAt;
+  List<Offset>? _liveQuad; // التحديد التلقائي الحي فوق المعاينة
+  bool _live = false, _liveBusy = false;
+  int _lastLive = 0, _liveMiss = 0;
 
   static const _flashIcons = [Icons.flash_off, Icons.flash_auto, Icons.flash_on, Icons.highlight];
   static const _flashNames = ['الفلاش مقفول', 'فلاش تلقائي', 'فلاش', 'كشاف'];
@@ -5479,6 +5600,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     if (c == null) return;
     if (state == AppLifecycleState.inactive) {
       _c = null;
+      _live = false;
+      _liveQuad = null;
       c.dispose();
       if (mounted) setState(() => _ready = false);
     }
@@ -5490,6 +5613,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     try {
       final old = _c;
       _c = null;
+      _live = false;
+      _liveQuad = null;
       if (mounted) setState(() => _ready = false);
       await old?.dispose();
       final cams = await cam.availableCameras();
@@ -5500,8 +5625,11 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final preset = _hd && perf != PerfMode.lite
           ? cam.ResolutionPreset.ultraHigh
           : cam.ResolutionPreset.veryHigh;
+      // YUV420 عشان نقدر نحلل الإطارات للتحديد الحي (التصوير نفسه لسه JPEG)
       final c = cam.CameraController(back, preset,
-          enableAudio: false, imageFormatGroup: cam.ImageFormatGroup.jpeg);
+          enableAudio: false,
+          imageFormatGroup:
+              Platform.isAndroid ? cam.ImageFormatGroup.yuv420 : cam.ImageFormatGroup.bgra8888);
       await c.initialize();
       try {
         await c.lockCaptureOrientation(DeviceOrientation.portraitUp);
@@ -5522,11 +5650,58 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         _ready = true;
         _err = null;
       });
+      unawaited(_startLive(c));
     } catch (e, st) {
       AppLog.e('cam.start', e, st);
       if (mounted) setState(() => _err = errText(e));
     } finally {
       _starting = false;
+    }
+  }
+
+  Future<void> _startLive(cam.CameraController c) async {
+    if (_live || !mounted || !c.value.isInitialized || c.value.isStreamingImages) return;
+    try {
+      if (await Store.perfMode() == PerfMode.lite) return;
+      _liveMiss = 0;
+      await c.startImageStream(_onFrame);
+      _live = true;
+    } catch (e, st) {
+      AppLog.e('cam.live', e, st);
+    }
+  }
+
+  Future<void> _stopLive() async {
+    final c = _c;
+    _live = false;
+    _liveQuad = null;
+    if (c == null) return;
+    try {
+      if (c.value.isStreamingImages) await c.stopImageStream();
+    } catch (_) {}
+  }
+
+  void _onFrame(cam.CameraImage f) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (!_live || _liveBusy || now - _lastLive < 200 || !mounted) return;
+    _liveBusy = true;
+    _lastLive = now;
+    try {
+      var q = _liveDetect(f, _c?.description.sensorOrientation ?? 90);
+      final prev = _liveQuad;
+      if (q == null) {
+        if (++_liveMiss <= 3) return; // نثبّت آخر تحديد شوية بدل ما يومض
+      } else {
+        _liveMiss = 0;
+        if (prev != null) {
+          q = [for (var i = 0; i < 4; i++) Offset.lerp(prev[i], q[i], 0.5)!];
+        }
+      }
+      if (mounted && _live) setState(() => _liveQuad = q);
+    } catch (e, st) {
+      AppLog.e('cam.liveFrame', e, st);
+    } finally {
+      _liveBusy = false;
     }
   }
 
@@ -5588,6 +5763,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     setState(() => _shooting = true);
     try {
       HapticFeedback.mediumImpact();
+      await _stopLive();
       final x = await c.takePicture();
       try {
         await c.pausePreview();
@@ -5603,7 +5779,11 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       AppLog.e('cam.shot', e, st);
       if (mounted) snack(context, 'تعذر التصوير: ${errText(e)}');
     } finally {
-      if (mounted) setState(() => _shooting = false);
+      if (mounted) {
+        setState(() => _shooting = false);
+        final cc = _c;
+        if (cc != null) unawaited(_startLive(cc));
+      }
     }
   }
 
@@ -5623,6 +5803,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     final g = widget.onGallery;
     if (g == null) return;
     final c = _c;
+    await _stopLive();
     try {
       await c?.pausePreview();
     } catch (_) {}
@@ -5631,6 +5812,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     try {
       await c?.resumePreview();
     } catch (_) {}
+    if (c != null && identical(c, _c)) unawaited(_startLive(c));
     _apply(s);
   }
 
@@ -5731,6 +5913,10 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     return LayoutBuilder(builder: (ctx, cons) {
       final box = Size(cons.maxWidth, cons.maxHeight);
       final ar = 1 / c.value.aspectRatio; // عرض/طول في الوضع الرأسي
+      final pw0 = ar * 1000, ph0 = 1000.0;
+      final sc = math.min(box.width / pw0, box.height / ph0);
+      final pvW = pw0 * sc, pvH = ph0 * sc;
+      final pvL = (box.width - pvW) / 2, pvT = (box.height - pvH) / 2;
       return GestureDetector(
         onTapDown: (d) => _tapFocus(d, box),
         onScaleStart: (_) => _zoom0 = _zoom,
@@ -5751,6 +5937,14 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
             ),
           ),
           if (_grid) const Positioned.fill(child: IgnorePointer(child: CustomPaint(painter: _GridPainter()))),
+          if (_liveQuad != null)
+            Positioned(
+              left: pvL,
+              top: pvT,
+              width: pvW,
+              height: pvH,
+              child: IgnorePointer(child: CustomPaint(painter: _LiveQuadPainter(_liveQuad!))),
+            ),
           if (_focusAt != null)
             Positioned(
               left: _focusAt!.dx - 30,
