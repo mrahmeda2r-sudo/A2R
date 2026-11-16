@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
 
@@ -171,4 +172,18 @@ jobs:
         with:
           tag_name: v1.${{ github.run_number }}
           name: A2R v1.${{ github.run_number }}
+          body: "Commit ${{ github.sha }}"
           files: A2R.apk
+          fail_on_unmatched_files: true
+          make_latest: true
+
+      - name: Keep only the latest 5 releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 200 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[5:][].tagName' |
+          while read -r tag; do
+            echo "Deleting old release $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done
