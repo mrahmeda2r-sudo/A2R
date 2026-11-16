@@ -252,8 +252,91 @@ class AppData {
 //  أدوات الصور (خفيفة على الذاكرة)
 // =====================================================================
 
-// receipt لازم يفضل آخر واحد (عشان الإعدادات المحفوظة)
-enum ScanFilter { original, enhance, bw, receipt }
+// الفلتر بيتخزن بالرقم (index) في الإعدادات وفي EditParams: الأربعة الأولانيين مايتحركوش من مكانهم،
+// وأي فلتر جديد بيتضاف في الآخر بس، عشان الصور والإعدادات القديمة تفضل شغالة.
+enum ScanFilter {
+  original,
+  enhance,
+  bw,
+  receipt,
+  gray,
+  lighten,
+  magic,
+  document,
+  sharpen,
+  thermal,
+  receiptBw,
+  auto,
+}
+
+/// ترتيب وأسماء الفلاتر في الشاشة (الإيصالات الأول لأنها الأهم).
+const kFilterOrder = <ScanFilter>[
+  ScanFilter.original,
+  ScanFilter.receipt,
+  ScanFilter.thermal,
+  ScanFilter.receiptBw,
+  ScanFilter.auto,
+  ScanFilter.enhance,
+  ScanFilter.magic,
+  ScanFilter.document,
+  ScanFilter.bw,
+  ScanFilter.gray,
+  ScanFilter.lighten,
+  ScanFilter.sharpen,
+];
+
+const kFilterLabels = <ScanFilter, String>{
+  ScanFilter.original: 'أصلي',
+  ScanFilter.receipt: 'إيصال',
+  ScanFilter.thermal: 'حراري باهت',
+  ScanFilter.receiptBw: 'إيصال أ/س',
+  ScanFilter.auto: 'تلقائي',
+  ScanFilter.enhance: 'تحسين',
+  ScanFilter.magic: 'ألوان',
+  ScanFilter.document: 'مستند',
+  ScanFilter.bw: 'أ/س',
+  ScanFilter.gray: 'رمادي',
+  ScanFilter.lighten: 'تفتيح',
+  ScanFilter.sharpen: 'حدة',
+};
+
+/// فلاتر الإيصال: بتعدي على _cleanJob (تقدير لون الورق وقسمة الصورة عليه) قبل أي مصفوفة ألوان.
+bool isCleanFilter(ScanFilter f) =>
+    f == ScanFilter.receipt || f == ScanFilter.thermal || f == ScanFilter.receiptBw;
+
+/// الحراري الباهت وإيصال الأبيض والأسود بيستخدموا منحنى أقوى عشان الكتابة الخفيفة متختفيش.
+bool usesThermalClean(ScanFilter f) => f == ScanFilter.thermal || f == ScanFilter.receiptBw;
+
+/// قوة الحدة الفعلية: فلتر "حدة" بيضمن حد أدنى حتى لو السلايدر على صفر.
+double effSharpness(ScanFilter f, double s) => f == ScanFilter.sharpen ? math.max(s, 0.7) : s;
+
+/// شريط الفلاتر (بيتمرر أفقياً) ومشترك بين المحرر وشاشة الإيصالات.
+class FilterBar extends StatelessWidget {
+  final ScanFilter selected;
+  final ValueChanged<ScanFilter>? onChanged;
+  const FilterBar({super.key, required this.selected, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 44,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [
+          for (final f in kFilterOrder)
+            Padding(
+              padding: const EdgeInsetsDirectional.only(end: 6),
+              child: ChoiceChip(
+                label: Text(kFilterLabels[f] ?? f.name),
+                selected: f == selected,
+                onSelected: onChanged == null ? null : (_) => onChanged!(f),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
 
 String errText(Object e) {
   if (e is FileSystemException && (e.osError?.errorCode == 28)) {
@@ -286,6 +369,68 @@ Uint8List _matrixJob(Map<String, dynamic> a) {
     out[i + 3] = 255;
   }
   return out;
+}
+
+/// حدة (Unsharp 3x3) على الـ CPU في Isolate. k من 0 لـ 1.
+Uint8List _sharpenJob(Map<String, dynamic> a) {
+  final src = a['src'] as Uint8List;
+  final w = a['w'] as int, h = a['h'] as int;
+  final k = ((a['k'] as num).toDouble() * 0.8).clamp(0.0, 0.9).toDouble();
+  final out = Uint8List.fromList(src);
+  final row = w * 4;
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = (y * w + x) * 4;
+      for (var c = 0; c < 3; c++) {
+        final j = i + c;
+        final v = src[j] * (1 + 4 * k) - k * (src[j - 4] + src[j + 4] + src[j - row] + src[j + row]);
+        out[j] = v < 0 ? 0 : (v > 255 ? 255 : v.round());
+      }
+    }
+  }
+  return out;
+}
+
+/// مستويات "التحسين التلقائي": أدنى قيمة للحبر، وأعلى قيمة لكل قناة (لون الورق) من نسخة مصغرة جداً (160px).
+/// بيرجّع [أدنى، أعلى R، أعلى G، أعلى B] أو null.
+Future<List<double>?> autoLevelsOf(Uint8List bytes) async {
+  try {
+    final img = await decodeImage(bytes, maxWidth: 160);
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    img.dispose();
+    if (bd == null) return null;
+    final px = _bytesOf(bd);
+    final n = px.length ~/ 4;
+    if (n < 16) return null;
+    final hl = List<int>.filled(256, 0);
+    final hc = List.generate(3, (_) => List<int>.filled(256, 0));
+    for (var i = 0; i < n; i++) {
+      final r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+      hl[(r * 54 + g * 183 + b * 19) >> 8]++;
+      hc[0][r]++;
+      hc[1][g]++;
+      hc[2][b]++;
+    }
+    int pct(List<int> h, double p) {
+      final target = (n * p).floor();
+      var acc = 0;
+      for (var t = 0; t < 256; t++) {
+        acc += h[t];
+        if (acc >= target) return t;
+      }
+      return 255;
+    }
+
+    final lo = pct(hl, 0.01).clamp(0, 90).toInt();
+    final out = <double>[lo.toDouble()];
+    for (var c = 0; c < 3; c++) {
+      out.add(pct(hc[c], 0.85).clamp(lo + 70, 255).toDouble());
+    }
+    return out;
+  } catch (e, st) {
+    AppLog.e('autoLevelsOf', e, st);
+    return null;
+  }
 }
 
 Uint8List _rotateJob(Map<String, dynamic> a) {
@@ -342,49 +487,127 @@ Future<double> imageAspect(String path) async {
 }
 
 /// مصفوفة الألوان النهائية: الفلتر الأساسي + تباين وسطوع (نفس المصفوفة للمعاينة وللحفظ).
-List<double> editMatrix(ScanFilter f, double contrast, double brightness) {
+/// y = k * (w·rgb + t0 - 127.5) + 127.5 + سطوع.  lv = مستويات "التلقائي": [أدنى، أعلى R، أعلى G، أعلى B].
+List<double> editMatrix(ScanFilter f, double contrast, double brightness, [List<double>? lv]) {
   late List<List<double>> w;
-  late double t0;
+  late List<double> t0; // إزاحة لكل قناة (R,G,B)
+  const lr = 0.2126, lg = 0.7152, lb = 0.0722;
+
+  List<List<double>> sat(double s, double c) => [
+        [c * (lr * (1 - s) + s), c * lg * (1 - s), c * lb * (1 - s)],
+        [c * lr * (1 - s), c * (lg * (1 - s) + s), c * lb * (1 - s)],
+        [c * lr * (1 - s), c * lg * (1 - s), c * (lb * (1 - s) + s)],
+      ];
+
   switch (f) {
     case ScanFilter.original:
     case ScanFilter.receipt: // المعالجة الحقيقية في _cleanJob، والمصفوفة هنا للتباين والسطوع بس
+    case ScanFilter.thermal:
+    case ScanFilter.sharpen: // الحدة بتتطبق في _sharpenJob
       w = [
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
         [0.0, 0.0, 1.0],
       ];
-      t0 = 0;
+      t0 = [0.0, 0.0, 0.0];
       break;
     case ScanFilter.enhance:
-      const c = 1.3;
-      w = [
-        [c, 0.0, 0.0],
-        [0.0, c, 0.0],
-        [0.0, 0.0, c],
-      ];
-      t0 = 127.5 * (1 - c) + 10;
-      break;
+      {
+        const c = 1.3;
+        w = [
+          [c, 0.0, 0.0],
+          [0.0, c, 0.0],
+          [0.0, 0.0, c],
+        ];
+        t0 = List<double>.filled(3, 127.5 * (1 - c) + 10);
+        break;
+      }
     case ScanFilter.bw:
-      // أبيض وأسود عالي التباين (مناسب للإيصالات الحرارية الباهتة)
-      const c = 1.7;
-      const r = 0.2126 * c, g = 0.7152 * c, b = 0.0722 * c;
+      {
+        // أبيض وأسود عالي التباين (مناسب للإيصالات الحرارية الباهتة)
+        const c = 1.7;
+        const r = lr * c, g = lg * c, b = lb * c;
+        w = [
+          [r, g, b],
+          [r, g, b],
+          [r, g, b],
+        ];
+        t0 = List<double>.filled(3, 127.5 * (1 - c) + 40);
+        break;
+      }
+    case ScanFilter.gray:
       w = [
-        [r, g, b],
-        [r, g, b],
-        [r, g, b],
+        [lr, lg, lb],
+        [lr, lg, lb],
+        [lr, lg, lb],
       ];
-      t0 = 127.5 * (1 - c) + 40;
+      t0 = [0.0, 0.0, 0.0];
       break;
+    case ScanFilter.lighten:
+      {
+        const c = 1.1;
+        w = [
+          [c, 0.0, 0.0],
+          [0.0, c, 0.0],
+          [0.0, 0.0, c],
+        ];
+        t0 = List<double>.filled(3, 38.0);
+        break;
+      }
+    case ScanFilter.magic:
+      {
+        // ألوان أنشط وتباين أعلى
+        const c = 1.2;
+        w = sat(1.4, c);
+        t0 = List<double>.filled(3, 127.5 * (1 - c) + 12);
+        break;
+      }
+    case ScanFilter.document:
+      {
+        // ألوان أهدى وورق أنصع ونص أغمق
+        const c = 1.35;
+        w = sat(0.75, c);
+        t0 = List<double>.filled(3, 127.5 * (1 - c) + 22);
+        break;
+      }
+    case ScanFilter.receiptBw:
+      {
+        // بعد تنضيف الإيصال: أبيض وأسود بانتقال ناعم (مش قطع حاد) عشان الأرقام الصغيرة متتقطعش
+        const lo = 150.0, hi = 215.0, s = 255 / (hi - lo);
+        w = [
+          [lr * s, lg * s, lb * s],
+          [lr * s, lg * s, lb * s],
+          [lr * s, lg * s, lb * s],
+        ];
+        t0 = List<double>.filled(3, -lo * s);
+        break;
+      }
+    case ScanFilter.auto:
+      {
+        final l = (lv != null && lv.length == 4) ? lv : const <double>[0.0, 255.0, 255.0, 255.0];
+        final lo = l[0];
+        double sc(int c) => 255 / math.max(40.0, l[1 + c] - lo);
+        w = [
+          [sc(0), 0.0, 0.0],
+          [0.0, sc(1), 0.0],
+          [0.0, 0.0, sc(2)],
+        ];
+        t0 = [-sc(0) * lo, -sc(1) * lo, -sc(2) * lo];
+        break;
+      }
   }
   final k = 1 + contrast;
-  final t = k * (t0 - 127.5) + 127.5 + brightness * 100;
   return [
-    for (final row in w) ...[k * row[0], k * row[1], k * row[2], 0.0, t],
+    for (var i = 0; i < 3; i++) ...[
+      k * w[i][0],
+      k * w[i][1],
+      k * w[i][2],
+      0.0,
+      k * (t0[i] - 127.5) + 127.5 + brightness * 100,
+    ],
     0.0, 0.0, 0.0, 1.0, 0.0, // صف الشفافية: ColorFilter.matrix لازم 20 رقم وإلا التطبيق يقفل
   ];
 }
-
-List<double> _matrix(ScanFilter f) => editMatrix(f, 0, 0);
 
 /// فلتر "إيصال": بيقسم الصورة بلاطات، يقدّر لون الورق في كل بلاطة (أفتح 20%)،
 /// ويقسم الصورة عليه. النتيجة: ورق أبيض متساوي، الأزرق/الظلال بتروح، الحبر يفضل واضح.
@@ -393,6 +616,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   final src = a['src'] as Uint8List;
   final w = a['w'] as int, h = a['h'] as int;
   final gray = a['gray'] as bool;
+  final th = (a['th'] as bool?) ?? false; // حراري باهت: منحنى أقوى وحدة أعلى
   final bs = math.max(16, (math.max(w, h) / 40).round());
   final gw = (w + bs - 1) ~/ bs, gh = (h + bs - 1) ~/ bs;
   final bg = List.generate(3, (_) => List<double>.filled(gw * gh, 255.0));
@@ -462,8 +686,9 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   }
 
   // أي قيمة من 238 لفوق = أبيض صافي (بيضغط أحسن بكتير)، وجاما خفيفة بتغمّق الحبر
+  final wp = th ? 245.0 : 238.0, gam = th ? 2.0 : 1.25;
   final lut = List<int>.generate(
-      256, (i) => (255 * math.pow(math.min(1.0, i / 238), 1.25)).round().clamp(0, 255).toInt());
+      256, (i) => (255 * math.pow(math.min(1.0, i / wp), gam)).round().clamp(0, 255).toInt());
 
   final cx0 = List<int>.filled(w, 0), cx1 = List<int>.filled(w, 0);
   final ctx = List<double>.filled(w, 0);
@@ -505,7 +730,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   }
 
   // حدة خفيفة (Unsharp) تحسّن النص المهتز شوية
-  const k = 0.35;
+  final k = th ? 0.6 : 0.35;
   final cp = Uint8List.fromList(out);
   final row = w * 4;
   for (var y = 1; y < h - 1; y++) {
@@ -522,7 +747,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
 }
 
 /// بتطبّق فلتر الإيصال على ui.Image وبترجّع صورة جديدة (الأصلية مبتتمسحش).
-Future<ui.Image> cleanUiImage(ui.Image img, {bool gray = false}) async {
+Future<ui.Image> cleanUiImage(ui.Image img, {bool gray = false, bool thermal = false}) async {
   final w = img.width, h = img.height;
   final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
   if (bd == null) throw Exception('تعذر قراءة الصورة');
@@ -531,6 +756,7 @@ Future<ui.Image> cleanUiImage(ui.Image img, {bool gray = false}) async {
     'w': w,
     'h': h,
     'gray': gray,
+    'th': thermal,
   });
   final comp = Completer<ui.Image>();
   ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
@@ -543,12 +769,27 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
     final img = await decodeImage(bytes);
     final w = img.width, h = img.height;
     ui.Image out;
-    if (f == ScanFilter.receipt) {
-      out = await cleanUiImage(img);
+    if (isCleanFilter(f)) {
+      var c = await cleanUiImage(img, thermal: usesThermalClean(f));
+      if (f == ScanFilter.receiptBw) {
+        final raw = await c.toByteData(format: ui.ImageByteFormat.rawRgba);
+        if (raw == null) throw Exception('تعذر قراءة الصورة');
+        final bwRgba =
+            await compute(_matrixJob, <String, dynamic>{'src': _bytesOf(raw), 'm': editMatrix(f, 0, 0)});
+        c.dispose();
+        c = await _imageFromRgba(bwRgba, w, h);
+      }
+      out = c;
     } else {
       final raw = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
       if (raw == null) throw Exception('تعذر قراءة الصورة');
-      final rgba = await compute(_matrixJob, <String, dynamic>{'src': _bytesOf(raw), 'm': _matrix(f)});
+      final lv = f == ScanFilter.auto ? await autoLevelsOf(bytes) : null;
+      var rgba = await compute(
+          _matrixJob, <String, dynamic>{'src': _bytesOf(raw), 'm': editMatrix(f, 0, 0, lv)});
+      if (f == ScanFilter.sharpen) {
+        rgba = await compute(
+            _sharpenJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': effSharpness(f, 0)});
+      }
       out = await _imageFromRgba(rgba, w, h);
     }
     final bd = await out.toByteData(format: ui.ImageByteFormat.png);
@@ -3128,6 +3369,8 @@ class EditParams {
   final ScanFilter filter;
   final double contrast; // -0.5 .. 1
   final double brightness; // -1 .. 1
+  final double sharp; // حدة 0 .. 1
+  final List<double>? levels; // مستويات التحسين التلقائي
   const EditParams({
     this.quad,
     this.turns = 0,
@@ -3135,6 +3378,8 @@ class EditParams {
     this.filter = ScanFilter.original,
     this.contrast = 0,
     this.brightness = 0,
+    this.sharp = 0,
+    this.levels,
   });
 
   String encode() => jsonEncode({
@@ -3147,6 +3392,8 @@ class EditParams {
         'f': filter.index,
         'c': contrast,
         'b': brightness,
+        if (sharp > 0) 's': sharp,
+        if (levels != null) 'lv': levels,
       });
 
   static EditParams? decode(String? s) {
@@ -3167,6 +3414,10 @@ class EditParams {
         filter: ScanFilter.values[fi],
         contrast: ((m['c'] as num?) ?? 0).toDouble(),
         brightness: ((m['b'] as num?) ?? 0).toDouble(),
+        sharp: ((m['s'] as num?) ?? 0).toDouble().clamp(0.0, 1.0).toDouble(),
+        levels: (m['lv'] is List && (m['lv'] as List).length == 4)
+            ? [for (final e in (m['lv'] as List)) (e as num).toDouble()]
+            : null,
       );
     } catch (e, st) {
       AppLog.e('EditParams.decode', e, st);
@@ -3533,10 +3784,24 @@ class _EditorPageState extends State<EditorPage> {
   bool _quadTouched = false; // الموظف حدد الإطار بنفسه: القص التلقائي المتأخر ميلمسوش
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
   int _viewGen = 0;
-  ui.Image? cleaned; // نسخة منضّفة للمعاينة لما الفلتر = إيصال
+  ui.Image? cleaned; // نسخة منضّفة للمعاينة لما الفلتر من فلاتر الإيصال
+  bool _cleanedThermal = false; // النسخة المنضّفة دي بالمنحنى الحراري ولا العادي
   int _cleanGen = 0;
+  double sharp = 0; // حدة يدوية 0..1
+  List<double>? levels; // مستويات التحسين التلقائي (بتتحسب مرة واحدة من نسخة مصغرة)
+  ui.Image? sharpImg; // نسخة المعاينة بعد الحدة (بتتحدّث لما السلايدر يقف)
+  ui.Image? _sharpBase; // الصورة اللي اتحسبت منها sharpImg
+  int _sharpGen = 0;
 
-  ui.Image get _shown => (filter == ScanFilter.receipt && cleaned != null) ? cleaned! : view!;
+  bool get _cleanReady =>
+      isCleanFilter(filter) && cleaned != null && _cleanedThermal == usesThermalClean(filter);
+  ui.Image get _base => _cleanReady ? cleaned! : view!;
+  ui.Image get _shown {
+    final b = _base;
+    return (effSharpness(filter, sharp) > 0 && sharpImg != null && identical(_sharpBase, b))
+        ? sharpImg!
+        : b;
+  }
 
   @override
   void initState() {
@@ -3548,6 +3813,7 @@ class _EditorPageState extends State<EditorPage> {
   void dispose() {
     view?.dispose();
     cleaned?.dispose();
+    sharpImg?.dispose();
     super.dispose();
   }
 
@@ -3555,17 +3821,95 @@ class _EditorPageState extends State<EditorPage> {
     final v = view;
     if (v == null) return;
     final gen = ++_cleanGen;
+    final th = usesThermalClean(filter);
     try {
-      final c = await cleanUiImage(v);
+      final c = await cleanUiImage(v, thermal: th);
       if (!mounted || gen != _cleanGen || view != v) {
         c.dispose();
         return;
       }
       final old = cleaned;
-      setState(() => cleaned = c);
+      setState(() {
+        cleaned = c;
+        _cleanedThermal = th;
+      });
       WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
+      _resharp();
     } catch (e, st) {
       AppLog.e('_makeClean', e, st);
+    }
+  }
+
+  /// نسخة معاينة الحدة: بتتحسب على الصورة المعروضة في Isolate، ولما السلايدر يقف بس (مش مع كل حركة).
+  Future<void> _resharp() async {
+    final v = view;
+    if (v == null) return;
+    final k = effSharpness(filter, sharp);
+    final gen = ++_sharpGen;
+    if (k <= 0) {
+      final old = sharpImg;
+      if (old != null && mounted) {
+        setState(() {
+          sharpImg = null;
+          _sharpBase = null;
+        });
+        WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+      }
+      return;
+    }
+    final b = _base;
+    try {
+      final bd = await b.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (bd == null) return;
+      final rgba = await compute(_sharpenJob,
+          <String, dynamic>{'src': _bytesOf(bd), 'w': b.width, 'h': b.height, 'k': k});
+      final img = await _imageFromRgba(rgba, b.width, b.height);
+      if (!mounted || gen != _sharpGen || !identical(b, _base)) {
+        img.dispose();
+        return;
+      }
+      final old = sharpImg;
+      setState(() {
+        sharpImg = img;
+        _sharpBase = b;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
+    } catch (e, st) {
+      AppLog.e('_resharp', e, st);
+    }
+  }
+
+  /// مصفوفة المعاينة: لحد ما النسخة المنضّفة تجهز بنعرض الصورة من غير فلتر الإيصال (عشان مايظهرش أسود فجأة).
+  List<double> _matrixNow() => (isCleanFilter(filter) && !_cleanReady)
+      ? editMatrix(ScanFilter.original, 0, 0)
+      : editMatrix(filter, contrast, brightness, levels);
+
+  Future<void> _makeLevels() async {
+    final p = src;
+    if (p == null) return;
+    try {
+      final lv = await autoLevelsOf(await File(p).readAsBytes());
+      if (!mounted || lv == null) return;
+      setState(() => levels = lv);
+    } catch (e, st) {
+      AppLog.e('_makeLevels', e, st);
+    }
+  }
+
+  void _onFilter(ScanFilter f) {
+    setState(() {
+      filter = f;
+      if (f == ScanFilter.sharpen && sharp < 0.7) sharp = 0.7;
+    });
+    if (isCleanFilter(f)) {
+      if (cleaned == null || _cleanedThermal != usesThermalClean(f)) {
+        _makeClean();
+      } else {
+        _resharp();
+      }
+    } else {
+      _resharp();
+      if (f == ScanFilter.auto && levels == null) _makeLevels();
     }
   }
 
@@ -3588,7 +3932,12 @@ class _EditorPageState extends State<EditorPage> {
         old?.dispose();
         oldClean?.dispose();
       });
-      if (filter == ScanFilter.receipt) _makeClean();
+      if (isCleanFilter(filter)) {
+        _makeClean();
+      } else {
+        _resharp();
+      }
+      if (filter == ScanFilter.auto && levels == null) _makeLevels();
     } catch (e, st) {
       AppLog.e('_loadView', e, st);
       if (mounted) {
@@ -3615,6 +3964,8 @@ class _EditorPageState extends State<EditorPage> {
           filter = e.filter;
           contrast = e.contrast;
           brightness = e.brightness;
+          sharp = e.sharp;
+          levels = e.levels;
           if (e.quad != null && _quadConvex(e.quad!)) quad = List.of(e.quad!);
         }
       });
@@ -3635,7 +3986,7 @@ class _EditorPageState extends State<EditorPage> {
   // ---------- اللمس ----------
 
   String _sig() =>
-      '${quad.map((o) => '${o.dx.toStringAsFixed(4)},${o.dy.toStringAsFixed(4)}').join(';')}|$turns|${angle.toStringAsFixed(2)}|${filter.name}|${contrast.toStringAsFixed(2)}|${brightness.toStringAsFixed(2)}';
+      '${quad.map((o) => '${o.dx.toStringAsFixed(4)},${o.dy.toStringAsFixed(4)}').join(';')}|$turns|${angle.toStringAsFixed(2)}|${filter.name}|${contrast.toStringAsFixed(2)}|${brightness.toStringAsFixed(2)}|${sharp.toStringAsFixed(2)}';
 
   bool _quadFull() {
     for (var i = 0; i < 4; i++) {
@@ -3848,7 +4199,7 @@ class _EditorPageState extends State<EditorPage> {
       : CustomPaint(
           size: Size(w, h),
           painter: _ViewPainter(_shown, Size(w, h), angle * math.pi / 180,
-              editMatrix(filter, contrast, brightness)),
+              _matrixNow()),
         );
 
   /// عدسة مكبّرة بتظهر فوق الإصبع وقت سحب الزاوية.
@@ -3874,7 +4225,7 @@ class _EditorPageState extends State<EditorPage> {
                 CustomPaint(
                   size: const Size(d, d),
                   painter: _ViewPainter(_shown, s, angle * math.pi / 180,
-                      editMatrix(filter, contrast, brightness),
+                      _matrixNow(),
                       focus: f, zoom: z),
                 ),
               const Center(child: Icon(Icons.add, size: 22, color: Colors.redAccent)),
@@ -3921,6 +4272,9 @@ class _EditorPageState extends State<EditorPage> {
       // علامة: لو التطبيق اتقفل جوه "تم"، في التشغيل الجاي بنشغّل وضع آمن بدقة أقل
       await sp.setBool('apply_guard', true);
       AppLog.i('apply start turns=$turns angle=${angle.toStringAsFixed(1)} filter=${filter.name}');
+      if (filter == ScanFilter.auto && levels == null) {
+        levels = await autoLevelsOf(await File(src!).readAsBytes());
+      }
       final r = await _rotatedImage(src!, turns);
       final rw = r.width, rh = r.height;
       AppLog.i('apply decoded ${rw}x$rh');
@@ -3947,17 +4301,32 @@ class _EditorPageState extends State<EditorPage> {
         'oh': h,
         'theta': angle * math.pi / 180,
         'h': _homography(pts),
-        'm': editMatrix(filter, contrast, brightness),
+        // فلاتر الإيصال: التباين والسطوع بيتطبقوا بعد التنضيف (زي المعاينة بالظبط)
+        'm': isCleanFilter(filter)
+            ? editMatrix(ScanFilter.original, 0, 0)
+            : editMatrix(filter, contrast, brightness, levels),
       });
       AppLog.i('apply warp done');
-      if (filter == ScanFilter.receipt) {
+      if (isCleanFilter(filter)) {
         rgba = await compute(_cleanJob, <String, dynamic>{
           'src': rgba,
           'w': w,
           'h': h,
           'gray': false,
+          'th': usesThermalClean(filter),
         });
         AppLog.i('apply clean done');
+        if (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw) {
+          rgba = await compute(_matrixJob, <String, dynamic>{
+            'src': rgba,
+            'm': editMatrix(filter, contrast, brightness),
+          });
+        }
+      }
+      final sk = effSharpness(filter, sharp);
+      if (sk > 0) {
+        rgba = await compute(_sharpenJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': sk});
+        AppLog.i('apply sharpen done');
       }
       final comp = Completer<ui.Image>();
       ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
@@ -3993,7 +4362,9 @@ class _EditorPageState extends State<EditorPage> {
               angle: angle,
               filter: filter,
               contrast: contrast,
-              brightness: brightness));
+              brightness: brightness,
+              sharp: sharp,
+              levels: levels));
       AppLog.i('apply done');
       if (mounted) Navigator.pop(context, nav == null ? nf.path : '$kNavPrefix|$nav|${nf.path}');
     } catch (e, st) {
@@ -4091,25 +4462,7 @@ class _EditorPageState extends State<EditorPage> {
         ]);
       default:
         return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          SizedBox(
-            width: double.infinity,
-            child: SegmentedButton<ScanFilter>(
-              showSelectedIcon: false,
-              segments: const [
-                ButtonSegment(value: ScanFilter.original, label: Text('أصلي')),
-                ButtonSegment(value: ScanFilter.enhance, label: Text('تحسين')),
-                ButtonSegment(value: ScanFilter.bw, label: Text('أ/س')),
-                ButtonSegment(value: ScanFilter.receipt, label: Text('إيصال')),
-              ],
-              selected: {filter},
-              onSelectionChanged: busy
-                  ? null
-                  : (v) {
-                      setState(() => filter = v.first);
-                      if (v.first == ScanFilter.receipt && cleaned == null) _makeClean();
-                    },
-            ),
-          ),
+          FilterBar(selected: filter, onChanged: busy ? null : _onFilter),
           Row(children: [
             const Icon(Icons.brightness_6, size: 20),
             Expanded(
@@ -4137,8 +4490,25 @@ class _EditorPageState extends State<EditorPage> {
                   : () => setState(() {
                         brightness = 0;
                         contrast = 0;
+                        sharp = 0;
+                        _resharp();
                       }),
             ),
+          ]),
+          Row(children: [
+            const Icon(Icons.deblur, size: 20),
+            Expanded(
+              child: Slider(
+                value: sharp,
+                min: 0,
+                max: 1,
+                onChanged: busy ? null : (v) => setState(() => sharp = v),
+                onChangeEnd: busy ? null : (_) => _resharp(),
+              ),
+            ),
+            const SizedBox(width: 6),
+            const Text('حدة', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(width: 6),
           ]),
         ]);
     }
@@ -4282,7 +4652,7 @@ class _EditorPageState extends State<EditorPage> {
               ),
               if (widget.pageCount > 0) _pager(),
               SizedBox(
-                height: 112,
+                height: tab == 2 ? 150 : 112,
                 child: Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   child: _panel(),
@@ -5480,20 +5850,13 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             child: Column(mainAxisSize: MainAxisSize.min, children: [
               SizedBox(
                 width: double.infinity,
-                child: SegmentedButton<ScanFilter>(
-                  showSelectedIcon: false,
-                  segments: const [
-                    ButtonSegment(value: ScanFilter.original, label: Text('أصلي')),
-                    ButtonSegment(value: ScanFilter.enhance, label: Text('تحسين')),
-                    ButtonSegment(value: ScanFilter.bw, label: Text('أ/س')),
-                    ButtonSegment(value: ScanFilter.receipt, label: Text('إيصال')),
-                  ],
-                  selected: {filter},
-                  onSelectionChanged: busy
+                child: FilterBar(
+                  selected: filter,
+                  onChanged: busy
                       ? null
-                      : (v) {
-                          setState(() => filter = v.first);
-                          Store.setFilter(v.first);
+                      : (f) {
+                          setState(() => filter = f);
+                          Store.setFilter(f);
                         },
                 ),
               ),
