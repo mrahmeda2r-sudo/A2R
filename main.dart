@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:camera/camera.dart' as cam;
 import 'package:document_scan/document_scan.dart' as ds;
 import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -2806,30 +2807,59 @@ class _BatchScreenState extends State<BatchScreen> {
     }
   }
 
-  Future<void> _capture() async {
-    await markPickTarget('batch');
-    if (!mounted) return;
-    final r = await scanImages(context, 1);
-    if (!mounted) return;
-    if (r.isEmpty) {
-      if (img == null) Navigator.pop(context);
-      return;
-    }
+  /// بيحفظ الصورة كباتش ويعرضها. بيرجّع true لو نجح.
+  Future<bool> _ingest(String src) async {
     setState(() => busy = true);
     try {
       final path = await persistImage(
-          r.first, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
+          src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
           filter: ScanFilter.receipt);
       await Store.setBatchImg(path);
       await _show(path);
       final warn = await qualityWarning(path);
       if (warn != null && mounted) snack(context, warn);
+      return true;
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+      return false;
     } finally {
       if (mounted) setState(() => busy = false);
     }
-    if (mounted && img != null && (_lastScanManual || await Store.autoEdit())) await _edit(tab: 2);
+  }
+
+  /// كاميرا التطبيق: صورة واحدة بس، بعدها شاشة التعديل علطول (من غير عداد).
+  Future<void> _capture() async {
+    if (!await ensureCamera(context)) {
+      if (mounted && img == null) Navigator.pop(context);
+      return;
+    }
+    if (!mounted) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => A2RCameraScreen(
+          title: 'الباتش',
+          single: true,
+          onShot: (p) async {
+            _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
+            if (!await _ingest(p)) return null;
+            if (mounted && img != null && await _edit(tab: 2, fromCam: true)) {
+              // إعادة أخذ: نمسح الصورة دي والكاميرا تفضل مفتوحة
+              await Store.clearBatchImg();
+              if (mounted) setState(() => img = null);
+              return null;
+            }
+            return const A2RCamState(close: true);
+          },
+          onGallery: () async {
+            final before = img;
+            await _gallery();
+            return img != before ? const A2RCamState(close: true) : null;
+          },
+        ),
+      ),
+    );
+    if (mounted && img == null) Navigator.pop(context);
   }
 
   Timer? _saveT;
@@ -2898,12 +2928,13 @@ class _BatchScreenState extends State<BatchScreen> {
   }
 
   /// تعديل: قص بزوايا حرة وتدوير وفلاتر للصورة الحالية.
-  Future<void> _edit({int tab = 0}) async {
+  Future<bool> _edit({int tab = 0, bool fromCam = false}) async {
     final cur = img;
-    if (cur == null) return;
+    if (cur == null) return false;
     final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_', initialTab: tab)));
-    if (out == null || !mounted) return;
+        context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_', initialTab: tab, canRetake: fromCam)));
+    if (out == kRetake) return true;
+    if (out == null || !mounted) return false;
     setState(() => busy = true);
     try {
       if (noTag) await Store.setNoTag(out, true); // الاختيار يفضل بعد التعديل
@@ -2914,6 +2945,7 @@ class _BatchScreenState extends State<BatchScreen> {
     } finally {
       if (mounted) setState(() => busy = false);
     }
+    return false;
   }
 
   Future<void> _send() async {
@@ -3222,10 +3254,14 @@ Uint8List _warpJob(Map<String, dynamic> a) {
       final X = (ha * u + hb * v + hc) / den;
       final Y = (hd * u + he * v + hf) / den;
       final dx = X - cx, dy = Y - cy;
-      final sx = cx + cs * dx + sn * dy;
-      final sy = cy - sn * dx + cs * dy;
+      var sx = cx + cs * dx + sn * dy;
+      var sy = cy - sn * dx + cs * dy;
       var r = 255.0, g = 255.0, b = 255.0;
-      if (sx >= 0 && sy >= 0 && sx <= sw - 1 && sy <= sh - 1) {
+      if (sx >= -1 && sy >= -1 && sx <= sw && sy <= sh) {
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        if (sx > sw - 1) sx = sw - 1.0;
+        if (sy > sh - 1) sy = sh - 1.0;
         final x0 = sx.floor(), y0 = sy.floor();
         final x1 = x0 + 1 < sw ? x0 + 1 : x0;
         final y1 = y0 + 1 < sh ? y0 + 1 : y0;
@@ -3434,21 +3470,26 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
 
 /// بترجّع مسار الصورة الجديدة بعد التعديل، أو null لو الموظف رجع من غير تأكيد.
 /// التعديل دايماً بيبدأ من النسخة الأصلية، فتقدر تكبّر القص أو ترجّع الفلتر في أي وقت.
+const kRetake = '__retake__'; // EditorPage بترجّعه لما الموظف يدوس "إعادة أخذ"
+
 class EditorPage extends StatefulWidget {
+  final bool canRetake; // بيظهر زر إعادة الأخذ لما الشاشة تتفتح من الكاميرا
   final String path;
   final String prefix; // 'batch_' أو 'r_'
   final int initialTab; // 0 قص، 1 تدوير، 2 ألوان/فلاتر
-  const EditorPage({super.key, required this.path, this.prefix = 'r_', this.initialTab = 0});
+  const EditorPage(
+      {super.key, required this.path, this.prefix = 'r_', this.initialTab = 0, this.canRetake = false});
   @override
   State<EditorPage> createState() => _EditorPageState();
 }
 
 class _EditorPageState extends State<EditorPage> {
+  // الصورة كلها بالظبط (محاذية للحواف): مفيش هامش، فمفيش أي جزء بيتقص
   static const _full = [
-    Offset(0.02, 0.02),
-    Offset(0.98, 0.02),
-    Offset(0.98, 0.98),
-    Offset(0.02, 0.98),
+    Offset(0, 0),
+    Offset(1, 0),
+    Offset(1, 1),
+    Offset(0, 1),
   ];
   String? src; // النسخة الأصلية لو موجودة
   double? aspect; // ارتفاع/عرض الصورة الأصلية (قبل التدوير)
@@ -3928,52 +3969,63 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
+  Widget _barBtn(IconData i, String label, bool on, VoidCallback? onTap) {
+    final col = on ? const Color(0xFF1EC8A5) : Theme.of(context).colorScheme.onSurface;
+    return InkResponse(
+      onTap: onTap,
+      radius: 36,
+      child: SizedBox(
+        width: 62,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(i, color: onTap == null ? Colors.grey : col, size: 27),
+          const SizedBox(height: 3),
+          Text(label,
+              maxLines: 1,
+              style: TextStyle(fontSize: 11, color: onTap == null ? Colors.grey : col)),
+        ]),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('تعديل الصورة'),
-        actions: [
-          TextButton.icon(
-            onPressed: (busy || aspect == null) ? null : _apply,
-            icon: busy
-                ? const SizedBox(
-                    width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.check),
-            label: const Text('تم'),
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('تعديل الصورة')),
       body: (aspect == null || view == null)
           ? const Center(child: CircularProgressIndicator())
           : Column(children: [
               Expanded(
                 child: Padding(
-                  padding: const EdgeInsets.all(14),
+                  padding: EdgeInsets.zero,
                   child: LayoutBuilder(builder: (ctx, cons) {
+                    const pad = 14.0;
                     final asp = turns.isOdd ? 1 / aspect! : aspect!;
-                    var w = cons.maxWidth, h = w * asp;
-                    if (h > cons.maxHeight) {
-                      h = cons.maxHeight;
+                    final maxW = cons.maxWidth - 2 * pad, maxH = cons.maxHeight - 2 * pad;
+                    var w = maxW, h = w * asp;
+                    if (h > maxH) {
+                      h = maxH;
                       w = h / asp;
                     }
                     final size = Size(w, h);
                     final focus = _focus(size);
                     return Center(
                       child: SizedBox(
-                        width: w,
-                        height: h,
+                        width: w + 2 * pad,
+                        height: h + 2 * pad,
                         child: GestureDetector(
                           behavior: HitTestBehavior.opaque,
-                          onPanDown: (d) => _down(d.localPosition, size),
+                          onPanDown: (d) => _down(d.localPosition - const Offset(pad, pad), size),
                           onPanUpdate: (d) => _move(d.delta, size),
                           onPanEnd: (_) => setState(() => drag = -1),
                           onPanCancel: () => setState(() => drag = -1),
-                          child: Stack(clipBehavior: Clip.none, children: [
-                            _img(w, h),
-                            Positioned.fill(child: CustomPaint(painter: _QuadPainter(quad))),
-                            if (focus != null) _loupe(focus, size),
-                          ]),
+                          child: Padding(
+                            padding: const EdgeInsets.all(pad),
+                            child: Stack(clipBehavior: Clip.none, children: [
+                              _img(w, h),
+                              Positioned.fill(child: CustomPaint(painter: _QuadPainter(quad))),
+                              if (focus != null) _loupe(focus, size),
+                            ]),
+                          ),
                         ),
                       ),
                     );
@@ -3989,22 +4041,36 @@ class _EditorPageState extends State<EditorPage> {
               ),
               SafeArea(
                 top: false,
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-                  child: SizedBox(
-                    width: double.infinity,
-                    child: SegmentedButton<int>(
-                      showSelectedIcon: false,
-                      segments: const [
-                        ButtonSegment(value: 0, icon: Icon(Icons.crop), label: Text('قص')),
-                        ButtonSegment(
-                            value: 1, icon: Icon(Icons.rotate_right), label: Text('تدوير')),
-                        ButtonSegment(value: 2, icon: Icon(Icons.tune), label: Text('ألوان')),
-                      ],
-                      selected: {tab},
-                      onSelectionChanged: (v) => setState(() => tab = v.first),
+                child: Container(
+                  color: Colors.black12,
+                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                  child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+                    if (widget.canRetake)
+                      _barBtn(Icons.cameraswitch_outlined, 'إعادة أخذ', false,
+                          busy ? null : () => Navigator.pop(context, kRetake)),
+                    _barBtn(Icons.rotate_left, 'تدوير', tab == 1, () => setState(() => tab = 1)),
+                    _barBtn(Icons.auto_awesome, 'فلتر', tab == 2, () => setState(() => tab = 2)),
+                    _barBtn(Icons.crop, 'قص', tab == 0, () => setState(() => tab = 0)),
+                    InkResponse(
+                      onTap: (busy || aspect == null) ? null : _apply,
+                      radius: 40,
+                      child: Container(
+                        width: 78,
+                        height: 46,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1EC8A5),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: busy
+                            ? const Center(
+                                child: SizedBox(
+                                    width: 22,
+                                    height: 22,
+                                    child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white)))
+                            : const Icon(Icons.check, color: Colors.white, size: 30),
+                      ),
                     ),
-                  ),
+                  ]),
                 ),
               ),
             ]),
@@ -4278,6 +4344,440 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
 //  شاشة إيصالات الدفع
 // =====================================================================
 
+// =====================================================================
+//  كاميرا التطبيق (شكل كام اسكنر): كل الأدوات أيقونات تحت، وعداد الصور على المصغّرة
+// =====================================================================
+
+/// حالة الكاميرا بعد ما الشاشة اللي فوقها (تعديل / معرض) تخلص.
+class A2RCamState {
+  final int count; // عدد الصور المحفوظة لحد دلوقتي
+  final String? thumb; // آخر صورة (للمصغّرة)
+  final bool close; // اقفل الكاميرا (الباتش بعد أول صورة)
+  const A2RCamState({this.count = 0, this.thumb, this.close = false});
+}
+
+class A2RCameraScreen extends StatefulWidget {
+  final String title; // مكتوب تحت المعاينة (إيصالات / باتش)
+  final bool single; // true: تقفل بعد أول صورة (الباتش)
+  final int count;
+  final String? thumb;
+  final Future<A2RCamState?> Function(String path) onShot;
+  final Future<A2RCamState?> Function()? onGallery;
+  const A2RCameraScreen({
+    super.key,
+    required this.title,
+    required this.onShot,
+    this.onGallery,
+    this.single = false,
+    this.count = 0,
+    this.thumb,
+  });
+  @override
+  State<A2RCameraScreen> createState() => _A2RCameraScreenState();
+}
+
+class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingObserver {
+  cam.CameraController? _c;
+  String? _err;
+  bool _ready = false;
+  bool _starting = false; // يمنع تشغيل الكاميرا مرتين في نفس الوقت
+  bool _shooting = false;
+  bool _hd = true;
+  int _flash = 0; // 0 مقفول، 1 تلقائي، 2 فلاش، 3 كشاف
+  late int _count = widget.count;
+  String? _thumb;
+  double _minZoom = 1, _maxZoom = 1, _zoom = 1, _zoom0 = 1;
+  Offset? _focusAt;
+
+  static const _flashIcons = [Icons.flash_off, Icons.flash_auto, Icons.flash_on, Icons.highlight];
+  static const _flashNames = ['الفلاش مقفول', 'فلاش تلقائي', 'فلاش', 'كشاف'];
+
+  @override
+  void initState() {
+    super.initState();
+    _thumb = widget.thumb;
+    WidgetsBinding.instance.addObserver(this);
+    SharedPreferences.getInstance().then((p) {
+      _hd = p.getBool('camHd') ?? true;
+      _flash = p.getInt('camFlash') ?? 0;
+      _start();
+    }).catchError((Object e, StackTrace st) {
+      AppLog.e('cam.prefs', e, st);
+      _start();
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _c?.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (_c == null && !_starting) _start();
+      return;
+    }
+    final c = _c;
+    if (c == null) return;
+    if (state == AppLifecycleState.inactive) {
+      _c = null;
+      c.dispose();
+      if (mounted) setState(() => _ready = false);
+    }
+  }
+
+  Future<void> _start() async {
+    if (_starting) return;
+    _starting = true;
+    try {
+      final old = _c;
+      _c = null;
+      if (mounted) setState(() => _ready = false);
+      await old?.dispose();
+      final cams = await cam.availableCameras();
+      if (cams.isEmpty) throw Exception('مفيش كاميرا على الجهاز');
+      final back = cams.firstWhere((x) => x.lensDirection == cam.CameraLensDirection.back,
+          orElse: () => cams.first);
+      final perf = await Store.perfMode();
+      final preset = _hd && perf != PerfMode.lite
+          ? cam.ResolutionPreset.ultraHigh
+          : cam.ResolutionPreset.veryHigh;
+      final c = cam.CameraController(back, preset,
+          enableAudio: false, imageFormatGroup: cam.ImageFormatGroup.jpeg);
+      await c.initialize();
+      try {
+        await c.lockCaptureOrientation(DeviceOrientation.portraitUp);
+      } catch (_) {}
+      await _applyFlash(c);
+      try {
+        await c.setFocusMode(cam.FocusMode.auto);
+      } catch (_) {}
+      _minZoom = await c.getMinZoomLevel();
+      _maxZoom = math.min(await c.getMaxZoomLevel(), 6.0);
+      _zoom = _minZoom;
+      if (!mounted) {
+        await c.dispose();
+        return;
+      }
+      setState(() {
+        _c = c;
+        _ready = true;
+        _err = null;
+      });
+    } catch (e, st) {
+      AppLog.e('cam.start', e, st);
+      if (mounted) setState(() => _err = errText(e));
+    } finally {
+      _starting = false;
+    }
+  }
+
+  Future<void> _applyFlash(cam.CameraController c) async {
+    try {
+      await c.setFlashMode(const [
+        cam.FlashMode.off,
+        cam.FlashMode.auto,
+        cam.FlashMode.always,
+        cam.FlashMode.torch,
+      ][_flash]);
+    } catch (_) {}
+  }
+
+  Future<void> _cycleFlash() async {
+    final c = _c;
+    if (c == null) return;
+    HapticFeedback.selectionClick();
+    setState(() => _flash = (_flash + 1) % 4);
+    await _applyFlash(c);
+    try {
+      (await SharedPreferences.getInstance()).setInt('camFlash', _flash);
+    } catch (_) {}
+    if (mounted) snack(context, _flashNames[_flash]);
+  }
+
+  Future<void> _toggleHd() async {
+    HapticFeedback.selectionClick();
+    setState(() => _hd = !_hd);
+    try {
+      (await SharedPreferences.getInstance()).setBool('camHd', _hd);
+    } catch (_) {}
+    await _start();
+  }
+
+  void _apply(A2RCamState? s) {
+    if (s == null || !mounted) return;
+    if (s.close) {
+      Navigator.pop(context);
+      return;
+    }
+    setState(() {
+      _count = s.count;
+      _thumb = s.thumb;
+    });
+  }
+
+  Future<void> _shot() async {
+    final c = _c;
+    if (c == null || !c.value.isInitialized || _shooting) return;
+    setState(() => _shooting = true);
+    try {
+      HapticFeedback.mediumImpact();
+      final x = await c.takePicture();
+      try {
+        await c.pausePreview();
+      } catch (_) {}
+      final s = await widget.onShot(x.path);
+      if (!mounted) return;
+      try {
+        await c.resumePreview();
+      } catch (_) {}
+      if (widget.single && s == null) return; // الموظف رجع من التعديل: يصوّر تاني
+      _apply(s);
+    } catch (e, st) {
+      AppLog.e('cam.shot', e, st);
+      if (mounted) snack(context, 'تعذر التصوير: ${errText(e)}');
+    } finally {
+      if (mounted) setState(() => _shooting = false);
+    }
+  }
+
+  /// لو كاميرا التطبيق مش شغالة على الموبايل ده: كاميرا النظام بدالها.
+  Future<void> _systemCamera() async {
+    try {
+      final x = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 2000, imageQuality: 90);
+      if (x == null || !mounted) return;
+      _apply(await widget.onShot(x.path));
+    } catch (e, st) {
+      AppLog.e('cam.system', e, st);
+      if (mounted) snack(context, 'تعذر فتح الكاميرا');
+    }
+  }
+
+  Future<void> _gallery() async {
+    final g = widget.onGallery;
+    if (g == null) return;
+    final c = _c;
+    try {
+      await c?.pausePreview();
+    } catch (_) {}
+    final s = await g();
+    if (!mounted) return;
+    try {
+      await c?.resumePreview();
+    } catch (_) {}
+    _apply(s);
+  }
+
+  Future<void> _tapFocus(TapDownDetails d, Size box) async {
+    final c = _c;
+    if (c == null || !c.value.isInitialized) return;
+    final p = Offset(d.localPosition.dx / box.width, d.localPosition.dy / box.height);
+    setState(() => _focusAt = d.localPosition);
+    try {
+      await c.setFocusPoint(p);
+      await c.setExposurePoint(p);
+    } catch (_) {}
+    Future.delayed(const Duration(milliseconds: 900), () {
+      if (mounted) setState(() => _focusAt = null);
+    });
+  }
+
+  Widget _icon(IconData i, String label, VoidCallback? onTap, {bool on = false}) {
+    final col = on ? const Color(0xFF1EC8A5) : Colors.white;
+    return InkResponse(
+      onTap: onTap,
+      radius: 32,
+      child: SizedBox(
+        width: 64,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(i, color: col, size: 28),
+          const SizedBox(height: 2),
+          Text(label, style: TextStyle(color: col, fontSize: 11), maxLines: 1),
+        ]),
+      ),
+    );
+  }
+
+  Widget _thumbBox() {
+    final t = _thumb;
+    return GestureDetector(
+      onTap: (_count > 0 && !_shooting) ? () => Navigator.pop(context) : null,
+      child: SizedBox(
+        width: 64,
+        height: 64,
+        child: Stack(clipBehavior: Clip.none, children: [
+          Positioned.fill(
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white54, width: 1.5),
+                color: Colors.white10,
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: t != null
+                  ? Image.file(File(t), fit: BoxFit.cover, cacheWidth: 160, errorBuilder: (_, __, ___) => const SizedBox())
+                  : const Icon(Icons.photo_library_outlined, color: Colors.white38),
+            ),
+          ),
+          if (_count > 0)
+            Positioned(
+              top: -8,
+              left: -8,
+              child: Container(
+                constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFF6A4D),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.black, width: 1.5),
+                ),
+                child: Text('$_count',
+                    style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
+              ),
+            ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _preview() {
+    if (_err != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.no_photography, color: Colors.white54, size: 48),
+            const SizedBox(height: 12),
+            Text('كاميرا التطبيق مش شغالة على الموبايل ده\n$_err',
+                textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)),
+            const SizedBox(height: 16),
+            FilledButton(onPressed: _systemCamera, child: const Text('استخدم كاميرا النظام')),
+            TextButton(onPressed: _start, child: const Text('حاول تاني')),
+          ]),
+        ),
+      );
+    }
+    final c = _c;
+    if (!_ready || c == null || !c.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return LayoutBuilder(builder: (ctx, cons) {
+      final box = Size(cons.maxWidth, cons.maxHeight);
+      final ar = 1 / c.value.aspectRatio; // عرض/طول في الوضع الرأسي
+      return GestureDetector(
+        onTapDown: (d) => _tapFocus(d, box),
+        onScaleStart: (_) => _zoom0 = _zoom,
+        onScaleUpdate: (d) async {
+          if (d.pointerCount < 2) return;
+          final z = (_zoom0 * d.scale).clamp(_minZoom, _maxZoom).toDouble();
+          if ((z - _zoom).abs() < 0.02) return;
+          _zoom = z;
+          try {
+            await c.setZoomLevel(z);
+          } catch (_) {}
+        },
+        child: Stack(alignment: Alignment.center, children: [
+          ClipRect(
+            child: FittedBox(
+              fit: BoxFit.contain,
+              child: SizedBox(width: ar * 1000, height: 1000, child: cam.CameraPreview(c)),
+            ),
+          ),
+          if (_focusAt != null)
+            Positioned(
+              left: _focusAt!.dx - 30,
+              top: _focusAt!.dy - 30,
+              child: IgnorePointer(
+                child: Container(
+                  width: 60,
+                  height: 60,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: const Color(0xFF1EC8A5), width: 2),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
+            ),
+        ]),
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: Column(children: [
+            Expanded(child: _preview()),
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(widget.title,
+                  style: const TextStyle(color: Color(0xFF1EC8A5), fontSize: 15, fontWeight: FontWeight.w600)),
+            ),
+            // صف الأيقونات: إغلاق، فلاش، جودة، معرض
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
+              child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+                _icon(Icons.close, 'إغلاق', () => Navigator.pop(context)),
+                _icon(_flashIcons[_flash], 'فلاش', _cycleFlash, on: _flash != 0),
+                _icon(Icons.hd, _hd ? 'جودة عالية' : 'جودة عادية', _toggleHd, on: _hd),
+                if (widget.onGallery != null) _icon(Icons.photo_library_outlined, 'معرض', _gallery),
+              ]),
+            ),
+            // صف التصوير: المصغّرة بالعداد، الزر، تم
+            Padding(
+              padding: const EdgeInsets.fromLTRB(28, 14, 28, 18),
+              child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                _thumbBox(),
+                GestureDetector(
+                  onTap: _shot,
+                  child: Container(
+                    width: 78,
+                    height: 78,
+                    padding: const EdgeInsets.all(5),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: const Color(0xFF1EC8A5), width: 4),
+                    ),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _shooting ? Colors.white54 : Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 64,
+                  child: (!widget.single && _count > 0)
+                      ? InkResponse(
+                          onTap: _shooting ? null : () => Navigator.pop(context),
+                          radius: 36,
+                          child: Container(
+                            height: 48,
+                            decoration: BoxDecoration(
+                                color: const Color(0xFF1EC8A5), borderRadius: BorderRadius.circular(10)),
+                            child: const Icon(Icons.check, color: Colors.white, size: 30),
+                          ),
+                        )
+                      : const SizedBox(),
+                ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
 class ReceiptsScreen extends StatefulWidget {
   final Session session;
   const ReceiptsScreen({super.key, required this.session});
@@ -4387,20 +4887,48 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
-  /// تصوير متتالي: صوّر → قص → يرجع يفتح الكاميرا تاني لحد ما الموظف يقفل الماسح.
+  A2RCamState _camState({bool close = false}) =>
+      A2RCamState(count: imgs.length, thumb: imgs.isEmpty ? null : imgs.last, close: close);
+
+  /// كاميرا التطبيق (شكل كام اسكنر): كل صورة بتتحفظ وتتفتح للتعديل، والكاميرا تفضل مفتوحة والعداد بيزيد.
   Future<void> _add() async {
-    do {
-      await markPickTarget('receipts');
-      if (!mounted) break;
-      final r = await scanImages(context, 1, mode: kReceiptScanMode);
-      if (r.isEmpty || !mounted) break;
-      await _saveAll(r);
-      if (!mounted) break;
-      if (r.length == 1 && imgs.isNotEmpty && (_lastScanManual || await Store.autoEdit())) {
-        await _edit(imgs.length - 1, tab: 2);
-        if (!mounted) break;
-      }
-    } while (continuous);
+    if (!await ensureCamera(context)) return;
+    if (!mounted) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => A2RCameraScreen(
+          title: 'إيصالات الدفع',
+          single: !continuous,
+          count: imgs.length,
+          thumb: imgs.isEmpty ? null : imgs.last,
+          onShot: (p) async {
+            _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
+            final before = imgs.length;
+            await _saveAll([p]);
+            if (mounted && imgs.length > before) {
+              final retake = await _edit(imgs.length - 1, tab: 2, fromCam: true);
+              if (retake && mounted) {
+                // إعادة أخذ: بنمسح الصورة دي ونرجع للكاميرا
+                final p2 = imgs.last;
+                await Store.unlistFromDraft(p2);
+                await Store.del(p2);
+                if (mounted) setState(() {
+                  imgs.remove(p2);
+                  built = null;
+                });
+                return _camState();
+              }
+            }
+            return _camState(close: !continuous && imgs.length > before);
+          },
+          onGallery: () async {
+            await _addGallery();
+            return _camState();
+          },
+        ),
+      ),
+    );
   }
 
   /// من المعرض: منتقي الصور بتاع النظام مباشرة وتقدر تحدد أكتر من صورة.
@@ -4538,14 +5066,15 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   }
 
   /// تعديل إيصال بعد التصوير (قص، تدوير، فلتر) من النسخة الأصلية.
-  Future<void> _edit(int i, {int tab = 0}) async {
+  Future<bool> _edit(int i, {int tab = 0, bool fromCam = false}) async {
     final old = imgs[i];
     final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => EditorPage(path: old, prefix: 'r_', initialTab: tab)));
-    if (out == null || !mounted) return;
+        context, MaterialPageRoute(builder: (_) => EditorPage(path: old, prefix: 'r_', initialTab: tab, canRetake: fromCam)));
+    if (out == kRetake) return true;
+    if (out == null || !mounted) return false;
     try {
       await Store.replaceInDraft(old, out);
-      if (!mounted) return;
+      if (!mounted) return false;
       setState(() {
         imgs[i] = out;
         built = null;
@@ -4553,6 +5082,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     }
+    return false;
   }
 
   Widget _item(int i) {
