@@ -32,7 +32,8 @@ const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الص�
 const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
-const kBatchTagW = 0.8; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
+const kBatchTagW = 0.7; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
+const kBatchBorder = 0.006; // سمك الإطار الأسود حوالين ورقة الباتش (نسبة من عرض الورقة)
 const kBandGapNear = 0.004; // المسافة بين الورقة وصورة الباتش (الورقة لازقة في الصورة)
 const kBandMaxScale = 1.3; // أقصى حجم للورقة في الشريط (أكتر من 1.0 = أعرض من الصورة وبتزيد هوامش بيضا على الجنب)
 enum PerfMode { lite, balanced, pro }
@@ -1073,13 +1074,17 @@ Future<Tag> _renderTag(double w, Session s, {bool batch = false}) async {
   final ch = l1.height + l2.height + gap + pad * 2;
   final rec = ui.PictureRecorder();
   final c = Canvas(rec, Rect.fromLTWH(0, 0, cw, ch));
-  final rr = RRect.fromRectAndRadius(Rect.fromLTWH(0, 0, cw, ch), Radius.circular(fs * 0.5));
+  // الإطار بيتحط جوه حدود الصورة بنص سمكه، عشان يظهر كامل من الأربع اتجاهات (من غير ما يتقص)
+  final sw = w * (batch ? kBatchBorder : 0.004);
+  final inset = batch ? sw / 2 : 0.0;
+  final rr = RRect.fromRectAndRadius(
+      Rect.fromLTWH(inset, inset, cw - inset * 2, ch - inset * 2), Radius.circular(fs * 0.5));
   c.drawRRect(rr, Paint()..color = Colors.white);
   c.drawRRect(
       rr,
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = w * 0.004
+        ..strokeWidth = sw
         ..color = Colors.black);
   l1.paint(c, Offset((cw - l1.width) / 2, pad));
   l2.paint(c, Offset((cw - l2.width) / 2, pad + l1.height + gap));
@@ -1169,7 +1174,7 @@ Future<double?> _jpegMeanLum(Uint8List jpg) async {
   }
 }
 
-/// صورة الباتش + الورقة. layout 0/1: شريط أبيض فوق/تحت (الصورة كاملة من غير تغطية)،
+/// صورة الباتش + الورقة. layout 1: شريط أبيض تحت الصورة (الصورة كاملة من غير تغطية)،
 /// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
 Future<Uint8List> composeBatch(String path, Session s) async {
   final src = await File(path).readAsBytes();
@@ -1198,8 +1203,8 @@ Future<Uint8List> composeBatch(String path, Session s) async {
     final band = tag.h + pad + gap;
     ow = math.max(iw, tag.w.ceil());
     imgX = ((ow - iw) / 2).round();
-    tagAt = Offset((ow - tag.w) / 2, layout == 0 ? pad : h + gap);
-    imgY = layout == 0 ? band.ceil() : 0;
+    tagAt = Offset((ow - tag.w) / 2, h + gap);
+    imgY = 0;
     oh = ih + band.ceil();
   }
   final tImg = await decodeImage(tag.png);
@@ -1486,14 +1491,17 @@ class Store {
   static Future<bool> autoEdit() async => (await _p).getBool('autoEdit') ?? false;
   static Future<void> setAutoEdit(bool v) async => (await _p).setBool('autoEdit', v);
 
-  /// شكل ورقة الباتش: 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
-  static Future<int> batchLayout() async => ((await _p).getInt('batchLayout') ?? 0).clamp(0, 2);
+  /// شكل ورقة الباتش: 1 شريط تحت الصورة، 2 على الصورة (الشريط فوق اتلغى، والقيمة القديمة 0 بتتحول لـ 1)
+  static Future<int> batchLayout() async {
+    final v = (await _p).getInt('batchLayout') ?? 1;
+    return v == 2 ? 2 : 1;
+  }
   static Future<void> setBatchLayout(int v) async => (await _p).setInt('batchLayout', v);
 
   /// حجم الورقة في وضع الشريط (نسبة من عرض الصورة)
   static Future<double> bandScale() async =>
-      ((await _p).getDouble('bandScale') ?? kBatchTagW).clamp(0.3, kBandMaxScale).toDouble();
-  static Future<void> setBandScale(double v) async => (await _p).setDouble('bandScale', v);
+      ((await _p).getDouble('bandScale2') ?? kBatchTagW).clamp(0.3, kBandMaxScale).toDouble();
+  static Future<void> setBandScale(double v) async => (await _p).setDouble('bandScale2', v);
 
   // --- مكان وحجم الورقة ---
   static Future<TagPos?> pos(String path) async =>
@@ -3122,7 +3130,7 @@ class _BatchScreenState extends State<BatchScreen> {
   String? img;
   Tag? tag;
   Tag? bandTag;
-  int layout = 0; // 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
+  int layout = 1; // 1 تحت الصورة، 2 على الصورة
   double bandScale = kBatchTagW; // حجم الورقة في وضع الشريط
   Timer? _bandT;
   TagPos? pos;
@@ -3133,6 +3141,7 @@ class _BatchScreenState extends State<BatchScreen> {
   @override
   void initState() {
     super.initState();
+    unawaited(_warmTags());
     _init();
   }
 
@@ -3184,6 +3193,16 @@ class _BatchScreenState extends State<BatchScreen> {
     }
   }
 
+  /// بيجهّز رسم الورقة مرة واحدة في الخلفية (ميتكررش بعد كل تصوير).
+  Future<void> _warmTags() async {
+    try {
+      tag ??= await receiptTag(1000, widget.session, batch: true);
+      bandTag ??= await receiptTag(2000, widget.session, batch: true);
+    } catch (e, st) {
+      AppLog.e('warmTags', e, st);
+    }
+  }
+
   Future<void> _show(String path) async {
     try {
       final t = tag ?? await receiptTag(1000, widget.session, batch: true);
@@ -3193,7 +3212,7 @@ class _BatchScreenState extends State<BatchScreen> {
       if (p.cx != p0.cx || p.cy != p0.cy) await Store.savePos(path, p, true);
       final nt = await Store.noTag(path);
       final lay = await Store.batchLayout();
-      final bt = await receiptTag(2000, widget.session, batch: true); // نسخة مرجعية عالية الدقة للمعاينة
+      final bt = bandTag ?? await receiptTag(2000, widget.session, batch: true); // نسخة مرجعية عالية الدقة للمعاينة (بتتعمل مرة واحدة)
       final bsc = await Store.bandScale();
       if (!mounted) return;
       setState(() {
@@ -3235,6 +3254,21 @@ class _BatchScreenState extends State<BatchScreen> {
     }
   }
 
+  /// نسخة سريعة للتصوير بالكاميرا: بتحفظ الصورة بس وترجّع مسارها، من غير تجهيز المعاينة
+  /// ولا فحص الجودة قبل شاشة التعديل (دول بيتعملوا بعد ما الموظف يخلّص التعديل).
+  Future<String?> _ingestQuick(String src) async {
+    try {
+      final path = await persistImage(
+          src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
+          filter: ScanFilter.receipt);
+      await Store.setBatchImg(path);
+      return path;
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+      return null;
+    }
+  }
+
   /// كاميرا التطبيق: صورة واحدة بس، بعدها شاشة التعديل علطول (من غير عداد).
   Future<void> _capture() async {
     if (!await ensureCamera(context)) {
@@ -3250,12 +3284,24 @@ class _BatchScreenState extends State<BatchScreen> {
           single: true,
           onShot: (p) async {
             _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
-            if (!await _ingest(p)) return null;
-            if (mounted && img != null && await _edit(tab: 2, fromCam: true)) {
+            final saved = await _ingestQuick(p);
+            if (saved == null) return null;
+            if (mounted && await _edit(tab: 2, fromCam: true, path: saved)) {
               // إعادة أخذ: نمسح الصورة دي والكاميرا تفضل مفتوحة
               await Store.clearBatchImg();
               if (mounted) setState(() => img = null);
               return null;
+            }
+            if (mounted && img == null) {
+              // خرج من التعديل من غير حفظ: نعرض الصورة زي ما هي
+              final cur = await Store.batchImg();
+              if (cur != null) await _show(cur);
+            }
+            final shown = img;
+            if (shown != null) {
+              unawaited(qualityWarning(shown).then((warn) {
+                if (warn != null && mounted) snack(context, warn);
+              }));
             }
             return const A2RCamState(close: true);
           },
@@ -3340,8 +3386,8 @@ class _BatchScreenState extends State<BatchScreen> {
   }
 
   /// تعديل: قص بزوايا حرة وتدوير وفلاتر للصورة الحالية.
-  Future<bool> _edit({int tab = 0, bool fromCam = false}) async {
-    final cur = img;
+  Future<bool> _edit({int tab = 0, bool fromCam = false, String? path}) async {
+    final cur = path ?? img;
     if (cur == null) return false;
     final out = await Navigator.push<String>(
         context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_', initialTab: tab, canRetake: fromCam)));
@@ -3426,9 +3472,8 @@ class _BatchScreenState extends State<BatchScreen> {
                   child: SegmentedButton<int>(
                     showSelectedIcon: false,
                     segments: const [
-                      ButtonSegment(value: 0, label: Text('شريط فوق')),
-                      ButtonSegment(value: 1, label: Text('شريط تحت')),
-                      ButtonSegment(value: 2, label: Text('فوق الصورة')),
+                      ButtonSegment(value: 1, label: Text('تحت الصورة')),
+                      ButtonSegment(value: 2, label: Text('على الصورة')),
                     ],
                     selected: {layout},
                     onSelectionChanged: (busy || noTag) ? null : (v) => _setLayout(v.first),
