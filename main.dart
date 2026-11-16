@@ -3471,14 +3471,26 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
 /// بترجّع مسار الصورة الجديدة بعد التعديل، أو null لو الموظف رجع من غير تأكيد.
 /// التعديل دايماً بيبدأ من النسخة الأصلية، فتقدر تكبّر القص أو ترجّع الفلتر في أي وقت.
 const kRetake = '__retake__'; // EditorPage بترجّعه لما الموظف يدوس "إعادة أخذ"
+const kDelete = '__delete__'; // حذف الصفحة الحالية
+const kNavPrefix = '__nav__'; // __nav__|next|<path> أو __nav__|prev|<path>: انتقال لصفحة تانية بعد حفظ التعديل
 
 class EditorPage extends StatefulWidget {
   final bool canRetake; // بيظهر زر إعادة الأخذ لما الشاشة تتفتح من الكاميرا
+  final int pageIndex; // ترتيب الصفحة (من 0)
+  final int pageCount; // عدد الصفحات (0 = من غير تنقل، زي الباتش)
+  final bool canDelete; // زر حذف الصفحة
   final String path;
   final String prefix; // 'batch_' أو 'r_'
   final int initialTab; // 0 قص، 1 تدوير، 2 ألوان/فلاتر
   const EditorPage(
-      {super.key, required this.path, this.prefix = 'r_', this.initialTab = 0, this.canRetake = false});
+      {super.key,
+      required this.path,
+      this.prefix = 'r_',
+      this.initialTab = 0,
+      this.canRetake = false,
+      this.pageIndex = 0,
+      this.pageCount = 0,
+      this.canDelete = false});
   @override
   State<EditorPage> createState() => _EditorPageState();
 }
@@ -3515,6 +3527,8 @@ class _EditorPageState extends State<EditorPage> {
   DateTime _lastTapAt = DateTime(2000);
   Offset _lastTapPos = Offset.zero;
   static const _maxZoom = 6.0;
+  bool _swipeOk = false;
+  String _sig0 = '';
   bool busy = false;
   bool _quadTouched = false; // الموظف حدد الإطار بنفسه: القص التلقائي المتأخر ميلمسوش
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
@@ -3605,6 +3619,7 @@ class _EditorPageState extends State<EditorPage> {
         }
       });
       await _loadView();
+      _sig0 = _sig();
       AppLog.i('editor view loaded');
       WidgetsBinding.instance.addPostFrameCallback((_) => AppLog.i('editor first frame'));
       if (mounted && (e == null || e.quad == null) && _lastScanManual) await _auto(silent: true);
@@ -3618,6 +3633,41 @@ class _EditorPageState extends State<EditorPage> {
   }
 
   // ---------- اللمس ----------
+
+  String _sig() =>
+      '${quad.map((o) => '${o.dx.toStringAsFixed(4)},${o.dy.toStringAsFixed(4)}').join(';')}|$turns|${angle.toStringAsFixed(2)}|${filter.name}|${contrast.toStringAsFixed(2)}|${brightness.toStringAsFixed(2)}';
+
+  bool _quadFull() {
+    for (var i = 0; i < 4; i++) {
+      if ((quad[i] - _full[i]).distance > 0.002) return false;
+    }
+    return true;
+  }
+
+  /// انتقال لصفحة تانية (dir: next / prev) مع حفظ التعديل الحالي لو اتغيّر.
+  Future<void> _nav(String dir) async {
+    if (busy || widget.pageCount <= 0 || aspect == null) return;
+    if (dir == 'prev' && widget.pageIndex <= 0) return;
+    if (_sig() == _sig0) {
+      Navigator.pop(context, '$kNavPrefix|$dir|${widget.path}');
+      return;
+    }
+    await _apply(nav: dir);
+  }
+
+  Future<void> _confirmDelete() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('حذف الصفحة؟'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('حذف')),
+        ],
+      ),
+    );
+    if (ok == true && mounted) Navigator.pop(context, kDelete);
+  }
 
   Offset _clampPan(Offset p, Size s) => Offset(
         p.dx.clamp(s.width - s.width * _zm, 0.0).toDouble(),
@@ -3694,6 +3744,7 @@ class _EditorPageState extends State<EditorPage> {
       _lastPtr = p;
       _downAt = DateTime.now();
       _down(p, s);
+      _swipeOk = widget.pageCount > 0 && !busy && _zm <= 1.001 && (drag == -1 || (drag == 8 && _quadFull()));
     } else if (_ptrs.length == 2) {
       // إصبعين: تكبير/تصغير (وبنوقف سحب الزوايا)
       if (drag != -1) setState(() => drag = -1);
@@ -3739,15 +3790,26 @@ class _EditorPageState extends State<EditorPage> {
   }
 
   void _ptrUp(PointerEvent e, Size s, {bool cancel = false}) {
-    final had = _ptrs.remove(e.pointer) != null;
-    if (!had) return;
+    final lastP = _ptrs.remove(e.pointer);
+    if (lastP == null) return;
     if (_ptrs.isNotEmpty) {
       _lastPtr = _ptrs.values.first;
       return;
     }
     final wasDrag = drag;
     if (drag != -1) setState(() => drag = -1);
-    if (cancel || _pinched || _movedFar) return;
+    if (cancel || _pinched) return;
+    if (_swipeOk) {
+      // سويب أفقي: يمين = الصفحة اللي بعدها (أو إضافة صورة)، شمال = اللي قبلها
+      final d = lastP - _downPos;
+      if (d.dx.abs() > 80 &&
+          d.dx.abs() > d.dy.abs() * 2 &&
+          DateTime.now().difference(_downAt).inMilliseconds < 900) {
+        _nav(d.dx > 0 ? 'next' : 'prev');
+        return;
+      }
+    }
+    if (_movedFar) return;
     // نقرة سريعة: نقرتين ورا بعض = تكبير/رجوع
     final now = DateTime.now();
     if (now.difference(_downAt).inMilliseconds > 300) return;
@@ -3847,7 +3909,7 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
-  Future<void> _apply() async {
+  Future<void> _apply({String? nav}) async {
     if (!_quadConvex(quad)) {
       snack(context, 'حدود القص متداخلة، عدّل الزوايا');
       return;
@@ -3933,7 +3995,7 @@ class _EditorPageState extends State<EditorPage> {
               contrast: contrast,
               brightness: brightness));
       AppLog.i('apply done');
-      if (mounted) Navigator.pop(context, nf.path);
+      if (mounted) Navigator.pop(context, nav == null ? nf.path : '$kNavPrefix|$nav|${nf.path}');
     } catch (e, st) {
       AppLog.e('editor._apply', e, st);
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
@@ -4100,10 +4162,54 @@ class _EditorPageState extends State<EditorPage> {
     );
   }
 
+  Widget _pagerBtn(IconData i, VoidCallback? onTap) => InkResponse(
+        onTap: onTap,
+        radius: 26,
+        child: Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: onTap == null ? Colors.black12 : Colors.black26,
+          ),
+          child: Icon(i, size: 24, color: onTap == null ? Colors.grey : null),
+        ),
+      );
+
+  /// عداد الصفحات (زي كام اسكنر): < 1/3 >. السهم اليمين في آخر صفحة = إضافة صورة.
+  Widget _pager() {
+    final last = widget.pageIndex >= widget.pageCount - 1;
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+          _pagerBtn(Icons.chevron_left, (busy || widget.pageIndex <= 0) ? null : () => _nav('prev')),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 18),
+            child: Text('${widget.pageIndex + 1}/${widget.pageCount}',
+                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+          ),
+          _pagerBtn(last ? Icons.add_a_photo_outlined : Icons.chevron_right, busy ? null : () => _nav('next')),
+        ]),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('تعديل الصورة')),
+      appBar: AppBar(
+        title: const Text('تعديل الصورة'),
+        actions: [
+          if (widget.canDelete)
+            IconButton(
+              tooltip: 'حذف الصفحة',
+              icon: const Icon(Icons.delete_outline),
+              onPressed: busy ? null : _confirmDelete,
+            ),
+        ],
+      ),
       body: (aspect == null || view == null)
           ? const Center(child: CircularProgressIndicator())
           : Column(children: [
@@ -4174,6 +4280,7 @@ class _EditorPageState extends State<EditorPage> {
                   }),
                 ),
               ),
+              if (widget.pageCount > 0) _pager(),
               SizedBox(
                 height: 112,
                 child: Padding(
@@ -4190,7 +4297,14 @@ class _EditorPageState extends State<EditorPage> {
                     if (widget.canRetake)
                       _barBtn(Icons.cameraswitch_outlined, 'إعادة أخذ', false,
                           busy ? null : () => Navigator.pop(context, kRetake)),
-                    _barBtn(Icons.rotate_left, 'تدوير', tab == 1, () => setState(() => tab = 1)),
+                    _barBtn(Icons.rotate_left, 'يسار', tab == 1, busy
+                        ? null
+                        : () => setState(() {
+                              tab = 1;
+                              turns = (turns + 3) % 4;
+                              quad = _turnCcw(quad);
+                              _loadView();
+                            })),
                     _barBtn(Icons.auto_awesome, 'فلتر', tab == 2, () => setState(() => tab = 2)),
                     _barBtn(Icons.crop, 'قص', tab == 0, () => setState(() => tab = 0)),
                     InkResponse(
@@ -5052,17 +5166,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             await _saveAll([p]);
             if (mounted && imgs.length > before) {
               final retake = await _edit(imgs.length - 1, tab: 2, fromCam: true);
-              if (retake && mounted) {
-                // إعادة أخذ: بنمسح الصورة دي ونرجع للكاميرا
-                final p2 = imgs.last;
-                await Store.unlistFromDraft(p2);
-                await Store.del(p2);
-                if (mounted) setState(() {
-                  imgs.remove(p2);
-                  built = null;
-                });
-                return _camState();
-              }
+              if (retake && mounted) return _camState(); // إعادة أخذ: الصفحة اتمسحت والكاميرا مفتوحة
             }
             return _camState(close: !continuous && imgs.length > before);
           },
@@ -5209,22 +5313,75 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (done == true && mounted) Navigator.pop(context);
   }
 
-  /// تعديل إيصال بعد التصوير (قص، تدوير، فلتر) من النسخة الأصلية.
+  /// تعديل إيصال بعد التصوير (قص، تدوير، فلتر) من النسخة الأصلية، مع التنقل بين الصفحات
+  /// (أسهم / سويب)، والحذف، وإضافة صورة. بترجّع true لو الموظف داس "إعادة أخذ".
   Future<bool> _edit(int i, {int tab = 0, bool fromCam = false}) async {
-    final old = imgs[i];
-    final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => EditorPage(path: old, prefix: 'r_', initialTab: tab, canRetake: fromCam)));
-    if (out == kRetake) return true;
-    if (out == null || !mounted) return false;
-    try {
-      await Store.replaceInDraft(old, out);
-      if (!mounted) return false;
-      setState(() {
-        imgs[i] = out;
-        built = null;
-      });
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    var idx = i;
+    while (mounted && imgs.isNotEmpty) {
+      idx = idx.clamp(0, imgs.length - 1);
+      final old = imgs[idx];
+      final out = await Navigator.push<String>(
+        context,
+        PageRouteBuilder<String>(
+          transitionDuration: const Duration(milliseconds: 160),
+          reverseTransitionDuration: const Duration(milliseconds: 120),
+          pageBuilder: (_, __, ___) => EditorPage(
+              path: old,
+              prefix: 'r_',
+              initialTab: tab,
+              canRetake: fromCam,
+              pageIndex: idx,
+              pageCount: imgs.length,
+              canDelete: true),
+          transitionsBuilder: (_, a, __, child) => FadeTransition(opacity: a, child: child),
+        ),
+      );
+      tab = 0; // الصفحات اللي بننتقل ليها بتفتح على القص
+      if (!mounted || out == null) return false;
+      if (out == kRetake || out == kDelete) {
+        await Store.unlistFromDraft(old);
+        await Store.del(old);
+        if (mounted) {
+          setState(() {
+            imgs.remove(old);
+            built = null;
+          });
+        }
+        if (out == kRetake) return true;
+        continue; // بعد الحذف: يفضل في التعديل على الصفحة اللي جنبها
+      }
+      var path = out;
+      String? dir;
+      if (out.startsWith('$kNavPrefix|')) {
+        final parts = out.split('|');
+        dir = parts[1];
+        path = parts.sublist(2).join('|');
+      }
+      if (path != old) {
+        try {
+          await Store.replaceInDraft(old, path);
+          if (!mounted) return false;
+          setState(() {
+            imgs[idx] = path;
+            built = null;
+          });
+        } catch (e) {
+          if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+          return false;
+        }
+      }
+      if (dir == null) return false; // ✓ تم
+      if (dir == 'prev') {
+        idx -= 1;
+        continue;
+      }
+      idx += 1;
+      if (idx >= imgs.length) {
+        // آخر صفحة + "التالي": إضافة صورة جديدة
+        if (fromCam) return false; // الكاميرا تحت: نرجعلها
+        if (mounted) await _add();
+        return false;
+      }
     }
     return false;
   }
