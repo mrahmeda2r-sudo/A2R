@@ -444,7 +444,8 @@ Map<String, dynamic> _trimJob(Map<String, dynamic> a) {
   for (var y = 0; y < h; y++) {
     for (var x = 0; x < w; x++) {
       final i = (y * w + x) * 4;
-      if (src[i] + src[i + 1] + src[i + 2] < 3 * 235) {
+      // حساسية أعلى للكتابة الحرارية الرمادية الخفيفة عند أطراف الإيصال.
+      if (src[i] + src[i + 1] + src[i + 2] < 3 * 248) {
         rows[y]++;
         cols[x]++;
       }
@@ -757,21 +758,27 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
       final tx = ctx[x];
       final a0 = y0 * gw + cx0[x], a1 = y0 * gw + cx1[x];
       final b0 = y1 * gw + cx0[x], b1 = y1 * gw + cx1[x];
-      final res = [0, 0, 0];
-      for (var c = 0; c < 3; c++) {
-        final g = bg[c];
-        final b = (g[a0] * (1 - tx) + g[a1] * tx) * (1 - ty) + (g[b0] * (1 - tx) + g[b1] * tx) * ty;
-        var v = src[i + c] * 255 / (b < 40 ? 40 : b);
-        if (v > 255) v = 255;
-        res[c] = lut[v.round()];
-      }
+      // حساب القنوات مباشرة بدون إنشاء List أو دالة محلية لكل بكسل.
+      final paperR = (bg[0][a0] * (1 - tx) + bg[0][a1] * tx) * (1 - ty) +
+          (bg[0][b0] * (1 - tx) + bg[0][b1] * tx) * ty;
+      final paperG = (bg[1][a0] * (1 - tx) + bg[1][a1] * tx) * (1 - ty) +
+          (bg[1][b0] * (1 - tx) + bg[1][b1] * tx) * ty;
+      final paperB = (bg[2][a0] * (1 - tx) + bg[2][a1] * tx) * (1 - ty) +
+          (bg[2][b0] * (1 - tx) + bg[2][b1] * tx) * ty;
+      var vr = src[i] * 255 / (paperR < 40 ? 40 : paperR);
+      var vg = src[i + 1] * 255 / (paperG < 40 ? 40 : paperG);
+      var vb = src[i + 2] * 255 / (paperB < 40 ? 40 : paperB);
+      if (vr > 255) vr = 255;
+      if (vg > 255) vg = 255;
+      if (vb > 255) vb = 255;
+      var r = lut[vr.round()], g = lut[vg.round()], b = lut[vb.round()];
       if (gray) {
-        final l = (res[0] * 54 + res[1] * 183 + res[2] * 19) >> 8;
-        res[0] = res[1] = res[2] = l;
+        final l = (r * 54 + g * 183 + b * 19) >> 8;
+        r = g = b = l;
       }
-      out[i] = res[0];
-      out[i + 1] = res[1];
-      out[i + 2] = res[2];
+      out[i] = r;
+      out[i + 1] = g;
+      out[i + 2] = b;
       out[i + 3] = 255;
     }
   }
@@ -4110,8 +4117,9 @@ Uint8List _warpJob(Map<String, dynamic> a) {
 Future<List<Offset>?> detectDocQuad(String path) async {
   final swDet = Stopwatch()..start();
   try {
-    final q = await _detectDocQuadImpl(path);
-    return q == null ? null : _rectOf(q);
+    // احتفظ بالأركان الأربعة المكتشفة لتصحيح المنظور الحقيقي بدلاً من
+    // تحويلها إلى مستطيل مستقيم قد يقتطع أطراف الإيصال المائل.
+    return await _detectDocQuadImpl(path);
   } finally {
     AppLog.i('t detect ${swDet.elapsedMilliseconds}ms');
   }
