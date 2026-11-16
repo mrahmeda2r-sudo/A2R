@@ -1,7161 +1,12949 @@
-import 'dart:async';
 import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' as ui;
-import 'package:camera/camera.dart' as cam;
-import 'package:document_scan/document_scan.dart' as ds;
-import 'package:flutter/foundation.dart' show compute, listEquals;
-import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:flutter/material.dart';
+
+import 'package:archive/archive.dart';
+import 'package:flutter/material.dart' hide Text;
+import 'package:flutter/widgets.dart' as w show Text;
 import 'package:flutter/services.dart';
-import 'package:flutter_image_compress/flutter_image_compress.dart';
-import 'package:google_mlkit_document_scanner/google_mlkit_document_scanner.dart';
-import 'package:image_picker/image_picker.dart';
-import 'package:open_filex/open_filex.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:image/image.dart' as img;
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:printing/printing.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-// =====================================================================
-//  إعدادات عامة
-// =====================================================================
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await appSettings.load();
+  await prepareDefaultFiles();
+  FlutterError.onError = (d) {
+    _dbg('FLUTTER_ERROR ${d.exceptionAsString()}\n${(d.stack?.toString() ?? '').split('\n').take(8).join('\n')}');
+    FlutterError.presentError(d);
+  };
+  WidgetsBinding.instance.platformDispatcher.onError = (e, st) {
+    _dbg('UNCAUGHT $e\n$st');
+    return true;
+  };
+  runApp(const PosApp());
+}
 
-/// الأسماء والوحدات بتتبني جوه التطبيق من ملف data.xlsx وقت البناء (assets/data.json).
-const kVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
-
-const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
-const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
-const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
-const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
-const kBatchTagW = 0.7; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
-const kBatchBorder = 0.006; // سمك الإطار الأسود حوالين ورقة الباتش (نسبة من عرض الورقة)
-const kBandGapNear = 0.004; // المسافة بين الورقة وصورة الباتش (الورقة لازقة في الصورة)
-const kBandMaxScale = 1.3; // أقصى حجم للورقة في الشريط (أكتر من 1.0 = أعرض من الصورة وبتزيد هوامش بيضا على الجنب)
-enum PerfMode { lite, balanced, pro }
-
-/// الدقة الافتراضية لمعاينة الإيصال (نفس وضع balanced).
-const kMaxSide = 1400;
-
-/// سجل أخطاء بسيط في ملف (في مجلد منفصل عن الصور فمبيتمسحش مع التنظيف).
-/// بيتبعت من زرار "إرسال سجل الأخطاء" في الإعدادات.
-class AppLog {
-  static File? _f;
-  static const _max = 200 * 1024;
-
-  static Future<void> init() async {
-    try {
-      final d = await getApplicationSupportDirectory();
-      _f = File('${d.path}/a2r_log.txt');
-    } catch (_) {}
-  }
-
-  static void e(String where, Object err, [StackTrace? st]) {
-    final top = (st?.toString() ?? '')
-        .split('\n')
-        .where((l) => l.trim().isNotEmpty)
-        .take(4)
-        .join('\n');
-    _write('[ERR] $where: $err${top.isEmpty ? '' : '\n$top'}');
-  }
-
-  /// علامة بتتكتب فورًا (متزامنة) عشان لو التطبيق اتقفل فجأة نعرف كان فين.
-  static void i(String msg) => _write('[INF] $msg');
-
-  static void _write(String line) {
-    final f = _f;
-    if (f == null) return;
-    try {
-      f.writeAsStringSync('${DateTime.now().toIso8601String()} v$kVersion $line\n',
-          mode: FileMode.append, flush: true);
-      if (f.lengthSync() > _max) {
-        final t = f.readAsStringSync();
-        f.writeAsStringSync(t.substring(t.length ~/ 2));
-      }
-    } catch (_) {}
-  }
-
-  static Future<void> share(BuildContext context) async {
-    final f = _f;
-    if (f == null || !f.existsSync() || f.lengthSync() == 0) {
-      snack(context, 'السجل فاضي');
-      return;
+// بيختار DPI بحيث الضلع الأطول ما يزيدش عن ~2500 بكسل (PDF الممسوح بيبقى مقاسه كبير وبيخلّي الذاكرة تخلص)
+Future<double> _safeDpi(Uint8List bytes, int pageIdx, double wanted) async {
+  try {
+    await for (final p in Printing.raster(bytes, pages: [pageIdx], dpi: 72)) {
+      final side = math.max(p.width, p.height).toDouble();
+      if (side <= 0) return wanted;
+      final d = 72.0 * 2500.0 / side;
+      return d < wanted ? (d < 72 ? 72 : d) : wanted;
     }
-    try {
-      await Share.shareXFiles([XFile(f.path)]);
-    } catch (_) {
-      if (context.mounted) snack(context, 'تعذر إرسال السجل');
-    }
+  } catch (_) {}
+  return wanted;
+}
+
+bool _hasPdfHeader(File f) {
+  try {
+    final raf = f.openSync();
+    final h = raf.readSync(5);
+    raf.closeSync();
+    return String.fromCharCodes(h) == '%PDF-';
+  } catch (_) {
+    return false;
   }
 }
 
-int getMaxSide(PerfMode mode) {
-  switch (mode) {
-    case PerfMode.lite:
-      return 800;
-    case PerfMode.balanced:
-      return 1400;
-    case PerfMode.pro:
-      return 2400;
-  }
+// تاريخ إيصال في المستقبل = قراءة غلط
+bool _plausibleDay(String? d, String? m) {
+  if (d == null || m == null) return true;
+  final di = int.tryParse(d), mi = int.tryParse(m);
+  if (di == null || mi == null) return false;
+  final n = DateTime.now();
+  final dt = DateTime(n.year, mi, di);
+  return !dt.isAfter(DateTime(n.year, n.month, n.day).add(const Duration(days: 1)));
 }
 
-// =====================================================================
-//  البيانات (افتراضية مدمجة + تحديث من GitHub)
-// =====================================================================
+bool _pageEnd(Object e) => e.toString().contains('Invalid page index');
 
-class Unit {
-  final int num;
-  final String name;
-  final String tid;
-  final List<String> buildings;
-  const Unit(this.num, this.name, this.tid, [this.buildings = const []]);
+// قراءة OCR بحد أقصى للوقت: لو ML Kit علّق على صفحة، الصفحة دي بس بتفشل والعد بيكمّل
+Future<RecognizedText> _ocr(TextRecognizer rec, String path, {int secs = 90}) =>
+    rec.processImage(InputImage.fromFilePath(path)).timeout(Duration(seconds: secs));
 
-  factory Unit.fromJson(Map<String, dynamic> j) => Unit(
-        double.parse(j['num'].toString().trim()).toInt(),
-        (j['name'] as String).trim(),
-        j['tid'].toString().trim(),
-        ((j['buildings'] as List?) ?? const []).map((e) => e.toString()).toList(),
+// سجل تشخيصي بيتكتب في id_debug.txt (بيساعد نعرف ليه ملف اتخطّى أو التطبيق خرج)
+void _dbg(String m) {
+  try {
+    final t = DateTime.now().toIso8601String().substring(11, 19);
+    File('$baseDir/id_debug.txt').writeAsStringSync('[$t] $m\n', mode: FileMode.append);
+  } catch (_) {}
+}
+
+// ملف التقفيل اللي التطبيق نفسه بيطلّعه (الاسكندريه 5.11.pdf) بس، مش أي اسم بيبدأ بـ "الاسكندريه"
+bool _isAppReportName(String n) => RegExp(
+        r'^الاسكندريه\s*(\d{1,2}[.\-_]\d{1,2}|اليوم)(\s*\(\d+\))?\.pdf$')
+    .hasMatch(_normAr(n));
+
+// ───────── عناصر واجهة مدمجة (علشان الشاشة ما تبقاش زحمة) ─────────
+Widget _mini(IconData icon, String label, VoidCallback? onPressed, {bool filled = false}) {
+  const pad = WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 12));
+  const size = WidgetStatePropertyAll(Size(0, 36));
+  const txt = WidgetStatePropertyAll(TextStyle(fontSize: 13));
+  final st = const ButtonStyle(
+    padding: pad,
+    minimumSize: size,
+    textStyle: txt,
+    visualDensity: VisualDensity.compact,
+    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+  );
+  final ic = Icon(icon, size: 18);
+  return filled
+      ? FilledButton.tonalIcon(onPressed: onPressed, icon: ic, label: Text(label), style: st)
+      : OutlinedButton.icon(onPressed: onPressed, icon: ic, label: Text(label), style: st);
+}
+
+// ───────── شرائح المصدر / الفترة / الإخراج (بدل القسم القابل للفتح) ─────────
+// كل شريحة بتفتح قايمة سفلية. مستخدمة في تاب التقفيل وتاب إيصالات الدفع.
+Future<void> _sheet(BuildContext context, String title, List<Widget> children) {
+  return showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    isScrollControlled: true,
+    builder: (c) => SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            ),
+            ...children,
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+Widget _choiceTile(BuildContext c, {required bool selected, required String title, String? subtitle, required VoidCallback onTap, IconData? icon}) {
+  final cs = Theme.of(c).colorScheme;
+  return ListTile(
+    leading: Icon(selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+        color: selected ? cs.primary : cs.onSurfaceVariant),
+    title: Row(children: [
+      if (icon != null) ...[Icon(icon, size: 18), const SizedBox(width: 6)],
+      Flexible(child: Text(title)),
+    ]),
+    subtitle: subtitle == null
+        ? null
+        : Text(subtitle, maxLines: 2, overflow: TextOverflow.ellipsis, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12)),
+    onTap: onTap,
+  );
+}
+
+Widget _sourceChips(
+  BuildContext context, {
+  required bool busy,
+  required int days,
+  required void Function(int) onDays,
+  required String periodLabel,
+  required String? sourcePath, // null = واتساب (تلقائي)
+  required VoidCallback onPickSource,
+  required VoidCallback onUseWhatsApp,
+}) {
+  final cs = Theme.of(context).colorScheme;
+  final customSrc = sourcePath != null;
+
+  Widget chip(IconData icon, String label, bool highlight, VoidCallback onTap) => ActionChip(
+        avatar: Icon(icon, size: 18),
+        label: Row(mainAxisSize: MainAxisSize.min, children: [
+          Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13))),
+          const SizedBox(width: 2),
+          const Icon(Icons.arrow_drop_down, size: 18),
+        ]),
+        backgroundColor: highlight ? cs.secondaryContainer : null,
+        visualDensity: VisualDensity.compact,
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        onPressed: busy ? null : onTap,
       );
 
-  /// اسم الوحدة للملفات: بدون همزات/أقواس، والمسافات نقط
-  String get slug => name
-      .replaceAll(RegExp('[أإآ]'), 'ا')
-      .replaceAll(RegExp(r'[()\\/:*?"<>|]'), ' ')
-      .trim()
-      .split(RegExp(r'[\s.]+'))
-      .join('.');
+  void srcSheet() => _sheet(context, _l(context, 'المصدر', 'Source'), [
+        Builder(builder: (c) => _choiceTile(c,
+            selected: !customSrc,
+            icon: Icons.chat,
+            title: _l(c, 'واتساب (تلقائي)', 'WhatsApp (auto)'),
+            onTap: () {
+              Navigator.pop(c);
+              if (customSrc) onUseWhatsApp();
+            })),
+        Builder(builder: (c) => _choiceTile(c,
+            selected: customSrc,
+            icon: Icons.folder_open,
+            title: customSrc ? _l(c, 'فولدر تاني', 'Another folder') : _l(c, 'فولدر تاني…', 'Another folder…'),
+            subtitle: sourcePath,
+            onTap: () {
+              Navigator.pop(c);
+              onPickSource();
+            })),
+      ]);
+
+  void periodSheet() => _sheet(context, _l(context, 'الفترة', 'Period'), [
+        for (final o in const [
+          [0, 'اليوم', 'Today'],
+          [1, 'يومين', '2 days'],
+          [2, '3 أيام', '3 days'],
+          [-1, 'الكل', 'All'],
+        ])
+          Builder(builder: (c) => _choiceTile(c,
+              selected: days == o[0],
+              title: _l(c, o[1] as String, o[2] as String),
+              onTap: () {
+                Navigator.pop(c);
+                onDays(o[0] as int);
+              })),
+      ]);
+
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 4),
+    child: Wrap(
+      spacing: 6,
+      runSpacing: 0,
+      children: [
+        chip(customSrc ? Icons.folder_open : Icons.chat, customSrc ? baseName(sourcePath!) : _l(context, 'واتساب', 'WhatsApp'), customSrc, srcSheet),
+        chip(Icons.date_range, periodLabel, false, periodSheet),
+      ],
+    ),
+  );
 }
 
-class Session {
-  final String name;
-  final Unit unit;
-  final String? building;
-  Session(this.name, this.unit, this.building);
-
-  String get date {
-    final n = DateTime.now();
-    return '${n.day.toString().padLeft(2, '0')}/${n.month.toString().padLeft(2, '0')}/${n.year}';
-  }
-
-  /// مثال: 8.المنتزه.1.يوم.14.11
-  String get pdfName {
-    final n = DateTime.now();
-    return '${unit.num}.${unit.slug}.يوم.${n.day}.${n.month}';
-  }
-
-  String get batchName => '${unit.num}';
+// كارت فولدر الإخراج: أيقونة ملوّنة + اسم الفولدر + شارة "افتراضي" + زر فتح
+Widget _outputCard(
+  BuildContext context, {
+  required bool busy,
+  required String outPath,
+  required bool outIsDefault,
+  required VoidCallback onPickOut,
+  required VoidCallback onUseDefaultOut,
+  required VoidCallback onOpenOut,
+}) {
+  final cs = Theme.of(context).colorScheme;
+  void outSheet() => _sheet(context, _l(context, 'فولدر الإخراج', 'Output folder'), [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+          child: SelectableText(outPath, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12)),
+        ),
+        Builder(builder: (c) => ListTile(
+              leading: const Icon(Icons.edit_location_alt_outlined),
+              title: Text(_l(c, 'تغيير الفولدر', 'Change folder')),
+              onTap: () {
+                Navigator.pop(c);
+                onPickOut();
+              },
+            )),
+        if (!outIsDefault)
+          Builder(builder: (c) => ListTile(
+                leading: const Icon(Icons.settings_backup_restore),
+                title: Text(_l(c, 'رجوع للفولدر الافتراضي', 'Back to default folder')),
+                onTap: () {
+                  Navigator.pop(c);
+                  onUseDefaultOut();
+                },
+              )),
+      ]);
+  return Card(
+    margin: const EdgeInsets.only(top: 2, bottom: 4),
+    elevation: 0,
+    color: cs.surfaceContainerHighest.withAlpha(110),
+    clipBehavior: Clip.antiAlias,
+    child: InkWell(
+      onTap: busy ? null : outSheet,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        child: Row(
+          children: [
+            CircleAvatar(
+              radius: 18,
+              backgroundColor: cs.primaryContainer,
+              child: Icon(Icons.drive_file_move_outline, size: 20, color: cs.onPrimaryContainer),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(_l(context, 'فولدر الإخراج', 'Output folder'),
+                      style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                  Row(children: [
+                    Flexible(
+                      child: Text(baseName(outPath),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          textDirection: TextDirection.ltr,
+                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                    ),
+                    if (outIsDefault) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: _tintBg(context, Colors.green),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(_l(context, 'افتراضي', 'Default'),
+                            style: TextStyle(fontSize: 10, color: _tintFg(context, Colors.green))),
+                      ),
+                    ],
+                  ]),
+                ],
+              ),
+            ),
+            IconButton.filledTonal(
+              tooltip: _l(context, 'فتح الفولدر', 'Open folder'),
+              icon: const Icon(Icons.open_in_new, size: 18),
+              visualDensity: VisualDensity.compact,
+              onPressed: busy ? null : onOpenOut,
+            ),
+            const SizedBox(width: 2),
+            TextButton(
+              onPressed: busy ? null : outSheet,
+              style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 8)),
+              child: Text(_l(context, 'تغيير', 'Change')),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
 }
 
-const _defNames = <String>[
-  'خالد محمد',
-  'محمد السيد دندن',
-  'احمد وليد',
-  'محمد زكريا',
-  'احمد مصطفى',
-  'زياد أحمد',
-  'مصطفى محمد',
-  'ادهم ماهر',
-  'احمد سعيد',
-  'عبدالله محمد',
-  'محمد مجدى',
-  'سماح جمال',
-  'امير حسين',
-  'كريم صبرى',
-  'احمد مجدى',
-  'عمر فتحى',
-  'محمد احمد',
-  'احمد جابر',
-  'باسم محمد',
-  'باسم مصطفى',
-  'احمد رمضان',
-];
+// كارت الإعدادات مطوي في سطر ملخّص واحد (المصدر • الفترة • المخرجات) وبالضغط عليه يفتح بكل الإعدادات
+Widget _settingsCollapsed(BuildContext context, String summary, List<Widget> children) => Card(
+      margin: const EdgeInsets.only(bottom: 6),
+      clipBehavior: Clip.antiAlias,
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          tilePadding: const EdgeInsets.symmetric(horizontal: 10),
+          childrenPadding: const EdgeInsets.fromLTRB(10, 0, 10, 4),
+          dense: true,
+          maintainState: true,
+          leading: const Icon(Icons.tune, size: 20),
+          title: Text(summary, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13)),
+          children: [Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: children)],
+        ),
+      ),
+    );
 
-const _abis = ['تحت', 'فوق', 'المركز الزكي'];
-const _borg = ['برج العرب', 'محرم بيك', 'ابيس', 'الرحلات', 'المنتزه'];
-const _montaza = ['الاداري تحت', 'الاداري فوق', 'المركز الزكي'];
-const _moharam = ['محرم بيك', 'محرم بيك 1', 'محرم بيك 2'];
-const _agami = ['العجمي', 'الملاكي'];
-const _qabbari = ['النقل'];
+Widget _switchRow(String label, bool v, void Function(bool)? onChanged) => SwitchListTile(
+      dense: true,
+      visualDensity: VisualDensity.compact,
+      contentPadding: EdgeInsets.zero,
+      title: Text(label, style: const TextStyle(fontSize: 13)),
+      value: v,
+      onChanged: onChanged,
+    );
 
-const _defUnits = <Unit>[
-  Unit(1, 'أبيس 1', '50335710', _abis),
-  Unit(2, 'أبيس 2', '50335993', _abis),
-  Unit(3, 'أبيس 3', '50335987', _abis),
-  Unit(4, 'برج العرب 1', '50325716', _borg),
-  Unit(5, 'برج العرب 2', '50335998', _borg),
-  Unit(6, 'برج العرب 3', '50335994', _borg),
-  Unit(7, 'برج العرب 4', '50335711', _borg),
-  Unit(8, 'المنتزه 1', '50382298', _montaza),
-  Unit(9, 'المنتزه 2', '50382315', _montaza),
-  Unit(10, 'المنتزه 3', '50383712', _montaza),
-  Unit(11, 'محرم بك 1', '50382306', _moharam),
-  Unit(12, 'محرم بك 2', '50382316', _moharam),
-  Unit(13, 'العجمي 1', '50382308', _agami),
-  Unit(14, 'العجمي 2', '50383706', _agami),
-  Unit(15, 'أبيس (احتياطي)', '50325765', _abis),
-  Unit(16, 'برج العرب (احتياطي 1)', '50322364', _borg),
-  Unit(17, 'برج العرب (احتياطي 2)', '50322361', _borg),
-  Unit(18, 'المنتزه (احتياطي)', '50382150', _montaza),
-  Unit(19, 'محرم بك (احتياطي)', '50381092', _moharam),
-  Unit(20, 'العجمي (احتياطي)', '50381077', _agami),
-  Unit(21, 'القباري', '50382300', _qabbari),
-  Unit(22, 'مصطفى كامل', '50383702'),
-  Unit(23, 'مديرية الأمن', '50382312'),
-  Unit(24, 'ميناء الإسكندرية', '50383699'),
-  Unit(25, 'خدمات مصر', '50383700'),
-];
+// قايمة طرق العد: مطوية، بتفتحها بالضغط وتختار اللي عايزه. الديفولت = الأسرع (سريع متوازي).
+Widget _countMethodsPanel({required bool busy, required VoidCallback onChanged}) {
+  Widget radio(String label, String sub, bool sel, VoidCallback onTap) => ListTile(
+        dense: true,
+        visualDensity: VisualDensity.compact,
+        contentPadding: EdgeInsets.zero,
+        enabled: !busy,
+        leading: Icon(sel ? Icons.radio_button_checked : Icons.radio_button_unchecked, size: 20),
+        title: Text(label, style: const TextStyle(fontSize: 13)),
+        subtitle: sub.isEmpty ? null : Text(sub, style: const TextStyle(fontSize: 11)),
+        onTap: busy
+            ? null
+            : () {
+                onTap();
+                onChanged();
+              },
+      );
+  Widget chk(String label, String sub, bool v, void Function(bool) set) => CheckboxListTile(
+        dense: true,
+        visualDensity: VisualDensity.compact,
+        contentPadding: EdgeInsets.zero,
+        controlAffinity: ListTileControlAffinity.leading,
+        title: Text(label, style: const TextStyle(fontSize: 13)),
+        subtitle: sub.isEmpty ? null : Text(sub, style: const TextStyle(fontSize: 11)),
+        value: v,
+        onChanged: busy
+            ? null
+            : (x) {
+                set(x ?? false);
+                onChanged();
+              },
+      );
+  Widget head(String t) => Padding(
+        padding: const EdgeInsets.only(top: 8, bottom: 2),
+        child: Text(t, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+      );
+  const engines = <String>['سريع متوازي', 'سريع عادي', 'دقيق'];
+  return Builder(
+    builder: (context) => Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: const EdgeInsets.only(bottom: 8),
+        dense: true,
+        title: Text('طرق العد • ${engines[countEngine]} • طريقة $countMethod', style: const TextStyle(fontSize: 13)),
+        children: [
+          head('محرك العد (اختار واحد)'),
+          radio('⚡ سريع متوازي (الأسرع - الافتراضي)', 'بيقرا صفحتين مع بعض من صور الـ PDF مباشرة', countEngine == 0, () => setCountEngine(0)),
+          radio('سريع عادي', 'نفس السريع بس صفحة ورا صفحة (أخف على الذاكرة)', countEngine == 1, () => setCountEngine(1)),
+          head('العدد المعروض بيتحسب بـ (اختار واحدة)'),
+          radio('طريقة 3: تسلسل رأسي', 'شعار ← Terminal ← RRN ← AMOUNT ← Approved', countMethod == 3, () => setCountMethod(3)),
+          radio('طريقة 2: علامات الدفع بس', 'RRN / AMOUNT / Approved', countMethod == 2, () => setCountMethod(2)),
+          radio('طريقة 1: أكبر علامة (الافتراضية)', 'أكتر علامة متكررة في كل عمود', countMethod == 1, () => setCountMethod(1)),
+          head('إضافات (علّم على اللي عايزه)'),
+          chk('تدقيق مزدوج لآخر صفحة', 'قراءة تانية بصورة محسّنة - أدق وأبطأ شوية', dualCount, (v) {
+            dualCount = v;
+            _saveCfgKey('dualCount', v);
+          }),
+          chk('إعادة فحص الصفحات المشكوك فيها', 'إزالة الخط الأحمر + عدّ المستطيلات (بتشتغل بس لما الطرق تختلف)', redFixCount, setRedFixCount),
+          chk('حماية الزيادة (+1)', 'صفحة كاملة عددها أكتر بواحد والعلامات متفقة على الأقل = بتتصحح', consensusGuard, setConsensusGuard),
+          Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: TextButton.icon(
+              onPressed: busy
+                  ? null
+                  : () {
+                      resetCountDefaults();
+                      onChanged();
+                    },
+              icon: const Icon(Icons.restart_alt, size: 18),
+              label: const Text('رجوع للإعدادات الافتراضية', style: TextStyle(fontSize: 12)),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
 
-/// البيانات الحالية: بتبدأ بالمدمجة وبعدين بتتحمّل من ملف الإكسل (assets/data.json).
-/// لو الملف فيه غلط، التطبيق يكمل بالبيانات المدمجة.
-class AppData {
-  static List<String> names = List.of(_defNames);
-  static List<Unit> units = List.of(_defUnits);
-  static final ValueNotifier<int> rev = ValueNotifier(0);
-  static final ValueNotifier<String> status = ValueNotifier('بيانات مدمجة');
+Widget _statusBox(String text) => Builder(
+      builder: (c) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: Theme.of(c).colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 1),
+              child: Icon(Icons.info_outline, size: 16, color: Theme.of(c).colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(width: 8),
+            Expanded(child: Text(text, style: const TextStyle(fontSize: 13))),
+          ],
+        ),
+      ),
+    );
 
-  static bool _apply(String raw) {
+// ───────── نقل/نسخ ملفات لفولدر بيختاره المستخدم من متصفح ملفات التليفون ─────────
+// بيرجّع خريطة (المسار القديم ← الجديد) للملفات اللي اتنقلت/اتنسخت، أو null لو اتلغى
+String _todayFolderName() {
+  final n = DateTime.now();
+  return '${n.day}.${n.month}';
+}
+
+Future<Map<String, String>?> transferFilesViaPicker(BuildContext context, List<String> paths,
+    {String? forceMode, bool allowMove = true}) async {
+  final existing = paths.where((p) => File(p).existsSync()).toList();
+  if (existing.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('مفيش ملفات جاهزة للنقل.')),
+    );
+    return null;
+  }
+  final mode = forceMode ?? await showDialog<String>(
+    context: context,
+    builder: (c) => AlertDialog(
+      title: const Text('نقل الملفات'),
+      content: Text('${existing.length} ملف. اختار مكان من التليفون، وهيتعمل فيه فولدر بتاريخ النهارده (${_todayFolderName()}) والملفات تتحط جواه.'
+          '${allowMove ? '' : '\n\nالنقل هيتفعل لما العد يخلص. دلوقتي النسخ بس.'}'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(c), child: const Text('إلغاء')),
+        TextButton(onPressed: () => Navigator.pop(c, 'copy'), child: const Text('نسخ')),
+        FilledButton(onPressed: allowMove ? () => Navigator.pop(c, 'move') : null, child: const Text('نقل')),
+      ],
+    ),
+  );
+  if (mode == null) return null;
+  try {
+    if (!await Permission.manageExternalStorage.isGranted) {
+      await Permission.manageExternalStorage.request();
+    }
+  } catch (_) {}
+  if (!context.mounted) return null;
+  String? dir;
+  var fallback = false;
+  try {
+    final handlers = _toHandlers(await _chan.invokeMethod<List<dynamic>>('folderPickHandlers'));
+    if (!context.mounted) return null;
+    final picked = await chooseHandler(
+      context,
+      title: 'افتح بإيه عشان تختار الفولدر؟ (فيه زر إنشاء فولدر جديد)',
+      handlers: handlers,
+      prefKey: 'dest_folder_picker',
+      systemOption: <String, String>{'pkg': '', 'cls': '', 'kind': 'tree', 'label': 'متصفح ملفات النظام'},
+    );
+    if (picked == null) return null;
+    final r = await _chan.invokeMethod<String>('pickFolderWith', {
+      'pkg': picked['pkg'] ?? '',
+      'cls': picked['cls'] ?? '',
+    });
+    if (r == null || r == '?') {
+      fallback = true;
+    } else if (r.isEmpty) {
+      return null; // اتلغى
+    } else {
+      dir = r;
+    }
+  } catch (_) {
+    fallback = true;
+  }
+  if (fallback) {
+    if (!context.mounted) return null;
+    dir = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => FolderPicker(start: root)),
+    );
+  }
+  if (dir == null) return null;
+  // فولدر بتاريخ النهارده (مثلاً 14.11) جوا المكان اللي اخترته، والملفات بتتحط جواه
+  final folderName = _todayFolderName();
+  try {
+    final sub = Directory('$dir/$folderName');
+    if (!sub.existsSync()) sub.createSync(recursive: true);
+    dir = sub.path;
+  } catch (_) {}
+  final done = <String, String>{};
+  var failed = 0;
+  for (final p in existing) {
     try {
-      final j = jsonDecode(raw) as Map<String, dynamic>;
-      final n = (j['names'] as List)
-          .map((e) => e.toString().trim())
-          .where((e) => e.isNotEmpty)
-          .toList();
-      final u = (j['units'] as List)
-          .map((e) => Unit.fromJson(Map<String, dynamic>.from(e as Map)))
-          .toList();
-      if (n.isEmpty || u.isEmpty) return false;
-      if (u.any((x) => x.name.isEmpty || x.tid.isEmpty)) return false;
-      names = n;
-      units = u;
-      rev.value++;
+      final name = baseName(p);
+      var dot = name.lastIndexOf('.');
+      final stem = dot > 0 ? name.substring(0, dot) : name;
+      final ext = dot > 0 ? name.substring(dot) : '';
+      var dst = File('$dir/$name');
+      var k = 2;
+      while (dst.existsSync()) {
+        dst = File('$dir/${stem}_$k$ext');
+        k++;
+      }
+      if (dst.path == p) continue;
+      await File(p).copy(dst.path);
+      if (mode == 'move') {
+        try {
+          File(p).deleteSync();
+        } catch (_) {}
+      }
+      done[p] = dst.path;
+    } catch (_) {
+      failed++;
+    }
+  }
+  if (context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(
+          '${mode == 'move' ? 'اتنقل' : 'اتنسخ'} ${done.length} ملف لفولدر $folderName${failed > 0 ? ' • فشل $failed' : ''}'),
+    ));
+  }
+  return done;
+}
+
+Widget _bottomBar(Widget button, {bool busy = false, double? progress}) => Material(
+      elevation: 6,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (busy)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: LinearProgressIndicator(value: (progress ?? 0) > 0 ? progress : null),
+              ),
+            SizedBox(height: 44, width: double.infinity, child: button),
+          ],
+        ),
+      ),
+    );
+
+// ───────── عناصر موحّدة بين تاب التقفيل وتاب إيصالات الدفع ─────────
+
+// الشريط السفلي: [فحص التاب ده] + [فحص الكل]، وبيتحوّل لزرار إيقاف وقت الشغل
+Widget _scanBar({
+  required bool busy,
+  required bool stopReq,
+  required VoidCallback onStop,
+  required String thisLabel,
+  required VoidCallback onScanThis,
+  double? progress,
+}) =>
+    ValueListenableBuilder<int>(
+      valueListenable: chainStep,
+      builder: (c, step, _) {
+        final Widget child;
+        if (busy) {
+          final stepTxt = step == 1
+              ? ' • التقفيل (1 من 2)'
+              : step == 2
+                  ? ' • إيصالات الدفع (2 من 2)'
+                  : '';
+          final pct = (progress != null && progress > 0) ? ' • ${(progress * 100).round()}%' : '';
+          child = FilledButton.icon(
+            onPressed: stopReq ? null : onStop,
+            style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(c).colorScheme.error, foregroundColor: Theme.of(c).colorScheme.onError),
+            icon: const Icon(Icons.stop),
+            label: Text(stopReq ? 'جاري الإيقاف...' : 'إيقاف$stepTxt$pct'),
+          );
+        } else {
+          child = Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: FilledButton.icon(
+                  onPressed: chainRunning ? null : onScanThis,
+                  style: FilledButton.styleFrom(minimumSize: const Size(0, 44)),
+                  icon: const Icon(Icons.play_arrow),
+                  label: Text(thisLabel),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                flex: 2,
+                child: OutlinedButton.icon(
+                  onPressed: (chainRunning || homeBusyG || machBusyG) ? null : () => runAllScans(),
+                  style: OutlinedButton.styleFrom(minimumSize: const Size(0, 44)),
+                  icon: const Icon(Icons.playlist_play),
+                  label: const Text('فحص الكل'),
+                ),
+              ),
+            ],
+          );
+        }
+        return _bottomBar(child, busy: busy, progress: progress);
+      },
+    );
+
+// قايمة ⋮ الموحّدة (المظهر، الخلفية، الصيانة، الإصدار)
+Widget _moreMenu(BuildContext context, {required bool busy}) {
+  final ar = AppSettings.of(context).isAr;
+  return PopupMenuButton<String>(
+    tooltip: tr('المزيد'),
+    onSelected: (v) {
+      if (v == 'appearance') {
+        showAppearanceSheet(context);
+      } else if (v == 'battery') {
+        askBatteryExempt(force: true);
+      } else if (v == 'resetApps') {
+        resetDefaultHandlers(context);
+      } else if (v == 'resetSettings') {
+        resetAllSettings(context);
+      } else if (v == 'autolog') {
+        showAutoLog(context);
+      } else if (v == 'wipe') {
+        wipeEverything(context);
+      }
+    },
+    itemBuilder: (_) => [
+      if (MediaQuery.sizeOf(context).width < 400)
+        PopupMenuItem(value: 'appearance', child: w.Text(ar ? 'المظهر واللغة' : 'Theme & language')),
+      PopupMenuItem(
+          value: 'battery', child: w.Text(ar ? 'السماح بالعمل في الخلفية' : 'Allow background running')),
+      PopupMenuItem(
+          value: 'resetApps', child: w.Text(ar ? 'إعادة اختيار تطبيقات الفتح' : 'Reset default apps')),
+      PopupMenuItem(
+          value: 'resetSettings',
+          enabled: !busy,
+          child: w.Text(ar ? '↩️ رجّع كل الإعدادات للافتراضي' : '↩️ Reset all settings to default')),
+      PopupMenuItem(value: 'autolog', child: w.Text(ar ? 'سجل الفحص' : 'Scan log')),
+      const PopupMenuDivider(),
+      PopupMenuItem(
+          value: 'wipe',
+          enabled: !busy,
+          child: w.Text(ar ? '🧹 مسح كل حاجة (كاش + مؤقت)' : '🧹 Wipe everything (cache + temp)')),
+      const PopupMenuItem(enabled: false, child: Text('الإصدار $kAppVersion')),
+    ],
+  );
+}
+
+// زرار دايرة (أيقونة + اسم) لصف الأزرار الموحّد
+Widget _quickBtnG(BuildContext context, IconData icon, String label, VoidCallback? onTap) {
+  final cs = Theme.of(context).colorScheme;
+  return InkWell(
+    borderRadius: BorderRadius.circular(30),
+    onTap: onTap,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          CircleAvatar(
+            radius: 17,
+            backgroundColor: onTap == null ? cs.surfaceContainerHighest : cs.primaryContainer,
+            child: Icon(icon, size: 19, color: onTap == null ? Theme.of(context).disabledColor : cs.onPrimaryContainer),
+          ),
+          const SizedBox(height: 2),
+          Text(label,
+              style: TextStyle(
+                  fontSize: 11, color: onTap == null ? Theme.of(context).disabledColor : null)),
+        ],
+      ),
+    ),
+  );
+}
+
+Widget _actionRow(List<Widget> kids) =>
+    Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: kids);
+
+// تلميح السحب + زرار "الباقي صح" (نفس المكان والشكل في التابين)
+Widget _reviewTools(BuildContext context,
+        {required String hint,
+        required int count,
+        required bool reviewOnly,
+        required bool busy,
+        required VoidCallback onRestOk}) =>
+    Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (hint.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2),
+            child: w.Text(hint,
+                style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+          ),
+        if (reviewOnly && count > 0)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: _mini(Icons.done_all, 'الباقي صح ($count)', busy ? null : onRestOk),
+          ),
+      ],
+    );
+
+// رقم الإصدار: بييجي من GitHub Actions وقت البناء (APP_VERSION + رقم البناء)
+const String kAppVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'تجريبي');
+
+class PosApp extends StatelessWidget {
+  const PosApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: appSettings,
+      builder: (context, _) => MaterialApp(
+        title: kAppName,
+        debugShowCheckedModeBanner: false,
+        theme: _buildTheme(Brightness.light),
+        darkTheme: _buildTheme(Brightness.dark),
+        themeMode: appSettings.themeMode,
+        builder: (context, child) => _LangScope(
+          notifier: appSettings,
+          child: Directionality(
+            textDirection: appSettings.isAr ? TextDirection.rtl : TextDirection.ltr,
+            child: child!,
+          ),
+        ),
+        home: const RootPage(),
+      ),
+    );
+  }
+}
+
+Widget _badged(ValueNotifier<int> n, IconData icon) => ValueListenableBuilder<int>(
+      valueListenable: n,
+      builder: (_, v, __) => Badge(
+        isLabelVisible: v > 0,
+        label: w.Text('$v'),
+        child: Icon(icon),
+      ),
+    );
+
+class RootPage extends StatefulWidget {
+  const RootPage({super.key});
+
+  @override
+  State<RootPage> createState() => _RootPageState();
+}
+
+class _RootPageState extends State<RootPage> {
+  int tab = 0;
+
+  AppLifecycleListener? _lcl;
+
+  @override
+  void initState() {
+    super.initState();
+    chainStep.addListener(_onChain);
+    openReqG.addListener(_onOpenReq);
+    _chan.setMethodCallHandler(_onNative);
+    _lcl = AppLifecycleListener(onResume: _pullOpen);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _pullOpen());
+  }
+
+  @override
+  void dispose() {
+    chainStep.removeListener(_onChain);
+    openReqG.removeListener(_onOpenReq);
+    _lcl?.dispose();
+    super.dispose();
+  }
+
+  Future<dynamic> _onNative(MethodCall call) async {
+    if (call.method == 'onOpen') {
+      final p = call.arguments;
+      if (p is String && p.isNotEmpty) requestOpenG(p);
+      try {
+        await _chan.invokeMethod('getInitialOpen'); // نمسح الطلب من ناحية أندرويد
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  Future<void> _pullOpen() async {
+    try {
+      final p = await _chan.invokeMethod<String>('getInitialOpen');
+      if (p != null && p.isNotEmpty) requestOpenG(p);
+    } catch (_) {}
+  }
+
+  void _onOpenReq() {
+    final v = openReqG.value;
+    if (v == null || !mounted) return;
+    final t = v.startsWith('mach|') ? 1 : 0;
+    if (t != tab) setState(() => tab = t);
+  }
+
+  // أثناء الفحص الشامل: نفتح التاب اللي شغال دلوقتي
+  void _onChain() {
+    final s = chainStep.value;
+    final t = s == 1 ? 0 : (s == 2 ? 1 : tab);
+    if (mounted && t != tab) setState(() => tab = t);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    AppSettings.of(context);
+    return Scaffold(
+      body: IndexedStack(index: tab, children: const [HomePage(), MachinesPage()]),
+      bottomNavigationBar: NavigationBar(
+        height: 60,
+        selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        destinations: [
+          NavigationDestination(
+            icon: _badged(homeBadge, Icons.receipt_long),
+            label: tr('التقفيل'),
+          ),
+          NavigationDestination(
+            icon: _badged(machBadge, Icons.folder_copy),
+            label: tr('إيصالات الدفع'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+const String kAppName = 'A2R POS';
+const String kAppAuthor = 'Ahmed Ramadan - Alexandria';
+
+// ───────────────────── الإعدادات: اللغة + الدارك مود ─────────────────────
+class AppSettings extends ChangeNotifier with WidgetsBindingObserver {
+  ThemeMode themeMode = ThemeMode.system; // system = حسب النظام
+  String? langCode; // null = حسب لغة النظام
+  int seedIndex = kDefaultSeed;
+  SharedPreferences? _prefs;
+
+  bool get isAr {
+    final code = langCode ?? WidgetsBinding.instance.platformDispatcher.locale.languageCode;
+    return code == 'ar';
+  }
+
+  Future<void> load() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      _prefs = p;
+      final t = p.getString('theme_mode');
+      themeMode = t == 'dark' ? ThemeMode.dark : (t == 'light' ? ThemeMode.light : ThemeMode.system);
+      final l = p.getString('lang');
+      langCode = (l == 'ar' || l == 'en') ? l : null;
+      final sd = p.getInt('seed') ?? kDefaultSeed;
+      seedIndex = (sd >= 0 && sd < kSeeds.length) ? sd : kDefaultSeed;
+    } catch (_) {}
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeLocales(List<Locale>? locales) {
+    if (langCode == null) notifyListeners(); // بنتبع لغة النظام
+  }
+
+  void setLang(String? code) {
+    langCode = code;
+    try {
+      if (code == null) {
+        _prefs?.remove('lang');
+      } else {
+        _prefs?.setString('lang', code);
+      }
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  void setMode(ThemeMode m) {
+    themeMode = m;
+    try {
+      _prefs?.setString('theme_mode', m == ThemeMode.dark ? 'dark' : (m == ThemeMode.light ? 'light' : 'system'));
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  void setSeed(int i) {
+    seedIndex = i;
+    try {
+      _prefs?.setInt('seed', i);
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  // أي ويدجت بتنده عليها بتتسجّل وبتتحدّث لوحدها لما اللغة تتغير
+  static AppSettings of(BuildContext context) {
+    final s = context.dependOnInheritedWidgetOfExactType<_LangScope>();
+    return s?.notifier ?? appSettings;
+  }
+}
+
+final AppSettings appSettings = AppSettings();
+
+// لون هوية التطبيق (A2R): أزرق ملكي. بيتضاف في آخر القايمة علشان اللي اختار لون قبل كده يفضل لونه.
+const Color kBrandSeed = Color(0xFF2B59C3);
+const int kDefaultSeed = 6; // مكان kBrandSeed في kSeeds
+const List<Color> kSeeds = [Colors.teal, Colors.blue, Colors.indigo, Colors.green, Colors.orange, Colors.purple, kBrandSeed];
+const List<String> kSeedNamesAr = ['تيل', 'أزرق', 'نيلي', 'أخضر', 'برتقالي', 'بنفسجي', 'A2R (الهوية)'];
+const List<String> kSeedNamesEn = ['Teal', 'Blue', 'Indigo', 'Green', 'Orange', 'Purple', 'A2R (brand)'];
+
+// ───────── حالة مشتركة بين التابين ─────────
+final ValueNotifier<Map<int, int>> closingTxn = ValueNotifier<Map<int, int>>(<int, int>{}); // رقم الماكينة -> عدد معاملات الباتش
+final ValueNotifier<int> settingsResetSignal = ValueNotifier<int>(0); // بيتغير لما "رجّع كل الإعدادات للافتراضي" يخلص
+final ValueNotifier<int> wipeSignal = ValueNotifier<int>(0); // بيتغير لما "مسح كل حاجة" يخلص
+bool homeBusyG = false;
+bool machBusyG = false;
+bool quickBusyG = false; // الفحص التلقائي الخفيف شغال دلوقتي (الفحص اليدوي بيستنى لحد ما يخلص)
+
+Future<void> waitQuickIdle() async {
+  while (quickBusyG) {
+    await Future.delayed(const Duration(milliseconds: 400));
+  }
+}
+
+// قفل خدمة الخلفية بس لو مفيش فحص تلقائي شغال في أي تاب
+Future<void> stopKeepAliveSafe() async {
+  if (homeAutoG || machAutoG) return;
+  try {
+    await _chan.invokeMethod('stopKeepAlive');
+  } catch (_) {}
+}
+
+// ───────── الفحص التلقائي الخفيف: الملفات اللي اتفحصت (seen) + نتايج النهارده (لكشف التكرار) ─────────
+const int _kQuickSeenMax = 800; // آخر 800 مفتاح بس
+const int _kQuickBulk = 25; // أكتر من كده في دورة واحدة = مش وصول جديد (فترة/فولدر اتغيّر): ما نفحصهمش تلقائي
+
+String quickKeyOf(File f) {
+  var len = 0;
+  try {
+    len = f.lengthSync();
+  } catch (_) {}
+  return '${baseName(f.path)}:$len';
+}
+
+bool quickHasBaseline() => _readCfg()['quickSeen'] is List;
+
+Set<String> loadQuickSeen() {
+  final v = _readCfg()['quickSeen'];
+  return v is List ? v.map((e) => e.toString()).toSet() : <String>{};
+}
+
+void quickMarkSeen(Iterable<String> keys) {
+  final cfg = _readCfg();
+  final cur = cfg['quickSeen'] is List
+      ? (cfg['quickSeen'] as List).map((e) => e.toString()).toList()
+      : <String>[];
+  final have = cur.toSet();
+  for (final k in keys) {
+    if (have.add(k)) cur.add(k);
+  }
+  cfg['quickSeen'] = cur.length > _kQuickSeenMax ? cur.sublist(cur.length - _kQuickSeenMax) : cur;
+  _writeCfg(cfg);
+}
+
+// ───────── الفحص الشامل: الباتشات (التقفيل) ثم الملفات (إيصالات الدفع) ورا بعض ─────────
+bool chainRunning = false;
+bool chainAbort = false;
+
+// بيترمي من جوه حلقات الصفحات/الصور لما تضغط إيقاف، علشان الفحص يقف في ثواني مش بعد ما الملف الكبير يخلص
+class ScanStopped implements Exception {
+  const ScanStopped();
+}
+bool homeAutoG = false;
+bool machAutoG = false;
+final ValueNotifier<int> chainStep = ValueNotifier<int>(0); // 0 = واقف، 1 = الباتشات، 2 = الملفات
+final ValueNotifier<String> chainSummary = ValueNotifier<String>('');
+Future<void> Function()? homeRunG;
+Future<void> Function()? machRunG;
+String Function()? homeSumG;
+String Function()? machSumG;
+
+Future<void> runAllScans() async {
+  if (chainRunning || homeBusyG || machBusyG) return;
+  if (homeRunG == null || machRunG == null) return;
+  final perm = await Permission.manageExternalStorage.request();
+  if (!perm.isGranted) {
+    chainSummary.value = 'لازم تسمح بالوصول لكل الملفات الأول.';
+    return;
+  }
+  chainRunning = true;
+  chainAbort = false;
+  chainSummary.value = '';
+  await waitQuickIdle(); // لو الفحص الخفيف شغال نستناه يخلص
+  final chainSw = Stopwatch()..start();
+  try {
+    await Permission.notification.request();
+  } catch (_) {}
+  await askBatteryExempt();
+  try {
+    await _chan.invokeMethod('startKeepAlive', {'title': 'A2R POS', 'text': 'جاري الفحص الشامل (التقفيل + إيصالات الدفع)...'});
+  } catch (_) {}
+  try {
+    await _chan.invokeMethod('keepScreenOn', {'on': true});
+  } catch (_) {}
+  try {
+    chainStep.value = 1;
+    await homeRunG!();
+    if (!chainAbort) {
+      chainStep.value = 2;
+      await machRunG!();
+    }
+  } catch (e) {
+    _dbg('CHAIN_ERROR $e');
+  } finally {
+    chainSw.stop();
+    final aborted = chainAbort;
+    chainRunning = false;
+    chainStep.value = 0;
+    try {
+      if (homeAutoG || machAutoG) {
+        await _chan.invokeMethod('startKeepAlive', {'title': 'A2R POS', 'text': 'مراقبة الإيصالات الجديدة...'});
+      } else {
+        await _chan.invokeMethod('stopKeepAlive');
+      }
+    } catch (_) {}
+    try {
+      await _chan.invokeMethod('keepScreenOn', {'on': false});
+    } catch (_) {}
+    final hs = homeSumG?.call() ?? '';
+    final ms = machSumG?.call() ?? '';
+    chainSummary.value = '${aborted ? 'اتوقف الفحص الشامل.' : 'اكتمل الفحص الشامل ✓'}\n'
+        '• التقفيل: $hs\n'
+        '• إيصالات الدفع: $ms\n'
+        '⏱ الوقت المستغرق: ${fmtElapsed(chainSw.elapsed)}';
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      try {
+        await _chan.invokeMethod('notify', {
+          'title': tr('A2R POS - انتهى الفحص الشامل'),
+          'text': tr('$hs • $ms • ⏱ ${fmtElapsed(chainSw.elapsed)}')
+        });
+      } catch (_) {}
+    }
+  }
+}
+
+// ملخص الفحص الشامل (الأزرار نفسها بقت في الشريط السفلي)
+Widget _runAllCard() => ValueListenableBuilder<String>(
+      valueListenable: chainSummary,
+      builder: (c, sm, _) => sm.isEmpty
+          ? const SizedBox.shrink()
+          : Padding(padding: const EdgeInsets.only(bottom: 6), child: _statusBox(sm)),
+    );
+
+// ───────── مبلغ السيستم (صورة A2R Operations Console) + حفظ نتايج فحص التقفيل ─────────
+// صورة السيستم: فيها رقم الترمنل + "إجمالي مبالغ السيستم". مش باتش، فمتتعدّش، والمبلغ بيتربط بالباتشات بالترمنل.
+class SysTotal {
+  final String? tid; // رقم الترمنل المقروء
+  final double? amount; // إجمالي مبالغ السيستم
+  final String? date; // بنفس صيغة تاريخ الإيصالات (يوم.شهر)
+  final String printed; // وقت الطباعة (لو فيه أكتر من صورة لنفس الترمنل ناخد الأحدث)
+  final String file;
+  final int? txn; // إيصالات إلكترونية (ده الرقم اللي بنقارن بيه عدد إيصالات الدفع)
+  final int? txnAll; // إجمالي العمليات
+  const SysTotal(this.tid, this.amount, this.date, this.printed, this.file, {this.txn, this.txnAll});
+
+  Map<String, dynamic> toJson() =>
+      {'tid': tid, 'amt': amount, 'date': date, 'pr': printed, 'f': file, 'tx': txn, 'ta': txnAll};
+
+  static SysTotal fromJson(Map m) => SysTotal(
+        m['tid'] as String?,
+        (m['amt'] as num?)?.toDouble(),
+        m['date'] as String?,
+        (m['pr'] as String?) ?? '',
+        (m['f'] as String?) ?? '',
+        txn: (m['tx'] as num?)?.toInt(),
+        txnAll: (m['ta'] as num?)?.toInt(),
+      );
+}
+
+// أعداد صورة السيستم من مواقع الأسطر (الـ OCR لاتيني فبيقرا الأرقام بس، والعناوين العربي مش مقروءة).
+// الترتيب من فوق لتحت بعد سطر التاريخ وقبل سطر المبلغ: إجمالي العمليات، إيصالات إلكترونية، يدوية، ملغية.
+// بترجع [إجمالي العمليات، الإلكترونية] أو [null, null] لو مش متأكدين.
+List<int?> _sysCounts(RecognizedText rt) {
+  final lines = <TextLine>[for (final b in rt.blocks) ...b.lines];
+  final egpRe = RegExp(r'\d[.,]\d{2}\s*EG[PR]', caseSensitive: false);
+  double? egpTop;
+  for (final l in lines) {
+    if (egpRe.hasMatch(l.text)) {
+      final t = l.boundingBox.top;
+      if (egpTop == null || t < egpTop) egpTop = t;
+    }
+  }
+  if (egpTop == null) return [null, null];
+  final dateRe = RegExp(r'\d{1,2}\s?[.\-/]\s?\d{1,2}\s?[.\-/]\s?20\d{2}');
+  double? dateBottom;
+  for (final l in lines) {
+    if (dateRe.hasMatch(l.text) && l.boundingBox.top < egpTop) {
+      final b = l.boundingBox.bottom;
+      if (dateBottom == null || b < dateBottom) dateBottom = b;
+    }
+  }
+  final numRe = RegExp(r'^[^A-Za-z\d]{0,3}(\d{1,5})[^A-Za-z\d]{0,3}$');
+  final nums = <MapEntry<double, int>>[];
+  for (final l in lines) {
+    final m = numRe.firstMatch(l.text.trim());
+    if (m == null) continue;
+    if (l.boundingBox.bottom > egpTop + 4) continue;
+    if (dateBottom != null && l.boundingBox.top < dateBottom - 4) continue;
+    nums.add(MapEntry(l.boundingBox.top, int.parse(m.group(1)!)));
+  }
+  nums.sort((a, b) => a.key.compareTo(b.key));
+  if (nums.length < 2) return [null, null];
+  final total = nums[0].value, elec = nums[1].value;
+  if (elec > total) return [null, null];
+  return [total, elec];
+}
+
+SysTotal? parseSysConsole(String text, String file, {RecognizedText? rt}) {
+  final up = text.toUpperCase();
+  final hasTitle = RegExp(r'OPERATIONS?\s*CONS|A2R\s*OPER').hasMatch(up);
+  final printedM = RegExp(
+          r'PRINTED\W{0,3}\s*(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?',
+          caseSensitive: false)
+      .firstMatch(text);
+  final egpRe = RegExp(r'(?<![\d,.])(\d{1,3}(?:,\d{3})+|\d+)[.,](\d{2})\s*EG[PR]', caseSensitive: false);
+  double? amount;
+  for (final m in egpRe.allMatches(text)) {
+    final v = double.tryParse('${m.group(1)!.replaceAll(',', '')}.${m.group(2)!}');
+    if (v != null && (amount == null || v > amount)) amount = round2(v);
+  }
+  if (!hasTitle) {
+    // العنوان اتقرا غلط: نتأكد من علامات تانية (Printed + EGP + ترمنل معروف) ومن إنه مش إيصال بنك
+    if (printedM == null || amount == null) return null;
+    if (classifyReceipt(text) != 'other') return null;
+    if (findTerminalIn([text]) == null) return null;
+  }
+  String? tid = findTerminalIn([text]);
+  tid ??= RegExp(r'(?<!\d)(50\d{6})(?!\d)').firstMatch(text)?.group(1);
+  // إيصال السيستم لازم فيه رقم ترمنل (أي ترمنل). من غيره مش إيصال سيستم. رقم إصدار البرنامج (v60 / v51...) ملوش علاقة
+  if (tid == null) return null;
+
+  String? date;
+  final dm = RegExp(r'(?<!\d)(\d{1,2})\s?[.\-/]\s?(\d{1,2})\s?[.\-/]\s?(20\d{2})(?!\d)').firstMatch(text);
+  if (dm != null) {
+    date = '${int.parse(dm.group(1)!)}.${int.parse(dm.group(2)!)}';
+  } else if (printedM != null) {
+    date = '${int.parse(printedM.group(3)!)}.${int.parse(printedM.group(2)!)}';
+  }
+  var printed = '';
+  if (printedM != null) {
+    final t = printedM.group(4);
+    final tt = t == null ? '' : t.split(':').map((e) => e.padLeft(2, '0')).join(':');
+    printed = '${printedM.group(1)}-${printedM.group(2)!.padLeft(2, '0')}-${printedM.group(3)!.padLeft(2, '0')} $tt';
+  }
+  final cnt = rt == null ? <int?>[null, null] : _sysCounts(rt);
+  return SysTotal(tid, amount, date, printed, file, txnAll: cnt[0], txn: cnt[1]);
+}
+
+String _fmtMoney(double v) {
+  final s = v.toStringAsFixed(2);
+  final p = s.split('.');
+  final neg = p[0].startsWith('-');
+  final digits = neg ? p[0].substring(1) : p[0];
+  final b = StringBuffer();
+  for (var i = 0; i < digits.length; i++) {
+    if (i > 0 && (digits.length - i) % 3 == 0) b.write(',');
+    b.write(digits[i]);
+  }
+  return '${neg ? '-' : ''}$b.${p[1]}';
+}
+
+// نتايج قراءة كل صورة (بتتحفظ في SharedPreferences: بتتمسح مع "مسح البيانات والكاش").
+// الفحص الجديد بيقرا بس الصور الجديدة، والباقي بيتاخد من هنا.
+const int _kScanVer = 1;
+const String _kScanCacheKey = 'closing_scan_cache_v1';
+Map<String, dynamic> _scanCache = <String, dynamic>{};
+bool _scanCacheLoaded = false;
+int _scanCacheDirty = 0;
+
+Future<void> loadScanCache() async {
+  if (_scanCacheLoaded) return;
+  try {
+    final p = await SharedPreferences.getInstance();
+    final raw = p.getString(_kScanCacheKey);
+    _scanCache = raw == null ? <String, dynamic>{} : Map<String, dynamic>.from(jsonDecode(raw) as Map);
+  } catch (_) {
+    _scanCache = <String, dynamic>{};
+  }
+  // نشيل اللي أقدم من 21 يوم علشان الحجم ما يكبرش
+  final limit = DateTime.now().subtract(const Duration(days: 21)).millisecondsSinceEpoch;
+  _scanCache.removeWhere((k, v) => v is! Map || ((v['ts'] as num?) ?? 0) < limit);
+  _scanCacheLoaded = true;
+}
+
+Future<void> saveScanCache() async {
+  try {
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_kScanCacheKey, jsonEncode(_scanCache));
+    _scanCacheDirty = 0;
+  } catch (_) {}
+}
+
+Future<void> clearScanCache() async {
+  _scanCache = <String, dynamic>{};
+  _scanCacheLoaded = true;
+  _scanCacheDirty = 0;
+  try {
+    final p = await SharedPreferences.getInstance();
+    await p.remove(_kScanCacheKey);
+  } catch (_) {}
+}
+
+void _cachePut(String key, Map<String, dynamic> e) {
+  e['v'] = _kScanVer;
+  e['ts'] = DateTime.now().millisecondsSinceEpoch;
+  _scanCache[key] = e;
+  _scanCacheDirty++;
+}
+
+Map<String, dynamic> _receiptToCache(ReceiptItem it, int? rot) => {
+      'k': 'receipt',
+      'tid': it.tid,
+      'row': it.row,
+      'unit': it.unitName,
+      'amt': it.amount,
+      'date': it.date,
+      'ok': it.ok,
+      'how': it.how,
+      'bat': it.batches,
+      'alt': it.alt,
+      'rep': it.reprintSummary,
+      'nobc': it.missingBatchClosed,
+      'txn': it.txn,
+      'cands': it.cands,
+      'rot': rot,
+    };
+
+ReceiptItem _receiptFromCache(Map<String, dynamic> c, String key, String path) {
+  final tid = c['tid'] as String?;
+  final item = ReceiptItem(
+    path: path,
+    tid: tid,
+    orderNum: tid != null ? terminals[tid]!.orderNum : null,
+    row: c['row'] as int?,
+    unitName: c['unit'] as String?,
+    amount: ((c['amt'] as num?) ?? 0).toDouble(),
+    date: c['date'] as String?,
+    key: key,
+    ok: c['ok'] == true,
+    how: (c['how'] as String?) ?? 'none',
+    batches: ((c['bat'] as List?) ?? const []).map((e) => (e as num).toDouble()).toList(),
+    alt: (c['alt'] as num?)?.toDouble(),
+    reprintSummary: c['rep'] == true,
+    missingBatchClosed: c['nobc'] == true,
+  );
+  item.txn = c['txn'] as int?;
+  item.cands = ((c['cands'] as List?) ?? const []).map((e) => (e as num).toDouble()).toList();
+  return item;
+}
+
+void _publishClosing(List<ReceiptItem> items, [List<SysTotal> sys = const <SysTotal>[]]) {
+  final sums = <int, int>{};
+  final bad = <int>{};
+  for (final it in items) {
+    if (!it.counts) continue;
+    final n = it.orderNum ?? (it.tid != null ? terminals[it.tid]?.orderNum : null);
+    if (n == null) continue;
+    final t = it.txn;
+    if (t == null) {
+      bad.add(n);
+      continue;
+    }
+    sums[n] = (sums[n] ?? 0) + t;
+  }
+  for (final n in bad) {
+    sums.remove(n);
+  }
+  batchTxnByNum = Map<int, int>.from(sums);
+  final amts = <int, double>{};
+  final badAmt = <int>{};
+  for (final it in items) {
+    if (!it.counts) continue;
+    final n = it.orderNum ?? (it.tid != null ? terminals[it.tid]?.orderNum : null);
+    if (n == null) continue;
+    if (!it.ok || it.amount <= 0) {
+      badAmt.add(n);
+      continue;
+    }
+    amts[n] = (amts[n] ?? 0) + it.amount;
+  }
+  for (final n in badAmt) {
+    amts.remove(n);
+  }
+  batchAmtByNum = amts;
+  // عدد إيصالات صورة السيستم (إيصالات إلكترونية) أدق من مجموع الباتشات: بيغلب لو موجود (أحدث صورة لكل ترمنل)
+  final latest = <String, SysTotal>{};
+  for (final sy in sys) {
+    if (sy.tid == null || sy.txn == null) continue;
+    final p = latest[sy.tid!];
+    if (p == null || sy.printed.compareTo(p.printed) > 0) latest[sy.tid!] = sy;
+  }
+  final sysMap = <int, int>{};
+  for (final e in latest.entries) {
+    final n = terminals[e.key]?.orderNum;
+    if (n != null) {
+      sums[n] = e.value.txn!;
+      sysMap[n] = e.value.txn!;
+    }
+  }
+  sysTxnByNum = sysMap;
+  final cur = closingTxn.value;
+  var same = cur.length == sums.length;
+  if (same) {
+    for (final e in sums.entries) {
+      if (cur[e.key] != e.value) {
+        same = false;
+        break;
+      }
+    }
+  }
+  if (same) return;
+  WidgetsBinding.instance.addPostFrameCallback((_) => closingTxn.value = sums);
+}
+
+// تأكيد قبل الإرسال لو فيه حاجات لسه مفتوحة
+Future<bool> confirmSend(BuildContext context, {int review = 0, int missing = 0, int pending = 0}) async {
+  if (review == 0 && missing == 0 && pending == 0) return true;
+  final ar = AppSettings.of(context).isAr;
+  final lines = <String>[
+    if (review > 0) (ar ? '• $review محتاج مراجعة' : '• $review need review'),
+    if (missing > 0) (ar ? '• $missing ماكينة ناقصة' : '• $missing missing machine(s)'),
+    if (pending > 0) (ar ? '• $pending لسه ما اتعدّش' : '• $pending not counted yet'),
+  ];
+  final r = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: w.Text(ar ? 'لسه فيه حاجات مفتوحة' : 'Some things are still open'),
+      content: w.Text('${lines.join('\n')}\n\n${ar ? 'تبعت برضه؟' : 'Send anyway?'}'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: w.Text(ar ? 'رجوع' : 'Back')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: w.Text(ar ? 'ابعت برضه' : 'Send anyway')),
+      ],
+    ),
+  );
+  return r == true;
+}
+
+// رجّع كل الإعدادات للافتراضي: المظهر واللغة واللون، الفولدرات (المصدر والمخرجات)، الفترة، الفحص التلقائي،
+// طرق العد، التطبيقات الافتراضية. مش بيمس: الإيصالات والنتايج والتصحيحات والملفات.
+Future<void> resetAllSettings(BuildContext context) async {
+  final ar = AppSettings.of(context).isAr;
+  final m = ScaffoldMessenger.of(context);
+  if (homeBusyG || machBusyG) {
+    m.showSnackBar(SnackBar(
+        content: w.Text(ar ? 'استنى لحد ما المعالجة تخلص أو وقّفها الأول.' : 'Wait for processing to finish or stop it first.')));
+    return;
+  }
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: w.Text(ar ? 'رجّع كل الإعدادات للافتراضي؟' : 'Reset all settings to default?'),
+      content: w.Text(ar
+          ? 'هيرجع للافتراضي:\n• المظهر واللغة واللون\n• فولدر المصدر وفولدر المخرجات\n• الفترة (اليوم)\n• الفحص التلقائي والصور المقلوبة\n• طرق العد\n• التطبيقات الافتراضية للفتح\n\nمش هيتمس: الإيصالات ونتايج الفحص والتصحيحات والملفات.'
+          : 'Will be reset:\n• Theme, language and color\n• Source and output folders\n• Period (today)\n• Auto-scan and flipped-image scan\n• Counting methods\n• Default apps for opening files\n\nNot touched: receipts, scan results, corrections and files.'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: w.Text(ar ? 'إلغاء' : 'Cancel')),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx, true),
+          child: w.Text(ar ? 'رجّع للافتراضي' : 'Reset'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  resetCountDefaults();
+  try {
+    final cfg = _readCfg();
+    for (final k in const [
+      'folder', 'out', 'pdfDir', 'mOut', 'autoScan', 'autoScanM', 'fastCount', 'dualCount', 'parallelCount',
+      'countEngine', 'countMethod', 'redFixCount', 'consensusGuard', 'defFolder', 'defImage', 'defPdf', 'batteryAsked'
+    ]) {
+      cfg.remove(k);
+    }
+    _writeCfg(cfg);
+  } catch (_) {}
+  sharedDays.value = 0;
+  appSettings.setMode(ThemeMode.system);
+  appSettings.setLang(null);
+  appSettings.setSeed(kDefaultSeed);
+  settingsResetSignal.value++;
+  m.showSnackBar(SnackBar(
+      content: w.Text(appSettings.isAr ? 'رجعت كل الإعدادات للافتراضي ✓' : 'All settings reset to default ✓')));
+}
+
+// مسح كل حاجة: ملفات الإخراج + الصور + نتايج الفحص + التصحيحات + اللوج + الكاش والملفات المؤقتة (الإعدادات واللغة والثيم بيفضلوا)
+Future<void> wipeEverything(BuildContext context) async {
+  final ar = AppSettings.of(context).isAr;
+  final m = ScaffoldMessenger.of(context);
+  if (homeBusyG || machBusyG) {
+    m.showSnackBar(SnackBar(
+        content: w.Text(ar ? 'استنى لحد ما المعالجة تخلص أو وقّفها الأول.' : 'Wait for processing to finish or stop it first.')));
+    return;
+  }
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: w.Text(ar ? 'مسح كل حاجة؟' : 'Wipe everything?'),
+      content: w.Text(ar
+          ? 'هيتمسح نهائي:\n• ملفات الإخراج (الإكسيل والـ PDF)\n• الصور المرتبة والنسخ المتسمية لإيصالات الدفع\n• نتايج الفحص والتصحيحات المحفوظة\n• اللوج\n• الكاش والملفات المؤقتة\n\nمش هيتمس: ملفات واتساب الأصلية، والإعدادات (اللغة والثيم والفولدرات).'
+          : 'This will permanently delete:\n• Output files (Excel and PDF)\n• Sorted images and renamed payment receipt copies\n• Scan results and saved corrections\n• The log\n• Cache and temporary files\n\nNot touched: original WhatsApp files and settings (language, theme, folders).'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: w.Text(ar ? 'إلغاء' : 'Cancel')),
+        FilledButton(
+          style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error, foregroundColor: Theme.of(ctx).colorScheme.onError),
+          onPressed: () => Navigator.pop(ctx, true),
+          child: w.Text(ar ? 'امسح كل حاجة' : 'Wipe everything'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true) return;
+
+  var files = 0;
+  var bytes = 0;
+  bool delFile(File f) {
+    try {
+      bytes += f.lengthSync();
+      f.deleteSync();
+      files++;
       return true;
-    } catch (e, st) {
-      AppLog.e('_apply', e, st);
+    } catch (_) {
       return false;
     }
   }
 
-  /// بيحمّل البيانات من ملف الإكسل اللي اتحوّل وقت البناء. لو فيه مشكلة بيكمل بالبيانات المدمجة.
-  static Future<void> load() async {
+  void wipeTree(String path) {
     try {
-      final raw = await rootBundle.loadString('assets/data.json');
-      if (_apply(raw)) status.value = 'بيانات من ملف الإكسل';
-    } catch (e, st) {
-      AppLog.e('load', e, st);
-    }
-  }
-}
-
-// =====================================================================
-//  أدوات الصور (خفيفة على الذاكرة)
-// =====================================================================
-
-// الفلتر بيتخزن بالرقم (index) في الإعدادات وفي EditParams: الأربعة الأولانيين مايتحركوش من مكانهم،
-// وأي فلتر جديد بيتضاف في الآخر بس، عشان الصور والإعدادات القديمة تفضل شغالة.
-enum ScanFilter {
-  original,
-  enhance,
-  bw,
-  receipt,
-  gray,
-  lighten,
-  magic,
-  document,
-  sharpen,
-  thermal,
-  receiptBw,
-  auto,
-}
-
-/// ترتيب وأسماء الفلاتر في الشاشة (الإيصالات الأول لأنها الأهم).
-const kFilterOrder = <ScanFilter>[
-  ScanFilter.original,
-  ScanFilter.receipt,
-  ScanFilter.thermal,
-  ScanFilter.receiptBw,
-  ScanFilter.auto,
-  ScanFilter.enhance,
-  ScanFilter.magic,
-  ScanFilter.document,
-  ScanFilter.bw,
-  ScanFilter.gray,
-  ScanFilter.lighten,
-  ScanFilter.sharpen,
-];
-
-const kFilterLabels = <ScanFilter, String>{
-  ScanFilter.original: 'أصلي',
-  ScanFilter.receipt: 'إيصال',
-  ScanFilter.thermal: 'حراري باهت',
-  ScanFilter.receiptBw: 'إيصال أ/س',
-  ScanFilter.auto: 'تلقائي',
-  ScanFilter.enhance: 'تحسين',
-  ScanFilter.magic: 'ألوان',
-  ScanFilter.document: 'مستند',
-  ScanFilter.bw: 'أ/س',
-  ScanFilter.gray: 'رمادي',
-  ScanFilter.lighten: 'تفتيح',
-  ScanFilter.sharpen: 'حدة',
-};
-
-/// فلاتر الإيصال: بتعدي على _cleanJob (تقدير لون الورق وقسمة الصورة عليه) قبل أي مصفوفة ألوان.
-bool isCleanFilter(ScanFilter f) =>
-    f == ScanFilter.receipt || f == ScanFilter.thermal || f == ScanFilter.receiptBw;
-
-/// الحراري الباهت وإيصال الأبيض والأسود بيستخدموا منحنى أقوى عشان الكتابة الخفيفة متختفيش.
-bool usesThermalClean(ScanFilter f) => f == ScanFilter.thermal || f == ScanFilter.receiptBw;
-
-/// قوة الحدة الفعلية: فلتر "حدة" بيضمن حد أدنى حتى لو السلايدر على صفر.
-double effSharpness(ScanFilter f, double s) => f == ScanFilter.sharpen ? math.max(s, 0.7) : s;
-
-/// شريط الفلاتر (بيتمرر أفقياً) ومشترك بين المحرر وشاشة الإيصالات.
-class FilterBar extends StatelessWidget {
-  final ScanFilter selected;
-  final ValueChanged<ScanFilter>? onChanged;
-  const FilterBar({super.key, required this.selected, required this.onChanged});
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: 44,
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        children: [
-          for (final f in kFilterOrder)
-            Padding(
-              padding: const EdgeInsetsDirectional.only(end: 6),
-              child: ChoiceChip(
-                label: Text(kFilterLabels[f] ?? f.name),
-                selected: f == selected,
-                onSelected: onChanged == null ? null : (_) => onChanged!(f),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-String errText(Object e) {
-  if (e is FileSystemException && (e.osError?.errorCode == 28)) {
-    return 'مساحة التليفون ممتلئة، امسح ملفات وجرب تاني';
-  }
-  final s = e.toString();
-  return s.startsWith('Exception: ') ? s.substring(11) : s;
-}
-
-/// بايتات ByteData بالظبط (من غير ما نسحب باقي الـ buffer لو الـ view مش كل الـ buffer).
-Uint8List _bytesOf(ByteData bd) => bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
-
-Future<ui.Image> _imageFromRgba(Uint8List rgba, int w, int h) {
-  final c = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, c.complete);
-  return c.future;
-}
-
-/// مصفوفة الألوان على الـ CPU (من غير رسم GPU) عشان الصورة متتشوهش.
-Uint8List _matrixJob(Map<String, dynamic> a) {
-  final src = a['src'] as Uint8List;
-  final m = (a['m'] as List).cast<double>();
-  final out = Uint8List(src.length);
-  double cl(double v) => v < 0 ? 0 : (v > 255 ? 255 : v);
-  for (var i = 0; i + 3 < src.length; i += 4) {
-    final r = src[i].toDouble(), g = src[i + 1].toDouble(), b = src[i + 2].toDouble();
-    out[i] = cl(m[0] * r + m[1] * g + m[2] * b + m[4]).round();
-    out[i + 1] = cl(m[5] * r + m[6] * g + m[7] * b + m[9]).round();
-    out[i + 2] = cl(m[10] * r + m[11] * g + m[12] * b + m[14]).round();
-    out[i + 3] = 255;
-  }
-  return out;
-}
-
-/// حدة (Unsharp 3x3) على الـ CPU في Isolate. k من 0 لـ 1.
-Uint8List _sharpenJob(Map<String, dynamic> a) {
-  final src = a['src'] as Uint8List;
-  final w = a['w'] as int, h = a['h'] as int;
-  final k = ((a['k'] as num).toDouble() * 0.8).clamp(0.0, 0.9).toDouble();
-  final out = Uint8List.fromList(src);
-  final row = w * 4;
-  for (var y = 1; y < h - 1; y++) {
-    for (var x = 1; x < w - 1; x++) {
-      final i = (y * w + x) * 4;
-      for (var c = 0; c < 3; c++) {
-        final j = i + c;
-        final v = src[j] * (1 + 4 * k) - k * (src[j - 4] + src[j + 4] + src[j - row] + src[j + row]);
-        out[j] = v < 0 ? 0 : (v > 255 ? 255 : v.round());
+      final d = Directory(path);
+      if (!d.existsSync()) return;
+      for (final e in d.listSync(recursive: true, followLinks: false)) {
+        if (e is File) delFile(e);
       }
-    }
-  }
-  return out;
-}
-
-/// مستويات "التحسين التلقائي": أدنى قيمة للحبر، وأعلى قيمة لكل قناة (لون الورق) من نسخة مصغرة جداً (160px).
-/// بيرجّع [أدنى، أعلى R، أعلى G، أعلى B] أو null.
-Future<List<double>?> autoLevelsOf(Uint8List bytes) async {
-  try {
-    final img = await decodeImage(bytes, maxWidth: 160);
-    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-    img.dispose();
-    if (bd == null) return null;
-    final px = _bytesOf(bd);
-    final n = px.length ~/ 4;
-    if (n < 16) return null;
-    final hl = List<int>.filled(256, 0);
-    final hc = List.generate(3, (_) => List<int>.filled(256, 0));
-    for (var i = 0; i < n; i++) {
-      final r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
-      hl[(r * 54 + g * 183 + b * 19) >> 8]++;
-      hc[0][r]++;
-      hc[1][g]++;
-      hc[2][b]++;
-    }
-    int pct(List<int> h, double p) {
-      final target = (n * p).floor();
-      var acc = 0;
-      for (var t = 0; t < 256; t++) {
-        acc += h[t];
-        if (acc >= target) return t;
-      }
-      return 255;
-    }
-
-    final lo = pct(hl, 0.01).clamp(0, 90).toInt();
-    final out = <double>[lo.toDouble()];
-    for (var c = 0; c < 3; c++) {
-      out.add(pct(hc[c], 0.85).clamp(lo + 70, 255).toDouble());
-    }
-    return out;
-  } catch (e, st) {
-    AppLog.e('autoLevelsOf', e, st);
-    return null;
-  }
-}
-
-/// قص الهوامش البيضاء الفاضية (بعد تنضيف الإيصال). بيرجّع {out, w, h}، أو {w: 0} لو مفيش داعي للقص.
-Map<String, dynamic> _trimJob(Map<String, dynamic> a) {
-  final src = a['src'] as Uint8List;
-  final w = a['w'] as int, h = a['h'] as int;
-  final rows = List<int>.filled(h, 0), cols = List<int>.filled(w, 0);
-  for (var y = 0; y < h; y++) {
-    for (var x = 0; x < w; x++) {
-      final i = (y * w + x) * 4;
-      // حساسية أعلى للكتابة الحرارية الرمادية الخفيفة عند أطراف الإيصال.
-      if (src[i] + src[i + 1] + src[i + 2] < 3 * 248) {
-        rows[y]++;
-        cols[x]++;
-      }
-    }
-  }
-  var y0 = 0, y1 = h - 1, x0 = 0, x1 = w - 1;
-  while (y0 < h && rows[y0] < 2) {
-    y0++;
-  }
-  while (y1 > y0 && rows[y1] < 2) {
-    y1--;
-  }
-  while (x0 < w && cols[x0] < 2) {
-    x0++;
-  }
-  while (x1 > x0 && cols[x1] < 2) {
-    x1--;
-  }
-  if (y0 >= y1 || x0 >= x1) return <String, dynamic>{'w': 0};
-  final px = math.max(6, (w * 0.03).round()), py = math.max(6, (h * 0.02).round());
-  x0 = math.max(0, x0 - px);
-  x1 = math.min(w - 1, x1 + px);
-  y0 = math.max(0, y0 - py);
-  y1 = math.min(h - 1, y1 + py);
-  final nw = x1 - x0 + 1, nh = y1 - y0 + 1;
-  // لو الناتج صغير جداً (الصورة فاضية تقريباً) أو مفيش هوامش تستاهل: منقصش
-  if (nw < w * 0.2 || nh < h * 0.1 || nw * nh > w * h * 0.97) return <String, dynamic>{'w': 0};
-  final out = Uint8List(nw * nh * 4);
-  for (var y = 0; y < nh; y++) {
-    final s = ((y + y0) * w + x0) * 4;
-    out.setRange(y * nw * 4, (y + 1) * nw * 4, src, s);
-  }
-  return <String, dynamic>{'out': out, 'w': nw, 'h': nh};
-}
-
-Uint8List _rotateJob(Map<String, dynamic> a) {
-  final src = a['src'] as Uint8List;
-  final w = a['w'] as int, h = a['h'] as int, t = a['t'] as int;
-  final ow = t.isOdd ? h : w, oh = t.isOdd ? w : h;
-  final out = Uint8List(ow * oh * 4);
-  for (var y = 0; y < h; y++) {
-    for (var x = 0; x < w; x++) {
-      var nx = 0, ny = 0;
-      if (t == 1) {
-        nx = h - 1 - y;
-        ny = x;
-      } else if (t == 2) {
-        nx = w - 1 - x;
-        ny = h - 1 - y;
-      } else {
-        nx = y;
-        ny = w - 1 - x;
-      }
-      final si = (y * w + x) * 4, di = (ny * ow + nx) * 4;
-      out[di] = src[si];
-      out[di + 1] = src[si + 1];
-      out[di + 2] = src[si + 2];
-      out[di + 3] = 255;
-    }
-  }
-  return out;
-}
-
-Future<ui.Image> decodeImage(Uint8List b, {int? maxWidth}) async {
-  final c = await ui.instantiateImageCodec(b, targetWidth: maxWidth);
-  final f = await c.getNextFrame();
-  c.dispose();
-  return f.image;
-}
-
-/// أبعاد الصورة من غير ما نفك ضغطها (سريع وبيوفر ذاكرة).
-Future<({int w, int h})> imageSize(Uint8List bytes) async {
-  final buf = await ui.ImmutableBuffer.fromUint8List(bytes);
-  try {
-    final d = await ui.ImageDescriptor.encoded(buf);
-    final r = (w: d.width, h: d.height);
-    d.dispose();
-    return r;
-  } finally {
-    buf.dispose();
-  }
-}
-
-Future<double> imageAspect(String path) async {
-  final s = await imageSize(await File(path).readAsBytes());
-  return s.h / s.w;
-}
-
-/// مصفوفة الألوان النهائية: الفلتر الأساسي + تباين وسطوع (نفس المصفوفة للمعاينة وللحفظ).
-/// y = k * (w·rgb + t0 - 127.5) + 127.5 + سطوع.  lv = مستويات "التلقائي": [أدنى، أعلى R، أعلى G، أعلى B].
-List<double> editMatrix(ScanFilter f, double contrast, double brightness, [List<double>? lv]) {
-  late List<List<double>> w;
-  late List<double> t0; // إزاحة لكل قناة (R,G,B)
-  const lr = 0.2126, lg = 0.7152, lb = 0.0722;
-
-  List<List<double>> sat(double s, double c) => [
-        [c * (lr * (1 - s) + s), c * lg * (1 - s), c * lb * (1 - s)],
-        [c * lr * (1 - s), c * (lg * (1 - s) + s), c * lb * (1 - s)],
-        [c * lr * (1 - s), c * lg * (1 - s), c * (lb * (1 - s) + s)],
-      ];
-
-  switch (f) {
-    case ScanFilter.original:
-    case ScanFilter.receipt: // المعالجة الحقيقية في _cleanJob، والمصفوفة هنا للتباين والسطوع بس
-    case ScanFilter.thermal:
-    case ScanFilter.sharpen: // الحدة بتتطبق في _sharpenJob
-      w = [
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-      ];
-      t0 = [0.0, 0.0, 0.0];
-      break;
-    case ScanFilter.enhance:
-      {
-        const c = 1.3;
-        w = [
-          [c, 0.0, 0.0],
-          [0.0, c, 0.0],
-          [0.0, 0.0, c],
-        ];
-        t0 = List<double>.filled(3, 127.5 * (1 - c) + 10);
-        break;
-      }
-    case ScanFilter.bw:
-      {
-        // أبيض وأسود عالي التباين (مناسب للإيصالات الحرارية الباهتة)
-        const c = 1.7;
-        const r = lr * c, g = lg * c, b = lb * c;
-        w = [
-          [r, g, b],
-          [r, g, b],
-          [r, g, b],
-        ];
-        t0 = List<double>.filled(3, 127.5 * (1 - c) + 40);
-        break;
-      }
-    case ScanFilter.gray:
-      w = [
-        [lr, lg, lb],
-        [lr, lg, lb],
-        [lr, lg, lb],
-      ];
-      t0 = [0.0, 0.0, 0.0];
-      break;
-    case ScanFilter.lighten:
-      {
-        const c = 1.1;
-        w = [
-          [c, 0.0, 0.0],
-          [0.0, c, 0.0],
-          [0.0, 0.0, c],
-        ];
-        t0 = List<double>.filled(3, 38.0);
-        break;
-      }
-    case ScanFilter.magic:
-      {
-        // ألوان أنشط وتباين أعلى
-        const c = 1.2;
-        w = sat(1.4, c);
-        t0 = List<double>.filled(3, 127.5 * (1 - c) + 12);
-        break;
-      }
-    case ScanFilter.document:
-      {
-        // ألوان أهدى وورق أنصع ونص أغمق
-        const c = 1.35;
-        w = sat(0.75, c);
-        t0 = List<double>.filled(3, 127.5 * (1 - c) + 22);
-        break;
-      }
-    case ScanFilter.receiptBw:
-      {
-        // بعد تنضيف الإيصال: أبيض وأسود بانتقال ناعم (مش قطع حاد) عشان الأرقام الصغيرة متتقطعش
-        const lo = 150.0, hi = 215.0, s = 255 / (hi - lo);
-        w = [
-          [lr * s, lg * s, lb * s],
-          [lr * s, lg * s, lb * s],
-          [lr * s, lg * s, lb * s],
-        ];
-        t0 = List<double>.filled(3, -lo * s);
-        break;
-      }
-    case ScanFilter.auto:
-      {
-        final l = (lv != null && lv.length == 4) ? lv : const <double>[0.0, 255.0, 255.0, 255.0];
-        final lo = l[0];
-        double sc(int c) => 255 / math.max(40.0, l[1 + c] - lo);
-        w = [
-          [sc(0), 0.0, 0.0],
-          [0.0, sc(1), 0.0],
-          [0.0, 0.0, sc(2)],
-        ];
-        t0 = [-sc(0) * lo, -sc(1) * lo, -sc(2) * lo];
-        break;
-      }
-  }
-  final k = 1 + contrast;
-  return [
-    for (var i = 0; i < 3; i++) ...[
-      k * w[i][0],
-      k * w[i][1],
-      k * w[i][2],
-      0.0,
-      k * (t0[i] - 127.5) + 127.5 + brightness * 100,
-    ],
-    0.0, 0.0, 0.0, 1.0, 0.0, // صف الشفافية: ColorFilter.matrix لازم 20 رقم وإلا التطبيق يقفل
-  ];
-}
-
-/// فلتر "إيصال": بيقسم الصورة بلاطات، يقدّر لون الورق في كل بلاطة (أفتح 20%)،
-/// ويقسم الصورة عليه. النتيجة: ورق أبيض متساوي، الأزرق/الظلال بتروح، الحبر يفضل واضح.
-/// بيشتغل في Isolate.
-Uint8List _cleanJob(Map<String, dynamic> a) {
-  final src = a['src'] as Uint8List;
-  final w = a['w'] as int, h = a['h'] as int;
-  final gray = a['gray'] as bool;
-  final th = (a['th'] as bool?) ?? false; // حراري باهت: منحنى أقوى وحدة أعلى
-  final bs = math.max(16, (math.max(w, h) / 40).round());
-  final gw = (w + bs - 1) ~/ bs, gh = (h + bs - 1) ~/ bs;
-  final bg = List.generate(3, (_) => List<double>.filled(gw * gh, 255.0));
-  final hist = List<int>.filled(256, 0);
-
-  for (var gy = 0; gy < gh; gy++) {
-    for (var gx = 0; gx < gw; gx++) {
-      final x0 = gx * bs, y0 = gy * bs;
-      final x1 = math.min(w, x0 + bs), y1 = math.min(h, y0 + bs);
-      hist.fillRange(0, 256, 0);
-      for (var y = y0; y < y1; y++) {
-        var i = (y * w + x0) * 4;
-        for (var x = x0; x < x1; x++, i += 4) {
-          hist[(src[i] * 54 + src[i + 1] * 183 + src[i + 2] * 19) >> 8]++;
-        }
-      }
-      final target = ((x1 - x0) * (y1 - y0) * 0.8).floor();
-      var acc = 0, thr = 255;
-      for (var t = 0; t < 256; t++) {
-        acc += hist[t];
-        if (acc >= target) {
-          thr = t;
-          break;
-        }
-      }
-      var sr = 0, sg = 0, sb = 0, n = 0;
-      for (var y = y0; y < y1; y++) {
-        var i = (y * w + x0) * 4;
-        for (var x = x0; x < x1; x++, i += 4) {
-          if (((src[i] * 54 + src[i + 1] * 183 + src[i + 2] * 19) >> 8) >= thr) {
-            sr += src[i];
-            sg += src[i + 1];
-            sb += src[i + 2];
-            n++;
-          }
-        }
-      }
-      if (n > 0) {
-        final k = gy * gw + gx;
-        bg[0][k] = sr / n;
-        bg[1][k] = sg / n;
-        bg[2][k] = sb / n;
-      }
-    }
+      try {
+        d.deleteSync(recursive: true);
+      } catch (_) {}
+    } catch (_) {}
   }
 
-  List<double> blur(List<double> g) {
-    final o = List<double>.filled(g.length, 0);
-    for (var y = 0; y < gh; y++) {
-      for (var x = 0; x < gw; x++) {
-        var s = 0.0;
-        for (var dy = -1; dy <= 1; dy++) {
-          for (var dx = -1; dx <= 1; dx++) {
-            final yy = (y + dy).clamp(0, gh - 1).toInt();
-            final xx = (x + dx).clamp(0, gw - 1).toInt();
-            s += g[yy * gw + xx];
-          }
-        }
-        o[y * gw + x] = s / 9;
-      }
-    }
-    return o;
-  }
-
-  for (var c = 0; c < 3; c++) {
-    bg[c] = blur(blur(bg[c]));
-  }
-
-  // أي قيمة من 238 لفوق = أبيض صافي (بيضغط أحسن بكتير)، وجاما خفيفة بتغمّق الحبر
-  final wp = th ? 245.0 : 238.0, gam = th ? 2.0 : 1.25;
-  final lut = List<int>.generate(
-      256, (i) => (255 * math.pow(math.min(1.0, i / wp), gam)).round().clamp(0, 255).toInt());
-
-  final cx0 = List<int>.filled(w, 0), cx1 = List<int>.filled(w, 0);
-  final ctx = List<double>.filled(w, 0);
-  for (var x = 0; x < w; x++) {
-    final fx = ((x + 0.5) / bs - 0.5).clamp(0.0, gw - 1.0).toDouble();
-    cx0[x] = fx.floor();
-    cx1[x] = math.min(gw - 1, cx0[x] + 1);
-    ctx[x] = fx - cx0[x];
-  }
-
-  final out = Uint8List(w * h * 4);
-  for (var y = 0; y < h; y++) {
-    final fy = ((y + 0.5) / bs - 0.5).clamp(0.0, gh - 1.0).toDouble();
-    final y0 = fy.floor();
-    final y1 = math.min(gh - 1, y0 + 1);
-    final ty = fy - y0;
-    for (var x = 0; x < w; x++) {
-      final i = (y * w + x) * 4;
-      final tx = ctx[x];
-      final a0 = y0 * gw + cx0[x], a1 = y0 * gw + cx1[x];
-      final b0 = y1 * gw + cx0[x], b1 = y1 * gw + cx1[x];
-      // حساب القنوات مباشرة بدون إنشاء List أو دالة محلية لكل بكسل.
-      final paperR = (bg[0][a0] * (1 - tx) + bg[0][a1] * tx) * (1 - ty) +
-          (bg[0][b0] * (1 - tx) + bg[0][b1] * tx) * ty;
-      final paperG = (bg[1][a0] * (1 - tx) + bg[1][a1] * tx) * (1 - ty) +
-          (bg[1][b0] * (1 - tx) + bg[1][b1] * tx) * ty;
-      final paperB = (bg[2][a0] * (1 - tx) + bg[2][a1] * tx) * (1 - ty) +
-          (bg[2][b0] * (1 - tx) + bg[2][b1] * tx) * ty;
-      var vr = src[i] * 255 / (paperR < 40 ? 40 : paperR);
-      var vg = src[i + 1] * 255 / (paperG < 40 ? 40 : paperG);
-      var vb = src[i + 2] * 255 / (paperB < 40 ? 40 : paperB);
-      if (vr > 255) vr = 255;
-      if (vg > 255) vg = 255;
-      if (vb > 255) vb = 255;
-      var r = lut[vr.round()], g = lut[vg.round()], b = lut[vb.round()];
-      if (gray) {
-        final l = (r * 54 + g * 183 + b * 19) >> 8;
-        r = g = b = l;
-      }
-      out[i] = r;
-      out[i + 1] = g;
-      out[i + 2] = b;
-      out[i + 3] = 255;
-    }
-  }
-
-  // حدة خفيفة (Unsharp) تحسّن النص المهتز شوية
-  final k = th ? 0.6 : 0.35;
-  final cp = Uint8List.fromList(out);
-  final row = w * 4;
-  for (var y = 1; y < h - 1; y++) {
-    for (var x = 1; x < w - 1; x++) {
-      final i = (y * w + x) * 4;
-      for (var c = 0; c < 3; c++) {
-        final j = i + c;
-        final v = cp[j] * (1 + 4 * k) - k * (cp[j - 4] + cp[j + 4] + cp[j - row] + cp[j + row]);
-        out[j] = v < 0 ? 0 : (v > 255 ? 255 : v.round());
-      }
-    }
-  }
-  return out;
-}
-
-/// بتطبّق فلتر الإيصال على ui.Image وبترجّع صورة جديدة (الأصلية مبتتمسحش).
-Future<ui.Image> cleanUiImage(ui.Image img, {bool gray = false, bool thermal = false}) async {
-  final w = img.width, h = img.height;
-  final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-  if (bd == null) throw Exception('تعذر قراءة الصورة');
-  final rgba = await compute(_cleanJob, <String, dynamic>{
-    'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
-    'w': w,
-    'h': h,
-    'gray': gray,
-    'th': thermal,
-  });
-  final comp = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
-  return comp.future;
-}
-
-Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
-  if (f == ScanFilter.original) return bytes;
-  try {
-    final img = await decodeImage(bytes);
-    final w = img.width, h = img.height;
-    ui.Image out;
-    if (isCleanFilter(f)) {
-      var c = await cleanUiImage(img, thermal: usesThermalClean(f));
-      if (f == ScanFilter.receiptBw) {
-        final raw = await c.toByteData(format: ui.ImageByteFormat.rawRgba);
-        if (raw == null) throw Exception('تعذر قراءة الصورة');
-        final bwRgba =
-            await compute(_matrixJob, <String, dynamic>{'src': _bytesOf(raw), 'm': editMatrix(f, 0, 0)});
-        c.dispose();
-        c = await _imageFromRgba(bwRgba, w, h);
-      }
-      out = c;
-    } else {
-      final raw = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-      if (raw == null) throw Exception('تعذر قراءة الصورة');
-      final lv = f == ScanFilter.auto ? await autoLevelsOf(bytes) : null;
-      var rgba = await compute(
-          _matrixJob, <String, dynamic>{'src': _bytesOf(raw), 'm': editMatrix(f, 0, 0, lv)});
-      if (f == ScanFilter.sharpen) {
-        rgba = await compute(
-            _sharpenJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': effSharpness(f, 0)});
-      }
-      out = await _imageFromRgba(rgba, w, h);
-    }
-    final bd = await out.toByteData(format: ui.ImageByteFormat.png);
-    img.dispose();
-    out.dispose();
-    return await FlutterImageCompress.compressWithList(
-      _bytesOf(bd!),
-      minWidth: w,
-      minHeight: h,
-      quality: await Store.jpegQuality(),
-      format: CompressFormat.jpeg,
-    );
-  } catch (e, st) {
-    AppLog.e('applyFilter', e, st);
-    return bytes; // لو الفلتر فشل (ذاكرة) نكمل بالصورة الأصلية
-  }
-}
-
-/// فحص سريع بعد التصوير: بيرجّع رسالة تحذير أو null لو الصورة تمام.
-/// الأرقام بتتكتب في السجل (quality var / p90) عشان تضبط الحدود حسب موبايلات الموظفين.
-Future<String?> qualityWarning(String path) async {
-  try {
-    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 800);
-    final w = img.width, h = img.height;
-    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-    img.dispose();
-    if (bd == null || w < 16 || h < 16) return null;
-    final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
-    final lum = Float32List(w * h);
-    final hist = List<int>.filled(256, 0);
-    for (var i = 0; i < w * h; i++) {
-      final l = (px[i * 4] * 54 + px[i * 4 + 1] * 183 + px[i * 4 + 2] * 19) >> 8;
-      lum[i] = l.toDouble();
-      hist[l]++;
-    }
-    var acc = 0, p90 = 255;
-    for (var t = 0; t < 256; t++) {
-      acc += hist[t];
-      if (acc >= w * h * 0.9) {
-        p90 = t;
-        break;
-      }
-    }
-    var s = 0.0, s2 = 0.0, n = 0;
-    for (var y = 1; y < h - 1; y++) {
-      for (var x = 1; x < w - 1; x++) {
-        final i = y * w + x;
-        final v = 4 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
-        s += v;
-        s2 += v * v;
-        n++;
-      }
-    }
-    final varL = n == 0 ? 999.0 : s2 / n - (s / n) * (s / n);
-    AppLog.i('quality var=${varL.toStringAsFixed(1)} p90=$p90');
-    if (p90 < 130) return 'الإضاءة ضعيفة، صوّر في مكان أنور';
-    if (varL < 25) return 'الصورة شكلها مهزوزة، ثبّت إيدك وصوّر تاني لو الكلام مش واضح';
-    return null;
-  } catch (e, st) {
-    AppLog.e('qualityWarning', e, st);
-    return null;
-  }
-}
-
-Future<bool> _decodesOk(Uint8List b) async {
-  try {
-    final s = await imageSize(b);
-    return s.w > 0 && s.h > 0;
-  } catch (e, st) {
-    AppLog.e('_decodesOk', e, st);
-    return false;
-  }
-}
-
-/// نسخ الصورة من مكان الماسح المؤقت لمكان ثابت كـ JPEG واحد مضغوط (مرة واحدة بس).
-/// وبعدها بيتطبق الفلتر لو الموظف اختاره.
-Future<String> persistImage(String src, String name,
-    {ScanFilter filter = ScanFilter.original}) async {
-  final swPersist = Stopwatch()..start();
-  final mode = await Store.perfMode();
-  final maxSide = getMaxSide(mode);
-  Uint8List? bytes;
-  try {
-    bytes = await FlutterImageCompress.compressWithFile(
-      src,
-      minWidth: maxSide,
-      minHeight: maxSide,
-      quality: await Store.jpegQuality(),
-      format: CompressFormat.jpeg,
-      keepExif: false,
-    );
-  } catch (e, st) {
-    AppLog.e('persistImage', e, st);
-  }
-  AppLog.i('t persist.compress ${swPersist.elapsedMilliseconds}ms');
-  if (bytes != null && !await _decodesOk(bytes)) bytes = null;
-  if (bytes == null) {
+  void wipeFlat(String path, bool Function(File) only) {
     try {
-      final raw = await File(src).readAsBytes();
-      final img = await decodeImage(raw, maxWidth: maxSide);
-      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
-      final w = img.width, h = img.height;
-      img.dispose();
-      bytes = await FlutterImageCompress.compressWithList(
-        _bytesOf(bd!),
-        minWidth: w,
-        minHeight: h,
-        quality: await Store.jpegQuality(),
-        format: CompressFormat.jpeg,
-      );
-    } catch (e, st) {
-      AppLog.e('persistImage', e, st);
-    }
-  }
-  if (bytes == null || !await _decodesOk(bytes)) {
-    throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
-  }
-  final f = File('${(await Store.dir()).path}/$name');
-  if (filter != ScanFilter.original) {
-    // نسخة من غير فلتر عشان التعديل بعد كده يبقى ممكن يرجّع الأصلي
-    await File(Store.baseOf(f.path)).writeAsBytes(bytes, flush: true);
-    await Store.setEdit(f.path, EditParams(filter: filter));
-  }
-  final tFilter = swPersist.elapsedMilliseconds;
-  bytes = await applyFilter(bytes, filter);
-  await f.writeAsBytes(bytes, flush: true);
-  AppLog.i('t persist.filter ${swPersist.elapsedMilliseconds - tFilter}ms total ${swPersist.elapsedMilliseconds}ms');
-  return f.path;
-}
-
-// =====================================================================
-//  ورقة البيانات
-// =====================================================================
-
-String _isoLtr(String s) => '\u2066$s\u2069';
-
-TextPainter _tp(String t, double fs, TextDirection d) => TextPainter(
-      text: TextSpan(
-          text: t,
-          style: TextStyle(color: Colors.black, fontSize: fs, fontWeight: FontWeight.bold)),
-      textDirection: d,
-    )..layout();
-
-class Tag {
-  final Uint8List png;
-  final double w, h;
-  Tag(this.png, this.w, this.h);
-}
-
-/// مكان وحجم الورقة. كل الأرقام نسب من عرض الصورة.
-class TagPos {
-  final double cx, cy, s;
-  const TagPos(this.cx, this.cy, this.s);
-
-  static TagPos initial(Tag ref) {
-    final s0 = ref.w / 1000;
-    return TagPos(0.5, kTagTop + s0 * ref.h / ref.w / 2, s0);
-  }
-
-  TagPos copyWith({double? cx, double? cy, double? s}) =>
-      TagPos(cx ?? this.cx, cy ?? this.cy, s ?? this.s);
-
-  String encode() => '$cx,$cy,$s';
-
-  static TagPos? decode(String? v) {
-    if (v == null) return null;
-    final p = v.split(',');
-    if (p.length != 3) return null;
-    final a = double.tryParse(p[0]), b = double.tryParse(p[1]), c = double.tryParse(p[2]);
-    if (a == null || b == null || c == null) return null;
-    if (!a.isFinite || !b.isFinite || !c.isFinite) return null;
-    return TagPos(a.clamp(0.0, 1.0).toDouble(), b.clamp(0.0, 10.0).toDouble(),
-        c.clamp(0.1, 0.98).toDouble());
-  }
-}
-
-/// بتتأكد إن الورقة كلها جوه الصورة، حتى لو مكانها المحفوظ كان لصورة بأبعاد تانية.
-TagPos fitTagPos(TagPos p, Tag t, double aspect) {
-  final th = p.s * t.h / t.w; // ارتفاع الورقة كنسبة من عرض الصورة
-  final cx = p.cx.clamp(p.s / 2, 1 - p.s / 2).toDouble();
-  final cy = th >= aspect ? aspect / 2 : p.cy.clamp(th / 2, aspect - th / 2).toDouble();
-  return p.copyWith(cx: cx, cy: cy);
-}
-
-/// فحص إن صورة الورقة سليمة: الورقة أبيض وأسود بس، فأي ألوان كتير أو غياب الأبيض = تشويه من الرسم.
-Future<bool> _tagLooksOk(Uint8List png) async {
-  try {
-    final img = await decodeImage(png);
-    final w = img.width, h = img.height;
-    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-    img.dispose();
-    if (bd == null) return false;
-    final px = _bytesOf(bd);
-    var total = 0, color = 0, white = 0;
-    for (var i = 0; i < w * h; i++) {
-      final j = i * 4;
-      if (px[j + 3] < 200) continue;
-      total++;
-      final r = px[j], g = px[j + 1], b = px[j + 2];
-      final mx = math.max(r, math.max(g, b)), mn = math.min(r, math.min(g, b));
-      if (mx - mn > 60) color++;
-      if (mn > 200) white++;
-    }
-    if (total == 0) return false;
-    return color / total < 0.005 && white / total > 0.15;
-  } catch (e, st) {
-    AppLog.e('_tagLooksOk', e, st);
-    return true;
-  }
-}
-
-/// بترسم الورقة وتتأكد إنها سليمة، ولو طلعت مشوّهة بتعيد الرسم (لحد 3 مرات).
-Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
-  late Tag t;
-  for (var i = 0; i < 3; i++) {
-    t = await _renderTag(w, s, batch: batch);
-    if (await _tagLooksOk(t.png)) return t;
-    AppLog.i('tag garbled, retry ${i + 1}');
-  }
-  return t;
-}
-
-Future<Tag> _renderTag(double w, Session s, {bool batch = false}) async {
-  final fs = w * kTagFont;
-  final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
-  final l1 = _tp('${s.name}  |  $unitLine', fs, TextDirection.rtl);
-  final l2 = _tp(
-      batch ? _isoLtr(s.date) : '${_isoLtr('TID: ${s.unit.tid}')}  |  ${_isoLtr(s.date)}',
-      fs,
-      TextDirection.rtl);
-  final pad = fs * 0.6;
-  final gap = fs * 0.25;
-  final textW = l1.width > l2.width ? l1.width : l2.width;
-  final cw = (textW + pad * 2).clamp(0.0, w * 0.96).toDouble();
-  final ch = l1.height + l2.height + gap + pad * 2;
-  final rec = ui.PictureRecorder();
-  final c = Canvas(rec, Rect.fromLTWH(0, 0, cw, ch));
-  // الإطار بيتحط جوه حدود الصورة بنص سمكه، عشان يظهر كامل من الأربع اتجاهات (من غير ما يتقص)
-  final sw = w * (batch ? kBatchBorder : 0.004);
-  final inset = batch ? sw / 2 : 0.0;
-  final rr = RRect.fromRectAndRadius(
-      Rect.fromLTWH(inset, inset, cw - inset * 2, ch - inset * 2), Radius.circular(fs * 0.5));
-  c.drawRRect(rr, Paint()..color = Colors.white);
-  c.drawRRect(
-      rr,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = sw
-        ..color = Colors.black);
-  l1.paint(c, Offset((cw - l1.width) / 2, pad));
-  l2.paint(c, Offset((cw - l2.width) / 2, pad + l1.height + gap));
-  final img = await rec.endRecording().toImage(cw.ceil(), ch.ceil());
-  final bd = await img.toByteData(format: ui.ImageByteFormat.png);
-  img.dispose();
-  return Tag(_bytesOf(bd!), cw, ch);
-}
-
-/// ورقة الباتش بحجم الشريط. w = عرض الصورة بالبكسل.
-Future<Tag> batchBandTag(Session s, double w) async {
-  final k = await Store.bandScale();
-  final r = await receiptTag(1000, s, batch: true);
-  return receiptTag(1000 * (w * k) / r.w, s, batch: true);
-}
-
-/// تركيب الباتش بيتم كله على الـ CPU (Isolate) من غير رسم GPU، لأن الرسم الكبير على GPU
-/// كان بيطلّع صورة مشوّهة (ألوان وبلاطات) على الموبايلات الضعيفة.
-Uint8List _composeJob(Map<String, dynamic> a) {
-  final img = a['img'] as Uint8List;
-  final iw = a['iw'] as int, ih = a['ih'] as int;
-  final tag = a['tag'] as Uint8List;
-  final tw = a['tw'] as int, th = a['th'] as int;
-  final ow = a['ow'] as int, oh = a['oh'] as int;
-  final ix = a['ix'] as int, iy = a['iy'] as int;
-  final tx = a['tx'] as int, ty = a['ty'] as int;
-  final out = Uint8List(ow * oh * 4)..fillRange(0, ow * oh * 4, 255);
-  final sx0 = math.max(0, -ix), sx1 = math.min(iw, ow - ix);
-  if (sx1 > sx0) {
-    for (var y = 0; y < ih; y++) {
-      final dy = y + iy;
-      if (dy < 0 || dy >= oh) continue;
-      out.setRange((dy * ow + ix + sx0) * 4, (dy * ow + ix + sx1) * 4, img, (y * iw + sx0) * 4);
-    }
-  }
-  for (var y = 0; y < th; y++) {
-    final dy = y + ty;
-    if (dy < 0 || dy >= oh) continue;
-    for (var x = 0; x < tw; x++) {
-      final dx = x + tx;
-      if (dx < 0 || dx >= ow) continue;
-      final si = (y * tw + x) * 4, di = (dy * ow + dx) * 4;
-      final al = tag[si + 3];
-      if (al == 0) continue;
-      if (al == 255) {
-        out[di] = tag[si];
-        out[di + 1] = tag[si + 1];
-        out[di + 2] = tag[si + 2];
-      } else {
-        // الألوان من rawRgba بتيجي premultiplied
-        final k = 1 - al / 255;
-        for (var c = 0; c < 3; c++) {
-          final v = tag[si + c] + out[di + c] * k;
-          out[di + c] = v > 255 ? 255 : v.round();
-        }
+      final d = Directory(path);
+      if (!d.existsSync()) return;
+      for (final e in d.listSync(followLinks: false)) {
+        if (e is File && only(e)) delFile(e);
       }
-      out[di + 3] = 255;
+    } catch (_) {}
+  }
+
+  bool appOut(File f) {
+    final n = baseName(f.path);
+    final l = n.toLowerCase();
+    return n == 'review_report.txt' ||
+        n == 'ocr_debug.txt' ||
+        ((l.endsWith('.xlsx') || l.endsWith('.pdf')) && _normAr(n).contains('اسكندري'));
+  }
+
+  final protectedDirs = <String>{root, baseDir, '$root/Download', '$root/Documents', '$root/DCIM', '$root/Pictures'};
+  for (final dir in {outputDir, defaultOutputDir}) {
+    if (protectedDirs.contains(dir)) {
+      wipeFlat(dir, appOut);
+    } else if (dir == defaultOutputDir) {
+      wipeTree(dir);
+    } else {
+      wipeFlat(dir, (f) => true);
     }
   }
-  return out;
-}
-
-/// متوسط السطوع (عينات) لفحص إن الصورة النهائية مش مشوّهة.
-double _meanLum(Uint8List px, int w, int h) {
-  final n = w * h;
-  final step = math.max(1, n ~/ 20000) | 1;
-  var sum = 0.0, cnt = 0;
-  for (var i = 0; i < n; i += step) {
-    final j = i * 4;
-    sum += (px[j] * 54 + px[j + 1] * 183 + px[j + 2] * 19) >> 8;
-    cnt++;
-  }
-  return cnt == 0 ? 0.0 : sum / cnt;
-}
-
-Future<double?> _jpegMeanLum(Uint8List jpg) async {
+  wipeTree(rawImagesDir);
+  wipeTree('$baseDir/.scans');
+  wipeTree(tmpDir);
+  wipeTree(mTmpDir);
+  wipeTree(defaultMDest);
+  // نسخ إيصالات الدفع المتسمية لو الفولدر مخصص
   try {
-    final img = await decodeImage(jpg, maxWidth: 96);
-    final w = img.width, h = img.height;
-    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-    img.dispose();
-    if (bd == null) return null;
-    return _meanLum(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes), w, h);
-  } catch (e, st) {
-    AppLog.e('_jpegMeanLum', e, st);
-    return null;
-  }
-}
-
-/// صورة الباتش + الورقة. layout 1: شريط أبيض تحت الصورة (الصورة كاملة من غير تغطية)،
-/// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
-Future<Uint8List> composeBatch(String path, Session s) async {
-  final src = await File(path).readAsBytes();
-  if (await Store.noTag(path)) return src; // من غير ورقة
-  final layout = await Store.batchLayout();
-  final sz = await imageSize(src);
-  final maxSide = getMaxSide(await Store.perfMode());
-  final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
-  final iw = img.width, ih = img.height;
-  final w = iw.toDouble(), h = ih.toDouble();
-  final Tag tag;
-  final Offset tagAt;
-  int imgY = 0, imgX = 0;
-  final int oh;
-  int ow = iw;
-  if (layout == 2) {
-    final ref = await receiptTag(1000, s, batch: true);
-    final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref), ref, h / w);
-    tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
-    tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
-    oh = ih;
-  } else {
-    tag = await batchBandTag(s, w);
-    final pad = w * kBandPad; // الهامش الخارجي
-    final gap = w * kBandGapNear; // الهامش اللي بين الورقة والصورة (صغير)
-    final band = tag.h + pad + gap;
-    ow = math.max(iw, tag.w.ceil());
-    imgX = ((ow - iw) / 2).round();
-    tagAt = Offset((ow - tag.w) / 2, h + gap);
-    imgY = 0;
-    oh = ih + band.ceil();
-  }
-  final tImg = await decodeImage(tag.png);
-  final tw = tImg.width, th = tImg.height;
-  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
-  img.dispose();
-  tImg.dispose();
-  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
-  final rgba = await compute(_composeJob, <String, dynamic>{
-    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
-    'iw': iw,
-    'ih': ih,
-    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
-    'tw': tw,
-    'th': th,
-    'ow': ow,
-    'oh': oh,
-    'ix': imgX,
-    'iy': imgY,
-    'tx': tagAt.dx.round(),
-    'ty': tagAt.dy.round(),
-  });
-  final comp = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
-  final outImg = await comp.future;
-  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
-  outImg.dispose();
-  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
-  final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
-  final q = await Store.jpegQuality();
-  final want = _meanLum(rgba, ow, oh);
-  // أول محاولة بالأبعاد الكاملة، ولو الناتج مشوّه نجرّب أبعاد أصغر، ولو برضه مشوّه منبعتش صورة بايظة
-  for (final k in const [1.0, 0.75]) {
-    final jpg = await FlutterImageCompress.compressWithList(
-      png,
-      minWidth: (ow * k).round(),
-      minHeight: (oh * k).round(),
-      quality: q,
-      format: CompressFormat.jpeg,
-    );
-    final got = await _jpegMeanLum(jpg);
-    AppLog.i('compose ${ow}x$oh k=$k ${jpg.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} '
-        'got=${got?.toStringAsFixed(0)}');
-    if (got != null && (got - want).abs() < 25) return jpg;
-  }
-  throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
-}
-
-/// صورة الإيصال النهائية للمشاركة: نفس صفحة الـ PDF (شريط أبيض فيه الورقة فوق الإيصال).
-/// من غير ورقة (إخفاء الورقة) بترجع الصورة زي ما هي.
-Future<Uint8List> composeReceiptImage(String path, Session s) async {
-  final src = await File(path).readAsBytes();
-  if (await Store.noTag(path)) return src;
-  final sz = await imageSize(src);
-  final maxSide = getMaxSide(await Store.perfMode());
-  final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
-  final iw = img.width, ih = img.height;
-  final tag = await receiptTag(iw.toDouble(), s);
-  final pad = iw * kBandPad;
-  final band = (tag.h + pad * 2).ceil();
-  final oh = ih + band;
-  final tImg = await decodeImage(tag.png);
-  final tw = tImg.width, th = tImg.height;
-  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
-  img.dispose();
-  tImg.dispose();
-  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
-  final rgba = await compute(_composeJob, <String, dynamic>{
-    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
-    'iw': iw,
-    'ih': ih,
-    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
-    'tw': tw,
-    'th': th,
-    'ow': iw,
-    'oh': oh,
-    'ix': 0,
-    'iy': band,
-    'tx': ((iw - tag.w) / 2).round(),
-    'ty': pad.round(),
-  });
-  final comp = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, iw, oh, ui.PixelFormat.rgba8888, comp.complete);
-  final outImg = await comp.future;
-  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
-  outImg.dispose();
-  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
-  final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
-  final q = await Store.jpegQuality();
-  final want = _meanLum(rgba, iw, oh);
-  for (final k in const [1.0, 0.75]) {
-    final jpg = await FlutterImageCompress.compressWithList(
-      png,
-      minWidth: (iw * k).round(),
-      minHeight: (oh * k).round(),
-      quality: q,
-      format: CompressFormat.jpeg,
-    );
-    final got = await _jpegMeanLum(jpg);
-    if (got != null && (got - want).abs() < 25) return jpg;
-  }
-  throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
-}
-
-/// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال الأصلية (JPEG بيتحط في الـ PDF زي ما هو
-/// من غير إعادة رسم ولا إعادة ضغط، فالجودة أحسن والذاكرة أقل بكتير).
-Future<File> buildReceiptsPdf(Session s, List<String> receipts,
-    {void Function(int done, int total)? onProgress}) async {
-  Store.working++;
-  try {
-    final doc = pw.Document();
-    const pageW = 595.0;
-    final tag = await receiptTag(1000, s);
-    final tagImg = pw.MemoryImage(tag.png);
-    final tw = pageW * tag.w / 1000;
-    final th = pageW * tag.h / 1000;
-    final pad = pageW * kBandPad;
-    final bandH = th + pad * 2;
-    final compact = (await Store.pdfSize()) == 1;
-    for (var i = 0; i < receipts.length; i++) {
-      onProgress?.call(i, receipts.length);
-      var bytes = await File(receipts[i]).readAsBytes();
-      if (compact) {
-        // PDF مضغوط: نسخة أصغر (عرض ~720 وجودة 70) لو طلعت أخف وسليمة، وإلا بنستخدم الأصلية
-        try {
-          final c = await FlutterImageCompress.compressWithList(bytes,
-              minWidth: 720, minHeight: 720, quality: 70, format: CompressFormat.jpeg);
-          if (c.isNotEmpty && c.length < bytes.length && await _decodesOk(c)) bytes = c;
-        } catch (e, st) {
-          AppLog.e('pdf.compact', e, st);
+    final dest = loadMOut();
+    if (dest != defaultMDest) {
+      for (final r in loadMState()) {
+        final p = r.openPath;
+        if (r.newName != null && p != null && p != r.srcPath && p.startsWith(dest)) {
+          final f = File(p);
+          if (f.existsSync()) delFile(f);
         }
-      }
-      final sz = await imageSize(bytes);
-      final imgH = pageW * sz.h / sz.w;
-      final hide = await Store.noTag(receipts[i]);
-      final pageH = (hide ? 0.0 : bandH) + imgH + 1;
-      final image = pw.MemoryImage(bytes);
-      doc.addPage(pw.Page(
-        pageFormat: PdfPageFormat(pageW, pageH),
-        margin: pw.EdgeInsets.zero,
-        build: (_) => pw.Column(children: [
-          if (!hide)
-            pw.Container(
-              width: pageW,
-              height: bandH,
-              alignment: pw.Alignment.center,
-              child: pw.Image(tagImg, width: tw, height: th),
-            ),
-          pw.Image(image, width: pageW, height: imgH),
-        ]),
-      ));
-      await Future.delayed(Duration.zero); // نسيب الواجهة تتنفس على التليفونات الضعيفة
-    }
-    onProgress?.call(receipts.length, receipts.length);
-    final dir = await Store.dir();
-    final file = File('${dir.path}/${s.pdfName}.pdf');
-    await file.writeAsBytes(await doc.save(), flush: true);
-    return file;
-  } finally {
-    Store.working--;
-  }
-}
-
-// =====================================================================
-//  التخزين
-// =====================================================================
-
-String _dayKey() {
-  final n = DateTime.now();
-  return '${n.year}-${n.month}-${n.day}';
-}
-
-class Store {
-  static const pdfLife = Duration(hours: 24);
-  static int working = 0; // عدد العمليات الشغالة (بتمنع التنظيف أثناءها)
-  static Future<SharedPreferences> get _p => SharedPreferences.getInstance();
-
-  static Future<Directory> dir() async {
-    final base = await getApplicationDocumentsDirectory();
-    final d = Directory('${base.path}/a2r');
-    if (!await d.exists()) await d.create(recursive: true);
-    return d;
-  }
-
-  static Future<void> del(String path) async {
-    try {
-      final f = File(path);
-      if (await f.exists()) await f.delete();
-      final bf = File(baseOf(path));
-      if (await bf.exists()) await bf.delete();
-      final p = await _p;
-      await p.remove('pos:$path');
-      await p.remove('edit:$path');
-      await p.remove('notag:$path');
-    } catch (e, st) {
-      AppLog.e('del', e, st);
-    }
-  }
-
-  // --- إعدادات الموظف ---
-
-  static Future<PerfMode> perfMode() async {
-    final i = (await _p).getInt('perfMode') ?? 1;
-    return PerfMode.values[i.clamp(0, 2)];
-  }
-
-  static Future<void> setPerfMode(PerfMode m) async => (await _p).setInt('perfMode', m.index);
-
-  /// وضع الماسح: 0 تلقائي، 1 قص بس، 2 قص + فلتر، 3 كامل
-  static Future<int> scanSetting() async => ((await _p).getInt('scanMode') ?? 0).clamp(0, 3);
-  static Future<void> setScanSetting(int v) async => (await _p).setInt('scanMode', v);
-
-  /// جودة الصورة: 0 صغيرة، 1 عادية، 2 عالية
-  static Future<int> qualitySetting() async => ((await _p).getInt('jpegQ') ?? 1).clamp(0, 2);
-  static Future<void> setQualitySetting(int v) async => (await _p).setInt('jpegQ', v);
-
-  static Future<int> jpegQuality() async {
-    switch (await qualitySetting()) {
-      case 0:
-        return 65;
-      case 2:
-        return 92;
-      default:
-        return (await perfMode()) == PerfMode.pro ? 90 : 82;
-    }
-  }
-
-  /// شيل الصورة من المسودة من غير ما نمسح الملف (عشان "تراجع").
-  static Future<void> unlistFromDraft(String path) async {
-    final l = await draft();
-    l.remove(path);
-    await (await _p).setStringList('draft', l);
-  }
-
-  static Future<void> relistInDraft(String path, int index) async {
-    if (!File(path).existsSync()) return;
-    final l = await draft();
-    if (!l.contains(path)) l.insert(index.clamp(0, l.length), path);
-    await (await _p).setStringList('draft', l);
-  }
-
-  static Future<ScanFilter> filter() async {
-    final i = (await _p).getInt('filter') ?? ScanFilter.receipt.index;
-    return ScanFilter.values[i.clamp(0, ScanFilter.values.length - 1)];
-  }
-
-  static Future<void> setFilter(ScanFilter f) async => (await _p).setInt('filter', f.index);
-
-  /// المظهر: 0 داكن (الافتراضي)، 1 زي النظام، 2 فاتح
-  static Future<int> themeSetting() async => ((await _p).getInt('themeMode') ?? 0).clamp(0, 2).toInt();
-  static Future<void> setThemeSetting(int v) async => (await _p).setInt('themeMode', v);
-
-  /// اللون: 0 ذهبي (الافتراضي)، 1 فضي، 2 أزرق
-  static Future<int> paletteSetting() async =>
-      ((await _p).getInt('palette') ?? 0).clamp(0, AppPalette.values.length - 1).toInt();
-  static Future<void> setPaletteSetting(int v) async => (await _p).setInt('palette', v);
-
-  /// القص التلقائي: 0 ذكي (الافتراضي)، 1 مستطيل دايماً، 2 منظور دايماً
-  static Future<int> autoCropSetting() async =>
-      ((await _p).getInt('autoCrop') ?? 0).clamp(0, 2).toInt();
-  static Future<void> setAutoCropSetting(int v) async => (await _p).setInt('autoCrop', v);
-
-  static Future<bool> continuous() async => (await _p).getBool('continuous') ?? true;
-  static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
-
-  /// فتح شاشة الفلاتر والقص بعد كل صورة (تصوير أو معرض)
-  /// قص الهوامش البيضاء الفاضية بعد تعديل الإيصال (مقفول افتراضياً)
-  static Future<bool> trimMargins() async => (await _p).getBool('trim') ?? false;
-  static Future<void> setTrimMargins(bool v) async => (await _p).setBool('trim', v);
-
-  /// حجم الـ PDF: 0 كما هو، 1 مضغوط
-  static Future<int> pdfSize() async => ((await _p).getInt('pdfSize') ?? 0).clamp(0, 1).toInt();
-  static Future<void> setPdfSize(int v) async => (await _p).setInt('pdfSize', v);
-
-  /// إعداد مفضل لكل فلتر: [تباين، سطوع، حدة]
-  static Future<List<double>?> favOf(ScanFilter f) async {
-    try {
-      final s = (await _p).getString('fav:${f.name}');
-      if (s == null) return null;
-      final l = [for (final e in (jsonDecode(s) as List)) (e as num).toDouble()];
-      return l.length == 3 ? l : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  static Future<void> setFav(ScanFilter f, List<double>? v) async {
-    final p = await _p;
-    if (v == null) {
-      await p.remove('fav:${f.name}');
-    } else {
-      await p.setString('fav:${f.name}', jsonEncode(v));
-    }
-  }
-
-  static Future<bool> autoEdit() async => (await _p).getBool('autoEdit') ?? false;
-  static Future<void> setAutoEdit(bool v) async => (await _p).setBool('autoEdit', v);
-
-  /// شكل ورقة الباتش: 1 شريط تحت الصورة، 2 على الصورة (الشريط فوق اتلغى، والقيمة القديمة 0 بتتحول لـ 1)
-  static Future<int> batchLayout() async {
-    final v = (await _p).getInt('batchLayout') ?? 1;
-    return v == 2 ? 2 : 1;
-  }
-  static Future<void> setBatchLayout(int v) async => (await _p).setInt('batchLayout', v);
-
-  /// حجم الورقة في وضع الشريط (نسبة من عرض الصورة)
-  static Future<double> bandScale() async =>
-      ((await _p).getDouble('bandScale2') ?? kBatchTagW).clamp(0.3, kBandMaxScale).toDouble();
-  static Future<void> setBandScale(double v) async => (await _p).setDouble('bandScale2', v);
-
-  // --- مكان وحجم الورقة ---
-  static Future<TagPos?> pos(String path) async =>
-      TagPos.decode((await _p).getString('pos:$path'));
-
-  static Future<TagPos> assignPos(String path, Tag ref, bool batch) async {
-    final p = await _p;
-    var v = TagPos.decode(p.getString('pos:$path'));
-    if (v == null) {
-      v = TagPos.decode(p.getString(batch ? 'lastPos_b' : 'lastPos_r')) ?? TagPos.initial(ref);
-      await p.setString('pos:$path', v.encode());
-    }
-    return v;
-  }
-
-  static Future<void> savePos(String path, TagPos v, bool batch) async {
-    final p = await _p;
-    await p.setString('pos:$path', v.encode());
-    await p.setString(batch ? 'lastPos_b' : 'lastPos_r', v.encode());
-  }
-
-  // --- صورة الباتش ---
-  static Future<String?> batchImg() async {
-    final v = (await _p).getString('batchImg');
-    if (v == null || !File(v).existsSync()) return null;
-    return v;
-  }
-
-  static Future<void> setBatchImg(String path) async {
-    final p = await _p;
-    final old = p.getString('batchImg');
-    if (old != null && old != path) await del(old);
-    await p.setString('batchImg', path);
-  }
-
-  static Future<void> clearBatchImg() async {
-    final p = await _p;
-    final old = p.getString('batchImg');
-    if (old != null) await del(old);
-    await p.remove('batchImg');
-  }
-
-  static Future<void> afterBatchSent() async {
-    await clearBatchImg();
-    final p = await _p;
-    for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
-      await p.remove(k);
-    }
-    await setFlag('batch');
-  }
-
-  // --- صور الإيصالات ---
-  static Future<void> setDraft(List<String> l) async => (await _p).setStringList('draft', l);
-
-  static Future<List<String>> pdfImgs() async => (await _p).getStringList('pdfImgs') ?? [];
-
-  static Future<List<String>> draft() async {
-    final l = (await _p).getStringList('draft') ?? [];
-    return l.where((e) => File(e).existsSync()).toList();
-  }
-
-  static Future<void> addToDraft(String path) async {
-    final l = await draft();
-    l.add(path);
-    await (await _p).setStringList('draft', l);
-  }
-
-  static Future<void> removeFromDraft(String path) async {
-    final l = await draft();
-    l.remove(path);
-    await del(path);
-    await (await _p).setStringList('draft', l);
-  }
-
-  static Future<void> clearDraft() async {
-    for (final e in await draft()) {
-      await del(e);
-    }
-    await (await _p).setStringList('draft', []);
-  }
-
-  // --- نسخة الصورة الأصلية + إعدادات التعديل (تعديل غير مدمّر) ---
-  static String baseOf(String path) => path.replaceFirst(RegExp(r'\.jpg$'), '_base.jpg');
-
-  /// صورة معلّم عليها "من غير ورقة". الصورة الجديدة دايماً بتبدأ بالورقة.
-  static Future<bool> noTag(String path) async => (await _p).getBool('notag:$path') ?? false;
-
-  static Future<void> setNoTag(String path, bool v) async {
-    final p = await _p;
-    if (v) {
-      await p.setBool('notag:$path', true);
-    } else {
-      await p.remove('notag:$path');
-    }
-  }
-
-  static Future<EditParams?> editOf(String path) async =>
-      EditParams.decode((await _p).getString('edit:$path'));
-
-  static Future<void> setEdit(String path, EditParams e) async =>
-      (await _p).setString('edit:$path', e.encode());
-
-  /// بعد تعديل إيصال: الصورة الجديدة تاخد مكان القديمة في نفس الترتيب.
-  static Future<void> replaceInDraft(String old, String neu) async {
-    final l = await draft();
-    final i = l.indexOf(old);
-    if (i < 0) {
-      l.add(neu);
-    } else {
-      l[i] = neu;
-    }
-    await (await _p).setStringList('draft', l);
-    if (await noTag(old)) await setNoTag(neu, true); // الاختيار يفضل بعد التعديل
-    await del(old);
-  }
-
-  // --- ملف الـ PDF (يفضل 24 ساعة) ---
-  static Future<({File file, DateTime time})?> pdf() async {
-    final p = await _p;
-    final path = p.getString('pdfPath');
-    final t = p.getInt('pdfTime');
-    if (path == null || t == null) return null;
-    final time = DateTime.fromMillisecondsSinceEpoch(t);
-    final age = DateTime.now().difference(time);
-    if (age > pdfLife || !File(path).existsSync()) {
-      await clearPdf();
-      return null;
-    }
-    return (file: File(path), time: time);
-  }
-
-  static Future<void> setPdf(File f, List<String> imgs) async {
-    final p = await _p;
-    final old = p.getString('pdfPath');
-    if (old != null && old != f.path) await del(old);
-    await p.setString('pdfPath', f.path);
-    await p.setInt('pdfTime', DateTime.now().millisecondsSinceEpoch);
-    await p.setStringList('pdfImgs', imgs);
-  }
-
-  static Future<void> clearPdf() async {
-    final p = await _p;
-    final old = p.getString('pdfPath');
-    if (old != null) await del(old);
-    await p.remove('pdfPath');
-    await p.remove('pdfTime');
-    await p.remove('pdfImgs');
-  }
-
-  static Future<void> afterPdfSent() async {
-    final p = await _p;
-    final used = p.getStringList('pdfImgs') ?? [];
-    final left = await draft();
-    for (final u in used) {
-      await del(u);
-      left.remove(u);
-    }
-    await p.setStringList('draft', left);
-    await p.remove('pdfImgs');
-    await setFlag('receipts');
-  }
-
-  // --- علامة ✓ (بتتصفّر كل يوم جديد) ---
-  static Future<bool> flag(String k) async {
-    final p = await _p;
-    if (p.getString('flagDay') != _dayKey()) {
-      await p.setString('flagDay', _dayKey());
-      await p.setBool('f_batch', false);
-      await p.setBool('f_receipts', false);
-    }
-    return p.getBool('f_$k') ?? false;
-  }
-
-  static Future<void> setFlag(String k) async {
-    await flag(k);
-    await (await _p).setBool('f_$k', true);
-  }
-
-  /// مسح أي ملفات مؤقتة مش تابعة لمسودة أو PDF شغّال. مبتشتغلش لو فيه عملية شغالة.
-  static Future<void> cleanup() async {
-    if (working > 0) return;
-    final keep = <String>{...await draft(), ...await pdfImgs()};
-    final bi = await batchImg();
-    if (bi != null) keep.add(bi);
-    final pdfPath = (await pdf())?.file.path;
-    if (pdfPath != null) keep.add(pdfPath);
-    keep.addAll(keep.map(baseOf).toList());
-    await for (final e in (await dir()).list()) {
-      if (working > 0) return;
-      if (e is File && !keep.contains(e.path)) {
-        try {
-          if (DateTime.now().difference(e.lastModifiedSync()) < const Duration(minutes: 2)) {
-            continue;
-          }
-        } catch (_) {
-          continue;
-        }
-        await del(e.path);
+        r.ctl.dispose();
       }
     }
-  }
-}
-
-// =====================================================================
-//  الكاميرا والمشاركة
-// =====================================================================
-
-Future<bool> askYesNo(BuildContext context, String title, String body,
-    {String yes = 'تمام', String no = 'لا'}) async {
-  final r = await showDialog<bool>(
-    context: context,
-    builder: (c) => Directionality(
-      textDirection: TextDirection.rtl,
-      child: AlertDialog(
-        title: Text(title),
-        content: Text(body),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(c, false), child: Text(no)),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: Text(yes)),
-        ],
-      ),
-    ),
-  );
-  return r ?? false;
-}
-
-/// بيتطلب أول ما التطبيق يفتح. الكاميرا بس: المعرض بيشتغل من منتقي الصور بتاع النظام من غير إذن.
-Future<void> requestAllPermissions() async {
-  try {
-    await Permission.camera.request();
-  } catch (e, st) {
-    AppLog.e('requestAllPermissions', e, st);
-  }
-}
-
-Future<bool> ensureCamera(BuildContext context) async {
-  var st = await Permission.camera.status;
-  if (st.isGranted) return true;
-  st = await Permission.camera.request();
-  if (st.isGranted) return true;
-  if (!context.mounted) return false;
-  final go = await askYesNo(context, 'محتاج إذن الكاميرا',
-      'من غير الإذن التطبيق مش هيقدر يصوّر. افتح الإعدادات > الأذونات > الكاميرا واختار "السماح".',
-      yes: 'افتح الإعدادات', no: 'إلغاء');
-  if (go) await openAppSettings();
-  return false;
-}
-
-Future<List<String>> simplePick(BuildContext context, {bool multi = false}) async {
-  final src = await showModalBottomSheet<ImageSource>(
-    context: context,
-    builder: (c) => SafeArea(
-      child: Wrap(children: [
-        ListTile(
-            leading: const Icon(Icons.photo_camera_rounded),
-            title: const Text('الكاميرا'),
-            onTap: () => Navigator.pop(c, ImageSource.camera)),
-        ListTile(
-            leading: const Icon(Icons.photo_library_rounded),
-            title: const Text('المعرض'),
-            onTap: () => Navigator.pop(c, ImageSource.gallery)),
-      ]),
-    ),
-  );
-  if (src == null) return [];
-  try {
-    final picker = ImagePicker();
-    if (src == ImageSource.gallery && multi) {
-      final xs = await picker.pickMultiImage(maxWidth: 2000, imageQuality: 85);
-      return xs.map((e) => e.path).toList();
-    }
-    final x = await picker.pickImage(source: src, maxWidth: 2000, imageQuality: 85);
-    return x == null ? [] : [x.path];
-  } catch (e, st) {
-    AppLog.e('simplePick', e, st);
-    if (context.mounted) snack(context, 'تعذر فتح الكاميرا أو المعرض');
-    return [];
-  }
-}
-
-/// لو أندرويد قفل التطبيق وهو في الكاميرا (رامات قليلة)، الصورة بتترجع هنا بعد ما التطبيق يفتح تاني.
-Future<void> markPickTarget(String t) async {
-  try {
-    await (await SharedPreferences.getInstance()).setString('pickTarget', t);
-  } catch (e, st) {
-    AppLog.e('markPickTarget', e, st);
-  }
-}
-
-Future<void> stashLostPick() async {
-  try {
-    final r = await ImagePicker().retrieveLostData();
-    if (r.isEmpty || r.file == null) return;
-    final d = Directory('${(await Store.dir()).path}/lost');
-    await d.create(recursive: true);
-    final f = await File(r.file!.path)
-        .copy('${d.path}/${DateTime.now().microsecondsSinceEpoch}.jpg');
-    await (await SharedPreferences.getInstance()).setString('lostPick', f.path);
-  } catch (e, st) {
-    AppLog.e('stashLostPick', e, st);
-  }
-}
-
-/// بترجّع مسار الصورة الضايعة لو كانت تابعة للشاشة دي (مرة واحدة بس).
-Future<String?> takeLostPick(String target) async {
-  try {
-    final p = await SharedPreferences.getInstance();
-    final path = p.getString('lostPick');
-    if (path == null || p.getString('pickTarget') != target) return null;
-    await p.remove('lostPick');
-    return await File(path).exists() ? path : null;
-  } catch (e, st) {
-    AppLog.e('takeLostPick', e, st);
-    return null;
-  }
-}
-
-/// كل التصوير (كاميرا أو معرض) بيعدي على ماسح المستندات (قص).
-/// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية تلقائياً.
-List<Offset>? _shotQuad; // آخر تحديد حي وقت الضغط على زر التصوير (اقتراح فوري لشاشة التعديل، بيتستخدم مرة واحدة)
-bool _lastScanManual = false; // آخر تصوير اتعمل بالكاميرا العادية (من غير ماسح ML Kit) فمحتاج شاشة القص
-bool _scannerFailed = false; // فشل الماسح في الجلسة دي (بيتصفّر لما التطبيق يتقفل)
-
-Future<List<String>> _manualPick(BuildContext context, {bool multi = false}) async {
-  final r = await simplePick(context, multi: multi);
-  _lastScanManual = r.isNotEmpty;
-  return r;
-}
-
-ScannerMode _scanModeOf(int i, ScannerMode fallback) {
-  switch (i) {
-    case 1:
-      return ScannerMode.base;
-    case 2:
-      // الوضع الأوسط (قص + فلتر): بنختاره بالترتيب عشان اسمه بيختلف بين نسخ الحزمة
-      return ScannerMode.values.length > 2 ? ScannerMode.values[1] : ScannerMode.base;
-    case 3:
-      return ScannerMode.full;
-    default:
-      return fallback;
-  }
-}
-
-const _scanOpts = <(int, String, String)>[
-  (0, 'تلقائي', 'الباتش كامل والإيصالات قص بس (الافتراضي)'),
-  (1, 'قص بس', 'أسرع وأخف، من غير تحسينات'),
-  (2, 'قص + فلتر', 'قص مع تحسين تلقائي للألوان'),
-  (3, 'كامل', 'قص وتنضيف الصورة وإزالة الصوابع'),
-];
-
-const _qualOpts = <(int, String, String)>[
-  (0, 'صغيرة', 'ملف أخف وأسرع في الإرسال'),
-  (1, 'عادية', 'متوازنة (الافتراضي)'),
-  (2, 'عالية', 'أوضح وحجم أكبر'),
-];
-
-bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
-
-Future<List<String>> scanImages(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full}) async {
-  if (_scanBusy) return [];
-  _scanBusy = true;
-  try {
-    return await _scanImagesImpl(context, limit, mode: mode);
-  } finally {
-    _scanBusy = false;
-  }
-}
-
-Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full}) async {
-  _lastScanManual = false;
-  if (!await ensureCamera(context)) return [];
-  if (!context.mounted) return [];
-  final perf = await Store.perfMode();
-  if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1);
-  final sm = await Store.scanSetting();
-  final effMode = _scanModeOf(sm, perf == PerfMode.pro ? ScannerMode.full : mode);
-  final scanner = DocumentScanner(
-    options: DocumentScannerOptions(mode: effMode, pageLimit: limit, isGalleryImport: true),
-  );
-  try {
-    final r = await scanner.scanDocument();
-    return List<String>.from(r.images ?? const []);
-  } catch (e) {
-    if (e.toString().toLowerCase().contains('cancel')) return [];
-    if (!context.mounted) return [];
-    _scannerFailed = true;
-    try {
-      (await SharedPreferences.getInstance())
-          .setInt('scannerFailedAt', DateTime.now().millisecondsSinceEpoch);
-    } catch (e, st) {
-      AppLog.e('scanImages.prefs', e, st);
-    }
-    if (!context.mounted) return [];
-    await showDialog<void>(
-      context: context,
-      builder: (c) => Directionality(
-        textDirection: TextDirection.rtl,
-        child: AlertDialog(
-          title: const Text('الماسح مش شغال على الموبايل ده'),
-          content: SingleChildScrollView(
-            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('هنفتح الكاميرا العادية وبعدها شاشة القص. سبب المشكلة:'),
-              const SizedBox(height: 8),
-              SelectableText(e.toString(), textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12)),
-            ]),
-          ),
-          actions: [FilledButton(onPressed: () => Navigator.pop(c), child: const Text('تمام'))],
-        ),
-      ),
-    );
-    if (!context.mounted) return [];
-    return _manualPick(context, multi: limit > 1);
-  } finally {
-    scanner.close();
-  }
-}
-
-/// قايمة المشاركة العادية: الموظف يختار واتساب أو أي تطبيق.
-bool _shareBusy = false;
-
-Future<bool> shareFiles(BuildContext context, List<String> paths, {String? text}) async {
-  if (_shareBusy) return false;
-  _shareBusy = true;
-  try {
-    if (text != null) await Clipboard.setData(ClipboardData(text: text));
-    final r = await Share.shareXFiles(paths.map((p) => XFile(p)).toList(), text: text);
-    if (text != null && context.mounted) {
-      snack(context, 'الوصف اتنسخ، لو مظهرش في الواتساب الصقه');
-    }
-    if (r.status == ShareResultStatus.success) return true;
-    if (r.status == ShareResultStatus.dismissed) return false;
-    if (!context.mounted) return false;
-    return await askYesNo(context, 'تم الإرسال؟', 'لو بعت الملف فعلاً اضغط "تم".',
-        yes: 'تم', no: 'لا');
-  } catch (e, st) {
-    AppLog.e('shareFiles', e, st);
-    if (context.mounted) snack(context, 'تعذر فتح قائمة المشاركة');
-    return false;
-  } finally {
-    _shareBusy = false;
-  }
-}
-
-// =====================================================================
-//  وصف الباتش (واتساب)
-// =====================================================================
-
-class BatchInfo {
-  final String count, piasters, collected, total;
-  const BatchInfo(this.count, this.piasters, this.collected, this.total);
-}
-
-/// أرقام عربية/فارسية ← إنجليزي، وفاصلة عشرية موحّدة
-String _digits(String s) {
-  const ar = '٠١٢٣٤٥٦٧٨٩', fa = '۰۱۲۳۴۵۶۷۸۹';
-  final b = StringBuffer();
-  for (final ch in s.trim().split('')) {
-    final i = ar.indexOf(ch), j = fa.indexOf(ch);
-    b.write(i >= 0 ? i : (j >= 0 ? j : ch));
-  }
-  var t = b.toString().replaceAll(' ', '').replaceAll('٫', '.').replaceAll('،', ',');
-  t = t.contains(',') && t.contains('.') ? t.replaceAll(',', '') : t.replaceAll(',', '.');
-  return t;
-}
-
-String batchCaption(Session s, BatchInfo i) => [
-      'الاسم: ${s.name}',
-      'الوحده : ${s.unit.name}',
-      if (s.building != null) 'اسم المبني : ${s.building}',
-      'عدد المعاملات : ${i.count}',
-      'عدد القروش الفاصله: ${i.piasters}',
-      'عدد المعاملات المجمعه : ${i.collected}',
-      'الاجمالي: ${i.total}',
-    ].join('\n');
-
-Future<BatchInfo?> askBatchInfo(BuildContext context) async {
-  final p = await SharedPreferences.getInstance();
-  final init = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
-      p.getString('bi_col') ?? '', p.getString('bi_total') ?? '');
-  if (!context.mounted) return null;
-  final r = await showModalBottomSheet<BatchInfo>(
-    context: context,
-    isScrollControlled: true,
-    builder: (c) =>
-        Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init)),
-  );
-  if (r != null) {
-    await p.setString('bi_count', r.count);
-    await p.setString('bi_pi', r.piasters);
-    await p.setString('bi_col', r.collected);
-    await p.setString('bi_total', r.total);
-  }
-  return r;
-}
-
-class _BatchInfoSheet extends StatefulWidget {
-  final BatchInfo init;
-  const _BatchInfoSheet({required this.init});
-  @override
-  State<_BatchInfoSheet> createState() => _BatchInfoSheetState();
-}
-
-class _BatchInfoSheetState extends State<_BatchInfoSheet> {
-  late final c1 = TextEditingController(text: widget.init.count);
-  late final c2 =
-      TextEditingController(text: widget.init.piasters.isEmpty ? '0' : widget.init.piasters);
-  late final c3 =
-      TextEditingController(text: widget.init.collected.isEmpty ? '0' : widget.init.collected);
-  late final c4 = TextEditingController(text: widget.init.total);
-  String? err;
-
-  @override
-  void dispose() {
-    c1.dispose();
-    c2.dispose();
-    c3.dispose();
-    c4.dispose();
-    super.dispose();
-  }
-
-  void _ok() {
-    final count = _digits(c1.text), pi = _digits(c2.text);
-    final col = _digits(c3.text), tot = _digits(c4.text);
-    bool isInt(String s) => RegExp(r'^\d+$').hasMatch(s);
-    if (!isInt(count)) return setState(() => err = 'اكتب عدد المعاملات (أرقام بس)');
-    if (pi.isNotEmpty && !isInt(pi)) {
-      return setState(() => err = 'عدد القروش الفاصلة لازم يكون رقم');
-    }
-    if (col.isNotEmpty && !isInt(col)) {
-      return setState(() => err = 'عدد المعاملات المجمعة لازم يكون رقم');
-    }
-    final t = double.tryParse(tot);
-    if (t == null || t < 0) return setState(() => err = 'اكتب الإجمالي صح (مثال 28107.19)');
-    Navigator.pop(
-        context,
-        BatchInfo('${int.parse(count)}', pi.isEmpty ? '0' : '${int.parse(pi)}',
-            col.isEmpty ? '0' : '${int.parse(col)}', t.toStringAsFixed(2)));
-  }
-
-  Widget _f(TextEditingController c, String label, {bool dec = false, bool selectAll = false}) =>
-      Padding(
-        padding: const EdgeInsets.only(bottom: 12),
-        child: TextField(
-          controller: c,
-          // الخانة اللي قيمتها 0 تتحدد كلها أول ما تدوس عليها، فأي رقم بتكتبه يحل محل الصفر
-          onTap: selectAll
-              ? () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length)
-              : null,
-          keyboardType: TextInputType.numberWithOptions(decimal: dec),
-          decoration: InputDecoration(labelText: label, border: kFieldBorder),
-        ),
-      );
-
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + MediaQuery.of(context).viewInsets.bottom),
-        child: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            const Text('بيانات الباتش',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            _f(c1, 'عدد المعاملات'),
-            _f(c2, 'عدد القروش الفاصلة', selectAll: true),
-            _f(c3, 'عدد المعاملات المجمعة', selectAll: true),
-            _f(c4, 'الإجمالي', dec: true),
-            if (err != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: Text(err!, style: const TextStyle(color: Colors.red)),
-              ),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
-            ),
-          ]),
-        ),
-      );
-}
-
-Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
-  final info = await askBatchInfo(context);
-  if (info == null || !context.mounted) return false;
-  final caption = batchCaption(s, info);
-  Store.working++;
-  File out;
-  try {
-    final bytes = await composeBatch(img, s);
-    out = File('${(await Store.dir()).path}/${s.batchName}.jpg');
-    await out.writeAsBytes(bytes, flush: true);
-  } finally {
-    Store.working--;
-  }
-  if (!context.mounted) return false;
-  final ok = await shareFiles(context, [out.path], text: caption);
-  if (ok) await Store.afterBatchSent();
-  return ok;
-}
-
-// =====================================================================
-//  عناصر العرض
-// =====================================================================
-
-class TaggedImage extends StatelessWidget {
-  final String path;
-  final Tag tag;
-  final TagPos pos;
-  final double? aspect;
-  final ValueChanged<TagPos>? onChanged;
-  final bool showTag;
-  const TaggedImage(
-      {super.key,
-      required this.path,
-      required this.tag,
-      required this.pos,
-      this.aspect,
-      this.onChanged,
-      this.showTag = true});
-
-  @override
-  Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
-        var cw = cons.maxWidth;
-        double? ch;
-        if (aspect != null) {
-          ch = cw * aspect!;
-          if (cons.hasBoundedHeight && ch > cons.maxHeight) {
-            ch = cons.maxHeight;
-            cw = ch / aspect!;
-          }
-        }
-        final dw = cw * pos.s;
-        final dh = dw * tag.h / tag.w;
-        Widget t = Image.memory(tag.png,
-            width: dw, height: dh, fit: BoxFit.fill, gaplessPlayback: true);
-        if (onChanged != null) {
-          t = _TagDrag(
-            pos: pos,
-            cw: cw,
-            maxCy: aspect ?? 3,
-            onChanged: onChanged!,
-            child: DecoratedBox(
-                decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
-                child: t),
-          );
-        }
-        Widget err(BuildContext _, Object __, StackTrace? ___) =>
-            const Center(child: Text('تعذر عرض الصورة'));
-        final img = ch != null
-            ? Image.file(File(path),
-                width: cw, height: ch, fit: BoxFit.fill, cacheWidth: 1000, errorBuilder: err)
-            : Image.file(File(path),
-                width: cw, fit: BoxFit.fitWidth, cacheWidth: 1000, errorBuilder: err);
-        final stack = Stack(clipBehavior: Clip.hardEdge, children: [
-          img,
-          if (showTag)
-            Positioned(
-                left: pos.cx * cw - dw / 2,
-                top: pos.cy * cw - dh / 2,
-                width: dw,
-                height: dh,
-                child: t),
-        ]);
-        return Center(
-            child: ch != null
-                ? SizedBox(width: cw, height: ch, child: stack)
-                : SizedBox(width: cw, child: stack));
-      });
-}
-
-class _TagDrag extends StatefulWidget {
-  final TagPos pos;
-  final double cw, maxCy;
-  final ValueChanged<TagPos> onChanged;
-  final Widget child;
-  const _TagDrag(
-      {required this.pos,
-      required this.cw,
-      required this.maxCy,
-      required this.onChanged,
-      required this.child});
-  @override
-  State<_TagDrag> createState() => _TagDragState();
-}
-
-class _TagDragState extends State<_TagDrag> {
-  double startS = 0.3;
-
-  @override
-  Widget build(BuildContext context) => GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onScaleStart: (_) => startS = widget.pos.s,
-        onScaleUpdate: (d) {
-          final p = widget.pos;
-          final s = (startS * d.scale).clamp(0.1, 0.98).toDouble();
-          final cx = (p.cx + d.focalPointDelta.dx / widget.cw).clamp(0.0, 1.0).toDouble();
-          final cy =
-              (p.cy + d.focalPointDelta.dy / widget.cw).clamp(0.0, widget.maxCy).toDouble();
-          widget.onChanged(TagPos(cx, cy, s));
-        },
-        child: widget.child,
-      );
-}
-
-class ZoomPage extends StatefulWidget {
-  final Widget child;
-  const ZoomPage({super.key, required this.child});
-  @override
-  State<ZoomPage> createState() => _ZoomPageState();
-}
-
-class _ZoomPageState extends State<ZoomPage> {
-  final _tc = TransformationController();
-  Offset _tap = Offset.zero;
-  static const _zoom = 2.5;
-
-  @override
-  void dispose() {
-    _tc.dispose();
-    super.dispose();
-  }
-
-  /// نقرتين: لو متكبرة ترجع للحجم الطبيعي، ولو طبيعية تكبّر عند مكان النقر.
-  void _toggle() {
-    if (_tc.value.getMaxScaleOnAxis() > 1.05) {
-      _tc.value = Matrix4.identity();
-    } else {
-      final tx = -_tap.dx * (_zoom - 1), ty = -_tap.dy * (_zoom - 1);
-      _tc.value = Matrix4(_zoom, 0, 0, 0, 0, _zoom, 0, 0, 0, 0, 1, 0, tx, ty, 0, 1);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final w = MediaQuery.of(context).size.width;
-    return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white),
-      body: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onDoubleTapDown: (d) => _tap = d.localPosition,
-        onDoubleTap: _toggle,
-        child: InteractiveViewer(
-          transformationController: _tc,
-          constrained: false,
-          minScale: 1,
-          maxScale: 6,
-          child: SizedBox(width: w, child: widget.child),
-        ),
-      ),
-    );
-  }
-}
-
-class ReceiptPreview extends StatelessWidget {
-  final String path;
-  final Tag tag;
-  final int cacheWidth;
-  final bool showTag;
-  final bool bottom; // الشريط تحت الصورة بدل فوقها
-  /// لو متحدد: الورقة بنسبة من عرض الصورة (زي ما بتتركب في الباتش) وملزوقة في الصورة،
-  /// والـ tag بيكون نسخة مرجعية بتتكبّر وتتصغّر فوراً من غير إعادة رسم.
-  final double? bandScale;
-  const ReceiptPreview(
-      {super.key,
-      required this.path,
-      required this.tag,
-      this.cacheWidth = kMaxSide,
-      this.showTag = true,
-      this.bottom = false,
-      this.bandScale});
-  @override
-  Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
-        final k = bandScale;
-        final full = cons.maxWidth;
-        // عرض الصورة نفسها: لو الورقة أعرض من الصورة (k > 1) الصورة بتتوسّط بهوامش بيضا
-        final cw = k == null ? full : full / math.max(1.0, k);
-        Widget errW(BuildContext _, Object __, StackTrace? ___) =>
-            const SizedBox(height: 120, child: Center(child: Text('تعذر عرض الصورة')));
-        final pic = Image.file(File(path),
-            width: cw, fit: BoxFit.fitWidth, cacheWidth: cacheWidth, errorBuilder: errW);
-        if (k == null) {
-          final band = Container(
-            width: cw,
-            color: Colors.white,
-            padding: EdgeInsets.symmetric(vertical: cw * kBandPad),
-            alignment: Alignment.center,
-            child: Image.memory(tag.png,
-                width: cw * tag.w / 1000, height: cw * tag.h / 1000, fit: BoxFit.fill),
-          );
-          return Column(
-              mainAxisSize: MainAxisSize.min,
-              children: bottom ? [pic, if (showTag) band] : [if (showTag) band, pic]);
-        }
-        final tw = cw * k;
-        final th = tw * tag.h / tag.w;
-        final pad = cw * kBandPad, gap = cw * kBandGapNear;
-        final band = Container(
-          width: full,
-          color: Colors.white,
-          padding: EdgeInsets.only(top: bottom ? gap : pad, bottom: bottom ? pad : gap),
-          alignment: Alignment.center,
-          child: Image.memory(tag.png,
-              width: tw, height: th, fit: BoxFit.fill, gaplessPlayback: true),
-        );
-        final picBox = Container(
-            width: full, color: Colors.white, alignment: Alignment.center, child: pic);
-        return Column(
-            mainAxisSize: MainAxisSize.min,
-            children: bottom
-                ? [picBox, if (showTag) band]
-                : [if (showTag) band, picBox]);
-      });
-}
-
-void snack(BuildContext context, String m) =>
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
-
-/// الألوان المتاحة. الشعار أبيض فمحتاج خلفية غامقة (dark) في كل لون.
-enum AppPalette { gold, silver, blue }
-
-class Pal {
-  final String name;
-  final Color seed, accent, dark, mid, bg, onAccent;
-  const Pal(this.name, this.seed, this.accent, this.dark, this.mid, this.bg, this.onAccent);
-}
-
-const kPalettes = <AppPalette, Pal>{
-  AppPalette.gold: Pal('ذهبي', Color(0xFFC9A227), Color(0xFFE3B94A), Color(0xFF15120B),
-      Color(0xFF4A3A12), Color(0xFF0D0C09), Color(0xFF15120B)),
-  AppPalette.silver: Pal('فضي', Color(0xFF8E9AA8), Color(0xFFD3DAE3), Color(0xFF14171C),
-      Color(0xFF3C444F), Color(0xFF0C0D10), Color(0xFF14171C)),
-  AppPalette.blue: Pal('أزرق', Color(0xFF0B5FA5), Color(0xFF1EC8A5), Color(0xFF0E131A),
-      Color(0xFF0B5FA5), Color(0xFF0A0E13), Colors.white),
-};
-
-/// اللون الحالي (الافتراضي ذهبي).
-final ValueNotifier<AppPalette> appPalette = ValueNotifier(AppPalette.gold);
-Pal get pal => kPalettes[appPalette.value]!;
-Color get kAccent => pal.accent;
-Color get kBrandDark => pal.dark;
-
-const kFieldBorder = OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(14)));
-const kCardShape = RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(18)));
-
-Widget appLogo({double height = 36}) => Image.asset(
-      'assets/logo.png',
-      height: height,
-      fit: BoxFit.contain,
-      errorBuilder: (_, __, ___) => Text('A2R',
-          style: TextStyle(
-              color: Colors.white,
-              fontSize: height * 0.8,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 3)),
-    );
-
-// =====================================================================
-//  التطبيق
-// =====================================================================
-
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await AppLog.init();
-  FlutterError.onError = (d) {
-    FlutterError.presentError(d);
-    AppLog.e('flutter', d.exception, d.stack);
-  };
-  ui.PlatformDispatcher.instance.onError = (err, st) {
-    AppLog.e('async', err, st);
-    return true;
-  };
-  await AppData.load();
-  try {
-    appThemeMode.value = _themeOf(await Store.themeSetting());
-    appPalette.value = AppPalette.values[await Store.paletteSetting()];
-    autoCropMode = await Store.autoCropSetting();
   } catch (_) {}
-  try {
-    final sp = await SharedPreferences.getInstance();
-    if (sp.getBool('apply_guard') == true) {
-      await sp.setBool('apply_safe', true);
-      await sp.setBool('apply_guard', false);
-      AppLog.i('التطبيق اتقفل أثناء حفظ التعديل، اتفعّل الوضع الآمن (دقة أقل)');
-    }
-    if (sp.getBool('det_guard') == true) {
-      await sp.setBool('det_off', true);
-      await sp.setBool('det_guard', false);
-      AppLog.i('الكشف الأصلي قفل التطبيق المرة اللي فاتت، اتوقف واتحوّل للكشف البسيط');
-    }
-    final t = sp.getInt('scannerFailedAt') ?? 0;
-    _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
-  } catch (e, st) {
-    AppLog.e('main', e, st);
+  for (final p in [fixPath, mStatePath, '$baseDir/id_debug.txt']) {
+    final f = File(p);
+    if (f.existsSync()) delFile(f);
   }
-  await stashLostPick();
-  String? resume;
   try {
-    final sp = await SharedPreferences.getInstance();
-    final lp = sp.getString('lostPick');
-    if (lp != null && File(lp).existsSync()) resume = sp.getString('pickTarget');
-  } catch (e, st) {
-    AppLog.e('main.resume', e, st);
-  }
-  runApp(A2RApp(resumeTarget: resume));
+    final cfg = _readCfg();
+    cfg.remove('doneM');
+    _writeCfg(cfg);
+  } catch (_) {}
+  // الكاش والملفات المؤقتة بتاعة التطبيق
+  try {
+    for (final e in Directory.systemTemp.listSync(followLinks: false)) {
+      if (e is File) {
+        delFile(e);
+      } else if (e is Directory) {
+        wipeTree(e.path);
+      }
+    }
+  } catch (_) {}
+  imageCache.clear();
+  imageCache.clearLiveImages();
+  await clearScanCache();
+  closingTxn.value = <int, int>{};
+  sysTxnByNum = <int, int>{};
+  batchTxnByNum = <int, int>{};
+  batchAmtByNum = <int, double>{};
+  wipeSignal.value++;
+  final mb = (bytes / 1048576).toStringAsFixed(1);
+  m.showSnackBar(SnackBar(
+      content: w.Text(ar ? 'تم المسح: $files ملف ($mb ميجا) 🧹' : 'Wiped: $files files ($mb MB) 🧹')));
 }
 
-ThemeData _theme(Brightness b) {
-  final p = pal;
-  final dark = b == Brightness.dark;
-  final cs = ColorScheme.fromSeed(seedColor: p.seed, brightness: b);
-  RoundedRectangleBorder rr(double r) =>
-      RoundedRectangleBorder(borderRadius: BorderRadius.circular(r));
+final ValueNotifier<int> sharedDays = ValueNotifier<int>(0); // الفترة (اليوم/يومين/...) واحدة للتابين
+final ValueNotifier<int> homeBadge = ValueNotifier<int>(0); // عدد اللي محتاج مراجعة في التقفيل
+final ValueNotifier<int> machBadge = ValueNotifier<int>(0); // عدد اللي محتاج مراجعة في إيصالات الدفع
+
+void _syncBadge(ValueNotifier<int> n, int v) {
+  if (n.value == v) return;
+  WidgetsBinding.instance.addPostFrameCallback((_) => n.value = v);
+}
+
+ThemeData _buildTheme(Brightness b) {
+  final cs = ColorScheme.fromSeed(seedColor: kSeeds[appSettings.seedIndex], brightness: b);
   return ThemeData(
     useMaterial3: true,
     colorScheme: cs,
-    scaffoldBackgroundColor: dark ? p.bg : null,
     appBarTheme: AppBarTheme(
-      backgroundColor: p.dark,
-      foregroundColor: Colors.white,
+      backgroundColor: cs.surface,
+      foregroundColor: cs.onSurface,
       surfaceTintColor: Colors.transparent,
-      centerTitle: true,
-      elevation: 0,
-      iconTheme: IconThemeData(color: p.accent),
-      actionsIconTheme: IconThemeData(color: p.accent),
-      titleTextStyle:
-          const TextStyle(color: Colors.white, fontSize: 19, fontWeight: FontWeight.bold),
-      systemOverlayStyle: SystemUiOverlayStyle.light,
+      scrolledUnderElevation: 1,
     ),
+    cardTheme: CardThemeData(
+      elevation: 0,
+      color: cs.surfaceContainerLow,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: cs.outlineVariant),
+      ),
+    ),
+    navigationBarTheme: NavigationBarThemeData(
+      backgroundColor: cs.surfaceContainer,
+      indicatorColor: cs.secondaryContainer,
+      labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+    ),
+    inputDecorationTheme: InputDecorationTheme(
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+    ),
+    // أزرار بنفس الشكل والارتفاع في كل التطبيق
     filledButtonTheme: FilledButtonThemeData(
       style: FilledButton.styleFrom(
-        minimumSize: const Size(0, 48),
-        shape: rr(14),
-        textStyle: const TextStyle(fontWeight: FontWeight.bold),
+        minimumSize: const Size(0, 44),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
     ),
     outlinedButtonTheme: OutlinedButtonThemeData(
       style: OutlinedButton.styleFrom(
-        minimumSize: const Size(0, 46),
-        shape: rr(14),
-        side: BorderSide(color: dark ? p.accent.withAlpha(120) : cs.outline),
+        minimumSize: const Size(0, 44),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        side: BorderSide(color: cs.outline),
       ),
     ),
-    chipTheme: const ChipThemeData(shape: StadiumBorder()),
-    snackBarTheme: SnackBarThemeData(behavior: SnackBarBehavior.floating, shape: rr(14)),
-    bottomSheetTheme: const BottomSheetThemeData(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+    textButtonTheme: TextButtonThemeData(
+      style: TextButton.styleFrom(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
     ),
-    dividerTheme: DividerThemeData(color: cs.outlineVariant),
+    dialogTheme: DialogThemeData(
+      backgroundColor: cs.surfaceContainerHigh,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+    ),
+    bottomSheetTheme: BottomSheetThemeData(
+      backgroundColor: cs.surfaceContainerLow,
+      surfaceTintColor: Colors.transparent,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+    ),
+    snackBarTheme: SnackBarThemeData(
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    ),
+    popupMenuTheme: PopupMenuThemeData(
+      color: cs.surfaceContainerHigh,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    ),
+    chipTheme: ChipThemeData(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      side: BorderSide(color: cs.outlineVariant),
+    ),
+    dividerTheme: DividerThemeData(color: cs.outlineVariant, space: 1, thickness: 1),
   );
 }
 
-/// المظهر: الافتراضي داكن. الإعدادات: 0 داكن، 1 زي النظام، 2 فاتح.
-final ValueNotifier<ThemeMode> appThemeMode = ValueNotifier(ThemeMode.dark);
-
-ThemeMode _themeOf(int i) =>
-    i == 1 ? ThemeMode.system : (i == 2 ? ThemeMode.light : ThemeMode.dark);
-
-class A2RApp extends StatelessWidget {
-  final String? resumeTarget;
-  const A2RApp({super.key, this.resumeTarget});
-  @override
-  Widget build(BuildContext context) => AnimatedBuilder(
-        animation: Listenable.merge([appThemeMode, appPalette]),
-        builder: (_, __) => MaterialApp(
-          title: 'A2R',
-          debugShowCheckedModeBanner: false,
-          theme: _theme(Brightness.light),
-          darkTheme: _theme(Brightness.dark),
-          themeMode: appThemeMode.value,
-          // اللغة حسب لغة التليفون: عربي لو التليفون عربي، وغير كده إنجليزي (واتجاه الشاشة بيتبع اللغة)
-          supportedLocales: const [Locale('ar'), Locale('en')],
-          localeResolutionCallback: (l, supported) =>
-              (l != null && l.languageCode == 'ar') ? const Locale('ar') : const Locale('en'),
-          localizationsDelegates: GlobalMaterialLocalizations.delegates,
-          home: LoginScreen(resumeTarget: resumeTarget),
-        ),
-      );
+class _LangScope extends InheritedNotifier<AppSettings> {
+  const _LangScope({Key? key, required AppSettings notifier, required Widget child})
+      : super(key: key, notifier: notifier, child: child);
 }
 
-class LoginScreen extends StatefulWidget {
-  final String? resumeTarget; // 'batch' أو 'receipts' لو التطبيق اتقفل أثناء التصوير
-  const LoginScreen({super.key, this.resumeTarget});
-  @override
-  State<LoginScreen> createState() => _LoginScreenState();
-}
-
-class _LoginScreenState extends State<LoginScreen> {
-  String? name;
-  String? unitName;
-  String? building;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    final p = await SharedPreferences.getInstance();
-    String? nz(String? v) => (v == null || v.isEmpty) ? null : v;
-    if (!mounted) return;
-    setState(() {
-      name = nz(p.getString('name'));
-      unitName = nz(p.getString('unit'));
-      building = nz(p.getString('building'));
-    });
-    final rt = widget.resumeTarget;
-    if (rt != null && _ready) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) _resume(rt);
-      });
-    }
-  }
-
-  /// أندرويد قفل التطبيق وهو في الكاميرا (رامات قليلة): نرجّع الموظف لنفس الشاشة بدل شاشة الدخول.
-  void _resume(String target) {
-    final u = _unit;
-    final n = _name;
-    if (u == null || n == null) return;
-    final b = _needsBuilding ? _building : (u.buildings.length == 1 ? u.buildings.first : null);
-    final s = Session(n, u, b);
-    final nav = Navigator.of(context);
-    nav.push(MaterialPageRoute(builder: (_) => MainScreen(session: s)));
-    nav.push(MaterialPageRoute(
-        builder: (_) => target == 'batch' ? BatchScreen(session: s) : ReceiptsScreen(session: s)));
-  }
-
-  Future<void> _save() async {
-    final p = await SharedPreferences.getInstance();
-    await p.setString('name', name ?? '');
-    await p.setString('unit', unitName ?? '');
-    await p.setString('building', building ?? '');
-  }
-
-  // قيم سليمة حتى لو البيانات اتغيرت من GitHub
-  String? get _name => AppData.names.contains(name) ? name : null;
-  Unit? get _unit {
-    for (final u in AppData.units) {
-      if (u.name == unitName) return u;
-    }
-    return null;
-  }
-
-  bool get _needsBuilding => _unit != null && _unit!.buildings.length > 1;
-  String? get _building =>
-      (_needsBuilding && _unit!.buildings.contains(building)) ? building : null;
-  bool get _ready => _name != null && _unit != null && (!_needsBuilding || _building != null);
-
-  bool _starting = false;
-
-  void _start() {
-    if (_starting) return;
-    _starting = true;
-    final u = _unit!;
-    final b = _needsBuilding ? _building : (u.buildings.length == 1 ? u.buildings.first : null);
-    name = _name;
-    building = _building;
-    _save();
-    Navigator.push(
-            context, MaterialPageRoute(builder: (_) => MainScreen(session: Session(name!, u, b))))
-        .then((_) => _starting = false);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: ValueListenableBuilder<int>(
-          valueListenable: AppData.rev,
-          builder: (context, _, __) {
-            final u = _unit;
-            return SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: ConstrainedBox(
-                constraints: BoxConstraints(
-                    minHeight: MediaQuery.of(context).size.height -
-                        MediaQuery.of(context).padding.vertical -
-                        48),
-                child: Column(children: [
-                  const SizedBox(height: 8),
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.symmetric(vertical: 24),
-                    decoration: BoxDecoration(
-                      color: kBrandDark,
-                      border: Border.all(color: kAccent.withAlpha(120), width: 1.5),
-                      borderRadius: BorderRadius.circular(28),
-                    ),
-                    child: appLogo(height: 120),
-                  ),
-                  const SizedBox(height: 32),
-                  DropdownButtonFormField<String>(
-                    value: _name,
-                    isExpanded: true,
-                    decoration: const InputDecoration(
-                        labelText: 'الاسم',
-                        prefixIcon: Icon(Icons.person_rounded), border: kFieldBorder),
-                    items: AppData.names
-                        .map((n) => DropdownMenuItem(value: n, child: Text(n)))
-                        .toList(),
-                    onChanged: (v) => setState(() => name = v),
-                  ),
-                  const SizedBox(height: 16),
-                  DropdownButtonFormField<String>(
-                    value: u?.name,
-                    isExpanded: true,
-                    decoration: const InputDecoration(
-                        labelText: 'الوحدة',
-                        prefixIcon: Icon(Icons.location_on_rounded), border: kFieldBorder),
-                    items: AppData.units
-                        .map((x) => DropdownMenuItem(value: x.name, child: Text(x.name)))
-                        .toList(),
-                    onChanged: (v) => setState(() {
-                      unitName = v;
-                      building = null;
-                    }),
-                  ),
-                  if (_needsBuilding) ...[
-                    const SizedBox(height: 16),
-                    DropdownButtonFormField<String>(
-                      key: ValueKey(u!.name),
-                      value: _building,
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                          labelText: 'المبنى',
-                          prefixIcon: Icon(Icons.apartment_rounded), border: kFieldBorder),
-                      items: u.buildings
-                          .map((b) => DropdownMenuItem(value: b, child: Text(b)))
-                          .toList(),
-                      onChanged: (v) => setState(() => building = v),
-                    ),
-                  ],
-                  const SizedBox(height: 32),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 56,
-                    child: FilledButton(
-                      onPressed: _ready ? _start : null,
-                      child: const Text('ابدأ', style: TextStyle(fontSize: 20)),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  ValueListenableBuilder<String>(
-                    valueListenable: AppData.status,
-                    builder: (_, st, __) => Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Flexible(
-                            child: Text('$st  •  v$kVersion',
-                                style: const TextStyle(fontSize: 12, color: Colors.grey))),
-                      ],
-                    ),
-                  ),
-                ]),
-              ),
-            );
-          },
-        ),
-      ),
-    );
-  }
-}
-
-// =====================================================================
-//  شاشة الإعدادات
-// =====================================================================
-
-class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key});
-  @override
-  State<SettingsScreen> createState() => _SettingsScreenState();
-}
-
-class _SettingsScreenState extends State<SettingsScreen> {
-  PerfMode mode = PerfMode.balanced;
-  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0;
-  bool autoEdit = false, trim = false, slow = false;
-  AppPalette palSel = AppPalette.gold;
-  bool loaded = false;
-
-  static const _perfOpts = <(PerfMode, String, String)>[
-    (PerfMode.lite, 'اقتصادي (Lite)', 'دقة أقل وبدون كشف حي، للتليفونات القديمة'),
-    (PerfMode.balanced, 'متوازن (Balanced)', 'الوضع الافتراضي'),
-    (PerfMode.pro, 'احترافي (Pro)', 'أعلى جودة، للتليفونات القوية بس'),
-  ];
-
-  // الإعدادات الجاهزة: (الأداء، وضع الماسح، الجودة، حجم الـ PDF)
-  static const _presets = <(PerfMode, int, int, int)>[
-    (PerfMode.lite, 1, 0, 1), // خفيف جداً
-    (PerfMode.balanced, 0, 1, 0), // متوازن
-    (PerfMode.pro, 0, 2, 0), // أعلى جودة
-  ];
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    final m = await Store.perfMode();
-    final sc = await Store.scanSetting();
-    final q = await Store.qualitySetting();
-    final ae = await Store.autoEdit();
-    final tr = await Store.trimMargins();
-    final pz = await Store.pdfSize();
-    final th = await Store.themeSetting();
-    final pl = await Store.paletteSetting();
-    final cr = await Store.autoCropSetting();
-    var sl = false;
-    try {
-      sl = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
-    } catch (_) {}
-    if (!mounted) return;
-    setState(() {
-      mode = m;
-      scan = sc;
-      qual = q;
-      autoEdit = ae;
-      trim = tr;
-      pdfSz = pz;
-      theme = th;
-      palSel = AppPalette.values[pl];
-      crop = cr;
-      slow = sl;
-      loaded = true;
-    });
-  }
-
-  /// 0 خفيف جداً، 1 متوازن، 2 أعلى جودة، -1 مخصص
-  int get _preset {
-    for (var i = 0; i < _presets.length; i++) {
-      final p = _presets[i];
-      if (mode == p.$1 && scan == p.$2 && qual == p.$3 && pdfSz == p.$4) return i;
-    }
-    return -1;
-  }
-
-  Future<void> _setPreset(int i) async {
-    final p = _presets[i];
-    final pdfChanged = pdfSz != p.$4;
-    setState(() {
-      mode = p.$1;
-      scan = p.$2;
-      qual = p.$3;
-      pdfSz = p.$4;
-      if (i == 0) {
-        autoEdit = false;
-        trim = false;
-      }
-    });
-    await Store.setPerfMode(p.$1);
-    await Store.setScanSetting(p.$2);
-    await Store.setQualitySetting(p.$3);
-    await Store.setPdfSize(p.$4);
-    if (i == 0) {
-      await Store.setAutoEdit(false);
-      await Store.setTrimMargins(false);
-    }
-    if (pdfChanged) await Store.clearPdf();
-    if (i == 0 && mounted) snack(context, 'اتفعّل وضع التليفون الضعيف: أخف وأسرع بجودة أقل');
-  }
-
-  Future<void> _setMode(PerfMode v) async {
-    setState(() => mode = v);
-    await Store.setPerfMode(v);
-  }
-
-  Future<void> _setScan(int v) async {
-    setState(() => scan = v);
-    await Store.setScanSetting(v);
-  }
-
-  Future<void> _setQual(int v) async {
-    setState(() => qual = v);
-    await Store.setQualitySetting(v);
-  }
-
-  Future<void> _setPdf(int v) async {
-    setState(() => pdfSz = v);
-    await Store.setPdfSize(v);
-    await Store.clearPdf();
-  }
-
-  Future<void> _setTheme(int v) async {
-    setState(() => theme = v);
-    await Store.setThemeSetting(v);
-    appThemeMode.value = _themeOf(v);
-  }
-
-  Future<void> _setCrop(int v) async {
-    setState(() => crop = v);
-    autoCropMode = v;
-    await Store.setAutoCropSetting(v);
-  }
-
-  Future<void> _setPalette(AppPalette v) async {
-    setState(() => palSel = v);
-    await Store.setPaletteSetting(v.index);
-    appPalette.value = v;
-  }
-
-  Future<void> _reset() async {
-    if (!await askYesNo(context, 'إعادة الضبط؟', 'كل الإعدادات هترجع للوضع الافتراضي.',
-        yes: 'إعادة ضبط', no: 'إلغاء')) {
-      return;
-    }
-    await _setPreset(1);
-    setState(() {
-      autoEdit = false;
-      trim = false;
-    });
-    await Store.setAutoEdit(false);
-    await Store.setTrimMargins(false);
-    await _setTheme(0);
-    await _setPalette(AppPalette.gold);
-    await _setCrop(0);
-    if (mounted) snack(context, 'اتعمل إعادة ضبط');
-  }
-
-  // ---------- عناصر ----------
-
-  Widget _sec(String t, {String? sub}) => Padding(
-        padding: const EdgeInsets.fromLTRB(4, 22, 4, 8),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(t, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: kAccent)),
-          if (sub != null)
-            Text(sub, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-        ]),
-      );
-
-  /// أيقونة التليفون الضعيف: تليفون وفوقه ورقة شجر (خفيف).
-  Widget _weakIcon() => SizedBox(
-        width: 32,
-        height: 32,
-        child: Stack(clipBehavior: Clip.none, children: [
-          Center(child: Icon(Icons.phone_android_rounded, size: 30, color: kAccent)),
-          Positioned(right: -3, bottom: -3, child: Icon(Icons.eco_rounded, size: 16, color: kAccent)),
-        ]),
-      );
-
-  Widget _presetCard(
-      {required Widget icon,
-      required String title,
-      required String sub,
-      required bool on,
-      required VoidCallback onTap}) {
-    final cs = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Material(
-        color: on ? kAccent.withAlpha(28) : cs.surfaceContainerHigh,
-        clipBehavior: Clip.antiAlias,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(18),
-          side: BorderSide(color: on ? kAccent : cs.outlineVariant, width: on ? 1.6 : 1),
-        ),
-        child: InkWell(
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.all(14),
-            child: Row(children: [
-              Container(
-                width: 52,
-                height: 52,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(shape: BoxShape.circle, color: kAccent.withAlpha(30)),
-                child: icon,
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 2),
-                  Text(sub, style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
-                ]),
-              ),
-              if (on) Icon(Icons.check_circle_rounded, color: kAccent),
-            ]),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _paletteRow() {
-    final cs = Theme.of(context).colorScheme;
-    return Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-      for (final pp in AppPalette.values)
-        InkResponse(
-          onTap: () => _setPalette(pp),
-          radius: 40,
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Container(
-              width: 50,
-              height: 50,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: kPalettes[pp]!.accent,
-                border: Border.all(color: pp == palSel ? cs.onSurface : Colors.transparent, width: 3),
-              ),
-              child: pp == palSel ? Icon(Icons.check_rounded, color: kPalettes[pp]!.onAccent) : null,
-            ),
-            const SizedBox(height: 6),
-            Text(kPalettes[pp]!.name, style: const TextStyle(fontSize: 12)),
-          ]),
-        ),
-    ]);
-  }
-
-  Widget _radioGroup<T>(List<(T, String, String)> opts, T cur, ValueChanged<T> on) => Column(children: [
-        for (final o in opts)
-          RadioListTile<T>(
-            dense: true,
-            title: Text(o.$2),
-            subtitle: Text(o.$3),
-            value: o.$1,
-            groupValue: cur,
-            onChanged: (v) => on(v as T),
-          ),
-      ]);
-
-  Widget _sub(String t) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 2),
-        child: Align(
-            alignment: AlignmentDirectional.centerStart,
-            child: Text(t, style: const TextStyle(fontWeight: FontWeight.bold))),
-      );
-
-  @override
-  Widget build(BuildContext context) {
-    final cur = _preset;
-    return Scaffold(
-      appBar: AppBar(title: const Text('الإعدادات')),
-      body: !loaded
-          ? const Center(child: CircularProgressIndicator())
-          : SafeArea(
-              child: ListView(padding: const EdgeInsets.fromLTRB(16, 0, 16, 24), children: [
-                if (slow && cur != 0)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 16),
-                    child: Card(
-                      shape: kCardShape,
-                      color: Colors.orange.withAlpha(30),
-                      child: ListTile(
-                        leading: const Icon(Icons.hourglass_bottom_rounded, color: Colors.orange),
-                        title: const Text('الكاميرا بطيئة على تليفونك؟'),
-                        subtitle: const Text('جرّب وضع التليفون الضعيف تحت'),
-                      ),
-                    ),
-                  ),
-                _sec('نمط الاستخدام', sub: 'اختار اللي يناسب تليفونك'),
-                _presetCard(
-                  icon: _weakIcon(),
-                  title: 'تليفون ضعيف جداً',
-                  sub: 'أقل إعدادات: أخف وأسرع وملفات صغيرة، بجودة أقل',
-                  on: cur == 0,
-                  onTap: () => _setPreset(0),
-                ),
-                _presetCard(
-                  icon: Icon(Icons.balance_rounded, size: 28, color: kAccent),
-                  title: 'متوازن',
-                  sub: 'الافتراضي: أداء كويس وجودة مناسبة',
-                  on: cur == 1,
-                  onTap: () => _setPreset(1),
-                ),
-                _presetCard(
-                  icon: Icon(Icons.diamond_rounded, size: 28, color: kAccent),
-                  title: 'أعلى جودة',
-                  sub: 'أوضح صورة وأكبر حجم، للتليفونات القوية',
-                  on: cur == 2,
-                  onTap: () => _setPreset(2),
-                ),
-                if (cur == -1)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 4),
-                    child: Text('إعداداتك الحالية مخصصة (من قسم متقدم)',
-                        style: TextStyle(fontSize: 12, color: Colors.grey)),
-                  ),
-                _sec('المظهر'),
-                SizedBox(
-                  width: double.infinity,
-                  child: SegmentedButton<int>(
-                    showSelectedIcon: false,
-                    segments: const [
-                      ButtonSegment(
-                          value: 0, label: Text('داكن'), icon: Icon(Icons.dark_mode_rounded)),
-                      ButtonSegment(
-                          value: 1, label: Text('النظام'), icon: Icon(Icons.brightness_auto_rounded)),
-                      ButtonSegment(
-                          value: 2, label: Text('فاتح'), icon: Icon(Icons.light_mode_rounded)),
-                    ],
-                    selected: {theme},
-                    onSelectionChanged: (v) => _setTheme(v.first),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                _paletteRow(),
-                _sec('التصوير'),
-                Card(
-                  shape: kCardShape,
-                  child: Column(children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
-                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        const Text('القص التلقائي', style: TextStyle(fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 2),
-                        Text(
-                            crop == 0
-                                ? 'ذكي: يعدّل الورقة لو شكلها مستطيل، ولو الكشف مش مظبوط يرجع لمستطيل مستقيم'
-                                : (crop == 1
-                                    ? 'مستطيل مستقيم دايماً، من غير ميلان'
-                                    : 'أربع أركان حرة مع تصحيح المنظور'),
-                            style: const TextStyle(fontSize: 12, color: Colors.grey)),
-                        const SizedBox(height: 10),
-                        SizedBox(
-                          width: double.infinity,
-                          child: SegmentedButton<int>(
-                            showSelectedIcon: false,
-                            segments: const [
-                              ButtonSegment(value: 0, label: Text('ذكي')),
-                              ButtonSegment(value: 1, label: Text('مستطيل')),
-                              ButtonSegment(value: 2, label: Text('منظور')),
-                            ],
-                            selected: {crop},
-                            onSelectionChanged: (v) => _setCrop(v.first),
-                          ),
-                        ),
-                      ]),
-                    ),
-                    SwitchListTile(
-                      title: const Text('أوضاع الفلتر بعد كل صورة'),
-                      subtitle: const Text('تظهر شاشة الفلاتر والقص بعد كل صورة'),
-                      value: autoEdit,
-                      onChanged: (v) {
-                        setState(() => autoEdit = v);
-                        Store.setAutoEdit(v);
-                      },
-                    ),
-                    SwitchListTile(
-                      title: const Text('قص الهوامش البيضاء تلقائياً'),
-                      subtitle: const Text('في فلاتر الإيصال: بيشيل البياض الفاضي حوالين الإيصال'),
-                      value: trim,
-                      onChanged: (v) {
-                        setState(() => trim = v);
-                        Store.setTrimMargins(v);
-                      },
-                    ),
-                  ]),
-                ),
-                _sec('متقدم'),
-                Card(
-                  shape: kCardShape,
-                  clipBehavior: Clip.antiAlias,
-                  child: ExpansionTile(
-                    shape: const Border(),
-                    collapsedShape: const Border(),
-                    leading: const Icon(Icons.tune_rounded),
-                    title: const Text('إعدادات متقدمة'),
-                    subtitle: const Text('الأداء ووضع الماسح وجودة الصورة وحجم الـ PDF'),
-                    children: [
-                      _sub('الأداء'),
-                      _radioGroup<PerfMode>(_perfOpts, mode, _setMode),
-                      const Divider(),
-                      _sub('وضع الماسح'),
-                      _radioGroup<int>(_scanOpts, scan, _setScan),
-                      const Divider(),
-                      _sub('جودة الصورة'),
-                      _radioGroup<int>(_qualOpts, qual, _setQual),
-                      const Divider(),
-                      _sub('حجم ملف الـ PDF'),
-                      _radioGroup<int>(const [
-                        (0, 'كما هو (أعلى جودة)', 'من غير ضغط إضافي'),
-                        (1, 'مضغوط (حجم أصغر)', 'أنسب للنت الضعيف، والكتابة الصغيرة ممكن تقل وضوحها'),
-                      ], pdfSz, _setPdf),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-                OutlinedButton.icon(
-                  onPressed: () => AppLog.share(context),
-                  icon: const Icon(Icons.bug_report_rounded),
-                  label: const Text('إرسال سجل الأخطاء'),
-                ),
-                const SizedBox(height: 8),
-                TextButton.icon(
-                  onPressed: _reset,
-                  icon: const Icon(Icons.restart_alt_rounded),
-                  label: const Text('إعادة الضبط للافتراضي'),
-                ),
-                const SizedBox(height: 8),
-                Center(
-                    child: Text('v$kVersion',
-                        style: const TextStyle(fontSize: 11, color: Colors.grey))),
-              ]),
-            ),
-    );
-  }
-}
-
-// =====================================================================
-//  الشاشة الرئيسية
-// =====================================================================
-
-class MainScreen extends StatefulWidget {
-  final Session session;
-  const MainScreen({super.key, required this.session});
-  @override
-  State<MainScreen> createState() => _MainScreenState();
-}
-
-class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
-  List<String> draft = [];
-  String? batchImg;
-  ({File file, DateTime time})? pdf;
-  bool batchSent = false;
-  bool receiptsSent = false;
-  bool busy = false;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _init();
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    super.dispose();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _reload();
-  }
-
-  Future<void> _init() async {
-    await requestAllPermissions();
-    try {
-      await Store.cleanup();
-    } catch (e, st) {
-      AppLog.e('_init', e, st);
-    }
-    await _reload();
-  }
-
-  Future<void> _reload() async {
-    final d = await Store.draft();
-    final f = await Store.pdf();
-    final bi = await Store.batchImg();
-    final b = await Store.flag('batch');
-    final r = await Store.flag('receipts');
-    if (!mounted) return;
-    setState(() {
-      draft = d;
-      pdf = f;
-      batchImg = bi;
-      batchSent = b;
-      receiptsSent = r;
-    });
-  }
-
-  Future<void> _showSettings() async {
-    await Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen()));
-    if (mounted) _reload();
-  }
-
-  bool _opening = false;
-
-  Future<void> _open(Widget screen) async {
-    if (_opening) return;
-    _opening = true;
-    try {
-      await Navigator.push(context, MaterialPageRoute(builder: (_) => screen));
-    } finally {
-      _opening = false;
-    }
-    _reload();
-  }
-
-  Future<void> _sendBatch() async {
-    final b = batchImg;
-    if (b == null) return;
-    setState(() => busy = true);
-    try {
-      final ok = await sendBatchFile(context, widget.session, b);
-      if (ok) {
-        HapticFeedback.mediumImpact();
-        await _reload();
-      }
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> _trashBatch() async {
-    if (!await askYesNo(context, 'مسح صورة الباتش؟', 'الصورة هتتمسح من التطبيق.',
-        yes: 'امسح', no: 'إلغاء')) {
-      return;
-    }
-    await Store.clearBatchImg();
-    await _reload();
-  }
-
-  Future<void> _openPdf() async {
-    final f = pdf;
-    if (f == null) return;
-    try {
-      final r = await OpenFilex.open(f.file.path);
-      if (r.type != ResultType.done && mounted) {
-        snack(context, 'مفيش تطبيق يفتح ملفات PDF على التليفون');
-      }
-    } catch (e, st) {
-      AppLog.e('_openPdf', e, st);
-      if (mounted) snack(context, 'تعذر فتح الملف');
-    }
-  }
-
-  Future<void> _sendPdf() async {
-    final f = pdf;
-    if (f == null) return;
-    final used = <String>[];
-    for (final x in await Store.pdfImgs()) {
-      if (await File(x).exists()) used.add(x);
-    }
-    if (!mounted) return;
-    if (used.isEmpty) {
-      // مفيش صور نعرضها: مشاركة الـ PDF مباشرة زي الأول
-      final ok = await shareFiles(context, [f.file.path]);
-      if (ok) {
-        HapticFeedback.mediumImpact();
-        await Store.afterPdfSent();
-        await _reload();
-      }
-      return;
-    }
-    await Navigator.push<bool>(
-        context,
-        MaterialPageRoute(
-            builder: (_) =>
-                PdfResultScreen(session: widget.session, pdf: f.file, imgs: used)));
-    if (mounted) await _reload();
-  }
-
-  Future<void> _trashPdf() async {
-    if (!await askYesNo(context, 'مسح ملف الـ PDF؟', 'الملف هيتمسح من التطبيق.',
-        yes: 'امسح', no: 'إلغاء')) {
-      return;
-    }
-    await Store.clearPdf();
-    await _reload();
-  }
-
-  Future<void> _trashDraft() async {
-    if (!await askYesNo(context, 'مسح صور الإيصالات؟', 'كل الصور اللي لسه متبعتتش هتتمسح.',
-        yes: 'امسح', no: 'إلغاء')) {
-      return;
-    }
-    await Store.clearDraft();
-    await _reload();
-  }
-
-  Widget _statusChip(IconData icon, String label, bool done, String doneText, String todoText) {
-    final color = done ? Colors.green : Colors.orange;
-    return Expanded(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-        decoration: BoxDecoration(
-          color: color.withAlpha(30),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: color.withAlpha(120)),
-        ),
-        child: Row(children: [
-          Icon(done ? Icons.check_circle_rounded : Icons.pending_rounded, color: color, size: 22),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-              Text(done ? doneText : todoText,
-                  style: TextStyle(fontSize: 12, color: color.withAlpha(255))),
-            ]),
-          ),
-        ]),
-      ),
-    );
-  }
-
-  Widget _big(IconData icon, String label, VoidCallback onTap) {
-    final cs = Theme.of(context).colorScheme;
-    return SizedBox(
-      height: 140,
-      child: Material(
-        color: cs.surfaceContainerHigh,
-        clipBehavior: Clip.antiAlias,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(24),
-          side: BorderSide(color: kAccent.withAlpha(110), width: 1.2),
-        ),
-        child: InkWell(
-          onTap: onTap,
-          child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Container(
-              width: 58,
-              height: 58,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: kAccent.withAlpha(32),
-                border: Border.all(color: kAccent.withAlpha(140)),
-              ),
-              child: Icon(icon, size: 30, color: kAccent),
-            ),
-            const SizedBox(height: 10),
-            Text(label,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          ]),
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final s = widget.session;
-    final cs = Theme.of(context).colorScheme;
-    final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
-    final pf = pdf;
-    final bi = batchImg;
-    return Scaffold(
-      appBar: AppBar(
-        title: appLogo(height: 30),
-        centerTitle: true,
-        actions: [
-          IconButton(
-              tooltip: 'إعدادات الأداء',
-              icon: const Icon(Icons.settings_rounded),
-              onPressed: _showSettings),
-          IconButton(
-              tooltip: 'تغيير الحساب',
-              icon: const Icon(Icons.switch_account_rounded),
-              onPressed: () => Navigator.pop(context)),
-        ],
-      ),
-      body: ListView(padding: const EdgeInsets.all(16), children: [
-        if (busy) const LinearProgressIndicator(),
-        Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(22),
-            gradient: LinearGradient(
-              begin: Alignment.topRight,
-              end: Alignment.bottomLeft,
-              colors: [kBrandDark, pal.mid],
-            ),
-            border: Border.all(color: kAccent.withAlpha(110), width: 1.2),
-          ),
-          child: DefaultTextStyle(
-            style: const TextStyle(color: Colors.white, fontSize: 16),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                Icon(Icons.person_rounded, color: kAccent),
-                const SizedBox(width: 8),
-                Expanded(
-                    child: Text(s.name,
-                        style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold))),
-              ]),
-              const SizedBox(height: 8),
-              Row(children: [
-                Icon(Icons.location_on_rounded, color: kAccent),
-                const SizedBox(width: 8),
-                Expanded(child: Text(unitLine)),
-              ]),
-              const SizedBox(height: 8),
-              Row(children: [
-                Icon(Icons.calendar_today_rounded, color: kAccent, size: 20),
-                const SizedBox(width: 8),
-                Text(s.date,
-                    textDirection: TextDirection.ltr,
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(width: 8),
-                Expanded(
-                    child: Text('(تاريخ التليفون - اتأكد إنه صح)',
-                        style: TextStyle(fontSize: 11, color: Colors.white.withAlpha(200)))),
-              ]),
-            ]),
-          ),
-        ),
-        const SizedBox(height: 14),
-        Row(children: [
-          _statusChip(Icons.receipt_long_rounded, 'الباتش', batchSent, 'اتبعت', 'لسه'),
-          const SizedBox(width: 10),
-          _statusChip(Icons.payments_rounded, 'الإيصالات', receiptsSent, 'اتبعت',
-              draft.isEmpty ? 'لسه' : '${draft.length} صورة جاهزة'),
-        ]),
-        const SizedBox(height: 14),
-        Row(children: [
-          Expanded(
-              child: _big(Icons.receipt_long_rounded, 'الباتش',
-                  () => _open(BatchScreen(session: s, fresh: true)))),
-          const SizedBox(width: 12),
-          Expanded(
-              child: _big(
-                  Icons.payments_rounded, 'إيصالات الدفع', () => _open(ReceiptsScreen(session: s)))),
-        ]),
-        if (draft.isNotEmpty || pf != null || bi != null) ...[
-          const SizedBox(height: 24),
-          const Text('ملفاتي (لسه متبعتتش)',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          if (bi != null)
-            Card(
-      shape: kCardShape,
-              child: ListTile(
-                leading: ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Image.file(File(bi),
-                      width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
-                ),
-                title: Text('الباتش - ${s.batchName}.jpg'),
-                subtitle: const Text('اضغط للمعاينة'),
-                onTap: () => _open(BatchScreen(session: s)),
-                trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                  IconButton(
-                      tooltip: 'إرسال',
-                      icon: const Icon(Icons.send_rounded),
-                      onPressed: busy ? null : _sendBatch),
-                  IconButton(
-                      tooltip: 'مسح',
-                      icon: const Icon(Icons.delete_rounded, color: Colors.red),
-                      onPressed: busy ? null : _trashBatch),
-                ]),
-              ),
-            ),
-          if (draft.isNotEmpty)
-            Card(
-      shape: kCardShape,
-              child: ListTile(
-                leading: ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Image.file(File(draft.first),
-                      width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
-                ),
-                title: Text('إيصالات الدفع (${draft.length} صورة)'),
-                subtitle: const Text('اضغط للمعاينة أو لتكمل التصوير'),
-                onTap: () => _open(ReceiptsScreen(session: s)),
-                trailing: IconButton(
-                    tooltip: 'مسح',
-                    icon: const Icon(Icons.delete_rounded, color: Colors.red),
-                    onPressed: _trashDraft),
-              ),
-            ),
-          if (pf != null)
-            Card(
-      shape: kCardShape,
-              child: ListTile(
-                leading: const Icon(Icons.picture_as_pdf_rounded, size: 36, color: Colors.red),
-                title: Text(pf.file.path.split('/').last,
-                    maxLines: 2, overflow: TextOverflow.ellipsis),
-                subtitle: Text(
-                    'اضغط لفتحه - يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
-                onTap: _openPdf,
-                trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                  IconButton(
-                      tooltip: 'إرسال', icon: const Icon(Icons.send_rounded), onPressed: _sendPdf),
-                  IconButton(
-                      tooltip: 'مسح',
-                      icon: const Icon(Icons.delete_rounded, color: Colors.red),
-                      onPressed: _trashPdf),
-                ]),
-              ),
-            ),
-        ],
-        const SizedBox(height: 24),
-        Center(
-            child: Text('v$kVersion',
-                style: const TextStyle(fontSize: 11, color: Colors.grey))),
-      ]),
-    );
-  }
-}
-
-// =====================================================================
-//  شاشة الباتش
-// =====================================================================
-
-class BatchScreen extends StatefulWidget {
-  final Session session;
-  final bool fresh; // true = تصوير باتش جديد (من غير ما نفتح القديم)
-  const BatchScreen({super.key, required this.session, this.fresh = false});
-  @override
-  State<BatchScreen> createState() => _BatchScreenState();
-}
-
-class _BatchScreenState extends State<BatchScreen> {
-  String? img;
-  Tag? tag;
-  Tag? bandTag;
-  int layout = 1; // 1 تحت الصورة، 2 على الصورة
-  double bandScale = kBatchTagW; // حجم الورقة في وضع الشريط
-  Timer? _bandT;
-  TagPos? pos;
-  double? aspect;
-  bool busy = false;
-  bool noTag = false; // الصورة دي من غير ورقة بيانات
-
-  @override
-  void initState() {
-    super.initState();
-    unawaited(_warmTags());
-    _init();
-  }
-
-  Future<void> _toggleTag(bool hide) async {
-    final path = img;
-    if (path == null) return;
-    setState(() => noTag = hide);
-    await Store.setNoTag(path, hide);
-  }
-
-  /// تكبير/تصغير الورقة لحظي أثناء السحب (من غير إعادة رسم)، والحفظ بيتأجل لحد ما الإيد تقف.
-  void _setBand(double v) {
-    setState(() => bandScale = v);
-    _bandT?.cancel();
-    _bandT = Timer(const Duration(milliseconds: 300), () {
-      Store.setBandScale(v).catchError((Object e, StackTrace st) {
-        AppLog.e('setBandScale', e, st);
-      });
-    });
-  }
-
-  Future<void> _setLayout(int v) async {
-    setState(() => layout = v);
-    await Store.setBatchLayout(v);
-  }
-
-  Future<void> _init() async {
-    final lost = await takeLostPick('batch');
-    if (lost != null && mounted) {
-      try {
-        final path = await persistImage(
-            lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-            filter: ScanFilter.receipt);
-        await Store.setBatchImg(path);
-        await _show(path);
-        _lastScanManual = true;
-        if (mounted && img != null) await _edit(tab: 2);
-        return;
-      } catch (e) {
-        if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-      }
-    }
-    final cur = await Store.batchImg();
-    if (!mounted) return;
-    if (cur != null && !widget.fresh) {
-      await _show(cur);
-    } else {
-      _capture();
-    }
-  }
-
-  /// بيجهّز رسم الورقة مرة واحدة في الخلفية (ميتكررش بعد كل تصوير).
-  Future<void> _warmTags() async {
-    try {
-      tag ??= await receiptTag(1000, widget.session, batch: true);
-      bandTag ??= await receiptTag(2000, widget.session, batch: true);
-    } catch (e, st) {
-      AppLog.e('warmTags', e, st);
-    }
-  }
-
-  Future<void> _show(String path) async {
-    try {
-      final t = tag ?? await receiptTag(1000, widget.session, batch: true);
-      final a = await imageAspect(path);
-      final p0 = await Store.assignPos(path, t, true);
-      final p = fitTagPos(p0, t, a);
-      if (p.cx != p0.cx || p.cy != p0.cy) await Store.savePos(path, p, true);
-      final nt = await Store.noTag(path);
-      final lay = await Store.batchLayout();
-      final bt = bandTag ?? await receiptTag(2000, widget.session, batch: true); // نسخة مرجعية عالية الدقة للمعاينة (بتتعمل مرة واحدة)
-      final bsc = await Store.bandScale();
-      if (!mounted) return;
-      setState(() {
-        bandScale = bsc;
-        noTag = nt;
-        tag = t;
-        bandTag = bt;
-        layout = lay;
-        img = path;
-        aspect = a;
-        pos = p;
-      });
-    } catch (e) {
-      if (mounted) {
-        snack(context, 'تعذر فتح الصورة: ${errText(e)}');
-        Navigator.pop(context);
-      }
-    }
-  }
-
-  /// بيحفظ الصورة كباتش ويعرضها. بيرجّع true لو نجح.
-  Future<bool> _ingest(String src) async {
-    setState(() => busy = true);
-    try {
-      final path = await persistImage(
-          src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
-      await _show(path);
-      unawaited(qualityWarning(path).then((warn) {
-        if (warn != null && mounted) snack(context, warn);
-      }));
-      return true;
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-      return false;
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  /// نسخة سريعة للتصوير بالكاميرا: بتحفظ الصورة بس وترجّع مسارها، من غير تجهيز المعاينة
-  /// ولا فحص الجودة قبل شاشة التعديل (دول بيتعملوا بعد ما الموظف يخلّص التعديل).
-  Future<String?> _ingestQuick(String src) async {
-    try {
-      final path = await persistImage(
-          src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
-      return path;
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-      return null;
-    }
-  }
-
-  /// كاميرا التطبيق: صورة واحدة بس، بعدها شاشة التعديل علطول (من غير عداد).
-  Future<void> _capture() async {
-    if (!await ensureCamera(context)) {
-      if (mounted && img == null) Navigator.pop(context);
-      return;
-    }
-    if (!mounted) return;
-    await Navigator.push<void>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => A2RCameraScreen(
-          title: 'الباتش',
-          single: true,
-          onShot: (p) async {
-            _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
-            final saved = await _ingestQuick(p);
-            if (saved == null) return null;
-            if (mounted && await _edit(tab: 2, fromCam: true, path: saved)) {
-              // إعادة أخذ: نمسح الصورة دي والكاميرا تفضل مفتوحة
-              await Store.clearBatchImg();
-              if (mounted) setState(() => img = null);
-              return null;
-            }
-            if (mounted && img == null) {
-              // خرج من التعديل من غير حفظ: نعرض الصورة زي ما هي
-              final cur = await Store.batchImg();
-              if (cur != null) await _show(cur);
-            }
-            final shown = img;
-            if (shown != null) {
-              unawaited(qualityWarning(shown).then((warn) {
-                if (warn != null && mounted) snack(context, warn);
-              }));
-            }
-            return const A2RCamState(close: true);
-          },
-          onGallery: () async {
-            final before = img;
-            await _gallery();
-            return img != before ? const A2RCamState(close: true) : null;
-          },
-        ),
-      ),
-    );
-    if (mounted && img == null) Navigator.pop(context);
-  }
-
-  Timer? _saveT;
-
-  void _set(TagPos p) {
-    setState(() => pos = p);
-    _saveT?.cancel();
-    final path = img;
-    if (path == null) return;
-    _saveT = Timer(const Duration(milliseconds: 400), () {
-      Store.savePos(path, p, true).catchError((Object e, StackTrace st) {
-        AppLog.e('savePos', e, st);
-      });
-    });
-  }
-
-  Future<void> _flushPos() async {
-    final t = _saveT;
-    if (t != null && t.isActive) {
-      t.cancel();
-      final path = img, p = pos;
-      if (path != null && p != null) await Store.savePos(path, p, true);
-    }
-  }
-
-  @override
-  void dispose() {
-    if (_bandT?.isActive ?? false) {
-      _bandT!.cancel();
-      Store.setBandScale(bandScale);
-    }
-    final t = _saveT;
-    if (t != null && t.isActive) {
-      t.cancel();
-      final path = img, p = pos;
-      if (path != null && p != null) Store.savePos(path, p, true);
-    }
-    super.dispose();
-  }
-
-  /// معرض: يختار صورة، وبعدين شاشة القص (تعديل) تفتح لوحدها.
-  Future<void> _gallery() async {
-    XFile? x;
-    await markPickTarget('batch');
-    try {
-      x = await ImagePicker()
-          .pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 90);
-    } catch (e, st) {
-      AppLog.e('_gallery', e, st);
-      if (mounted) snack(context, 'تعذر فتح المعرض');
-      return;
-    }
-    if (x == null || !mounted) return;
-    setState(() => busy = true);
-    try {
-      final path = await persistImage(
-          x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
-      await _show(path);
-      final warn = await qualityWarning(path);
-      if (warn != null && mounted) snack(context, warn);
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-    _lastScanManual = true; // صورة معرض من غير قص: القص التلقائي يشتغل
-    if (mounted && img != null) await _edit(tab: 2);
-  }
-
-  /// تعديل: قص بزوايا حرة وتدوير وفلاتر للصورة الحالية.
-  Future<bool> _edit({int tab = 0, bool fromCam = false, String? path}) async {
-    final cur = path ?? img;
-    if (cur == null) return false;
-    final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_', initialTab: tab, canRetake: fromCam)));
-    if (out == kRetake) return true;
-    if (out == null || !mounted) return false;
-    setState(() => busy = true);
-    try {
-      if (noTag) await Store.setNoTag(out, true); // الاختيار يفضل بعد التعديل
-      await Store.setBatchImg(out); // بتمسح القديمة
-      await _show(out);
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-    return false;
-  }
-
-  Future<void> _send() async {
-    setState(() => busy = true);
-    try {
-      await _flushPos();
-      _bandT?.cancel();
-      await Store.setBandScale(bandScale);
-      final ok = await sendBatchFile(context, widget.session, img!);
-      if (ok) HapticFeedback.mediumImpact();
-      if (ok && mounted) Navigator.pop(context);
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final ready = img != null && tag != null && pos != null && aspect != null && bandTag != null;
-    return Scaffold(
-      appBar: AppBar(title: const Text('الباتش')),
-      body: !ready
-          ? const Center(child: CircularProgressIndicator())
-          : Column(children: [
-              Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.all(8),
-                  child: layout == 2
-                      ? TaggedImage(
-                          path: img!,
-                          tag: tag!,
-                          pos: pos!,
-                          aspect: aspect,
-                          showTag: !noTag,
-                          onChanged: noTag ? null : _set)
-                      : Center(
-                          child: FittedBox(
-                            fit: BoxFit.contain,
-                            child: SizedBox(
-                              width: 1000 * math.max(1.0, bandScale),
-                              child: ReceiptPreview(
-                                  path: img!,
-                                  tag: bandTag!,
-                                  bandScale: bandScale,
-                                  bottom: layout == 1,
-                                  showTag: !noTag),
-                            ),
-                          ),
-                        ),
-                ),
-              ),
-              SwitchListTile(
-                dense: true,
-                title: const Text('ورقة البيانات على الصورة دي'),
-                subtitle: const Text('اقفلها لو الصورة مش محتاجة ورقة (الصورة الجاية بتبدأ بالورقة)',
-                    style: TextStyle(fontSize: 11)),
-                value: !noTag,
-                onChanged: busy ? null : (v) => _toggleTag(!v),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: SizedBox(
-                  width: double.infinity,
-                  child: SegmentedButton<int>(
-                    showSelectedIcon: false,
-                    segments: const [
-                      ButtonSegment(value: 1, label: Text('تحت الصورة')),
-                      ButtonSegment(value: 2, label: Text('على الصورة')),
-                    ],
-                    selected: {layout},
-                    onSelectionChanged: (busy || noTag) ? null : (v) => _setLayout(v.first),
-                  ),
-                ),
-              ),
-              if (layout != 2)
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Row(children: [
-                    const Icon(Icons.format_size_rounded),
-                    Expanded(
-                      child: Slider(
-                        value: bandScale.clamp(0.3, kBandMaxScale).toDouble(),
-                        min: 0.3,
-                        max: kBandMaxScale,
-                        onChanged: noTag ? null : _setBand,
-                      ),
-                    ),
-                    SizedBox(
-                        width: 44,
-                        child: Text('${(bandScale * 100).round()}%',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(fontSize: 12, color: Colors.grey))),
-                    IconButton(
-                      tooltip: 'الحجم الأصلي',
-                      icon: const Icon(Icons.restart_alt_rounded),
-                      onPressed: noTag ? null : () => _setBand(kBatchTagW),
-                    ),
-                  ]),
-                ),
-              if (layout == 2) ...[
-                const SizedBox(height: 4),
-                const Text('اسحب الورقة لتحريكها، وبإصبعين لتكبيرها أو تصغيرها',
-                    style: TextStyle(fontSize: 12, color: Colors.grey)),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Row(children: [
-                    const Icon(Icons.format_size_rounded),
-                    Expanded(
-                      child: Slider(
-                        value: pos!.s.clamp(0.1, 0.98).toDouble(),
-                        min: 0.1,
-                        max: 0.98,
-                        onChanged: noTag ? null : (v) => _set(pos!.copyWith(s: v)),
-                      ),
-                    ),
-                    IconButton(
-                      tooltip: 'المكان الأصلي',
-                      icon: const Icon(Icons.restart_alt_rounded),
-                      onPressed: noTag ? null : () => _set(TagPos.initial(tag!)),
-                    ),
-                  ]),
-                ),
-              ],
-              SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    Row(children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _capture,
-                          icon: const Icon(Icons.add_a_photo_rounded),
-                          label: const Text('تصوير'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _gallery,
-                          icon: const Icon(Icons.photo_library_rounded),
-                          label: const Text('معرض'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _edit,
-                          icon: const Icon(Icons.crop_rounded),
-                          label: const Text('تعديل'),
-                        ),
-                      ),
-                    ]),
-                    const SizedBox(height: 8),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 50,
-                      child: FilledButton.icon(
-                        onPressed: busy ? null : _send,
-                        icon: busy
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.send_rounded),
-                        label: const Text('إرسال'),
-                      ),
-                    ),
-                  ]),
-                ),
-              ),
-            ]),
-    );
-  }
-}
-
-// =====================================================================
-//  شاشة التعديل: قص بزوايا حرة + تدوير + فلاتر (للباتش والإيصالات)
-// =====================================================================
-
-/// إعدادات التعديل المحفوظة لكل صورة (عشان إعادة التعديل تبدأ من الأصل).
-class EditParams {
-  final List<Offset>? quad; // TL,TR,BR,BL كنسب من الصورة بعد التدوير
-  final int turns; // لفّات 90 درجة مع عقارب الساعة
-  final double angle; // تدوير دقيق بالدرجات
-  final ScanFilter filter;
-  final double contrast; // -0.5 .. 1
-  final double brightness; // -1 .. 1
-  final double sharp; // حدة 0 .. 1
-  final List<double>? levels; // مستويات التحسين التلقائي
-  const EditParams({
-    this.quad,
-    this.turns = 0,
-    this.angle = 0,
-    this.filter = ScanFilter.original,
-    this.contrast = 0,
-    this.brightness = 0,
-    this.sharp = 0,
-    this.levels,
+// ───────────────────── الترجمة (عربي ← إنجليزي) ─────────────────────
+// النصوص مكتوبة بالعربي في الكود، وبتتترجم وقت العرض لما اللغة تكون إنجليزي.
+// أي نص عربي مش موجود في القاموس بيفضل زي ما هو.
+class Text extends StatelessWidget {
+  const Text(
+    this.data, {
+    super.key,
+    this.style,
+    this.textAlign,
+    this.textDirection,
+    this.softWrap,
+    this.overflow,
+    this.maxLines,
   });
 
-  String encode() => jsonEncode({
-        if (quad != null)
-          'q': [
-            for (final p in quad!) ...[p.dx, p.dy]
+  final String data;
+  final TextStyle? style;
+  final TextAlign? textAlign;
+  final TextDirection? textDirection;
+  final bool? softWrap;
+  final TextOverflow? overflow;
+  final int? maxLines;
+
+  @override
+  Widget build(BuildContext context) {
+    AppSettings.of(context);
+    return w.Text(
+      tr(data),
+      style: style,
+      textAlign: textAlign,
+      textDirection: textDirection,
+      softWrap: softWrap,
+      overflow: overflow,
+      maxLines: maxLines,
+    );
+  }
+}
+
+const String _arL = '\u0621-\u063A\u0641-\u064A\u064B-\u0652\u0671-\u06D3\u0640';
+final RegExp _hasArabic = RegExp('[$_arL]');
+final Map<String, String> _trCache = {};
+late final List<RegExp> _ruleRes = [for (final r in _kEnRules) RegExp(r[0])];
+late final List<RegExp> _phraseRes = [
+  for (final p in _kEnPhrases) RegExp('(?<![$_arL])${RegExp.escape(p[0])}(?![$_arL])')
+];
+
+// الوقت المستغرق في الفحص: "3 دقيقة و 25 ثانية" أو "40 ثانية"
+String fmtElapsed(Duration d) {
+  final m = d.inMinutes;
+  final sec = d.inSeconds % 60;
+  return m > 0 ? '$m دقيقة و $sec ثانية' : '$sec ثانية';
+}
+
+bool _isFinalScanStatus(String s) =>
+    s.startsWith('اكتمل العد') || s.startsWith('تمت التسمية') || s.startsWith('اتوقف') || s.startsWith('تم فحص');
+
+String tr(String s) {
+  if (s.isEmpty || appSettings.isAr || !_hasArabic.hasMatch(s)) return s;
+  final cached = _trCache[s];
+  if (cached != null) return cached;
+  final r = _translateEn(s);
+  if (_trCache.length > 3000) _trCache.clear();
+  _trCache[s] = r;
+  return r;
+}
+
+String _translateEn(String s) {
+  final ex = _kEnExact[s];
+  if (ex != null) return ex;
+  var out = s;
+  for (var i = 0; i < _ruleRes.length; i++) {
+    final rep = _kEnRules[i][1];
+    out = out.replaceAllMapped(_ruleRes[i], (m) {
+      var t = rep;
+      for (var g = 1; g <= m.groupCount; g++) {
+        t = t.replaceAll('{$g}', m.group(g) ?? '');
+      }
+      return t;
+    });
+  }
+  for (var i = 0; i < _phraseRes.length; i++) {
+    final en = _kEnPhrases[i][1];
+    out = out.replaceAllMapped(_phraseRes[i], (_) => en);
+  }
+  return out.replaceAll('،', ',').replaceAll('؟', '?');
+}
+
+const Map<String, String> _kEnExact = {
+  'فحص التقفيل': 'Scan closing',
+  'فحص إيصالات الدفع': 'Scan payment receipts',
+  'فحص الكل': 'Scan all',
+  'عد متوازي': 'Parallel count',
+  'يدوي': 'Manual',
+  'العد المزدوج (طريقتين للعد ومقارنتهم)': 'Dual count (two methods, compared)',
+  'عد متوازي (الأسرع)': 'Parallel count (fastest)',
+  'تدقيق مزدوج (قراءة تانية لآخر صفحة - أدق وأبطأ شوية)': 'Double check (re-read the last page - more accurate, a bit slower)',
+  'اليوم': 'Today',
+  'الكل': 'All',
+  'تمام': 'OK',
+  'لا': 'No',
+  'إلغاء': 'Cancel',
+  'مسح': 'Delete',
+  'حفظ': 'Save',
+  'عرض': 'View',
+  'الصح': 'Correct',
+  'تغيير': 'Change',
+  'تجريبي': 'Dev',
+  'يومين': '2 days',
+  '؟': '?',
+  'صح ✓': 'Correct ✓',
+  'غلط ✗': 'Wrong ✗',
+  'المزيد': 'More',
+  'المصدر': 'Source',
+  'الإخراج': 'Output',
+  'واتساب': 'WhatsApp',
+  'إكسيل': 'Excel',
+  'تدوير': 'Rotate',
+  'السابق': 'Previous',
+  'التالي': 'Next',
+  'إيقاف': 'Stop',
+  'مراجعة': 'Review',
+  'ماكينة': 'Machine',
+  'الاسكندريه': 'Alexandria'
+};
+
+const List<List<String>> _kEnRules = [
+  [r'(\d+) من (\d+)', '{1} of {2}'],
+  [r'إيصال (\d+) بتاريخ', 'Receipt {1} dated'],
+  [r'ناقص (\d+) ماكينة', 'missing {1} machine(s)'],
+  [r'مراجعة (\d+) / (\d+)', 'Review {1} / {2}'],
+  [r'فاضل (\d+) لسه', '{1} remaining'],
+  [r'(\d+) دقيقة و (\d+) ثانية', '{1} min {2} sec'],
+  [r'(\d+) ثانية', '{1} sec']
+];
+
+// مرتبة من الأطول للأقصر علشان العبارات الطويلة تتبدّل الأول
+const List<List<String>> _kEnPhrases = [
+  ['بدأ فحص التقفيل', 'Closing scan started'],
+  ['بدأ فحص إيصالات الدفع', 'Payment receipts scan started'],
+  ['انتهى فحص التقفيل', 'Closing scan finished'],
+  ['انتهى فحص إيصالات الدفع', 'Payment receipts scan finished'],
+  ['اتوقف فحص التقفيل', 'Closing scan stopped'],
+  ['اتوقف فحص إيصالات الدفع', 'Payment receipts scan stopped'],
+  ['فحص التقفيل وقف بخطأ', 'Closing scan failed with an error'],
+  ['ضمن الفحص الشامل', 'part of the full scan'],
+  ['صور محددة يدوياً', 'manually selected images'],
+  ['ملفات محددة يدوياً', 'manually selected files'],
+
+  ['متوازي (تجريبي)', 'parallel (experimental)'],
+  ['متوازي', 'parallel'],
+  ['الوقت المستغرق:', 'Time taken:'],
+  ['Terminal ID مش واضح، الوحدة اتحددت من Merchant ID/الاسم جوه الـ PDF، راجع', 'Terminal ID unclear; unit determined from Merchant ID/name inside the PDF, review'],
+  ['الملف ده مش واضح إنه إيصال ماكينة (قراءة ضعيفة للـ Terminal ID)، راجعه', 'This file does not look like a machine receipt (weak Terminal ID reading), review it'],
+  ['الوحدة اتحددت بالاسم/الميرشانت فقط - اتأكد من الماكينة واضغط حفظ', 'Unit was determined by name/merchant only - verify the machine and tap Save'],
+  ['اضغط "فحص التقفيل" لسحب الصور وتوليد الإكسيل والـ PDF.', 'Tap "Scan closing" to collect the images and generate the Excel and PDF.'],
+  ['التطبيق اتجاهل الصورة دي لأن شكلها إيصال دفع أو مستند مش باتش', 'The app ignored this image because it looks like a payment receipt or a document, not a batch'],
+  ['اضغط "فحص إيصالات الدفع" لفحص إيصالات الدفع من مستندات واتساب.', 'Tap "Scan payment receipts" to scan payment receipts from WhatsApp documents.'],
+  ['مفيش صور (في الفترة المحددة) ولا ملفات PDF في المجلد المختار', 'No images (in the selected period) and no PDF files in the selected folder'],
+  ['العد وقف أكتر من مرة (التطبيق اتقفل). من ⋮ اختار إعادة العد', 'Counting stopped more than once (the app closed). From ⋮ choose Recount'],
+  ['مش محسوب في الإجمالي لحد ما تقرر. زوّم على الباتش وقارن', 'Not counted in the total until you decide. Zoom in on the batch and compare'],
+  ['اتعمل لها PDF منفصل لكل يوم، ومش داخلة في إجماليات يوم', 'a separate PDF was created for each day, and they are not included in the totals of day'],
+  ['زوّم وشوف: لو باتش حقيقي ادخله وكمّل المبلغ والماكينة', 'Zoom in and check: if it is a real batch, enter it and fill in the amount and machine'],
+  ['الـ PDF اتعرّف على نفس ماكينة ملف تاني، اتسمّى ماكينة', 'The PDF was identified as the same machine as another file, named machine'],
+  ['وهتتمسح نتيجة الفحص. (ملفات واتساب الأصلية مش هتتمس)', 'The scan result will also be deleted. (Original WhatsApp files will not be touched)'],
+  ['ظهرت في صورة تانية بمبلغ مختلف - اتحسبت كباتش إضافي', 'appeared in another image with a different amount - counted as an extra batch'],
+  ['فيه إيصال إقفال/ملخص/إعادة طباعة (اتجاهل ومش معدود)', 'Contains a closing/summary/reprint receipt (ignored, not counted)'],
+  ['فولدر الإخراج ده عام، فهيتمسح بس ملفات التطبيق منه', 'this output folder is shared, so only the app files will be deleted from it'],
+  ['عدد إيصالات الدفع: لسه ما اتعدّش (اضغط فحص إيصالات الدفع)', 'Payment receipts count: not counted yet (tap Scan payment receipts)'],
+  ['مش لاقي فولدر مستندات واتساب. اختار فولدر بإيدك', 'Could not find the WhatsApp documents folder. Pick a folder manually'],
+  ['اتجاهلته: شكله إيصال دفع/مستند مش باتش - راجعه', 'Ignored: looks like a payment receipt/document, not a batch - review it'],
+  ['ملف لسه ما اتعدّش، اضغط "فحص إيصالات الدفع" وهيكمّل من مكانه', 'file(s) not counted yet, tap "Scan" and it will continue where it left off'],
+  ['يجب منح إذن الوصول إلى جميع الملفات للمتابعة', 'You must grant all-files access to continue'],
+  ['لا توجد صور في مجلد الواتساب بالفترة المحددة', 'No images in the WhatsApp folder for the selected period'],
+  ['تعذر العثور على مجلد صور الواتساب تلقائياً', 'Could not find the WhatsApp images folder automatically'],
+  ['مش قادر أقرا المبلغ أو الوحدة - اضغط تعديل', 'Cannot read the amount or the unit - tap Edit'],
+  ['ممكن إيصالات ناقصة أو مش اتقرت، راجع الملف', 'possibly missing receipts or unread ones, check the file'],
+  ['ملف لسه ما اتعدّش. اضغط "فحص إيصالات الدفع" لما تحب', 'file(s) not counted yet. Tap "Scan payment receipts" when you want'],
+  ['الماكينة/الوحدة اتحددت تلقائياً - اتأكد', 'Machine/unit was determined automatically - verify'],
+  ['مشكوك إنه مكرر - مش محسوب لحد ما تراجعه', 'Possible duplicate - not counted until reviewed'],
+  ['صورة، ولم يتم العثور على إيصالات مطابقة', 'image(s), and no matching receipts were found'],
+  ['صفحة فشلت قراءتها، العدد ممكن يكون ناقص', 'page(s) failed to read, the count may be incomplete'],
+  ['كل الملفات في الفترة دي اتفحصت قبل كده', 'All files in this period were already scanned'],
+  ['جاري توليد الملفات وتحديث الشيتات...', 'Generating files and updating sheets...'],
+  ['لازم تسمح بالوصول لكل الملفات الأول', 'You need to allow access to all files first'],
+  ['الملف مش موجود. شغّل المعالجة الأول', 'File not found. Run the processing first'],
+  ['مراجعة التكرار وترقيم الماكينات...', 'Checking duplicates and numbering machines...'],
+  ['الوحدة اتحددت بالاسم/الميرشانت فقط', 'Unit was determined by name/merchant only'],
+  ['اسحب أي ملف لتعليمه: صح ✓ أو غلط ✗', 'Swipe any file to mark it: correct ✓ or wrong ✗'],
+  ['مقدرتش أفتح الفولدر. المسار اتنسخ', 'Could not open the folder. Path copied'],
+  ['تقرير إيصالات الإسكندرية (الرسمي)', 'Alexandria receipts report (official)'],
+  ['لم يتم إنشاء ملفات بعد لمشاركتها', 'No files have been created yet to share'],
+  ['ولا مضاف للتطبيق)، فمتعملش إكسيل', 'nor added to the app), so no Excel was created'],
+  ['مفيش صور. بدوّر على ملف PDF اسمه', 'No images. Looking for a PDF file named'],
+  ['مش قادر أعرف الماكينة من الـ PDF', 'Cannot identify the machine from the PDF'],
+  ['ملفات المراجعة غير متاحة حالياً', 'Review files are not available right now'],
+  ['مشكوك إنه مكرر (نفس مبلغ ماكينة', 'Possible duplicate (same amount as machine'],
+  ['مش قادر أعرف التاريخ من الـ PDF', 'Cannot identify the date from the PDF'],
+  ['استبعدته قبل كده - تقدر ترجّعه', 'excluded earlier - you can restore it'],
+  ['المرشح التاني من قراءة الـ PDF', 'second candidate from reading the PDF'],
+  ['مفيش لوج لسه. شغّل الفحص الأول', 'No log yet. Run the scan first'],
+  ['جاري البحث عن مجلدات الصور...', 'Searching for image folders...'],
+  ['إعادة تسمية الصور وترتيبها...', 'Renaming and sorting images...'],
+  ['اضغط "فحص إيصالات الدفع" لعدّ إيصالاته', 'Tap "Scan payment receipts" to count its receipts'],
+  ['صفحات الطريقتين اختلفوا فيها:', 'Pages where the two methods differ:'],
+  ['اتعلّم للعد. اضغط "فحص إيصالات الدفع".', 'Marked for counting. Tap "Scan payment receipts".'],
+  ['مشكوك إنه مكرر: نفس الماكينة', 'Possible duplicate: same machine'],
+  ['اضغط "فحص إيصالات الدفع" لعدّ إيصالات', 'Tap "Scan payment receipts" to count receipts of'],
+  ['صفحات ما لقيتش فيها إيصالات:', 'Pages with no receipts found:'],
+  ['العد: سريع ← الدقيق (القديم)', 'Counting: fast, then precise (old)'],
+  ['عدد إيصالات الدفع: بيتعدّ...', 'Payment receipts count: counting...'],
+  ['تم توليد ملف الـ PDF المجمع', 'Combined PDF file generated'],
+  ['رقم الماكينة اتحدد تلقائياً', 'Machine number was determined automatically'],
+  ['مش مكرر - احتسبه باتش إضافي', 'Not a duplicate - count it as an extra batch'],
+  ['إيصال (رقمه مش واضح) بتاريخ', 'Receipt (number unclear) dated'],
+  ['مفيش ملفات مسمّاة لمشاركتها', 'No named files to share'],
+  ['مفيش ملفات PDF في الفترة دي', 'No PDF files in this period'],
+  ['مش قادر أكتب في الفولدر ده', 'Cannot write to this folder'],
+  ['مفيش إيصالات محتاجة مراجعة', 'No receipts need review'],
+  ['صورة متجاهلة - محتاجة قرار', 'Ignored image - needs a decision'],
+  ['مفيش برنامج يفتح الملف ده', 'No app can open this file'],
+  ['فيه إيصالات بتواريخ تانية', 'There are receipts with other dates'],
+  ['فحص الصور المقلوبة (أبطأ)', 'Check rotated images (slower)'],
+  ['جاري فحص إيصالات الدفع...', 'Scanning payment receipts...'],
+  ['واتساب - مستندات (تلقائي)', 'WhatsApp - documents (auto)'],
+  ['تقرير إيصالات الإسكندرية', 'Alexandria receipts report'],
+  ['جاري تجهيز صفحات الـ PDF', 'Preparing PDF pages'],
+  ['الإيصال ده مستبعد (مكرر)', 'This receipt is excluded (duplicate)'],
+  ['مفيش برنامج يفتح الـ PDF', 'No app can open the PDF'],
+  ['مش قادر أفتح الفولدر ده', 'Cannot open this folder'],
+  ['انتهى فحص إيصالات الدفع', 'Payment receipts scan finished'],
+  ['جاري البحث عن ملفات PDF', 'Searching for PDF files'],
+  ['مش محسوب لحد ما تراجعه', 'not counted until you review it'],
+  ['إجمالي بعيد عن المعتاد', 'Total far from usual'],
+  ['القراءة التانية للمبلغ', 'The second amount reading'],
+  ['صورة من الصور المرتبة', 'image(s) from the sorted images'],
+  ['اختر الماكينة (1..25)', 'Select machine (1..25)'],
+  ['جاري فحص الإيصالات...', 'Scanning receipts...'],
+  ['ولا يوجد ملف PDF باسم', 'and there is no PDF file named'],
+  ['لو المبلغ صح اضغط حفظ', 'if the amount is correct, tap Save'],
+  ['ده إيصال أنهي ماكينة؟', 'Which machine is this receipt for?'],
+  ['الملف الأصلي مش موجود', 'Original file not found'],
+  ['ماكينات ما وصلش ملفها', 'Machines with no file received'],
+  ['تعديل بيانات الإيصال', 'Edit receipt data'],
+  ['راجعه من زر المراجعة', 'review it using the review button'],
+  ['المصدر: رجوع لواتساب', 'Source: back to WhatsApp'],
+  ['بدء المعالجة الشاملة', 'Run full processing'],
+  ['بينما أغلب الإيصالات', 'while most receipts are'],
+  ['افتح الفولدر بواسطة', 'Open folder with'],
+  ['المبلغ يحتاج مراجعة', 'Amount needs review'],
+  ['إيصال مكرر للماكينة', 'Duplicate receipt for machine'],
+  ['مقدرتش أدوّر الصورة', 'Could not rotate the image'],
+  ['اتأكد منه واضغط حفظ', 'verify it and tap Save'],
+  ['للمراجعة (مش معدود)', 'For review (not counted)'],
+  ['راجعها لو العدد مهم', 'check them if the count matters'],
+  ['العد: دقيق ← السريع', 'Counting: precise, then fast'],
+  ['متصفح ملفات النظام', 'System file browser'],
+  ['حفظ وتحديث الملفات', 'Save and update files'],
+  ['بقرأ صفحات ملف PDF', 'Reading pages of PDF file'],
+  ['راجع المبلغ يدوياً', 'check the amount manually'],
+  ['الإخراج: الافتراضي', 'Output: default'],
+  ['اختيار هذا الفولدر', 'Choose this folder'],
+  ['مستبعد (علامة غلط)', 'Excluded (marked wrong)'],
+  ['عدد إيصالات الدفع:', 'Payment receipts count:'],
+  ['إلغاء علامة صح/غلط', 'Clear correct/wrong mark'],
+  ['مش موجود في فولدر', 'not found in folder'],
+  ['الوحدة غير معروفة', 'Unknown unit'],
+  ['فتح فولدر الإخراج', 'Open output folder'],
+  ['التاريخ صح - سيبه', 'The date is correct - keep it'],
+  ['مش تبع نفس اليوم:', 'Not from the same day:'],
+  ['بس التسمية ماكينة', 'but the naming says machine'],
+  ['لوج إيصالات الدفع', 'Payment receipts log'],
+  ['ميناء الإسكندرية', 'Alexandria Port'],
+  ['الأيام اللي فاتت', 'previous days'],
+  ['تم توليد الإكسيل', 'Excel generated'],
+  ['ملاحظات للمراجعة', 'Notes for review'],
+  ['المبلغ غير مقروء', 'Amount unreadable'],
+  ['مش باتش - تجاهله', 'Not a batch - ignore it'],
+  ['القراءة التانية:', 'Second reading:'],
+  ['أرقام مش لاقيها:', 'Numbers not found:'],
+  ['ملف على إنهم صح؟', 'file(s) as correct?'],
+  ['ملف ونتيجة الفحص', 'file(s) and the scan result'],
+  ['اتأكد من المبلغ', 'check the amount'],
+  ['مفيش حاجة للمسح', 'Nothing to delete'],
+  ['المبلغ الإجمالي', 'Total amount'],
+  ['الإجمالي العام:', 'Grand total:'],
+  ['المصدر: ملف PDF', 'Source: PDF file'],
+  ['واتساب (تلقائي)', 'WhatsApp (auto)'],
+  ['وحدة غير معروفة', 'Unknown unit'],
+  ['ده باتش - ادخله', 'This is a batch - include it'],
+  ['اتعرفت كمان في:', 'also identified in:'],
+  ['العد لقى ماكينة', 'Counting found machine'],
+  ['الملف مش موجود', 'File not found'],
+  ['ملف من الإخراج', 'file(s) from the output'],
+  ['تقرير المراجعة', 'Review report'],
+  ['فشل ملء القالب', 'Failed to fill the template'],
+  ['ماكينات ناقصة:', 'Missing machines:'],
+  ['مشكوك إنه مكرر', 'possible duplicate'],
+  ['رجّعه (احتسبه)', 'Restore (count it)'],
+  ['اكتب مبلغ صحيح', 'Enter a valid amount'],
+  ['مكرر - استبعده', 'Duplicate - exclude it'],
+  ['اختار الماكينة', 'Select machine'],
+  ['اتسمّى، إجمالي', 'named, total'],
+  ['تحديد الماكينة', 'Set machine'],
+  ['إيصالات الدفع', 'Payment receipts'],
+  ['إجمالي ماكينة', 'Total of machine'],
+  ['بعيد عن متوسط', 'is far from the average of'],
+  ['مستبعد (مكرر)', 'Excluded (duplicate)'],
+  ['رقم الماكينة:', 'Machine number:'],
+  ['ماكينات ناقصة', 'Missing machines'],
+  ['تاريخ الإيصال', 'Receipt date'],
+  ['اتسمّى ماكينة', 'Named machine'],
+  ['ملف مسمّى من:', 'named file(s) from:'],
+  ['اتسمّى واتنسخ', 'named and copied'],
+  ['تعريف الملفات', 'Identifying files'],
+  ['عدّ الإيصالات', 'Counting receipts'],
+  ['مديرية الأمن', 'Security Directorate'],
+  ['قراءة تانية:', 'Second reading:'],
+  ['فشلت القراءة', 'read failed'],
+  ['نفس الماكينة', 'Same machine'],
+  ['مستند متجاهل', 'Ignored document'],
+  ['اختيار فولدر', 'Choose folder'],
+  ['فشل التسمية:', 'Naming failed:'],
+  ['تمت التسمية:', 'Naming done:'],
+  ['فشل التعريف:', 'Identification failed:'],
+  ['ناقص القراءة', 'partial read'],
+  ['لوج التقفيل', 'Closing log'],
+  ['تاريخ مختلف', 'Different date'],
+  ['انتهى الفحص', 'Scan finished'],
+  ['ونفس المبلغ', 'and the same amount'],
+  ['راجع الصورة', 'check the image'],
+  ['خليه بتاريخ', 'Set it to date'],
+  ['حفظ والتالي', 'Save & next'],
+  ['اتوقف. فاضل', 'Stopped. Remaining'],
+  ['اكتمل العد:', 'Counting complete:'],
+  ['فحص التقفيل وإيصالات الدفع مرة واحدة', 'Scan closing & payment receipts in one go'],
+  ['جاري فحص التقفيل', 'Scanning closing'],
+  ['جاري فحص إيصالات الدفع', 'Scanning payment receipts'],
+  ['اكتمل الفحص الشامل', 'Full scan complete'],
+  ['اتوقف الفحص الشامل', 'Full scan stopped'],
+  ['سجل الفحص', 'Scan log'],
+  ['مشاركة السجل', 'Share log'],
+  ['مشاكل بس', 'Problems only'],
+  ['جاري الإيقاف...', 'Stopping...'],
+  ['مفيش سجلات لسه.', 'No log entries yet.'],
+  ['مسح السجل؟', 'Clear the log?'],
+  ['فحص شامل', 'Full scan'],
+  ['يدوي', 'Manual'],
+  ['تلقائي', 'Auto'],
+  ['فحص تلقائي خفيف (يعدّ الملف الجديد لوحده ويبعتلك إشعار بالنتيجة)', 'Light auto scan (counts each new file by itself and notifies you of the result)'],
+  ['فحص تلقائي خفيف (يفحص الإيصال الجديد لوحده ويبعتلك إشعار بالنتيجة)', 'Light auto scan (checks each new receipt by itself and notifies you of the result)'],
+  ['الباقي صح', 'Mark rest OK'],
+  ['فتح الصورة', 'Open image'],
+  ['إرسال الصورة', 'Send image'],
+  ['إرسال الملف', 'Send file'],
+  ['تغيير اللغة', 'Change language'],
+  ['مصطفى كامل', 'Mostafa Kamel'],
+  ['الإسكندرية', 'Alexandria'],
+  ['ملء الشاشة', 'Full screen'],
+  ['بس التسلسل', 'but the sequence'],
+  ['آخر نتيجة:', 'Last result:'],
+  ['فحص وتسمية', 'Scan & name'],
+  ['إرسال الكل', 'Send all'],
+  ['اتراجع: صح', 'Reviewed: correct'],
+  ['إعادة العد', 'Recount'],
+  ['برج العرب', 'Borg El Arab'],
+  ['خدمات مصر', 'Misr Services'],
+  ['مختلفة عن', 'differs from'],
+  ['اتأكد منه', 'verify it'],
+  ['غير مقروء', 'unreadable'],
+  ['الباقي صح', 'The rest are correct'],
+  ['مسح الكل', 'Delete all'],
+  ['غير محدد', 'Unspecified'],
+  ['للمراجعة', 'for review'],
+  ['الماكينة', 'Machine'],
+  ['المقروء:', 'Read:'],
+  ['استخدمها', 'Use it'],
+  ['فشل العد', 'Counting failed'],
+  ['عدّ سريع', 'Quick count'],
+  ['بدء العد', 'Start counting'],
+  ['التقفيل', 'Closing'],
+  ['المنتزه', 'El Montaza'],
+  ['محرم بك', 'Moharram Bek'],
+  ['القباري', 'El Qabbary'],
+  ['ماكينات', 'Machines'],
+  ['والأغلب', 'while most are'],
+  ['المبلغ:', 'Amount:'],
+  ['الإصدار', 'Version'],
+  ['افتراضي', 'default'],
+  ['التسلسل', 'Sequence'],
+  ['الفترة', 'Period'],
+  ['العجمي', 'El Agamy'],
+  ['هتتمسح', 'Will delete'],
+  ['تم مسح', 'Deleted'],
+  ['ماكينة', 'Machine'],
+  ['اكتمل!', 'Done!'],
+  ['باتشات', 'batches'],
+  ['تاريخه', 'Date'],
+  ['مستبعد', 'Excluded'],
+  ['تم فحص', 'Scanned'],
+  ['بتاريخ', 'dated'],
+  ['هتعلّم', 'Mark'],
+  ['هيتمسح', 'Will delete'],
+  ['الأصل:', 'Original:'],
+  ['اتسمّى', 'named'],
+  ['مراجعة', 'Review'],
+  ['ملفات', 'files'],
+  ['إيصال', 'receipt(s)'],
+  ['صفحات', 'pages'],
+  ['العدد', 'Count'],
+  ['مقروء', 'read'],
+  ['أيام', 'days'],
+  ['أبيس', 'Abis'],
+  ['قالب', 'Template'],
+  ['باتش', 'batch'],
+  ['ناقص', 'missing'],
+  ['صفحة', 'page(s)'],
+  ['صورة', 'image(s)'],
+  ['فاضل', 'remaining'],
+  ['راجع', 'review'],
+  ['الكل', 'All'],
+  ['كامل', 'full'],
+  ['ملف', 'file(s)'],
+  ['ج.م', 'EGP'],
+  ['فحص', 'Scan'],
+  ['فيه', 'There are'],
+  ['لسه', 'yet'],
+  ['أو', 'or'],
+  ['و', 'and'],
+  // عامة: في الآخر علشان العبارات الأطول اللي فوق تتطبق الأول
+  ['إيصال/صورة', 'receipts/images'],
+  ['للمراجعة', 'to review'],
+  ['ناقص', 'missing'],
+  ['ماكينة', 'machine'],
+  ['ملاحظة تانية', 'more notes'],
+  ['إيصال', 'receipt'],
+];
+
+// ───────────────────── ألوان تتأقلم مع الدارك مود ─────────────────────
+bool _isDark(BuildContext c) => Theme.of(c).brightness == Brightness.dark;
+
+Color _tintBg(BuildContext c, MaterialColor m, {bool soft = false, bool strong = false}) {
+  if (_isDark(c)) return m.shade900.withAlpha(strong ? 210 : 140);
+  return strong ? m.shade300 : (soft ? m.shade50 : m.shade100);
+}
+
+// "محتاج مراجعة": برتقالي هادي/مطفي بدل البرتقالي الصافي الفاقع (بيتستخدم في كل التطبيق)
+const MaterialColor kReviewTone = MaterialColor(0xFFDE8E43, <int, Color>{
+  50: Color(0xFFFFF5EC),
+  100: Color(0xFFFCE6D0),
+  200: Color(0xFFF7CFA6),
+  300: Color(0xFFF0B67C),
+  400: Color(0xFFE8A15C),
+  500: Color(0xFFDE8E43),
+  600: Color(0xFFC97A34),
+  700: Color(0xFFAC6429),
+  800: Color(0xFF8C5121),
+  900: Color(0xFF6E3F1A),
+});
+
+Color _tintBorder(BuildContext c, MaterialColor m) => _isDark(c) ? m.shade300 : m.shade800;
+Color _tintFg(BuildContext c, MaterialColor m) => _isDark(c) ? m.shade200 : m.shade900;
+// لون أيقونة/نص/خط حالة (أخضر/أحمر/...) مقروء في الفاتح والدارك
+Color _tone(BuildContext c, MaterialColor m) => _isDark(c) ? m.shade300 : m.shade700;
+
+// ───────────────────── الهيدر: اسم التطبيق + زراير اللغة والدارك ─────────────────────
+class AppTitle extends StatelessWidget {
+  const AppTitle({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const w.Text(
+          kAppName,
+          textDirection: TextDirection.ltr,
+          style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, height: 1.1),
+        ),
+        w.Text(
+          kAppAuthor,
+          textDirection: TextDirection.ltr,
+          style: TextStyle(fontSize: 10, height: 1.2, color: cs.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+}
+
+// على الشاشات العريضة: أيقونة منفصلة. على الصغيرة: بتتنقل لقايمة "المزيد" (بند "المظهر واللغة").
+class HeaderButtons extends StatelessWidget {
+  const HeaderButtons({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    if (MediaQuery.sizeOf(context).width < 400) return const SizedBox.shrink();
+    final ar = AppSettings.of(context).isAr;
+    return IconButton(
+      tooltip: ar ? 'المظهر واللغة' : 'Theme & language',
+      icon: Icon(_isDark(context) ? Icons.dark_mode : Icons.palette_outlined),
+      onPressed: () => showAppearanceSheet(context),
+    );
+  }
+}
+
+void showAppearanceSheet(BuildContext context) {
+  showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    isScrollControlled: true,
+    builder: (_) => const _AppearanceSheet(),
+  );
+}
+
+class _AppearanceSheet extends StatelessWidget {
+  const _AppearanceSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    final s = AppSettings.of(context);
+    final ar = s.isAr;
+    final cs = Theme.of(context).colorScheme;
+    Widget label(String t) => Padding(
+          padding: const EdgeInsets.fromLTRB(4, 14, 4, 8),
+          child: w.Text(t, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+        );
+    final order = [kDefaultSeed, for (var i = 0; i < kSeeds.length; i++) if (i != kDefaultSeed) i];
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            label(ar ? 'اللغة' : 'Language'),
+            SegmentedButton<String>(
+              showSelectedIcon: false,
+              segments: [
+                ButtonSegment<String>(value: 'sys', label: w.Text(ar ? 'تلقائي' : 'Auto')),
+                const ButtonSegment<String>(value: 'ar', label: w.Text('العربية')),
+                const ButtonSegment<String>(value: 'en', label: w.Text('English')),
+              ],
+              selected: {s.langCode ?? 'sys'},
+              onSelectionChanged: (v) => s.setLang(v.first == 'sys' ? null : v.first),
+            ),
+            label(ar ? 'المظهر' : 'Theme'),
+            SegmentedButton<ThemeMode>(
+              showSelectedIcon: false,
+              segments: [
+                ButtonSegment<ThemeMode>(
+                  value: ThemeMode.system,
+                  icon: const Icon(Icons.brightness_auto, size: 18),
+                  label: w.Text(ar ? 'تلقائي' : 'Auto'),
+                ),
+                ButtonSegment<ThemeMode>(
+                  value: ThemeMode.light,
+                  icon: const Icon(Icons.light_mode, size: 18),
+                  label: w.Text(ar ? 'فاتح' : 'Light'),
+                ),
+                ButtonSegment<ThemeMode>(
+                  value: ThemeMode.dark,
+                  icon: const Icon(Icons.dark_mode, size: 18),
+                  label: w.Text(ar ? 'داكن' : 'Dark'),
+                ),
+              ],
+              selected: {s.themeMode},
+              onSelectionChanged: (v) => s.setMode(v.first),
+            ),
+            label(ar ? 'لون التطبيق' : 'Accent color'),
+            Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: [
+                for (final i in order)
+                  Tooltip(
+                    message: ar ? kSeedNamesAr[i] : kSeedNamesEn[i],
+                    child: InkWell(
+                      customBorder: const CircleBorder(),
+                      onTap: () => s.setSeed(i),
+                      child: Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          color: kSeeds[i],
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: s.seedIndex == i ? cs.onSurface : Colors.transparent,
+                            width: 3,
+                          ),
+                        ),
+                        child: s.seedIndex == i
+                            ? const Icon(Icons.check, color: Colors.white, size: 20)
+                            : null,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ],
-        't': turns,
-        'a': angle,
-        'f': filter.index,
-        'c': contrast,
-        'b': brightness,
-        if (sharp > 0) 's': sharp,
-        if (levels != null) 'lv': levels,
-      });
+        ),
+      ),
+    );
+  }
+}
 
-  static EditParams? decode(String? s) {
-    if (s == null) return null;
-    try {
-      final m = jsonDecode(s) as Map<String, dynamic>;
-      List<Offset>? q;
-      final raw = m['q'];
-      if (raw is List && raw.length == 8) {
-        final d = raw.map((e) => (e as num).toDouble()).toList();
-        q = [for (var i = 0; i < 8; i += 2) Offset(d[i], d[i + 1])];
-      }
-      final fi = ((m['f'] as num?) ?? 0).toInt().clamp(0, ScanFilter.values.length - 1).toInt();
-      return EditParams(
-        quad: q,
-        turns: ((m['t'] as num?) ?? 0).toInt() % 4,
-        angle: ((m['a'] as num?) ?? 0).toDouble(),
-        filter: ScanFilter.values[fi],
-        contrast: ((m['c'] as num?) ?? 0).toDouble(),
-        brightness: ((m['b'] as num?) ?? 0).toDouble(),
-        sharp: ((m['s'] as num?) ?? 0).toDouble().clamp(0.0, 1.0).toDouble(),
-        levels: (m['lv'] is List && (m['lv'] as List).length == 4)
-            ? [for (final e in (m['lv'] as List)) (e as num).toDouble()]
-            : null,
-      );
-    } catch (e, st) {
-      AppLog.e('EditParams.decode', e, st);
-      return null;
+// ───────────────────── جداول الماكينات والوحدات ─────────────────────
+class TerminalInfo {
+  final int orderNum;
+  final int excelRow;
+  final String unitName;
+  final bool spare; // ماكينة احتياطي: بتتحسب في إجمالي الوحدة ومبتتعدّش ناقصة لو مظهرتش
+  const TerminalInfo(this.orderNum, this.excelRow, this.unitName, {this.spare = false});
+}
+
+final Map<String, TerminalInfo> terminals = {
+  "50335710": const TerminalInfo(1, 2, "أبيس"),
+  "50335993": const TerminalInfo(2, 2, "أبيس"),
+  "50335987": const TerminalInfo(3, 2, "أبيس"),
+  "50325716": const TerminalInfo(4, 3, "برج العرب"), // برج العرب 1
+  "50335998": const TerminalInfo(5, 3, "برج العرب"), // برج العرب 2
+  "50335994": const TerminalInfo(6, 3, "برج العرب"), // برج العرب 3
+  "50335711": const TerminalInfo(7, 3, "برج العرب"), // برج العرب 4
+  "50382298": const TerminalInfo(8, 4, "المنتزه"), // المنتزه 1
+  "50382315": const TerminalInfo(9, 4, "المنتزه"), // المنتزه 2
+  "50383712": const TerminalInfo(10, 4, "المنتزه"), // المنتزه 3
+  "50382306": const TerminalInfo(11, 5, "محرم بك"), // محرم بك 1
+  "50382316": const TerminalInfo(12, 5, "محرم بك"), // محرم بك 2
+  "50382308": const TerminalInfo(13, 6, "العجمي"), // العجمي 1
+  "50383706": const TerminalInfo(14, 6, "العجمي"), // العجمي 2
+  "50382300": const TerminalInfo(15, 7, "القباري"),
+  "50383702": const TerminalInfo(16, 8, "مصطفى كامل"),
+  "50382312": const TerminalInfo(17, 9, "مديرية الأمن"),
+  "50383699": const TerminalInfo(18, 10, "ميناء الإسكندرية"),
+  "50383700": const TerminalInfo(19, 11, "خدمات مصر"),
+  // ───── ماكينات احتياطي (أرقامها بعد 19 عشان مبتتحسبش ناقصة) ─────
+  "50325765": const TerminalInfo(20, 2, "أبيس", spare: true), // أبيس (احتياطي)
+  "50322364": const TerminalInfo(21, 3, "برج العرب", spare: true), // برج العرب (احتياطي 1)
+  "50322361": const TerminalInfo(22, 3, "برج العرب", spare: true), // برج العرب (احتياطي 2)
+  "50382150": const TerminalInfo(23, 4, "المنتزه", spare: true), // المنتزه (احتياطي)
+  "50381092": const TerminalInfo(24, 5, "محرم بك", spare: true), // محرم بك (احتياطي)
+  "50381077": const TerminalInfo(25, 6, "العجمي", spare: true), // العجمي (احتياطي)
+};
+
+final Map<int, String> numToTid = {
+  1: "50335710", 2: "50335993", 3: "50335987",
+  4: "50325716", 5: "50335998", 6: "50335994", 7: "50335711",
+  8: "50382298", 9: "50382315", 10: "50383712",
+  11: "50382306", 12: "50382316",
+  13: "50382308", 14: "50383706",
+  15: "50382300", 16: "50383702", 17: "50382312",
+  18: "50383699", 19: "50383700",
+  20: "50325765", 21: "50322364", 22: "50322361",
+  23: "50382150", 24: "50381092", 25: "50381077",
+};
+
+final Map<String, String> tidFix = {
+  "50336994": "50335994",
+  "50336711": "50335711",
+  "50336998": "50335998",
+  "50302316": "50382316",
+  "50382318": "50382315",
+  "50330987": "50335987",
+  "60382308": "50382308",
+};
+
+// (فاضي) المنتزه 3 = 50383712 ماكينة مستقلة
+final Map<String, String> tidAlias = {};
+
+final Map<String, int> merchantCodeMap = {
+  "22": 2, "23": 3, "24": 4, "25": 5, "26": 6,
+  "27": 7, "28": 8, "29": 9, "30": 10, "31": 11,
+};
+
+// Merchant ID للوحدة: 0011470 + كود الوحدة (22..31) + 084، مثال برج العرب 001147023084
+String? merchantIdOfRow(int row) {
+  for (final e in merchantCodeMap.entries) {
+    if (e.value == row) return '0011470${e.key}084';
+  }
+  return null;
+}
+
+final List<MapEntry<List<String>, int>> nameHints = [
+  MapEntry(["ABYSS", "ABIS"], 2),
+  MapEntry(["BURJ", "BORG"], 3),
+  MapEntry(["MONTZAH", "TOSUN"], 4),
+  MapEntry(["MUHRAM", "MOHARAM"], 5),
+  MapEntry(["AJAMI", "AGAMI"], 6),
+  MapEntry(["KABBARY", "KABARY"], 7),
+  MapEntry(["MUSTAFA", "KAMEL"], 8),
+  MapEntry(["MODRYT", "MODERYT"], 9),
+  MapEntry(["ALEXANDRIA PORT", "ESMAT"], 10),
+  MapEntry(["EC ESC", "ELZREA", "ESC ALEX", "KHADAMAT"], 11),
+];
+
+final Map<int, String> rowNames = {
+  2: "أبيس", 3: "برج العرب", 4: "المنتزه", 5: "محرم بك",
+  6: "العجمي", 7: "القباري", 8: "مصطفى كامل", 9: "مديرية الأمن",
+  10: "ميناء الإسكندرية", 11: "خدمات مصر",
+};
+
+// ───────── ماكينات جديدة (TID مختلف) لوحدة موجودة: بتتعرف من الـ Merchant ID أو اسم الوحدة وبتتحفظ ─────────
+const int kMainMachines = 19; // الماكينات الأساسية: فحص الماكينات الناقصة عليها بس
+const int kBaseMachines = 25; // الأساسي + الاحتياطي المكتوبين في الكود (الماكينات الجديدة بتاخد رقم بعدهم)
+final Set<String> _extraTids = {};
+String get _extraTermPath => '$baseDir/extra_terminals.json';
+
+int get machineCount {
+  var m = 0;
+  for (final k in numToTid.keys) {
+    if (k > m) m = k;
+  }
+  return m;
+}
+
+void loadExtraTerminals() {
+  try {
+    final f = File(_extraTermPath);
+    if (!f.existsSync()) return;
+    final m = jsonDecode(f.readAsStringSync());
+    if (m is! List) return;
+    for (final e in m) {
+      final tid = e['tid'].toString();
+      final row = e['row'] as int;
+      if (terminals.containsKey(tid) || !rowNames.containsKey(row)) continue;
+      var order = (e['o'] as int?) ?? 0;
+      if (order <= kBaseMachines || numToTid.containsKey(order)) order = machineCount + 1;
+      terminals[tid] = TerminalInfo(order, row, rowNames[row]!);
+      numToTid[order] = tid;
+      _extraTids.add(tid);
     }
+  } catch (e) {
+    _dbg('extra terminals load error: $e');
   }
 }
 
-/// الرباعي لازم يكون محدّب وبنفس ترتيب TL,TR,BR,BL (من غير تقاطع أو قلب).
-bool _quadConvex(List<Offset> q) {
-  for (var i = 0; i < 4; i++) {
-    final a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
-    final cr = (b.dx - a.dx) * (c.dy - b.dy) - (b.dy - a.dy) * (c.dx - b.dx);
-    if (cr <= 1e-6) return false;
+void _saveExtraTerminals() {
+  try {
+    final list = [
+      for (final tid in _extraTids)
+        if (terminals[tid] != null)
+          {'tid': tid, 'row': terminals[tid]!.excelRow, 'o': terminals[tid]!.orderNum}
+    ];
+    Directory(baseDir).createSync(recursive: true);
+    File(_extraTermPath).writeAsStringSync(jsonEncode(list));
+  } catch (e) {
+    _dbg('extra terminals save error: $e');
   }
-  return true;
 }
 
-List<Offset> _turnCw(List<Offset> q) {
-  Offset m(Offset p) => Offset(1 - p.dy, p.dx);
-  return [m(q[3]), m(q[0]), m(q[1]), m(q[2])];
-}
-
-List<Offset> _turnCcw(List<Offset> q) {
-  Offset m(Offset p) => Offset(p.dy, 1 - p.dx);
-  return [m(q[1]), m(q[2]), m(q[3]), m(q[0])];
-}
-
-/// تحويل المربع (0..1) إلى الرباعي (Homography) بدقة المنظور.
-/// الناتج: [a, b, c, d, e, f, g, h] حيث x=(a*u+b*v+c)/(g*u+h*v+1).
-List<double> _homography(List<Offset> p) {
-  final x0 = p[0].dx, y0 = p[0].dy, x1 = p[1].dx, y1 = p[1].dy;
-  final x2 = p[2].dx, y2 = p[2].dy, x3 = p[3].dx, y3 = p[3].dy;
-  final dx1 = x1 - x2, dx2 = x3 - x2, dy1 = y1 - y2, dy2 = y3 - y2;
-  final sx = x0 - x1 + x2 - x3, sy = y0 - y1 + y2 - y3;
-  var g = 0.0, h = 0.0;
-  if (sx.abs() > 1e-9 || sy.abs() > 1e-9) {
-    final den = dx1 * dy2 - dx2 * dy1;
-    g = (sx * dy2 - dx2 * sy) / den;
-    h = (dx1 * sy - sx * dy1) / den;
+// ماكينة جديدة مكتوبة على الإيصال ومش في القايمة: بنربطها بالوحدة (من الـ Merchant ID أو اسم الوحدة)
+// ولو الوحدة مش معروفة منعملش حاجة (الإيصال بيروح للمراجعة زي الأول)
+String? discoverTerminal(List<String> texts) {
+  final row = findUnitExtraIn(texts);
+  if (row == null || !rowNames.containsKey(row)) return null;
+  final counts = <String, int>{};
+  for (final t in texts) {
+    final d = _tidLabeledRaw(t);
+    if (d != null && RegExp(r'^50\d{6}$').hasMatch(d)) counts[d] = (counts[d] ?? 0) + 1;
   }
-  return [x1 - x0 + g * x1, x3 - x0 + h * x3, x0, y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h];
+  if (counts.isEmpty) return null;
+  final best = counts.entries.reduce((a, b) => a.value >= b.value ? a : b);
+  final tid = best.key;
+  if (terminals.containsKey(tid)) return tid;
+  if (texts.length >= 2 && best.value < 2) return null; // أكتر من قراءة: لازم الرقم يتكرر مرتين
+  final order = machineCount + 1;
+  terminals[tid] = TerminalInfo(order, row, rowNames[row]!);
+  numToTid[order] = tid;
+  _extraTids.add(tid);
+  _saveExtraTerminals();
+  _dbg('NEW TERMINAL $tid -> ${rowNames[row]} (ماكينة $order)');
+  return tid;
 }
 
-/// تدوير صورة 90 درجة (turns مرة مع عقارب الساعة). لو turns=0 بترجّع نفس الصورة.
-Future<ui.Image> _rotateUi(ui.Image src, int turns) async {
-  final t = turns % 4;
-  if (t == 0) return src;
-  final w = src.width, h = src.height;
-  final bd = await src.toByteData(format: ui.ImageByteFormat.rawRgba);
-  if (bd == null) throw Exception('تعذر قراءة الصورة');
-  final rgba = await compute(_rotateJob, <String, dynamic>{'src': _bytesOf(bd), 'w': w, 'h': h, 't': t});
-  src.dispose();
-  return _imageFromRgba(rgba, t.isOdd ? h : w, t.isOdd ? w : h);
+// ───────── الملفات الافتراضية: فولدر التطبيق + قالب الإكسيل (من الـ assets لو مش موجود) ─────────
+Future<void> prepareDefaultFiles() async {
+  try {
+    if (await Permission.manageExternalStorage.isGranted) {
+      await ensureDefaultFiles();
+    }
+  } catch (_) {}
+  loadExtraTerminals();
 }
 
-/// الصورة بعد التدوير بدقة محدودة (kMaxSide) عشان الذاكرة.
-Future<ui.Image> _rotatedImage(String path, int turns) async {
-  final mode = await Store.perfMode();
-  final maxSide = getMaxSide(mode);
-  final bytes = await File(path).readAsBytes();
-  final sz = await imageSize(bytes);
-  final src = await decodeImage(bytes, maxWidth: sz.w > maxSide ? maxSide : null);
-  return _rotateUi(src, turns);
-}
-
-/// بيشتغل في Isolate: تحويل المنظور + التدوير الدقيق + الألوان، بيرجّع RGBA.
-Uint8List _warpJob(Map<String, dynamic> a) {
-  final src = a['src'] as Uint8List;
-  final sw = a['sw'] as int, sh = a['sh'] as int;
-  final ow = a['ow'] as int, oh = a['oh'] as int;
-  final theta = a['theta'] as double;
-  final hm = (a['h'] as List).cast<double>();
-  final m = (a['m'] as List).cast<double>();
-  final out = Uint8List(ow * oh * 4);
-  final cx = sw / 2, cy = sh / 2;
-  final cs = math.cos(theta), sn = math.sin(theta);
-  final ha = hm[0], hb = hm[1], hc = hm[2], hd = hm[3], he = hm[4], hf = hm[5], hg = hm[6], hh = hm[7];
-  double clamp255(double v) => v < 0 ? 0 : (v > 255 ? 255 : v);
-  for (var j = 0; j < oh; j++) {
-    final v = oh > 1 ? j / (oh - 1) : 0.0;
-    for (var i = 0; i < ow; i++) {
-      final u = ow > 1 ? i / (ow - 1) : 0.0;
-      final den = hg * u + hh * v + 1;
-      final X = (ha * u + hb * v + hc) / den;
-      final Y = (hd * u + he * v + hf) / den;
-      final dx = X - cx, dy = Y - cy;
-      var sx = cx + cs * dx + sn * dy;
-      var sy = cy - sn * dx + cs * dy;
-      var r = 255.0, g = 255.0, b = 255.0;
-      if (sx >= -1 && sy >= -1 && sx <= sw && sy <= sh) {
-        if (sx < 0) sx = 0;
-        if (sy < 0) sy = 0;
-        if (sx > sw - 1) sx = sw - 1.0;
-        if (sy > sh - 1) sy = sh - 1.0;
-        final x0 = sx.floor(), y0 = sy.floor();
-        final x1 = x0 + 1 < sw ? x0 + 1 : x0;
-        final y1 = y0 + 1 < sh ? y0 + 1 : y0;
-        final fx = sx - x0, fy = sy - y0;
-        final i00 = (y0 * sw + x0) * 4, i10 = (y0 * sw + x1) * 4;
-        final i01 = (y1 * sw + x0) * 4, i11 = (y1 * sw + x1) * 4;
-        final w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy);
-        final w01 = (1 - fx) * fy, w11 = fx * fy;
-        r = src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11;
-        g = src[i00 + 1] * w00 + src[i10 + 1] * w10 + src[i01 + 1] * w01 + src[i11 + 1] * w11;
-        b = src[i00 + 2] * w00 + src[i10 + 2] * w10 + src[i01 + 2] * w01 + src[i11 + 2] * w11;
+Future<void> ensureDefaultFiles() async {
+  try {
+    Directory(baseDir).createSync(recursive: true);
+    var has = false;
+    for (final e in Directory(baseDir).listSync().whereType<File>()) {
+      final n = baseName(e.path);
+      if (n.toLowerCase().endsWith('.xlsx') && n.contains('00') && !n.startsWith('~') && !n.startsWith('.')) {
+        has = true;
+        break;
       }
-      final o = (j * ow + i) * 4;
-      out[o] = clamp255(m[0] * r + m[1] * g + m[2] * b + m[4]).round();
-      out[o + 1] = clamp255(m[5] * r + m[6] * g + m[7] * b + m[9]).round();
-      out[o + 2] = clamp255(m[10] * r + m[11] * g + m[12] * b + m[14]).round();
-      out[o + 3] = 255;
+    }
+    if (!has) {
+      try {
+        final d = await rootBundle.load('assets/template.xlsx');
+        File('$baseDir/الاسكندريه 00.xlsx').writeAsBytesSync(d.buffer.asUint8List());
+      } catch (_) {}
+    }
+  } catch (e) {
+    _dbg('default files error: $e');
+  }
+}
+
+// ───────────────────── خوارزميات الاستخراج (منقولة من نسخة البايثون) ─────────────────────
+final List<RegExp> _markers = [
+  RegExp(r'TERMINAL', caseSensitive: false),
+  RegExp(r'GRAND|TOTALS?', caseSensitive: false),
+  RegExp(r'NATIONAL\s*BANK|\bNBE\b', caseSensitive: false),
+  RegExp(r'BATCH', caseSensitive: false),
+  RegExp(r'MERCHANT', caseSensitive: false),
+  RegExp(r'SUCCESSF|CLOSED', caseSensitive: false),
+  RegExp(r'\bVISA\b|MASTER|MEZZA|MEEZA|MEEZ', caseSensitive: false),
+  RegExp(r'THANK\s*YOU', caseSensitive: false),
+  RegExp(r'NET\s*AMOUNT', caseSensitive: false),
+  RegExp(r'\bSALE\b', caseSensitive: false),
+];
+
+int receiptScore(String text) => _markers.where((r) => r.hasMatch(text)).length;
+
+// سطر نص مع مكانه في الصورة
+class OcrLine {
+  final String text;
+  final double left, right, top, bottom;
+  OcrLine(this.text, this.left, this.right, this.top, this.bottom);
+  double get cy => (top + bottom) / 2;
+  double get h => bottom - top;
+}
+
+List<OcrLine> toLines(RecognizedText res) {
+  final out = <OcrLine>[];
+  for (final b in res.blocks) {
+    for (final l in b.lines) {
+      final t = l.text.trim();
+      if (t.isEmpty) continue;
+      final r = l.boundingBox;
+      out.add(OcrLine(t, r.left, r.right, r.top, r.bottom));
     }
   }
   return out;
 }
 
-/// كشف حدود الورقة: أول حاجة المحرك الأصلي (OpenCV) من حزمة document_scan، أوفلاين ومن غير Play Services،
-/// ولو فشل أو رجّع null بنرجع للكشف البسيط تحت. بيرجّع TL,TR,BR,BL كنسب، أو null.
-Future<List<Offset>?> detectDocQuad(String path) async {
-  final swDet = Stopwatch()..start();
-  try {
-    final q = await _detectDocQuadImpl(path);
-    if (q == null) return null;
-    return _shapeQuad(q, await imageAspect(path));
-  } finally {
-    AppLog.i('t detect ${swDet.elapsedMilliseconds}ms');
+// يرتب النص صفوف (الاسم يمين والرقم جنبه في نفس السطر) زي Tesseract بالظبط
+String rowsText(List<OcrLine> lines) {
+  final ls = [...lines]..sort((a, b) => a.cy.compareTo(b.cy));
+  final rows = <List<OcrLine>>[];
+  for (final l in ls) {
+    if (rows.isNotEmpty) {
+      final last = rows.last;
+      final cy = last.map((e) => e.cy).reduce((a, b) => a + b) / last.length;
+      final h = last.map((e) => e.h).reduce((a, b) => a + b) / last.length;
+      if ((l.cy - cy).abs() < h * 0.6) {
+        last.add(l);
+        continue;
+      }
+    }
+    rows.add([l]);
   }
+  final sb = StringBuffer();
+  for (final r in rows) {
+    r.sort((a, b) => a.left.compareTo(b.left));
+    sb.writeln(r.map((e) => e.text).join('  '));
+  }
+  return sb.toString();
 }
 
-Future<List<Offset>?> _detectDocQuadImpl(String path) async {
-  final mode = await Store.perfMode();
-  List<Offset>? native;
-  if (mode != PerfMode.lite && await _nativeDetectorAllowed()) {
-    final sp = await SharedPreferences.getInstance();
-    File? tmp;
-    try {
-      // لو التطبيق اتقفل وإحنا جوه الكشف الأصلي، العلامة دي بتفضل true وفي التشغيل الجاي بنوقفه تلقائيًا
-      await sp.setBool('det_guard', true);
-      var input = path;
-      try {
-        tmp = await _smallCopy(path);
-        if (tmp != null) input = tmp.path;
-      } catch (e, st) {
-        AppLog.e('detectDocQuad.smallCopy', e, st);
+String readingText(List<OcrLine> lines) => lines.map((e) => e.text).join('\n');
+
+// صورة فيها أكتر من إيصال جنب بعض -> نقسمها لأعمدة
+List<List<OcrLine>> splitColumns(List<OcrLine> lines) {
+  if (lines.length < 8) return [lines];
+  final minL = lines.map((e) => e.left).reduce(math.min);
+  final maxR = lines.map((e) => e.right).reduce(math.max);
+  final w = maxR - minL;
+  if (w <= 0) return [lines];
+  final sorted = [...lines]..sort((a, b) => a.left.compareTo(b.left));
+  for (final tolFrac in const [0.03, 0.02, 0.01]) {
+    final groups = <List<OcrLine>>[];
+    var curRight = -1e9;
+    for (final l in sorted) {
+      if (groups.isEmpty || l.left - curRight > w * tolFrac) {
+        groups.add([l]);
+        curRight = l.right;
+      } else {
+        groups.last.add(l);
+        curRight = math.max(curRight, l.right);
       }
-      AppLog.i('native detect start');
-      final c = await ds.DocumentDetector()
-          .detect(ds.ScanInput.file(input))
-          .timeout(const Duration(seconds: 20));
-      AppLog.i('native detect done');
-      if (c != null) {
-        final q = [
-          for (final p in c.toList())
-            Offset(p.x.clamp(0.0, 1.0).toDouble(), p.y.clamp(0.0, 1.0).toDouble())
-        ];
-        if (q.length == 4 && _quadConvex(q)) native = q;
-      }
-    } catch (e, st) {
-      AppLog.e('detectDocQuad', e, st);
-    } finally {
-      try {
-        await sp.setBool('det_guard', false);
-        if (tmp != null && await tmp.exists()) await tmp.delete();
-      } catch (_) {}
+    }
+    final big = groups.where((g) {
+      final gl = g.map((e) => e.left).reduce(math.min);
+      final gr = g.map((e) => e.right).reduce(math.max);
+      return gr - gl >= w * 0.12 && g.length >= 6;
+    }).toList();
+    if (big.length >= 2 &&
+        big.length <= 4 &&
+        big.every((g) => receiptScore(readingText(g)) >= 3)) {
+      return big;
     }
   }
-  final simple = await _detectDocQuadSimple(path);
-  if (native == null) return simple;
-  if (simple == null) return native;
-  // المحرك الأصلي أحياناً بيمسك جزء جوه الإيصال (منطقة الكتابة بس): لو الكشف البسيط
-  // لقى مساحة أكبر بوضوح (والأصلي جواه) نستخدم البسيط عشان القص يشمل الإيصال كامل.
-  final an = _quadArea(native), asimple = _quadArea(simple);
-  if (asimple < 0.97 && an < asimple * 0.85) return simple;
-  return native;
+  return [lines];
 }
 
-double _quadArea(List<Offset> q) {
-  var a = 0.0;
-  for (var i = 0; i < 4; i++) {
-    final p = q[i], n = q[(i + 1) % 4];
-    a += p.dx * n.dy - n.dx * p.dy;
+// ───────────── المبالغ ─────────────
+final RegExp _amountRe =
+    RegExp(r"(?<![\d,.])(\d{1,3}(?:,\d{3})*|\d+)[., ](\d{2})(?!\d)");
+final RegExp _brandRe = RegExp(
+    r"\b(VISA|MASTER(?:CARD)?|MEZZA|MEEZA|MEZA|MEZZ4|MEZZ)\b",
+    caseSensitive: false);
+
+List<double> amountsIn(String rawText) {
+  final text = rawText.replaceAllMapped(
+      RegExp(r'\bB(\d{2,3}[.,]\d{2})\b'), (m) => '8${m.group(1)}');
+  final out = <double>[];
+  for (final m in _amountRe.allMatches(text)) {
+    final v = double.tryParse("${m.group(1)!.replaceAll(',', '')}.${m.group(2)!}");
+    if (v != null && v >= 0.5 && v <= 5000000) out.add(round2(v));
   }
-  return a.abs() / 2;
+  return out;
 }
 
-/// أصغر مستطيل مستقيم (من غير ميلان) بيحتوي الرباعي: ده شكل القص التلقائي.
-/// بيرجّع TL,TR,BR,BL كنسب.
-List<Offset> _rectOf(List<Offset> q) {
-  var l = 1.0, t = 1.0, r = 0.0, b = 0.0;
-  for (final p in q) {
-    l = math.min(l, p.dx);
-    t = math.min(t, p.dy);
-    r = math.max(r, p.dx);
-    b = math.max(b, p.dy);
+MapEntry<T, int>? mostCommon<T>(List<T> vals) {
+  if (vals.isEmpty) return null;
+  final counts = <T, int>{};
+  for (final v in vals) {
+    counts[v] = (counts[v] ?? 0) + 1;
   }
-  return [Offset(l, t), Offset(r, t), Offset(r, b), Offset(l, b)];
+  MapEntry<T, int>? best;
+  for (final e in counts.entries) {
+    if (best == null || e.value > best.value) best = e;
+  }
+  return best;
 }
 
-/// شكل القص التلقائي: 0 ذكي (الافتراضي)، 1 مستطيل دايماً، 2 منظور (4 أركان) دايماً.
-int autoCropMode = 0;
-
-/// الفرق بين اتجاهين (بالدرجات) كخطوط، من 0 لـ 90.
-double _angDiff(double a, double b) {
-  final d = (a - b).abs() % 180;
-  return d > 90 ? 180 - d : d;
+// عدد المعاملات: مجموع (عدد كل كارت) = (عدد GRAND TOTALS)
+bool _countsAgreeOne(String raw) {
+  final paren = RegExp(r'\(\s*([0-9OoIl|]{1,5})\s*\)');
+  final gm = RegExp(r'GRAND|TOTALS', caseSensitive: false).firstMatch(raw);
+  if (gm == null) return false;
+  final pre = raw.substring(0, gm.start);
+  final bms = _brandRe.allMatches(pre).toList();
+  if (bms.length < 2) return false;
+  var sum = 0;
+  for (var i = 0; i < bms.length; i++) {
+    final end = i + 1 < bms.length ? bms[i + 1].start : pre.length;
+    final nums = <int>[];
+    for (final m in paren.allMatches(pre.substring(bms[i].end, end))) {
+      final v = _txnNum(m.group(1)!);
+      if (v != null) nums.add(v);
+    }
+    final mc = mostCommon(nums);
+    if (mc == null) return false;
+    sum += mc.key;
+  }
+  final gp = paren.firstMatch(raw.substring(gm.start));
+  final gv = gp == null ? null : _txnNum(gp.group(1)!);
+  return gv != null && sum == gv;
 }
 
-/// بيقرر شكل الإطار التلقائي. aspect = ارتفاع/عرض الصورة.
-/// الذكي: لو الأركان الأربعة شكلها مستطيل فعلاً (حتى لو ملفوف) بنحتفظ بيها عشان تتعدّل الورقة،
-/// ولو الشكل مائل أو مشوّه (غالباً الكشف غلط أو منظور قوي) بنرجع لمستطيل مستقيم.
-List<Offset> _shapeQuad(List<Offset> q, double aspect) {
-  if (autoCropMode == 2) return q;
-  if (autoCropMode == 1) return _rectOf(q);
-  final p = [for (final o in q) Offset(o.dx, o.dy * aspect)];
-  double dir(Offset a, Offset b) => math.atan2(b.dy - a.dy, b.dx - a.dx) * 180 / math.pi;
-  final top = dir(p[0], p[1]), right = dir(p[3], p[2]);
-  final left = dir(p[0], p[3]), rightSide = dir(p[1], p[2]);
-  final par = math.max(_angDiff(top, right), _angDiff(left, rightSide));
-  var dev = 0.0;
-  for (final a in [top, right]) {
-    for (final b in [left, rightSide]) {
-      dev = math.max(dev, 90 - _angDiff(a, b));
+// هل في توليفة (قراءة واحدة من كل كارت) مجموعها = g ؟
+bool _comboHits(List<List<double>> secs, double g) {
+  if (secs.length < 2 || secs.any((s) => s.isEmpty)) return false;
+  final target = (g * 100).round();
+  var hit = false;
+  void go(int i, int sum) {
+    if (hit) return;
+    if (i == secs.length) {
+      if (sum == target) hit = true;
+      return;
+    }
+    for (final v in secs[i].take(4)) {
+      go(i + 1, sum + (v * 100).round());
     }
   }
-  return (par <= 6 && dev <= 8) ? q : _rectOf(q);
+  go(0, 0);
+  return hit;
 }
 
-Future<bool> _nativeDetectorAllowed() async {
+class Parsed {
+  final List<double> grand;
+  final double? bsum;
+  final List<double> bvals;
+  final List<List<double>> secs; // كل القراءات المختلفة لكل كارت
+  final bool countsOk;
+  Parsed(this.grand, this.bsum, this.bvals, {this.secs = const [], this.countsOk = false});
+}
+
+Parsed parseReceipt(String txt) {
+  final t = txt
+      .split(RegExp(r"THANK\s*YOU|Hotline|App\s*Version", caseSensitive: false))
+      .first;
+  final gm = RegExp(r"GRAND|TOTALS", caseSensitive: false).firstMatch(t);
+  var pre = gm != null ? t.substring(0, gm.start) : t;
+  final post = gm != null ? t.substring(gm.start) : "";
+
+  final bms = _brandRe.allMatches(pre).toList();
+  final sections = <String>[];
+  if (bms.isNotEmpty) {
+    for (var i = 0; i < bms.length; i++) {
+      final end = i + 1 < bms.length ? bms[i + 1].start : pre.length;
+      sections.add(pre.substring(bms[i].end, end));
+    }
+  } else {
+    final sm =
+        RegExp(r"SUCCESSFULL?Y|CLOSED", caseSensitive: false).firstMatch(pre);
+    if (sm != null) pre = pre.substring(sm.end);
+    sections.add(pre);
+  }
+
+  final bvals = <double>[];
+  final secs = <List<double>>[];
+  for (final sec in sections) {
+    final am = amountsIn(sec);
+    secs.add(am.toSet().toList());
+    final mc = mostCommon(am);
+    if (mc != null) bvals.add(mc.key);
+  }
+  final grand = amountsIn(post);
+  final bsum = bvals.isNotEmpty ? round2(bvals.reduce((a, b) => a + b)) : null;
+  return Parsed(grand, bsum, bvals, secs: secs, countsOk: _countsAgreeOne(t));
+}
+
+// المبالغ المقترحة للإيصال. الأولوية للجزء التحتاني (قسم GRAND TOTALS) لأن الإجمالي الصح فيه، ومن غير باقي الأرقام.
+// لو القسم ده ما اتقراش خالص (علامات/تلف): نرجع لمجموع الكروت وإجماليات الكروت بس.
+List<double> candidateAmounts(List<String> texts) {
+  final grandScore = <double, int>{};
+  final otherScore = <double, double>{};
+  for (final t in texts) {
+    final pr = parseReceipt(t);
+    for (final g in pr.grand) {
+      if (g >= 0.5) grandScore[g] = (grandScore[g] ?? 0) + 1;
+    }
+    final b = pr.bsum;
+    if (b != null && b > 0) otherScore[round2(b)] = (otherScore[round2(b)] ?? 0) + 3;
+    for (final v in pr.bvals) {
+      if (v >= 0.5) otherScore[v] = (otherScore[v] ?? 0) + 1;
+    }
+  }
+  if (grandScore.isNotEmpty) {
+    final ks = grandScore.keys.toList()..sort((a, b) => grandScore[b]!.compareTo(grandScore[a]!));
+    return ks.take(3).toList();
+  }
+  final ks = otherScore.keys.toList()..sort((a, b) => otherScore[b]!.compareTo(otherScore[a]!));
+  return ks.take(4).toList();
+}
+
+// دمج مقترحات القراءتين: اللي ظهر في الاتنين الأول
+List<double> mergeCands(List<double> a, List<double> b) {
+  bool has(List<double> l, double v) => l.any((x) => (x - v).abs() < 0.005);
+  final out = <double>[];
+  for (final v in a) {
+    if (has(b, v)) out.add(v);
+  }
+  for (final v in [...a, ...b]) {
+    if (!has(out, v)) out.add(v);
+  }
+  return out.take(4).toList();
+}
+
+class Decision {
+  final double val;
+  final bool ok;
+  Decision(this.val, this.ok);
+}
+
+Decision decide(List<Parsed> results) {
+  // 1) تطابق تام بين مجموع الكروت و GRAND TOTALS
+  for (final r in results) {
+    final b = r.bsum;
+    if (b != null && b > 0 && r.grand.any((g) => (g - b).abs() < 0.005)) {
+      return Decision(b, true);
+    }
+  }
+  // 1.5) إجمالي GRAND اتقرا مرتين بنفس القيمة (في نفس القراءة): هو الأقوى.
+  // بنتجاهل القراءة اللي المبالغ فيها جاية بعد GRAND (ترتيب القراءة الخام) لأنها بتخلط مبالغ الكروت مع الإجمالي،
+  // وبنستبعد أي رقم هو نفسه مبلغ كارت.
+  final cardVals = <double>{};
+  for (final r in results) {
+    for (final s in r.secs) {
+      cardVals.addAll(s);
+    }
+  }
+  final gc = <double, int>{};
+  for (final r in results) {
+    if (r.secs.every((s) => s.isEmpty)) continue;
+    final loc = <double, int>{};
+    for (final g in r.grand) {
+      loc[g] = (loc[g] ?? 0) + 1;
+    }
+    loc.forEach((k, v) {
+      if (cardVals.contains(k)) return;
+      if (v > (gc[k] ?? 0)) gc[k] = v;
+    });
+  }
+  final strongC = [
+    for (final e in gc.entries)
+      if (e.value >= 2) e.key
+  ]..sort((x, y) => gc[y]!.compareTo(gc[x]!));
+  for (final g in strongC) {
+    for (final r in results) {
+      if (r.countsOk || _comboHits(r.secs, g)) return Decision(g, true);
+    }
+  }
+  if (strongC.length == 1) {
+    return Decision(strongC.first, false); // مش مؤكد، بس ده أقوى مرشح (ومش مجموع الكروت)
+  }
+  // 2) فرق رقم واحد (بس لما مفيش إجمالي متكرر)
+  for (final r in results) {
+    final b = r.bsum;
+    if (b != null && b > 0 && r.bvals.length >= 2) {
+      for (final g in r.grand) {
+        final sa = g.toStringAsFixed(2), sb = b.toStringAsFixed(2);
+        if (sa.length == sb.length) {
+          var diff = 0;
+          for (var i = 0; i < sa.length; i++) {
+            if (sa[i] != sb[i]) diff++;
+          }
+          if (diff == 1) return Decision(b, true);
+        }
+      }
+    }
+  }
+  // 3) إجمالي مكرر
+  for (final r in results) {
+    final c = mostCommon(r.grand);
+    if (c != null && c.value >= 2 && r.bsum == null) return Decision(c.key, false);
+  }
+  // 4) تصويت
+  final pool = <double>[];
+  for (final r in results) {
+    pool.addAll(r.grand);
+    final b = r.bsum;
+    if (b != null && b > 0) pool.add(b);
+  }
+  final c = mostCommon(pool);
+  if (c != null) return Decision(c.key, false);
+  return Decision(0.0, false);
+}
+
+class PieceResult {
+  final List<String> texts;
+  final double val;
+  final bool ok;
+  PieceResult(this.texts, this.val, this.ok);
+}
+
+// إيصال دفع (RRN / رقم كارت مخفي / Approved ...) ولا باتش كلوز / ملخص / ري برنت؟
+String classifyReceipt(String text) {
+  final up = text.toUpperCase();
+  final payRes = <RegExp>[
+    RegExp(r'R{1,2}N\W{0,3}\d{9,}'),
+    RegExp(r'\d{4,6}\W{0,2}\*{3,}\W{0,2}\d{4}'),
+    RegExp(r'APPROVED'),
+    RegExp(r'AUTH\W{0,3}\d{6}'),
+    RegExp(r'I\s*AUTHORI[SZ]E'),
+    RegExp(r'MERCHANT\s*COPY'),
+    RegExp(r'CLESS|CHIP\s*ONLINE'),
+  ];
+  final batchRes = <RegExp>[
+    RegExp(r'BATCH\s*CLOS'),
+    RegExp(r'SUCCESSF'),
+    RegExp(r'GRAND\s*TOTAL'),
+    RegExp(r'TOTAL\s*NET'),
+    RegExp(r'THANK\s*YOU'),
+    RegExp(r'NBE\s*NETWORK'),
+    RegExp(r'HOTLINE'),
+  ];
+  final pay = payRes.where((r) => r.hasMatch(up)).length;
+  final batch = batchRes.where((r) => r.hasMatch(up)).length;
+  if (pay >= 2 && batch < 2) return 'payment';
+  if (batch >= 1) return 'batch';
+  return 'other';
+}
+
+// لو GRAND TOTAL = مجموع إجماليات الكروت (حتى لو أسماء الكروت اتقرت غلط): نرجّعه مؤكد.
+double? sumClosure(List<String> texts) {
+  final cnt = <double, int>{};
+  for (final t in texts) {
+    final tt = t
+        .split(RegExp(r'THANK\s*YOU|Hotline|App\s*Version', caseSensitive: false))
+        .first;
+    final local = <double, int>{};
+    for (final a in amountsIn(tt)) {
+      local[a] = (local[a] ?? 0) + 1;
+    }
+    local.forEach((k, v) {
+      if (v > (cnt[k] ?? 0)) cnt[k] = v;
+    });
+  }
+  final c = cnt.entries.where((e) => e.value >= 2).map((e) => e.key).toList()..sort();
+  if (c.length < 3 || c.length > 14) return null;
+  for (var gi = c.length - 1; gi >= 2; gi--) {
+    final g = c[gi];
+    final others = c.sublist(0, gi);
+    final n = others.length;
+    for (var mask = 1; mask < (1 << n); mask++) {
+      var bits = 0, sum = 0.0;
+      for (var i = 0; i < n; i++) {
+        if (mask & (1 << i) != 0) {
+          bits++;
+          sum += others[i];
+        }
+      }
+      if (bits >= 2 && (sum - g).abs() < 0.005) return g;
+    }
+  }
+  return null;
+}
+
+PieceResult ocrPiece(List<OcrLine> lines) {
+  final texts = <String>[rowsText(lines), readingText(lines)];
+  final sc = sumClosure(texts);
+  if (sc != null) return PieceResult(texts, sc, true);
+  final d = decide(texts.map(parseReceipt).toList());
+  return PieceResult(texts, d.val, d.ok);
+}
+
+String? batchNo(List<String> texts) {
+  final reg = RegExp(r"BATCH\s*NO\D{0,6}(\d{4,7})", caseSensitive: false);
+  final all = <String>[];
+  for (final t in texts) {
+    for (final m in reg.allMatches(t)) {
+      all.add(m.group(1)!);
+    }
+  }
+  return mostCommon(all)?.key;
+}
+
+// ───────────── الماكينة / الوحدة / التاريخ ─────────────
+String? _tidLabeledRaw(String t) {
+  final m = RegExp(r"TERMINAL\s*(?:ID)?\D{0,15}?(\d[\d\s/]{6,9}\d)",
+          caseSensitive: false)
+      .firstMatch(t);
+  if (m == null) return null;
+  final raw = m.group(1)!.replaceAll('/', '7').replaceAll(RegExp(r'\D'), '');
+  if (raw.length < 8) return null;
+  final d = raw.substring(raw.length - 8);
+  return tidFix[d] ?? d;
+}
+
+String? _tidLabeled(String t) {
+  final d = _tidLabeledRaw(t);
+  return d != null && terminals.containsKey(d) ? d : null;
+}
+
+String? _tidLoose(String t) {
+  for (final tid in terminals.keys) {
+    if (t.contains(tid)) return tid;
+  }
+  for (final m in RegExp(r"\b(503\d{5})\b").allMatches(t)) {
+    var c = m.group(1)!;
+    c = tidFix[c] ?? c;
+    if (terminals.containsKey(c)) return c;
+  }
+  return null;
+}
+
+String? findTerminalIn(List<String> texts) {
+  for (final t in texts) {
+    final r = _tidLabeled(t);
+    if (r != null) return r;
+  }
+  for (final t in texts) {
+    final r = _tidLoose(t);
+    if (r != null) return r;
+  }
+  return null;
+}
+
+String? findTerminalFuzzyIn(List<String> texts, int? targetRow) {
+  final pool = terminals.entries
+      .where((e) => targetRow == null || e.value.excelRow == targetRow)
+      .map((e) => e.key)
+      .toList();
+  final dist = <String, int>{};
+  for (final t in texts) {
+    for (final run in RegExp(r"\d[\d /]{6,14}\d").allMatches(t)) {
+      final digits = run.group(0)!.replaceAll('/', '7').replaceAll(RegExp(r'\D'), '');
+      for (var i = 0; i + 8 <= digits.length; i++) {
+        final cand = digits.substring(i, i + 8);
+        if (!cand.startsWith('50') && !cand.startsWith('60')) continue;
+        for (final tid in pool) {
+          var d = 0;
+          for (var k = 0; k < 8; k++) {
+            if (cand[k] != tid[k]) d++;
+          }
+          if (d < (dist[tid] ?? 99)) dist[tid] = d;
+        }
+      }
+    }
+  }
+  if (dist.isEmpty) return null;
+  final best = dist.values.reduce(math.min);
+  final winners = dist.entries.where((e) => e.value == best).map((e) => e.key).toList();
+  if (best <= 1 && winners.length == 1) return winners.first;
+  return null;
+}
+
+int? findUnitExtraIn(List<String> texts) {
+  for (final t in texts) {
+    final m = RegExp(r"MERCHANT\s*(?:ID|10)\D{0,15}?(\d[\d\s/]{8,13}\d)", caseSensitive: false)
+        .firstMatch(t);
+    final cands = <String>[
+      if (m != null) m.group(1)!.replaceAll('/', '7').replaceAll(RegExp(r'\D'), ''),
+      t.replaceAll(RegExp(r'\D'), ''),
+    ];
+    for (final d in cands) {
+      final mm = RegExp(r"11470?(2[2-9]|3[01])084").firstMatch(d);
+      if (mm != null && merchantCodeMap.containsKey(mm.group(1))) {
+        return merchantCodeMap[mm.group(1)];
+      }
+    }
+  }
+  for (final t in texts) {
+    final up = t.toUpperCase();
+    for (final hint in nameHints) {
+      if (hint.key.any((w) => up.contains(w))) return hint.value;
+    }
+  }
+  return null;
+}
+
+String? findDateIn(List<String> texts) {
+  final reg = RegExp(r"DATE\s*:?\s*(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})",
+      caseSensitive: false);
+  for (final t in texts) {
+    final m = reg.firstMatch(t);
+    if (m != null) {
+      final mo = int.tryParse(m.group(2)!) ?? 0;
+      final d = int.tryParse(m.group(3)!) ?? 0;
+      return "$d.$mo";
+    }
+  }
+  return null;
+}
+
+// عدد معاملات الباتش من إيصال الإقفال: "GRAND TOTALS / Sale (010)" (ولو اتقرا مجموع الكروت بيتطابق معاه)
+int? _txnNum(String s) {
+  final t = s.trim().replaceAll(RegExp(r'[Oo]'), '0').replaceAll(RegExp(r'[Il|]'), '1');
+  return int.tryParse(t);
+}
+
+int? batchTxnOf(List<String> texts) {
+  final grandRe = RegExp(r'GRAND|TOTALS', caseSensitive: false);
+  final paren = RegExp(r'\(\s*([0-9OoIl|]{1,5})\s*\)');
+  final grands = <int>[];
+  final sums = <int>[];
+  for (final raw in texts) {
+    final gm = grandRe.firstMatch(raw);
+    if (gm != null) {
+      final m = paren.firstMatch(raw.substring(gm.start));
+      final v = m == null ? null : _txnNum(m.group(1)!);
+      if (v != null && v > 0 && v < 100000) grands.add(v);
+    }
+    final pre = gm != null ? raw.substring(0, gm.start) : raw;
+    var sum = 0, n = 0;
+    for (final m in RegExp(r'TOTAL(?!\s*NET)[^()\n]{0,12}\(\s*([0-9OoIl|]{1,5})\s*\)', caseSensitive: false)
+        .allMatches(pre)) {
+      final v = _txnNum(m.group(1)!);
+      if (v != null) {
+        sum += v;
+        n++;
+      }
+    }
+    if (n > 0 && sum > 0) sums.add(sum);
+  }
+  final g = mostCommon(grands)?.key;
+  final s = mostCommon(sums)?.key;
+  if (g != null && s != null && g != s) {
+    if (g > 0 && g < 1000) return g; // نثق في الإجمالي العام أكثر من مجموع الكروت
+  }
+  return g ?? s;
+}
+
+class Analysis {
+  String? tid;
+  String how;
+  int? row;
+  String? unitName;
+  double val;
+  bool ok;
+  List<double> batches;
+  String? date;
+  String debug = '';
+  int? txn; // عدد معاملات الباتش (من إيصال الإقفال)
+  List<double> cands = <double>[]; // مبالغ مقترحة من نفس الإيصال (الأرجح الأول)
+  Analysis(this.tid, this.how, this.row, this.unitName, this.val, this.ok,
+      this.batches, this.date);
+}
+
+// تحليل صورة كاملة (ممكن فيها أكتر من إيصال)
+Analysis analyzeLines(List<OcrLine> all) {
+  final pieces = splitColumns(all);
+  final multi = pieces.length > 1;
+  final allTexts = <String>[];
+  final batches = <double>[];
+  final txns = <int?>[];
+  var allOk = true;
+  final seen = <String>{};
+
+  final dbg = StringBuffer('pieces=${pieces.length}\n');
+  for (final pc in pieces) {
+    final r = ocrPiece(pc);
+    final pr = parseReceipt(r.texts[0]);
+    dbg.writeln('--- receipt ---\n${r.texts[0]}>> cards=${pr.bvals} sum=${pr.bsum} '
+        'grand=${pr.grand} => ${r.val} ok=${r.ok}');
+    allTexts.addAll(r.texts);
+    if (r.val <= 0) {
+      allOk = false;
+      continue;
+    }
+    final b = batchNo(r.texts);
+    final key = '$b|${r.val}';
+    if (b != null && seen.contains(key)) continue; // نفس الباتش اتصور مرتين
+    seen.add(key);
+    batches.add(r.val);
+    txns.add(batchTxnOf(r.texts));
+    allOk = allOk && r.ok;
+  }
+  var total = round2(batches.fold(0.0, (a, b) => a + b));
+  var ok = allOk && batches.isNotEmpty;
+
+  // شبكة أمان: لو التقسيم مش مؤكد جرّب الصورة كلها
+  if (multi && !ok) {
+    final r = ocrPiece(all);
+    allTexts.addAll(r.texts);
+    if (r.val > 0 && (r.ok || batches.isEmpty)) {
+      total = r.val;
+      ok = r.ok;
+      batches
+        ..clear()
+        ..add(r.val);
+      txns
+        ..clear()
+        ..add(batchTxnOf(r.texts));
+    }
+  }
+
+  final date = findDateIn(allTexts);
+  var tid = findTerminalIn(allTexts);
+  var how = 'terminal';
+  int? row;
+  String? name;
+  if (tid == null) {
+    final u0 = findUnitExtraIn(allTexts);
+    tid = findTerminalFuzzyIn(allTexts, u0);
+    how = 'fuzzy';
+    if (tid == null) {
+      tid = discoverTerminal(allTexts); // ماكينة جديدة لوحدة معروفة
+      if (tid != null) how = 'new-terminal';
+    }
+  }
+  if (tid != null) {
+    tid = tidAlias[tid] ?? tid;
+    final info = terminals[tid]!;
+    row = info.excelRow;
+    name = info.unitName;
+  } else {
+    how = 'none';
+    final u = findUnitExtraIn(allTexts);
+    if (u != null) {
+      row = u;
+      name = rowNames[u];
+      how = 'name/merchant';
+    }
+  }
+  final result = Analysis(tid, how, row, name, total, ok, batches, date);
+  result.debug = dbg.toString();
+  result.cands = candidateAmounts(allTexts);
+  result.txn = (txns.isNotEmpty && txns.every((e) => e != null)) ? txns.fold<int>(0, (a, e) => a + e!) : null;
+  return result;
+}
+
+double round2(double val) => double.parse(val.toStringAsFixed(2));
+
+// دمج القراءة التانية (الصورة المحسّنة) في القراءة الأولى.
+// بترجع قيمة المبلغ التانية لو متعارضة مع الأولى (علشان تتراجع)، وإلا null.
+double? mergeSecondRead(Analysis a, Analysis b) {
+  a.cands = mergeCands(a.cands, b.cands);
+  if (a.tid == null && b.tid != null) {
+    a.tid = b.tid;
+    a.row = b.row;
+    a.unitName = b.unitName;
+    a.how = b.how;
+  } else if (a.row == null && b.row != null) {
+    a.row = b.row;
+    a.unitName = b.unitName;
+    a.how = b.how;
+  }
+  a.date ??= b.date;
+  a.txn ??= b.txn;
+  if (b.val <= 0) return null;
+  // قراءة مقطوعة (مثل 49.95 بدل 49995.99): فرق أكبر من 5 أضعاف = مش قراءة حقيقية
+  if (a.val > 0 && (b.val < a.val / 5 || b.val > a.val * 5)) return null;
+  if (a.val <= 0) {
+    a.val = b.val;
+    a.ok = b.ok;
+    a.batches = [...b.batches];
+    a.txn = b.txn ?? a.txn;
+    return null;
+  }
+  if ((a.val - b.val).abs() < 0.005) return null; // القراءتين متطابقتين
+  if (!a.ok && b.ok) {
+    // الأولى مش مؤكدة والتانية مؤكدة بمجموع الكروت -> نعتمد التانية
+    a.val = b.val;
+    a.ok = true;
+    a.batches = [...b.batches];
+    a.txn = b.txn ?? a.txn;
+    return null;
+  }
+  if (a.ok && !b.ok) return null; // الأولى مؤكدة، نتجاهل التانية
+  a.ok = false; // قراءتين مختلفتين: لازم مراجعة
+  return b.val;
+}
+
+// بيحوّل صفحات ملف PDF لصور PNG (بيستخدم في حالة مفيش صور)
+Future<List<File>> extractPdfPages(File pdf) async {
+  final out = <File>[];
   try {
-    return !((await SharedPreferences.getInstance()).getBool('det_off') ?? false);
+    final bytes = await pdf.readAsBytes();
+    final dir = Directory('$tmpDir/pdf')..createSync(recursive: true);
+    var i = 0;
+    await for (final page in Printing.raster(bytes, dpi: 220)) {
+      i++;
+      final png = await page.toPng();
+      final f = File('${dir.path}/pdf${bytes.length}_p$i.png');
+      await f.writeAsBytes(png);
+      out.add(f);
+    }
+  } catch (_) {}
+  return out;
+}
+
+// ───────────────────── مسارات المجلدات ─────────────────────
+const String root = '/storage/emulated/0';
+final String baseDir = '$root/all';
+final String rawImagesDir = '$baseDir/raw_images';
+String outputDir = '$baseDir/output'; // ممكن المستخدم يغيّره من الشاشة
+final String defaultOutputDir = '$baseDir/output';
+final String tmpDir = '$baseDir/.tmp';
+// مجلد مؤقت خاص بإيصالات الدفع: تاب التقفيل بيمسح tmpDir في آخر فحصه وكان بيمسح ملفات العد وهي شغالة
+final String mTmpDir = '$baseDir/.tmp_m';
+void _ensureMTmp() {
+  try {
+    Directory(mTmpDir).createSync(recursive: true);
+  } catch (_) {}
+}
+final String cfgPath = '$baseDir/.app_cfg.json';
+
+String baseName(String path) => path.split('/').last;
+
+List<Directory> _subDirs(String path) {
+  try {
+    final dir = Directory(path);
+    if (!dir.existsSync()) return [];
+    return dir.listSync().whereType<Directory>().toList();
   } catch (_) {
-    return true;
+    return [];
   }
 }
 
-/// نسخة مصغّرة (حوالي 720px) من الصورة للكشف بس: الإحداثيات نسب فمفيش فرق، والذاكرة أقل بكتير.
-Future<File?> _smallCopy(String path) async {
-  final b = await FlutterImageCompress.compressWithFile(path,
-      minWidth: 720, minHeight: 720, quality: 80, format: CompressFormat.jpeg, keepExif: false);
-  if (b == null) return null;
-  final d = await getTemporaryDirectory();
-  final f = File('${d.path}/det_${DateTime.now().microsecondsSinceEpoch}.jpg');
-  await f.writeAsBytes(b, flush: true);
-  return f;
+List<Directory> findWhatsAppImageDirs() {
+  final out = <Directory>[];
+
+  void checkAndAdd(String p) {
+    final d = Directory(p);
+    if (d.existsSync() && !out.any((x) => x.path == d.path)) {
+      out.add(d);
+    }
+  }
+
+  checkAndAdd('$root/Android/media/com.whatsapp/WhatsApp/accounts/1003/Media/WhatsApp Images');
+  checkAndAdd('$root/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images');
+  checkAndAdd('$root/WhatsApp/Media/WhatsApp Images');
+
+  final mediaDir = Directory('$root/Android/media');
+  if (mediaDir.existsSync()) {
+    for (final pkg in _subDirs(mediaDir.path)) {
+      if (baseName(pkg.path).toLowerCase().contains('whatsapp')) {
+        checkAndAdd('${pkg.path}/Media/WhatsApp Images');
+        checkAndAdd('${pkg.path}/WhatsApp/Media/WhatsApp Images');
+        for (final acc in _subDirs('${pkg.path}/WhatsApp/accounts')) {
+          checkAndAdd('${acc.path}/Media/WhatsApp Images');
+        }
+        for (final acc in _subDirs('${pkg.path}/accounts')) {
+          checkAndAdd('${acc.path}/Media/WhatsApp Images');
+        }
+      }
+    }
+  }
+
+  for (final d in _subDirs(root)) {
+    if (baseName(d.path).toLowerCase().startsWith('whatsapp')) {
+      checkAndAdd('${d.path}/Media/WhatsApp Images');
+    }
+  }
+
+  return out;
 }
 
-/// كشف تقريبي بسيط: الورقة أفتح وأقل تشبعاً بالألوان من الخلفية (خشب/مكتب).
-Future<List<Offset>?> _detectDocQuadSimple(String path) async {
+DateTime fileDate(File f) {
+  final m = RegExp(r'-(\d{8})-').firstMatch(baseName(f.path));
+  if (m != null) {
+    final s = m.group(1)!;
+    final d = DateTime.tryParse(
+        '${s.substring(0, 4)}-${s.substring(4, 6)}-${s.substring(6, 8)}');
+    if (d != null) return d;
+  }
+  return f.lastModifiedSync();
+}
+
+Map<String, dynamic> _readCfg() {
   try {
-    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 160);
-    final w = img.width, h = img.height;
-    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-    img.dispose();
-    if (bd == null || w < 8 || h < 8) return null;
-    final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
-    final n = w * h;
-    final feat = Uint8List(n);
-    for (var i = 0; i < n; i++) {
-      final int r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
-      final int y = (r * 54 + g * 183 + b * 19) >> 8;
-      final int hi = r > g ? (r > b ? r : b) : (g > b ? g : b);
-      final int lo = r < g ? (r < b ? r : b) : (g < b ? g : b);
-      final int v = y - 2 * (hi - lo); // الخشب ملوّن فبيبقى أغمق، والورقة رمادية فبتفضل فاتحة
-      feat[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
+    return Map<String, dynamic>.from(jsonDecode(File(cfgPath).readAsStringSync()) as Map);
+  } catch (_) {
+    return <String, dynamic>{};
+  }
+}
+
+void _writeCfg(Map<String, dynamic> m) {
+  try {
+    File(cfgPath)
+      ..createSync(recursive: true)
+      ..writeAsStringSync(jsonEncode(m));
+  } catch (_) {}
+}
+
+String? loadFolder() => _readCfg()['folder'] as String?;
+
+void saveFolder(String? f) {
+  final m = _readCfg();
+  m['folder'] = f;
+  _writeCfg(m);
+}
+
+String? loadOutDir() => _readCfg()['out'] as String?;
+
+void saveOutDir(String? f) {
+  final m = _readCfg();
+  m['out'] = f;
+  _writeCfg(m);
+}
+
+// ───────────────── معالجة الصور (تدوير / تحسين) - بتشتغل في Isolate ─────────────────
+// بتصلّح اتجاه الـ EXIF وبتدوّر الصورة لو deg != 0. بترجع true لو كتبت ملف جديد.
+bool _fixImage(String src, String dst, int deg) {
+  final bytes = File(src).readAsBytesSync();
+  // تسريع: لو مفيش تدوير مطلوب والـ EXIF طبيعي، بننسخ الملف من غير ما نفك الصورة كلها (أسرع بكتير)
+  if (deg == 0) {
+    try {
+      final ex = img.decodeJpgExif(bytes);
+      final o = ex?.imageIfd.orientation ?? 1;
+      if (o == 1) {
+        if (src != dst) File(src).copySync(dst);
+        return false;
+      }
+    } catch (_) {}
+  }
+  var im = img.decodeImage(bytes);
+  if (im == null) {
+    if (src != dst) File(src).copySync(dst);
+    return false;
+  }
+  var ori = 1;
+  try {
+    ori = im.exif.imageIfd.orientation ?? 1;
+  } catch (_) {}
+  if (deg == 0 && ori == 1) {
+    if (src != dst) File(src).copySync(dst);
+    return false;
+  }
+  im = img.bakeOrientation(im);
+  if (deg != 0) im = img.copyRotate(im, angle: deg);
+  File(dst).writeAsBytesSync(img.encodeJpg(im, quality: 92));
+  return true;
+}
+
+// نسخة محسّنة للقراءة التانية: رمادي + كونتراست + تكبير/تصغير لمقاس مناسب للـ OCR
+void _enhanceImage(String src, String dst) {
+  var im = img.decodeImage(File(src).readAsBytesSync());
+  if (im == null) throw Exception('decode failed');
+  im = img.bakeOrientation(im);
+  im = img.grayscale(im);
+  im = img.adjustColor(im, contrast: 1.6);
+  if (im.width < 1800) {
+    im = img.copyResize(im,
+        width: (im.width * 1.6).round(), interpolation: img.Interpolation.cubic);
+  } else if (im.width > 2600) {
+    im = img.copyResize(im, width: 2200, interpolation: img.Interpolation.linear);
+  }
+  File(dst).writeAsBytesSync(img.encodeJpg(im, quality: 95));
+}
+
+// ───────── إزالة الخط الأحمر: الحبر الأحمر ساطع في القناة الحمرا (بيبان أبيض) والكتابة السودا غامقة فيها،
+// فبنستخدم القناة الحمرا لوحدها كصورة رمادي. كده الخط بيختفي والكتابة تفضل ─────────
+void _redRemove(String src, String dst) {
+  final im = img.decodeImage(File(src).readAsBytesSync());
+  if (im == null) throw Exception('decode');
+  final out = img.Image(width: im.width, height: im.height);
+  for (var y = 0; y < im.height; y++) {
+    for (var x = 0; x < im.width; x++) {
+      final px = im.getPixel(x, y);
+      final r = px.r.toInt();
+      final g = px.g.toInt();
+      final b = px.b.toInt();
+      // لو البكسل مش أحمر (أخضر/أزرق قريبين من الأحمر) نخليه رمادي عادي، غير كده نستخدم الأحمر
+      final v = (r - g > 40 && r - b > 40) ? 255 : ((r + g + b) ~/ 3);
+      out.setPixelRgb(x, y, v, v, v);
     }
-    return _quadFromFeature(feat, w, h);
-  } catch (e, st) {
-    AppLog.e('_detectDocQuadSimple', e, st);
+  }
+  File(dst).writeAsBytesSync(img.encodeJpg(out, quality: 92));
+}
+
+// ───────── عدّ المستطيلات البيضا (الإيصالات) من شكل الصورة من غير OCR ─────────
+// بيرجّع null لو الخلفية بيضا (الإيصالات مش بتتميز) أو الصورة مش مناسبة، فمش بيصوّت وقتها
+int? _rectCountPage(String src) {
+  try {
+    var im = img.decodeImage(File(src).readAsBytesSync());
+    if (im == null) return null;
+    im = img.copyResize(im, width: 700, interpolation: img.Interpolation.average);
+    final W = im.width, H = im.height;
+    final mask = List<Uint8List>.generate(H, (_) => Uint8List(W));
+    var on = 0;
+    for (var y = 0; y < H; y++) {
+      for (var x = 0; x < W; x++) {
+        final px = im.getPixel(x, y);
+        final r = px.r.toInt(), g = px.g.toInt(), b = px.b.toInt();
+        final mx = math.max(r, math.max(g, b)), mn = math.min(r, math.min(g, b));
+        if ((r + g + b) / 3 > 165 && mx - mn < 45) {
+          mask[y][x] = 1;
+          on++;
+        }
+      }
+    }
+    final cov = on / (W * H);
+    if (cov > 0.82 || cov < 0.15) return null;
+    // الأعمدة
+    final colF = List<double>.filled(W, 0);
+    for (var x = 0; x < W; x++) {
+      var c = 0;
+      for (var y = 0; y < H; y++) {
+        c += mask[y][x];
+      }
+      colF[x] = c / H;
+    }
+    final bands = <List<int>>[];
+    var st = -1;
+    for (var x = 0; x <= W; x++) {
+      final hi = x < W && colF[x] > 0.35;
+      if (hi && st < 0) st = x;
+      if (!hi && st >= 0) {
+        if (bands.isNotEmpty && st - bands.last[1] < W * 0.015) {
+          bands.last[1] = x;
+        } else {
+          bands.add([st, x]);
+        }
+        st = -1;
+      }
+    }
+    final cols = bands.where((b) => b[1] - b[0] > W * 0.08).toList();
+    if (cols.isEmpty || cols.length > 8) return null;
+    var total = 0;
+    for (final c in cols) {
+      final w0 = c[1] - c[0];
+      var runStart = -1, gap = 0;
+      for (var y = 0; y <= H; y++) {
+        var f = 0.0;
+        if (y < H) {
+          var s2 = 0;
+          for (var x = c[0]; x < c[1]; x++) {
+            s2 += mask[y][x];
+          }
+          f = s2 / w0;
+        }
+        final hi = y < H && f > 0.5;
+        if (hi) {
+          if (runStart < 0) runStart = y;
+          gap = 0;
+        } else if (runStart >= 0) {
+          gap++;
+          if (gap >= 4 || y >= H) {
+            final end = y - gap;
+            if (end - runStart > H * 0.12) total++;
+            runStart = -1;
+            gap = 0;
+          }
+        }
+      }
+    }
+    return total;
+  } catch (_) {
     return null;
   }
 }
 
-/// الجزء المشترك بين كشف الصورة المصوّرة والكشف الحي من الكاميرا.
-/// feat: قيمة 0..255 لكل بكسل (الورقة غالباً أعلى من الخلفية). بيرجّع TL,TR,BR,BL كنسب.
-List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
-  final n = w * h;
-  final hist = List<int>.filled(256, 0);
-  for (var i = 0; i < n; i++) {
-    hist[feat[i]]++;
+Future<bool> fixImageAsync(String src, String dst, int deg) =>
+    Isolate.run(() => _fixImage(src, dst, deg));
+
+Future<void> redRemoveAsync(String src, String dst) => Isolate.run(() => _redRemove(src, dst));
+Future<int?> rectCountAsync(String src) => Isolate.run(() => _rectCountPage(src));
+
+Future<void> enhanceImageAsync(String src, String dst) =>
+    Isolate.run(() => _enhanceImage(src, dst));
+
+// ───────────────── سكانر الباتش: قص الإيصال من الصورة + تعديل المنظور + تحسين (زي كام سكانر) ─────────────────
+// الفكرة: الورقة البيضا (الباتش) أفتح من الخلفية (ترابيزة/إيد/أرضية). بنفصل الورقة بحدّ Otsu،
+// بنطلّع أكبر مكوّن، بنفرد منظوره (4 أركان)، وبعدين بنشيل الظلال ونبيّض الورقة ونغمّق الكتابة.
+int _otsu(List<int> hist, int total) {
+  var sumAll = 0;
+  for (var i = 0; i < 256; i++) {
+    sumAll += i * hist[i];
   }
-  // Otsu
-  var sum = 0.0;
+  var wb = 0, sb = 0, th = 128;
+  var best = -1.0;
   for (var t = 0; t < 256; t++) {
-    sum += t * hist[t];
-  }
-  var sumB = 0.0, wB = 0.0, bestV = -1.0;
-  var thr = 128;
-  for (var t = 0; t < 256; t++) {
-    wB += hist[t];
-    if (wB == 0) continue;
-    final wF = n - wB;
-    if (wF == 0) break;
-    sumB += t * hist[t];
-    final mB = sumB / wB, mF = (sum - sumB) / wF;
-    final v = wB * wF * (mB - mF) * (mB - mF);
-    if (v > bestV) {
-      bestV = v;
-      thr = t;
+    wb += hist[t];
+    if (wb == 0) continue;
+    final wf = total - wb;
+    if (wf == 0) break;
+    sb += t * hist[t];
+    final mb = sb / wb;
+    final mf = (sumAll - sb) / wf;
+    final v = wb.toDouble() * wf * (mb - mf) * (mb - mf);
+    if (v > best) {
+      best = v;
+      th = t;
     }
   }
-  List<bool> maskOf(bool bright) =>
-      List<bool>.generate(n, (i) => bright ? feat[i] > thr : feat[i] <= thr);
-  bool onBorder(int i) {
-    final x = i % w, y = i ~/ w;
-    return x <= 2 || y <= 2 || x >= w - 3 || y >= h - 3;
-  }
+  return th;
+}
 
-  double borderFrac(List<bool> m) {
-    var c = 0, t = 0;
+List<double> _trimRange(List<double> v, double f) {
+  final s = List<double>.from(v)..sort();
+  final k = (s.length * f).floor();
+  return [s[k], s[s.length - 1 - k]];
+}
+
+int _ci(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
+double _cd(double v, double lo, double hi) => v < lo ? lo : (v > hi ? hi : v);
+
+// خط مستقيم q = m*p + k بأقل مربعات مع استبعاد النقط الشاردة. null لو النقط قليلة.
+List<double>? _fitLine(List<double?> qs, List<double> ps, int skip) {
+  var pp = <double>[];
+  var qq = <double>[];
+  for (var b = skip; b < qs.length - skip; b++) {
+    final q = qs[b];
+    if (q != null) {
+      pp.add(ps[b]);
+      qq.add(q);
+    }
+  }
+  if (pp.length < 4) return null;
+  var m = 0.0, k = 0.0;
+  for (var iter = 0; iter < 2; iter++) {
+    final n = pp.length;
+    var sp = 0.0, sq = 0.0, spp = 0.0, spq = 0.0;
     for (var i = 0; i < n; i++) {
-      if (!onBorder(i)) continue;
-      t++;
-      if (m[i]) c++;
+      sp += pp[i];
+      sq += qq[i];
+      spp += pp[i] * pp[i];
+      spq += pp[i] * qq[i];
     }
-    return t == 0 ? 1 : c / t;
+    final d = n * spp - sp * sp;
+    if (d.abs() < 1e-9) {
+      m = 0.0;
+      k = sq / n;
+      break;
+    }
+    m = (n * spq - sp * sq) / d;
+    k = (sq - m * sp) / n;
+    final res = <double>[for (var i = 0; i < n; i++) (qq[i] - (m * pp[i] + k)).abs()]..sort();
+    final lim = math.max(1.5, 2.5 * res[res.length ~/ 2]);
+    final np = <double>[];
+    final nq = <double>[];
+    for (var i = 0; i < n; i++) {
+      if ((qq[i] - (m * pp[i] + k)).abs() <= lim) {
+        np.add(pp[i]);
+        nq.add(qq[i]);
+      }
+    }
+    if (np.length < 4) break;
+    pp = np;
+    qq = nq;
   }
+  return [m, k];
+}
 
-  var mask = maskOf(true);
-  final inv = maskOf(false);
-  // الورقة هي اللي ما بتلزقش في حدود الصورة
-  if (borderFrac(inv) < borderFrac(mask)) mask = inv;
-  // قفل الثقوب الصغيرة (الكتابة) ثم تآكل بسيط لتنضيف النقط الصغيرة
-  final dil = List<bool>.filled(n, false);
-  for (var y = 1; y < h - 1; y++) {
-    for (var x = 1; x < w - 1; x++) {
-      final i = y * w + x;
-      dil[i] = mask[i] || mask[i - 1] || mask[i + 1] || mask[i - w] || mask[i + w];
+// أركان الورقة [tlx,tly,trx,try,blx,bly,brx,bry] بإحداثيات الصورة الصغيرة
+List<double>? _quadOfComponent(List<int> pts, Int32List lab, int cid, int sw, int sh) {
+  final bx = <double>[];
+  final by = <double>[];
+  for (final idx in pts) {
+    final x = idx % sw, y = idx ~/ sw;
+    var edge = false;
+    if (x == 0 || x == sw - 1 || y == 0 || y == sh - 1) {
+      edge = true;
+    } else if (lab[idx - 1] != cid ||
+        lab[idx + 1] != cid ||
+        lab[idx - sw] != cid ||
+        lab[idx + sw] != cid) {
+      edge = true;
+    }
+    if (edge) {
+      bx.add(x.toDouble());
+      by.add(y.toDouble());
     }
   }
-  final er = List<bool>.filled(n, false);
-  for (var y = 2; y < h - 2; y++) {
-    for (var x = 2; x < w - 2; x++) {
-      final i = y * w + x;
-      er[i] = dil[i] && dil[i - 1] && dil[i + 1] && dil[i - w] && dil[i + w] && mask[i];
+  if (bx.length < 20) return null;
+
+  // أصغر مستطيل مايل يحيط بالورقة
+  var bestArea = double.infinity;
+  var bestDeg = 0;
+  for (var deg = 0; deg < 90; deg += 2) {
+    final t = deg * math.pi / 180;
+    final c = math.cos(t), s = math.sin(t);
+    final us = <double>[];
+    final vs = <double>[];
+    for (var i = 0; i < bx.length; i++) {
+      us.add(bx[i] * c + by[i] * s);
+      vs.add(-bx[i] * s + by[i] * c);
+    }
+    final ur = _trimRange(us, 0.006);
+    final vr = _trimRange(vs, 0.006);
+    final area = (ur[1] - ur[0]) * (vr[1] - vr[0]);
+    if (area < bestArea) {
+      bestArea = area;
+      bestDeg = deg;
     }
   }
-  // أكبر مكوّن متصل
-  final seen = List<bool>.filled(n, false);
-  final queue = List<int>.filled(n, 0);
-  var bestSize = 0;
-  List<int>? best;
-  for (var s0 = 0; s0 < n; s0++) {
-    if (!er[s0] || seen[s0]) continue;
-    var head = 0, tail = 0;
-    queue[tail++] = s0;
-    seen[s0] = true;
-    var tl = s0, tr = s0, br = s0, bl = s0;
-    while (head < tail) {
-      final i = queue[head++];
-      final x = i % w, y = i ~/ w;
-      if (x + y < tl % w + tl ~/ w) tl = i;
-      if (x + y > br % w + br ~/ w) br = i;
-      if (x - y > tr % w - tr ~/ w) tr = i;
-      if (x - y < bl % w - bl ~/ w) bl = i;
-      if (x > 0 && er[i - 1] && !seen[i - 1]) {
-        seen[i - 1] = true;
-        queue[tail++] = i - 1;
-      }
-      if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
-        seen[i + 1] = true;
-        queue[tail++] = i + 1;
-      }
-      if (y > 0 && er[i - w] && !seen[i - w]) {
-        seen[i - w] = true;
-        queue[tail++] = i - w;
-      }
-      if (y < h - 1 && er[i + w] && !seen[i + w]) {
-        seen[i + w] = true;
-        queue[tail++] = i + w;
-      }
-    }
-    if (tail > bestSize) {
-      bestSize = tail;
-      best = [tl, tr, br, bl];
-    }
-  }
-  if (best == null || bestSize < n * 0.08) return null;
-  Offset pt(int i, double ex, double ey) => Offset(
-        (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
-        (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
-      );
-  final q = [
-    pt(best[0], -1.5, -1.5),
-    pt(best[1], 1.5, -1.5),
-    pt(best[2], 1.5, 1.5),
-    pt(best[3], -1.5, 1.5),
+  final t0 = bestDeg * math.pi / 180;
+  final eu = <double>[math.cos(t0), math.sin(t0)];
+  final ev = <double>[-math.sin(t0), math.cos(t0)];
+  final cands = <List<double>>[
+    eu,
+    <double>[-eu[0], -eu[1]],
+    ev,
+    <double>[-ev[0], -ev[1]],
   ];
-  return _quadConvex(q) ? q : null;
-}
-
-/// كشف حي من إطار الكاميرا (YUV420): بيلف الإطار لوضع رأسي ويصغّره لشبكة صغيرة.
-List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
-  if (f.planes.length < 3) return null;
-  final W = f.width, H = f.height;
-  final swap = rot == 90 || rot == 270;
-  final upW = swap ? H : W, upH = swap ? W : H;
-  const gw = 96;
-  final gh = math.max(8, (gw * upH / upW).round());
-  final yp = f.planes[0], up = f.planes[1], vp = f.planes[2];
-  final ub = up.bytesPerPixel ?? 1, vb = vp.bytesPerPixel ?? 1;
-  final feat = Uint8List(gw * gh);
-  for (var gy = 0; gy < gh; gy++) {
-    final int yu = math.min(upH - 1, math.max(0, ((gy + 0.5) * upH / gh).floor()));
-    for (var gx = 0; gx < gw; gx++) {
-      final int xu = math.min(upW - 1, math.max(0, ((gx + 0.5) * upW / gw).floor()));
-      int sx, sy;
-      switch (rot) {
-        case 90:
-          sx = yu;
-          sy = H - 1 - xu;
-          break;
-        case 270:
-          sx = W - 1 - yu;
-          sy = xu;
-          break;
-        case 180:
-          sx = W - 1 - xu;
-          sy = H - 1 - yu;
-          break;
-        default:
-          sx = xu;
-          sy = yu;
-      }
-      final y = yp.bytes[sy * yp.bytesPerRow + sx];
-      final cx = sx >> 1, cy = sy >> 1;
-      final ci = cy * up.bytesPerRow + cx * ub;
-      final vi = cy * vp.bytesPerRow + cx * vb;
-      var chroma = 0;
-      if (ci < up.bytes.length && vi < vp.bytes.length) {
-        chroma = (up.bytes[ci] - 128).abs() + (vp.bytes[vi] - 128).abs();
-      }
-      final int v = y - (chroma * 1.5).round();
-      feat[gy * gw + gx] = v < 0 ? 0 : (v > 255 ? 255 : v);
+  var ex = cands[0], ey = cands[0];
+  for (final c in cands) {
+    if (c[0] > ex[0]) ex = c;
+    if (c[1] > ey[1]) ey = c;
+  }
+  final ax = <double>[];
+  final ay = <double>[];
+  for (var i = 0; i < bx.length; i++) {
+    ax.add(bx[i] * ex[0] + by[i] * ex[1]);
+    ay.add(bx[i] * ey[0] + by[i] * ey[1]);
+  }
+  final xr = _trimRange(ax, 0.006);
+  final yr = _trimRange(ay, 0.006);
+  final vertical = (yr[1] - yr[0]) >= (xr[1] - xr[0]);
+  final lp = vertical ? ay : ax; // على طول الورقة
+  final lq = vertical ? ax : ay; // عرض الورقة
+  final l0 = vertical ? yr[0] : xr[0];
+  final l1 = vertical ? yr[1] : xr[1];
+  if (l1 - l0 < 4) return null;
+  const nbins = 24;
+  final lo = List<double?>.filled(nbins, null);
+  final loP = List<double>.filled(nbins, 0.0);
+  final hi = List<double?>.filled(nbins, null);
+  final hiP = List<double>.filled(nbins, 0.0);
+  for (var i = 0; i < lp.length; i++) {
+    final p = lp[i], q = lq[i];
+    if (p < l0 || p > l1) continue;
+    final b = math.min(nbins - 1, ((p - l0) / (l1 - l0) * nbins).floor());
+    final cl = lo[b];
+    if (cl == null || q < cl) {
+      lo[b] = q;
+      loP[b] = p;
+    }
+    final ch = hi[b];
+    if (ch == null || q > ch) {
+      hi[b] = q;
+      hiP[b] = p;
     }
   }
-  final q = _quadFromFeature(feat, gw, gh);
-  if (q == null || _quadArea(q) > 0.97) return null;
-  return _shapeQuad(q, gh / gw);
+  final lowFit = _fitLine(lo, loP, 2) ?? <double>[0.0, vertical ? xr[0] : yr[0]];
+  final highFit = _fitLine(hi, hiP, 2) ?? <double>[0.0, vertical ? xr[1] : yr[1]];
+  double qLow(double p) => lowFit[0] * p + lowFit[1];
+  double qHigh(double p) => highFit[0] * p + highFit[1];
+  List<double> toImg(double a, double b) =>
+      <double>[a * ex[0] + b * ey[0], a * ex[1] + b * ey[1]];
+  final List<double> tl, tr, bl, br;
+  if (vertical) {
+    tl = toImg(qLow(l0), l0);
+    tr = toImg(qHigh(l0), l0);
+    bl = toImg(qLow(l1), l1);
+    br = toImg(qHigh(l1), l1);
+  } else {
+    tl = toImg(l0, qLow(l0));
+    bl = toImg(l0, qHigh(l0));
+    tr = toImg(l1, qLow(l1));
+    br = toImg(l1, qHigh(l1));
+  }
+  return <double>[tl[0], tl[1], tr[0], tr[1], bl[0], bl[1], br[0], br[1]];
 }
 
-class _LiveQuadPainter extends CustomPainter {
-  final List<Offset> q;
-  const _LiveQuadPainter(this.q);
-  @override
-  void paint(Canvas canvas, Size size) {
-    final pts = [for (final o in q) Offset(o.dx * size.width, o.dy * size.height)];
-    final path = Path()..addPolygon(pts, true);
-    final col = kAccent;
-    canvas.drawPath(path, Paint()..color = col.withValues(alpha: 0.18));
-    canvas.drawPath(
-        path,
-        Paint()
-          ..color = col
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 3
-          ..strokeJoin = StrokeJoin.round);
-    for (final p in pts) {
-      canvas.drawCircle(p, 6, Paint()..color = Colors.white);
-      canvas.drawCircle(
-          p,
-          6,
-          Paint()
-            ..color = col
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 2);
+double _quadArea(List<double> q) {
+  // tl, tr, br, bl
+  final xs = [q[0], q[2], q[6], q[4]];
+  final ys = [q[1], q[3], q[7], q[5]];
+  var s = 0.0;
+  for (var i = 0; i < 4; i++) {
+    final j = (i + 1) % 4;
+    s += xs[i] * ys[j] - xs[j] * ys[i];
+  }
+  return s.abs() / 2;
+}
+
+double _dist(double x1, double y1, double x2, double y2) =>
+    math.sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+
+// بيرجّع أركان كل باتش في الصورة (بإحداثيات الصورة الأصلية). فاضي = مش عارف يلاقي ورقة.
+// mode 0: الكشف الأصلي (سطوع Otsu). mode 1: احتياطي بالتشبّع (الورقة رمادي/أبيض والترابيزة/الإيد ملوّنة).
+// mode 2: احتياطي لو الخلفية فاتحة: Otsu تاني على البكسلات الفاتحة بس (الورقة أفتح من الترابيزة الفاتحة).
+List<List<double>> _detectReceipts(img.Image im, {int mode = 0}) {
+  final w = im.width, h = im.height;
+  final s = 480.0 / math.max(w, h);
+  final sw = math.max(16, (w * s).round());
+  final sh = math.max(16, (h * s).round());
+  final small = img.copyResize(im, width: sw, height: sh, interpolation: img.Interpolation.linear);
+  final total = sw * sh;
+  final lum = Uint8List(total);
+  final hist = List<int>.filled(256, 0);
+  for (var y = 0; y < sh; y++) {
+    for (var x = 0; x < sw; x++) {
+      final p = small.getPixel(x, y);
+      final l = _ci(((p.r * 299 + p.g * 587 + p.b * 114) ~/ 1000).toInt(), 0, 255);
+      lum[y * sw + x] = l;
+      hist[l]++;
+    }
+  }
+  var th = _otsu(hist, total);
+  if (mode == 2) {
+    final h2 = List<int>.filled(256, 0);
+    var t2 = 0;
+    for (var i = 0; i < total; i++) {
+      if (lum[i] > th) {
+        h2[lum[i]]++;
+        t2++;
+      }
+    }
+    if (t2 < total * 0.05) return [];
+    final th2 = _otsu(h2, t2);
+    if (th2 - th < 12) return [];
+    th = th2;
+  } else if (mode == 1) {
+    final sat = Uint8List(total);
+    final sh2 = List<int>.filled(256, 0);
+    for (var y = 0; y < sh; y++) {
+      for (var x = 0; x < sw; x++) {
+        final p = small.getPixel(x, y);
+        final r = p.r.toInt(), g = p.g.toInt(), b = p.b.toInt();
+        final mx = math.max(r, math.max(g, b)), mn = math.min(r, math.min(g, b));
+        final sv = mx == 0 ? 0 : _ci(((mx - mn) * 255 / mx).round(), 0, 255);
+        sat[y * sw + x] = sv;
+        sh2[sv]++;
+      }
+    }
+    final ts = _otsu(sh2, total);
+    if (ts < 8) return []; // الصورة كلها رمادي تقريباً: التشبّع مش هيفرّق
+    final darkCut = (th * 0.6).round();
+    for (var i = 0; i < total; i++) {
+      lum[i] = (sat[i] <= ts && lum[i] > darkCut) ? 255 : 0;
+    }
+    th = 127;
+  }
+  final lab = Int32List(total);
+  final comps = <List<int>>[];
+  final stack = <int>[];
+  var cid = 0;
+  for (var i0 = 0; i0 < total; i0++) {
+    if (lum[i0] <= th || lab[i0] != 0) continue;
+    cid++;
+    final pts = <int>[];
+    lab[i0] = cid;
+    stack.add(i0);
+    while (stack.isNotEmpty) {
+      final i = stack.removeLast();
+      pts.add(i);
+      final x = i % sw, y = i ~/ sw;
+      if (x > 0 && lum[i - 1] > th && lab[i - 1] == 0) {
+        lab[i - 1] = cid;
+        stack.add(i - 1);
+      }
+      if (x < sw - 1 && lum[i + 1] > th && lab[i + 1] == 0) {
+        lab[i + 1] = cid;
+        stack.add(i + 1);
+      }
+      if (y > 0 && lum[i - sw] > th && lab[i - sw] == 0) {
+        lab[i - sw] = cid;
+        stack.add(i - sw);
+      }
+      if (y < sh - 1 && lum[i + sw] > th && lab[i + sw] == 0) {
+        lab[i + sw] = cid;
+        stack.add(i + sw);
+      }
+    }
+    comps.add(pts);
+  }
+  if (comps.isEmpty) return [];
+  final order = List<int>.generate(comps.length, (i) => i)
+    ..sort((a, b) => comps[b].length.compareTo(comps[a].length));
+  final mainSize = comps[order.first].length;
+  if (mainSize < total * 0.04) return [];
+  if (mainSize > total * 0.9) {
+    if (mode != 0) return [];
+    // الصورة كلها ورقة (سكرين/اسكانر جاهز): بس نحسّنها
+    return [
+      [0.0, 0.0, w.toDouble(), 0.0, 0.0, h.toDouble(), w.toDouble(), h.toDouble()]
+    ];
+  }
+  final out = <List<double>>[];
+  for (final oi in order) {
+    final pts = comps[oi];
+    if (out.length >= 4) break;
+    if (pts.length < mainSize * 0.3 || pts.length < total * 0.02) break;
+    final q = _quadOfComponent(pts, lab, oi + 1, sw, sh);
+    if (q == null) continue;
+    final area = _quadArea(q);
+    if (area <= 0 || pts.length / area < 0.45) continue;
+    out.add(<double>[for (final v in q) v / s]);
+  }
+  // لو في أكتر من باتش في الصورة: رتّبهم شمال ليمين (أو فوق لتحت لو فوق بعض)
+  out.sort((a, b) {
+    final acx = (a[0] + a[2] + a[4] + a[6]) / 4, bcx = (b[0] + b[2] + b[4] + b[6]) / 4;
+    final acy = (a[1] + a[3] + a[5] + a[7]) / 4, bcy = (b[1] + b[3] + b[5] + b[7]) / 4;
+    final aw = _dist(a[0], a[1], a[2], a[3]), bw = _dist(b[0], b[1], b[2], b[3]);
+    if ((acx - bcx).abs() > math.min(aw, bw) * 0.5) return acx.compareTo(bcx);
+    return acy.compareTo(bcy);
+  });
+  return out;
+}
+
+// بيفرد الورقة (تعديل منظور) ويحسّنها: يشيل الظلال، يبيّض الخلفية، يغمّق الكتابة
+img.Image? _warpAndEnhance(img.Image im, List<double> q) {
+  final wq = (_dist(q[0], q[1], q[2], q[3]) + _dist(q[4], q[5], q[6], q[7])) / 2;
+  final hq = (_dist(q[0], q[1], q[4], q[5]) + _dist(q[2], q[3], q[6], q[7])) / 2;
+  if (wq < 40 || hq < 40) return null;
+  final k = math.min(1.0, 2200.0 / math.max(wq, hq));
+  final wo = math.max(8, (wq * k).round());
+  final ho = math.max(8, (hq * k).round());
+
+  // قص المنطقة المحيطة بالورقة بس (أسرع كتير) وتصغيرها لو كبيرة
+  final xs = [q[0], q[2], q[4], q[6]];
+  final ys = [q[1], q[3], q[5], q[7]];
+  final cx0 = _ci(xs.reduce(math.min).floor() - 6, 0, im.width - 2);
+  final cy0 = _ci(ys.reduce(math.min).floor() - 6, 0, im.height - 2);
+  final cx1 = _ci(xs.reduce(math.max).ceil() + 6, cx0 + 2, im.width);
+  final cy1 = _ci(ys.reduce(math.max).ceil() + 6, cy0 + 2, im.height);
+  final cw = cx1 - cx0, ch = cy1 - cy0;
+  var crop = img.copyCrop(im, x: cx0, y: cy0, width: cw, height: ch);
+  if (k < 1.0) {
+    crop = img.copyResize(crop,
+        width: math.max(4, (cw * k).round()),
+        height: math.max(4, (ch * k).round()),
+        interpolation: img.Interpolation.linear);
+  }
+  final gw = crop.width, gh = crop.height;
+  final sx = gw / cw, sy = gh / ch;
+  final g = Uint8List(gw * gh);
+  for (var y = 0; y < gh; y++) {
+    for (var x = 0; x < gw; x++) {
+      final p = crop.getPixel(x, y);
+      g[y * gw + x] = _ci(((p.r * 299 + p.g * 587 + p.b * 114) ~/ 1000).toInt(), 0, 255);
+    }
+  }
+  final tlx = (q[0] - cx0) * sx, tly = (q[1] - cy0) * sy;
+  final trx = (q[2] - cx0) * sx, try0 = (q[3] - cy0) * sy;
+  final blx = (q[4] - cx0) * sx, bly = (q[5] - cy0) * sy;
+  final brx = (q[6] - cx0) * sx, bry = (q[7] - cy0) * sy;
+
+  // فرد المنظور (استيفاء ثنائي بين الأركان الأربعة)
+  const inset = 0.008;
+  final og = Uint8List(wo * ho);
+  for (var j = 0; j < ho; j++) {
+    final v = inset + (1 - 2 * inset) * (j / (ho - 1));
+    for (var i = 0; i < wo; i++) {
+      final u = inset + (1 - 2 * inset) * (i / (wo - 1));
+      final x = (1 - v) * ((1 - u) * tlx + u * trx) + v * ((1 - u) * blx + u * brx);
+      final y = (1 - v) * ((1 - u) * tly + u * try0) + v * ((1 - u) * bly + u * bry);
+      final x0 = _ci(x.floor(), 0, gw - 2);
+      final y0 = _ci(y.floor(), 0, gh - 2);
+      final fx = _cd(x - x0, 0.0, 1.0);
+      final fy = _cd(y - y0, 0.0, 1.0);
+      final a = g[y0 * gw + x0], b = g[y0 * gw + x0 + 1];
+      final c = g[(y0 + 1) * gw + x0], d = g[(y0 + 1) * gw + x0 + 1];
+      og[j * wo + i] =
+          ((a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy).round();
     }
   }
 
-  @override
-  bool shouldRepaint(covariant _LiveQuadPainter old) => old.q != q;
+  // تحسين: نقدّر لون الورقة (أعلى قيمة في كل مربع) ونقسم عليه = شيل الظلال وتبييض الخلفية
+  const bs = 12;
+  final hb = (ho + bs - 1) ~/ bs, wb = (wo + bs - 1) ~/ bs;
+  var bg = List<double>.filled(hb * wb, 0.0);
+  for (var by = 0; by < hb; by++) {
+    for (var bx = 0; bx < wb; bx++) {
+      var mx = 0;
+      final y1 = math.min(ho, (by + 1) * bs), x1 = math.min(wo, (bx + 1) * bs);
+      for (var y = by * bs; y < y1; y++) {
+        for (var x = bx * bs; x < x1; x++) {
+          final vv = og[y * wo + x];
+          if (vv > mx) mx = vv;
+        }
+      }
+      bg[by * wb + bx] = mx.toDouble();
+    }
+  }
+  for (var pass = 0; pass < 2; pass++) {
+    final nbg = List<double>.filled(hb * wb, 0.0);
+    for (var by = 0; by < hb; by++) {
+      for (var bx = 0; bx < wb; bx++) {
+        var sum = 0.0;
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            sum += bg[_ci(by + dy, 0, hb - 1) * wb + _ci(bx + dx, 0, wb - 1)];
+          }
+        }
+        nbg[by * wb + bx] = sum / 9;
+      }
+    }
+    bg = nbg;
+  }
+  final res = img.Image(width: wo, height: ho);
+  for (var y = 0; y < ho; y++) {
+    final gy = _cd((y + 0.5) / bs - 0.5, 0.0, (hb - 1).toDouble());
+    final by0 = gy.floor();
+    final by1 = math.min(hb - 1, by0 + 1);
+    final fy = gy - by0;
+    for (var x = 0; x < wo; x++) {
+      final gx = _cd((x + 0.5) / bs - 0.5, 0.0, (wb - 1).toDouble());
+      final bx0 = gx.floor();
+      final bx1 = math.min(wb - 1, bx0 + 1);
+      final fx = gx - bx0;
+      final top = bg[by0 * wb + bx0] * (1 - fx) + bg[by0 * wb + bx1] * fx;
+      final bot = bg[by1 * wb + bx0] * (1 - fx) + bg[by1 * wb + bx1] * fx;
+      final bgv = top * (1 - fy) + bot * fy;
+      final n = _cd(og[y * wo + x] / math.max(bgv, 40.0) * 255.0, 0.0, 255.0);
+      // منحنى أغمق للكتابة (gamma) علشان الأرقام تفضل تقيلة وواضحة
+      final o = math.pow(_cd((n - 30.0) / (240.0 - 30.0), 0.0, 1.0), 1.6).toDouble();
+      final c = (o * 255).round();
+      res.setPixelRgb(x, y, c, c, c);
+    }
+  }
+  return res;
 }
 
-/// بترجّع مسار الصورة الجديدة بعد التعديل، أو null لو الموظف رجع من غير تأكيد.
-/// التعديل دايماً بيبدأ من النسخة الأصلية، فتقدر تكبّر القص أو ترجّع الفلتر في أي وقت.
-const kRetake = '__retake__'; // EditorPage بترجّعه لما الموظف يدوس "إعادة أخذ"
-const kDelete = '__delete__'; // حذف الصفحة الحالية
-const kAllPrefix = '__all__'; // __all__|<EditParams json>|<path>: حفظ الصفحة الحالية وتطبيق الفلتر على كل الصفحات
-const kNavPrefix = '__nav__'; // __nav__|next|<path> أو __nav__|prev|<path>: انتقال لصفحة تانية بعد حفظ التعديل
-
-/// بيرسم صفحة بعد التعديل (قص + تدوير + فلتر) من نسختها الأصلية وبيرجّع مسار الصورة الجديدة.
-/// بيستخدمه المحرر (زر ✓) و"طبّق على كل الصفحات".
-Future<String> renderEditedPage(String path, String prefix, EditParams e) async {
-  final sp = await SharedPreferences.getInstance();
-  Store.working++;
+// لو فوق أو تحت الباتش في الصورة كارت/شريط مكتوب فيه الاسم والتاريخ (منفصل عن الورقة بفاصل غامق): نوسّع القص ليشمله
+// (بنقرا الصورة الأصلية بس، ومبنكتبش أي حاجة جوه الملف). لو مفيش شريط بيرجّع نفس القص.
+// بيرجّع المسافة (نسبة من طول الورقة) اللي لازم نوسّع بيها، أو 0 لو مفيش شريط.
+double _captionExtent(img.Image im, List<double> q, bool top) {
   try {
-    // علامة: لو التطبيق اتقفل جوه "تم"، في التشغيل الجاي بنشغّل وضع آمن بدقة أقل
-    await sp.setBool('apply_guard', true);
-    final baseF = File(Store.baseOf(path));
-    final src = await baseF.exists() ? baseF.path : path;
-    final turns = e.turns, angle = e.angle, filter = e.filter;
-    final contrast = e.contrast, brightness = e.brightness, sharp = e.sharp;
-    var levels = e.levels;
-    final quad = (e.quad != null && _quadConvex(e.quad!))
-        ? e.quad!
-        : const [Offset(0, 0), Offset(1, 0), Offset(1, 1), Offset(0, 1)];
-    AppLog.i('apply start turns=$turns angle=${angle.toStringAsFixed(1)} filter=${filter.name}');
-    if (filter == ScanFilter.auto && levels == null) {
-      levels = await autoLevelsOf(await File(src).readAsBytes());
+    final hq = (_dist(q[0], q[1], q[4], q[5]) + _dist(q[2], q[3], q[6], q[7])) / 2;
+    final wq = (_dist(q[0], q[1], q[2], q[3]) + _dist(q[4], q[5], q[6], q[7])) / 2;
+    if (hq < 150 || wq < 60) return 0;
+    // الحافة اللي بندوّر بعدها (e1,e2) والحافة المقابلة لها (o1,o2)
+    final e1x = top ? q[0] : q[4], e1y = top ? q[1] : q[5];
+    final e2x = top ? q[2] : q[6], e2y = top ? q[3] : q[7];
+    final o1x = top ? q[4] : q[0], o1y = top ? q[5] : q[1];
+    final o2x = top ? q[6] : q[2], o2y = top ? q[7] : q[3];
+    const maxExt = 0.35;
+    const steps = 140;
+    const cols = 31;
+    final prof = <double>[];
+    var hitEdge = false;
+    for (var k = 0; k <= steps; k++) {
+      final t = maxExt * k / steps;
+      var sum = 0.0;
+      var n = 0;
+      var out = false;
+      for (var i = 0; i < cols; i++) {
+        final u = 0.15 + 0.7 * i / (cols - 1);
+        final ex = e1x * (1 - u) + e2x * u, ey = e1y * (1 - u) + e2y * u;
+        final ox = o1x * (1 - u) + o2x * u, oy = o1y * (1 - u) + o2y * u;
+        final x = ex + (ex - ox) * t, y = ey + (ey - oy) * t;
+        if (x < 2 || y < 2 || x > im.width - 3 || y > im.height - 3) {
+          out = true;
+          break;
+        }
+        final p = im.getPixel(x.round(), y.round());
+        sum += (p.r * 299 + p.g * 587 + p.b * 114) / 1000;
+        n++;
+      }
+      if (out) {
+        hitEdge = true;
+        break;
+      }
+      prof.add(sum / n);
     }
-    final r = await _rotatedImage(src, turns);
-    final rw = r.width, rh = r.height;
-    AppLog.i('apply decoded ${rw}x$rh');
-    final bd = await r.toByteData(format: ui.ImageByteFormat.rawRgba);
-    r.dispose();
-    if (bd == null) throw Exception('تعذر قراءة الصورة');
-    final pts = [for (final q in quad) Offset(q.dx * rw, q.dy * rh)];
-    final topW = (pts[1] - pts[0]).distance, botW = (pts[2] - pts[3]).distance;
-    final leftH = (pts[3] - pts[0]).distance, rightH = (pts[2] - pts[1]).distance;
-    var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
-    final mode = await Store.perfMode();
-    final safe = sp.getBool('apply_safe') ?? false;
-    final maxSide = safe ? math.min(900, getMaxSide(mode)) : getMaxSide(mode);
-    final k = math.min(1.0, maxSide / math.max(ow, oh));
-    ow *= k;
-    oh *= k;
-    final w = math.max(8, ow.round()), h = math.max(8, oh.round());
-    AppLog.i('apply warp ${w}x$h safe=$safe');
-    var rgba = await compute(_warpJob, <String, dynamic>{
-      'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
-      'sw': rw,
-      'sh': rh,
-      'ow': w,
-      'oh': h,
-      'theta': angle * math.pi / 180,
-      'h': _homography(pts),
-      // فلاتر الإيصال: التباين والسطوع بيتطبقوا بعد التنضيف (زي المعاينة بالظبط)
-      'm': isCleanFilter(filter)
-          ? editMatrix(ScanFilter.original, 0, 0)
-          : editMatrix(filter, contrast, brightness, levels),
-    });
-    AppLog.i('apply warp done');
-    if (isCleanFilter(filter)) {
-      rgba = await compute(_cleanJob, <String, dynamic>{
-        'src': rgba,
-        'w': w,
-        'h': h,
-        'gray': false,
-        'th': usesThermalClean(filter),
-      });
-      AppLog.i('apply clean done');
-      if (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw) {
-        rgba = await compute(_matrixJob, <String, dynamic>{
-          'src': rgba,
-          'm': editMatrix(filter, contrast, brightness),
-        });
+    if (prof.length < 10) return 0;
+    final lo = prof.reduce(math.min), hi = prof.reduce(math.max);
+    if (hi - lo < 50) return 0;
+    final mid = (lo + hi) / 2;
+    // ورقة (فاتح) -> فاصل غامق -> كارت فاتح -> غامق/نهاية الصورة
+    var k1 = 0;
+    while (k1 < prof.length && prof[k1] >= mid) k1++;
+    if (k1 >= prof.length) return 0;
+    var k2 = k1;
+    while (k2 < prof.length && prof[k2] < mid) k2++;
+    if (k2 >= prof.length) return 0;
+    const per = maxExt / steps;
+    // سطور الكتابة جوه الكارت (الاسم / التاريخ) متوسط سطوعها بيقل عن الحد فكانت بتتحسب نهاية الكارت:
+    // نعدّي أي فجوة غامقة قصيرة (أقل من ~3.5% من طول الورقة) لو بعدها فاتح تاني أو وصلنا لحافة الصورة
+    final tolDark = (0.035 / per).round();
+    var k3 = k2;
+    while (k3 < prof.length) {
+      if (prof[k3] >= mid) {
+        k3++;
+        continue;
+      }
+      var e = k3;
+      while (e < prof.length && prof[e] < mid) e++;
+      if (e - k3 <= tolDark && (e < prof.length || hitEdge)) {
+        k3 = e;
+        continue;
+      }
+      break;
+    }
+    if ((k2 - k1) * per > 0.10) return 0; // الفاصل كبير: مش كارت لازق في الباتش
+    if ((k3 - k2) * per < 0.03) return 0; // الشريط الفاتح قصير: مش كارت
+    if (k3 >= prof.length && !hitEdge) {
+      var minInside = 255.0;
+      for (var idx = k2; idx < prof.length; idx++) {
+        if (prof[idx] < minInside) minInside = prof[idx];
+      }
+      if (hi - minInside < 25) return 0; // خلفية سادة بدون كتابة
+    }
+    return per * (math.min(k3, prof.length) - 1) + 0.015;
+  } catch (_) {
+    return 0;
+  }
+}
+
+List<double> _extendForCaption(img.Image im, List<double> q) {
+  final tb = _captionExtent(im, q, false); // تحت
+  final tt = _captionExtent(im, q, true); // فوق
+  if (tb <= 0 && tt <= 0) return q;
+  final mx = (im.width - 1).toDouble(), my = (im.height - 1).toDouble();
+  final r = List<double>.from(q);
+  if (tt > 0) {
+    // الحافة العليا بتتحرك لفوق (بعيد عن الحافة السفلى)
+    r[0] = _cd(q[0] + (q[0] - q[4]) * tt, 0.0, mx);
+    r[1] = _cd(q[1] + (q[1] - q[5]) * tt, 0.0, my);
+    r[2] = _cd(q[2] + (q[2] - q[6]) * tt, 0.0, mx);
+    r[3] = _cd(q[3] + (q[3] - q[7]) * tt, 0.0, my);
+  }
+  if (tb > 0) {
+    r[4] = _cd(q[4] + (q[4] - q[0]) * tb, 0.0, mx);
+    r[5] = _cd(q[5] + (q[5] - q[1]) * tb, 0.0, my);
+    r[6] = _cd(q[6] + (q[6] - q[2]) * tb, 0.0, mx);
+    r[7] = _cd(q[7] + (q[7] - q[3]) * tb, 0.0, my);
+  }
+  return r;
+}
+
+// بتشتغل في Isolate. بترجّع مسارات الصفحات (صفحة لكل باتش). فاضي = استخدم الصورة الأصلية.
+List<String> _scanToPages(String src, String base) {
+  final cached = <String>[];
+  var ci = 0;
+  while (File('${base}_$ci.jpg').existsSync()) {
+    cached.add('${base}_$ci.jpg');
+    ci++;
+  }
+  if (cached.isNotEmpty) return cached;
+  if (File('${base}_none2').existsSync()) return <String>[];
+  final out = <String>[];
+  try {
+    var im = img.decodeImage(File(src).readAsBytesSync());
+    if (im != null) {
+      im = img.bakeOrientation(im);
+      var quads = _detectReceipts(im);
+      if (quads.isEmpty) quads = _detectReceipts(im, mode: 1);
+      if (quads.isEmpty) quads = _detectReceipts(im, mode: 2);
+      for (final q0 in quads) {
+        final q = _extendForCaption(im, q0);
+        final o = _warpAndEnhance(im, q);
+        if (o == null) continue;
+        final p = '${base}_${out.length}.jpg';
+        File(p).writeAsBytesSync(img.encodeJpg(o, quality: 90));
+        out.add(p);
       }
     }
-    final sk = effSharpness(filter, sharp);
-    if (sk > 0) {
-      rgba = await compute(_sharpenJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': sk});
-      AppLog.i('apply sharpen done');
-    }
-    var fw = w, fh = h;
-    if (isCleanFilter(filter) && await Store.trimMargins()) {
-      final tr = await compute(_trimJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h});
-      final tw = tr['w'] as int;
-      if (tw > 0) {
-        rgba = tr['out'] as Uint8List;
-        fw = tw;
-        fh = tr['h'] as int;
-        AppLog.i('apply trim ${w}x$h -> ${fw}x$fh');
-      }
-    }
-    final comp = Completer<ui.Image>();
-    ui.decodeImageFromPixels(rgba, fw, fh, ui.PixelFormat.rgba8888, comp.complete);
-    final outImg = await comp.future;
-    final png = await outImg.toByteData(format: ui.ImageByteFormat.png);
-    outImg.dispose();
-    if (png == null) throw Exception('تعذر حفظ الصورة');
-    AppLog.i('apply png ${png.lengthInBytes ~/ 1024}KB');
-    final jpg = await FlutterImageCompress.compressWithList(
-      png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
-      minWidth: fw,
-      minHeight: fh,
-      quality: await Store.jpegQuality(),
-      format: CompressFormat.jpeg,
-    );
-    final dir = (await Store.dir()).path;
-    final nf = File('$dir/$prefix${DateTime.now().microsecondsSinceEpoch}.jpg');
-    await nf.writeAsBytes(jpg, flush: true);
-    AppLog.i('apply jpg ${jpg.length ~/ 1024}KB saved');
-    // النسخة الأصلية بتنتقل للصورة الجديدة (أو بتتعمل أول مرة من الصورة الحالية)
-    final oldBase = File(Store.baseOf(path));
-    final newBase = Store.baseOf(nf.path);
-    if (await oldBase.exists()) {
-      await oldBase.rename(newBase);
-    } else {
-      await File(path).copy(newBase);
-    }
-    await Store.setEdit(
-        nf.path,
-        EditParams(
-            quad: quad,
-            turns: turns,
-            angle: angle,
-            filter: filter,
-            contrast: contrast,
-            brightness: brightness,
-            sharp: sharp,
-            levels: levels));
-    AppLog.i('apply done');
-    return nf.path;
-  } finally {
+  } catch (_) {}
+  if (out.isEmpty) {
     try {
-      await sp.setBool('apply_guard', false);
+      File('${base}_none2').writeAsStringSync('1');
     } catch (_) {}
-    Store.working--;
+  }
+  return out;
+}
+
+Future<List<String>> scanReceiptAsync(String src) async {
+  try {
+    final st = File(src).statSync();
+    Directory('$baseDir/.scans').createSync(recursive: true);
+    final safe = baseName(src).replaceAll(RegExp(r'[^A-Za-z0-9_\-]'), '_');
+    final base = '$baseDir/.scans/v6_${safe}_${st.size}_${st.modified.millisecondsSinceEpoch}';
+    return await Isolate.run(() => _scanToPages(src, base));
+  } catch (_) {
+    return <String>[];
   }
 }
 
-/// لقطة من إعدادات المحرر (للتراجع والإعادة).
-class _EditSnap {
-  final List<Offset> quad;
-  final int turns;
-  final double angle;
-  final ScanFilter filter;
-  final double contrast, brightness, sharp;
-  final String sig;
-  _EditSnap(this.quad, this.turns, this.angle, this.filter, this.contrast, this.brightness,
-      this.sharp, this.sig);
+// ───────────────── ملء القالب مباشرة جوه ملف الـ xlsx (من غير ما نبوّظ التنسيق) ─────────────────
+Future<List<int>?> loadTemplateBytes() async {
+  try {
+    final exact = File('$baseDir/الاسكندريه 00.xlsx');
+    if (exact.existsSync()) return exact.readAsBytesSync();
+    final d = Directory(baseDir);
+    if (d.existsSync()) {
+      for (final e in d.listSync().whereType<File>()) {
+        final n = baseName(e.path);
+        if (n.toLowerCase().endsWith('.xlsx') &&
+            n.contains('00') &&
+            !n.startsWith('~') &&
+            !n.startsWith('.')) {
+          return e.readAsBytesSync();
+        }
+      }
+    }
+  } catch (_) {}
+  try {
+    final data = await rootBundle.load('assets/template.xlsx');
+    return data.buffer.asUint8List();
+  } catch (_) {}
+  return null;
 }
 
-class _GridPainter extends CustomPainter {
-  const _GridPainter();
-  @override
-  void paint(Canvas canvas, Size size) {
-    final p = Paint()
-      ..color = Colors.white54
-      ..strokeWidth = 1;
-    for (var i = 1; i < 3; i++) {
-      final x = size.width * i / 3, y = size.height * i / 3;
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), p);
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), p);
+String _firstSheetPath(Archive arc) {
+  String? text(String n) {
+    for (final f in arc.files) {
+      if (f.name == n) return utf8.decode(f.content as List<int>, allowMalformed: true);
+    }
+    return null;
+  }
+
+  final wb = text('xl/workbook.xml');
+  final rels = text('xl/_rels/workbook.xml.rels');
+  if (wb != null && rels != null) {
+    final sm = RegExp(r'<sheet\b[^>]*?r:id="([^"]+)"').firstMatch(wb);
+    if (sm != null) {
+      for (final m in RegExp(r'<Relationship\b[^>]*>').allMatches(rels)) {
+        final tag = m.group(0)!;
+        if (tag.contains('Id="${sm.group(1)}"')) {
+          final t = RegExp(r'Target="([^"]+)"').firstMatch(tag)?.group(1);
+          if (t != null) return t.startsWith('/') ? t.substring(1) : 'xl/$t';
+        }
+      }
     }
   }
-
-  @override
-  bool shouldRepaint(_GridPainter o) => false;
+  return 'xl/worksheets/sheet1.xml';
 }
 
-class EditorPage extends StatefulWidget {
-  final bool canRetake; // بيظهر زر إعادة الأخذ لما الشاشة تتفتح من الكاميرا
-  final int pageIndex; // ترتيب الصفحة (من 0)
-  final int pageCount; // عدد الصفحات (0 = من غير تنقل، زي الباتش)
-  final bool canDelete; // زر حذف الصفحة
-  final String path;
-  final String prefix; // 'batch_' أو 'r_'
-  final int initialTab; // 0 قص، 1 تدوير، 2 ألوان/فلاتر
-  const EditorPage(
-      {super.key,
-      required this.path,
-      this.prefix = 'r_',
-      this.initialTab = 0,
-      this.canRetake = false,
-      this.pageIndex = 0,
-      this.pageCount = 0,
-      this.canDelete = false});
-  @override
-  State<EditorPage> createState() => _EditorPageState();
+final RegExp _cellRe = RegExp(r'<c\b[^>]*?/>|<c\b[^>]*?>.*?</c>', dotAll: true);
+
+int _colNum(String c) {
+  var n = 0;
+  for (final ch in c.codeUnits) {
+    n = n * 26 + (ch - 64);
+  }
+  return n;
 }
 
-class _EditorPageState extends State<EditorPage> {
-  // الصورة كلها بالظبط (محاذية للحواف): مفيش هامش، فمفيش أي جزء بيتقص
-  static const _full = [
-    Offset(0, 0),
-    Offset(1, 0),
-    Offset(1, 1),
-    Offset(0, 1),
-  ];
-  String? src; // النسخة الأصلية لو موجودة
-  double? aspect; // ارتفاع/عرض الصورة الأصلية (قبل التدوير)
-  int turns = 0;
-  double angle = 0;
-  List<Offset> quad = List.of(_full);
-  ScanFilter filter = ScanFilter.original;
-  double contrast = 0;
-  double brightness = 0;
-  late int tab = widget.initialTab; // 0 قص، 1 تدوير، 2 ألوان
-  int drag = -1; // 0..3 زوايا، 4..7 حواف، 8 تحريك الكل
-  // تكبير/تصغير منطقة القص: قرصة بإصبعين، أو نقرتين، وسحب بإصبع واحد لتحريك الصورة وهي مكبّرة
-  double _zm = 1;
-  Offset _pan = Offset.zero;
-  final Map<int, Offset> _ptrs = {};
-  double _pinchD0 = 0, _pinchZ0 = 1;
-  Offset _pinchFocalImg = Offset.zero;
-  Offset _lastPtr = Offset.zero;
-  Offset _downPos = Offset.zero;
-  bool _movedFar = false;
-  bool _pinched = false;
-  DateTime _downAt = DateTime(2000);
-  DateTime _lastTapAt = DateTime(2000);
-  Offset _lastTapPos = Offset.zero;
-  static const _maxZoom = 6.0;
-  bool _swipeOk = false;
-  String _sig0 = '';
-  bool busy = false;
-  bool _quadTouched = false; // الموظف حدد الإطار بنفسه: القص التلقائي المتأخر ميلمسوش
-  ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
-  int _viewGen = 0;
-  ui.Image? cleaned; // نسخة منضّفة للمعاينة لما الفلتر من فلاتر الإيصال
-  bool _cleanedThermal = false; // النسخة المنضّفة دي بالمنحنى الحراري ولا العادي
-  int _cleanGen = 0;
-  double sharp = 0; // حدة يدوية 0..1
-  List<double>? levels; // مستويات التحسين التلقائي (بتتحسب مرة واحدة من نسخة مصغرة)
-  ui.Image? sharpImg; // نسخة المعاينة بعد الحدة (بتتحدّث لما السلايدر يقف)
-  ui.Image? _sharpBase; // الصورة اللي اتحسبت منها sharpImg
-  int _sharpGen = 0;
+RegExpMatch? _findRow(String xml, int row) => RegExp(
+        '<row\\b[^>]*\\br="$row"[^>]*?(?:/>|>.*?</row>)',
+        dotAll: true)
+    .firstMatch(xml);
 
-  // تراجع/إعادة
-  final List<_EditSnap> _hist = [];
-  int _hi = -1;
-  bool get _canUndo => _hi > 0;
-  bool get _canRedo => _hi >= 0 && _hi < _hist.length - 1;
-  bool _peek = false; // ضغط مطوّل على زر المقارنة = عرض الصورة الأصلية
-  final Map<ScanFilter, List<double>> _favs = {};
+double _readNum(String xml, String col, int row) {
+  final rm = _findRow(xml, row);
+  if (rm == null) return 0.0;
+  for (final m in _cellRe.allMatches(rm.group(0)!)) {
+    final cell = m.group(0)!;
+    final open = RegExp(r'<c\b[^>]*?>').firstMatch(cell)!.group(0)!;
+    final r = RegExp(r'\br="([A-Z]+)\d+"').firstMatch(open);
+    if (r == null || r.group(1) != col) continue;
+    final t = RegExp(r'\bt="([^"]+)"').firstMatch(open)?.group(1);
+    if (t != null && t != 'n') return 0.0;
+    final v = RegExp(r'<v>([^<]*)</v>').firstMatch(cell)?.group(1);
+    return double.tryParse(v ?? '') ?? 0.0;
+  }
+  return 0.0;
+}
 
-  void _mark() {
-    final sg = _sig();
-    if (_hi >= 0 && _hist[_hi].sig == sg) return;
-    _hist.removeRange(_hi + 1, _hist.length);
-    _hist.add(_EditSnap(List.of(quad), turns, angle, filter, contrast, brightness, sharp, sg));
-    if (_hist.length > 40) _hist.removeAt(0);
-    _hi = _hist.length - 1;
+// بيكتب خلية واحدة محافظ على الـ style بتاعها. build(style, oldFormulaElement) -> xml الخلية
+String _setCell(String xml, String col, int row,
+    String Function(String ref, String? style, String? formula) build) {
+  final rm = _findRow(xml, row);
+  if (rm == null) throw Exception('row $row missing');
+  var rowXml = rm.group(0)!;
+  final ref = '$col$row';
+  final target = _colNum(col);
+  RegExpMatch? existing, before;
+  for (final m in _cellRe.allMatches(rowXml)) {
+    final cell = m.group(0)!;
+    final open = RegExp(r'<c\b[^>]*?>').firstMatch(cell)!.group(0)!;
+    final r = RegExp(r'\br="([A-Z]+)\d+"').firstMatch(open);
+    if (r == null) continue;
+    final cn = _colNum(r.group(1)!);
+    if (cn == target) {
+      existing = m;
+      break;
+    }
+    if (cn > target && before == null) before = m;
+  }
+  String? style, formula;
+  if (existing != null) {
+    final cell = existing.group(0)!;
+    final open = RegExp(r'<c\b[^>]*?>').firstMatch(cell)!.group(0)!;
+    style = RegExp(r'\bs="(\d+)"').firstMatch(open)?.group(1);
+    formula = RegExp(r'<f\b[^>]*?(?:/>|>.*?</f>)', dotAll: true).firstMatch(cell)?.group(0);
+  }
+  final newCell = build(ref, style, formula);
+  if (existing != null) {
+    rowXml = rowXml.replaceRange(existing.start, existing.end, newCell);
+  } else if (before != null) {
+    rowXml = rowXml.replaceRange(before.start, before.start, newCell);
+  } else if (rowXml.endsWith('/>')) {
+    rowXml = '${rowXml.substring(0, rowXml.length - 2)}>$newCell</row>';
+  } else {
+    final i = rowXml.lastIndexOf('</row>');
+    rowXml = rowXml.replaceRange(i, i, newCell);
+  }
+  return xml.replaceRange(rm.start, rm.end, rowXml);
+}
+
+List<int> fillTemplate(List<int> bytes, Map<int, double> totals, Map<int, int> counts) {
+  final arc = ZipDecoder().decodeBytes(bytes);
+  final sheetPath = _firstSheetPath(arc);
+  final out = Archive();
+  var found = false;
+  for (final f in arc.files) {
+    if (!f.isFile) continue;
+    final c = f.content as List<int>;
+    if (f.name == sheetPath) {
+      found = true;
+      var xml = utf8.decode(c, allowMalformed: true);
+      for (var r = 2; r <= 11; r++) {
+        final tot = round2(totals[r] ?? 0.0);
+        // عمود C (POS Count): عدد الأجهزة اللي اشتغلت فعلاً في الوحدة (مش عدد الباتشات)
+        final cnt = counts[r] ?? 0;
+        xml = _setCell(xml, 'C', r, (ref, st, f0) =>
+            '<c r="$ref"${st != null ? ' s="$st"' : ''}><v>$cnt</v></c>');
+        xml = _setCell(xml, 'D', r, (ref, st, f0) =>
+            '<c r="$ref"${st != null ? ' s="$st"' : ''}><v>$tot</v></c>');
+        final cash = _readNum(xml, 'E', r);
+        final total = round2(tot + cash);
+        xml = _setCell(xml, 'F', r, (ref, st, f0) =>
+            '<c r="$ref"${st != null ? ' s="$st"' : ''}>'
+            '${f0 ?? '<f>D$r+IF(ISBLANK(E$r),0,E$r)</f>'}<v>$total</v></c>');
+      }
+      final b = utf8.encode(xml);
+      out.addFile(ArchiveFile(f.name, b.length, b));
+    } else {
+      out.addFile(ArchiveFile(f.name, c.length, c));
+    }
+  }
+  if (!found) throw Exception('sheet not found: $sheetPath');
+  final enc = ZipEncoder().encode(out);
+  if (enc == null) throw Exception('zip encode failed');
+  return enc;
+}
+
+// ───────────────── قنوات النظام (واتساب مباشر / فتح فولدر) ─────────────────
+const MethodChannel _chan = MethodChannel('pos/native');
+
+// ───────── سجل الفحص التلقائي + فتح الإيصال من الإشعار ─────────
+final ValueNotifier<String?> openReqG = ValueNotifier<String?>(null);
+String _lastOpenP = '';
+DateTime _lastOpenAt = DateTime(2000);
+
+// طلب فتح إيصال معين (من الإشعار أو من السجل): "home|مفتاح" أو "mach|مفتاح"
+void requestOpenG(String payload) {
+  final now = DateTime.now();
+  if (payload == _lastOpenP && now.difference(_lastOpenAt).inSeconds < 3) return; // منع التكرار
+  _lastOpenP = payload;
+  _lastOpenAt = now;
+  openReqG.value = '$payload#${now.microsecondsSinceEpoch}';
+}
+
+String? openKeyOf(String? v, String prefix) {
+  if (v == null || !v.startsWith(prefix)) return null;
+  final h = v.lastIndexOf('#');
+  return v.substring(prefix.length, h > prefix.length ? h : v.length);
+}
+
+class AutoLogEntry {
+  final DateTime t;
+  final String tab; // home | mach
+  final String title;
+  final String text;
+  final bool bad;
+  final String? payload;
+  final String kind; // auto = فحص تلقائي | manual = فحص يدوي | chain = فحص شامل
+  AutoLogEntry(this.t, this.tab, this.title, this.text, this.bad, this.payload, {this.kind = 'auto'});
+  Map<String, dynamic> toJson() =>
+      {'t': t.millisecondsSinceEpoch, 'tab': tab, 'title': title, 'text': text, 'bad': bad, 'p': payload, 'k': kind};
+  static AutoLogEntry fromJson(Map<String, dynamic> j) => AutoLogEntry(
+      DateTime.fromMillisecondsSinceEpoch((j['t'] as num).toInt()),
+      (j['tab'] ?? 'home') as String,
+      (j['title'] ?? '') as String,
+      (j['text'] ?? '') as String,
+      j['bad'] == true,
+      j['p'] as String?,
+      kind: (j['k'] ?? 'auto') as String);
+}
+
+final List<AutoLogEntry> autoLogG = <AutoLogEntry>[];
+bool _autoLogLoaded = false;
+String get _autoLogPath => '$baseDir/auto_log.json';
+
+void loadAutoLog() {
+  if (_autoLogLoaded) return;
+  _autoLogLoaded = true;
+  try {
+    final f = File(_autoLogPath);
+    if (!f.existsSync()) return;
+    final l = jsonDecode(f.readAsStringSync());
+    if (l is List) {
+      for (final e in l) {
+        if (e is Map) autoLogG.add(AutoLogEntry.fromJson(Map<String, dynamic>.from(e)));
+      }
+    }
+  } catch (_) {}
+}
+
+void _saveAutoLog() {
+  try {
+    Directory(baseDir).createSync(recursive: true);
+    File(_autoLogPath).writeAsStringSync(jsonEncode(autoLogG.map((e) => e.toJson()).toList()));
+  } catch (_) {}
+}
+
+final ValueNotifier<int> autoLogTick = ValueNotifier<int>(0);
+
+void _addLog(String tab, String title, String text, bool bad, String? payload, String kind) {
+  loadAutoLog();
+  autoLogG.insert(0, AutoLogEntry(DateTime.now(), tab, title, text, bad, payload, kind: kind));
+  while (autoLogG.length > 3000) {
+    autoLogG.removeLast();
+  }
+  _saveAutoLog();
+  autoLogTick.value++;
+}
+
+// بيسجّل في سجل الفحص من غير إشعار (الفحص اليدوي والشامل: بداية ونتيجة وإيقاف وأخطاء وكل ملف)
+void logScan({
+  required String tab,
+  required String title,
+  String text = '',
+  bool bad = false,
+  String kind = 'manual',
+  String? openKey,
+}) {
+  try {
+    _addLog(tab, title, text, bad, openKey == null ? null : '$tab|$openKey', kind);
+  } catch (_) {}
+}
+
+// بيسجّل الإشعار في السجل وبيبعته لشريط التليفون (بصوت واهتزاز لو فيه مشكلة، وهادي لو تمام)
+Future<void> postAutoNotify(
+    {required String tab, required String title, required String text, required bool bad, String? openKey}) async {
+  final payload = openKey == null ? null : '$tab|$openKey';
+  _addLog(tab, title, text, bad, payload, 'auto');
+  try {
+    await _chan.invokeMethod('notify', {
+      'title': tr(title),
+      'text': tr(text),
+      'alert': bad,
+      if (payload != null) 'open': payload,
+    });
+  } catch (_) {}
+}
+
+void showAutoLog(BuildContext context) {
+  Navigator.of(context).push(MaterialPageRoute(builder: (_) => const AutoLogPage()));
+}
+
+class AutoLogPage extends StatefulWidget {
+  const AutoLogPage({super.key});
+
+  @override
+  State<AutoLogPage> createState() => _AutoLogPageState();
+}
+
+class _AutoLogPageState extends State<AutoLogPage> {
+  bool onlyBad = false;
+  String kindF = 'all'; // all | auto | manual | chain
+
+  static String _kindLabel(String k) => k == 'chain' ? 'فحص شامل' : (k == 'manual' ? 'يدوي' : 'تلقائي');
+
+  @override
+  void initState() {
+    super.initState();
+    loadAutoLog();
+    autoLogTick.addListener(_onTick);
+  }
+
+  static String _hm(DateTime t) => '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  void _onTick() {
     if (mounted) setState(() {});
   }
 
-  void _restore(_EditSnap s) {
-    final turnsChanged = s.turns != turns;
-    final filterChanged = s.filter != filter;
-    setState(() {
-      quad = List.of(s.quad);
-      turns = s.turns;
-      angle = s.angle;
-      filter = s.filter;
-      contrast = s.contrast;
-      brightness = s.brightness;
-      sharp = s.sharp;
-    });
-    if (turnsChanged) {
-      _loadView();
-    } else if (filterChanged) {
-      _afterFilter(s.filter);
-    } else {
-      _resharp();
-    }
-  }
-
-  void _undo() {
-    if (!_canUndo) return;
-    _hi--;
-    _restore(_hist[_hi]);
-  }
-
-  void _redo() {
-    if (!_canRedo) return;
-    _hi++;
-    _restore(_hist[_hi]);
-  }
-
-  Future<void> _loadFavs() async {
-    for (final f in ScanFilter.values) {
-      final v = await Store.favOf(f);
-      if (v != null) _favs[f] = v;
-    }
-  }
-
-  Future<void> _toggleFav(bool isFav) async {
-    final f = filter;
-    if (isFav) {
-      await Store.setFav(f, null);
-      _favs.remove(f);
-    } else {
-      final v = [contrast, brightness, sharp];
-      await Store.setFav(f, v);
-      _favs[f] = v;
-    }
-    if (!mounted) return;
-    setState(() {});
-    snack(context, isFav ? 'اتمسح الإعداد المفضل' : 'اتحفظ الإعداد المفضل لفلتر ${kFilterLabels[f]}');
-  }
-
-  Widget _favBtn() {
-    final fv = _favs[filter];
-    final isFav = fv != null &&
-        (fv[0] - contrast).abs() < 0.001 &&
-        (fv[1] - brightness).abs() < 0.001 &&
-        (fv[2] - sharp).abs() < 0.001;
-    return IconButton(
-      visualDensity: VisualDensity.compact,
-      tooltip: isFav ? 'مسح الإعداد المفضل' : 'حفظ السطوع والتباين والحدة كإعداد مفضل للفلتر ده',
-      icon: Icon(isFav ? Icons.star_rounded : Icons.star_border_rounded, size: 22),
-      onPressed: busy ? null : () => _toggleFav(isFav),
-    );
-  }
-
-  Widget _peekBtn() => Listener(
-        onPointerDown: busy ? null : (_) => setState(() => _peek = true),
-        onPointerUp: (_) {
-          if (_peek) setState(() => _peek = false);
-        },
-        onPointerCancel: (_) {
-          if (_peek) setState(() => _peek = false);
-        },
-        child: Tooltip(
-          message: 'اضغط مطوّلاً لرؤية الأصل',
-          child: Padding(
-            padding: const EdgeInsets.all(10),
-            child: Icon(Icons.compare_rounded, color: _peek ? kAccent : null),
-          ),
-        ),
-      );
-
-  bool get _cleanReady =>
-      isCleanFilter(filter) && cleaned != null && _cleanedThermal == usesThermalClean(filter);
-  ui.Image get _base => _cleanReady ? cleaned! : view!;
-  ui.Image get _shownNow => _peek ? view! : _shown;
-
-  ui.Image get _shown {
-    final b = _base;
-    return (effSharpness(filter, sharp) > 0 && sharpImg != null && identical(_sharpBase, b))
-        ? sharpImg!
-        : b;
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _init();
-  }
-
   @override
   void dispose() {
-    view?.dispose();
-    cleaned?.dispose();
-    sharpImg?.dispose();
+    autoLogTick.removeListener(_onTick);
     super.dispose();
   }
 
-  Future<void> _makeClean() async {
-    final v = view;
-    if (v == null) return;
-    final gen = ++_cleanGen;
-    final th = usesThermalClean(filter);
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    bool today(DateTime a) => a.year == now.year && a.month == now.month && a.day == now.day;
+    final list = autoLogG.where((e) => (!onlyBad || e.bad) && (kindF == 'all' || e.kind == kindF)).toList();
+    final todayAll = autoLogG.where((e) => today(e.t)).toList();
+    final todayBad = todayAll.where((e) => e.bad).length;
+    return Scaffold(
+      appBar: AppBar(
+        toolbarHeight: 54,
+        title: w.Text(tr('سجل الفحص')),
+        actions: [
+          const HeaderButtons(),
+          IconButton(
+            tooltip: tr('مشاركة السجل'),
+            icon: const Icon(Icons.ios_share),
+            onPressed: () async {
+              final m = ScaffoldMessenger.of(context);
+              try {
+                final b = StringBuffer('===== سجل الفحص =====\n');
+                for (final e in autoLogG) {
+                  b.writeln('[${e.t.toIso8601String().substring(0, 19).replaceFirst('T', ' ')}] '
+                      '(${e.tab == 'mach' ? 'إيصالات الدفع' : 'التقفيل'} / ${_kindLabel(e.kind)}) ${e.title}'
+                      '${e.text.isEmpty ? '' : '\n    ${e.text.replaceAll('\n', '\n    ')}'}');
+                }
+                final d = File('$baseDir/id_debug.txt');
+                if (d.existsSync()) b.write('\n===== تفاصيل فنية =====\n${d.readAsStringSync()}');
+                final out = File('$baseDir/scan_log.txt');
+                out.writeAsStringSync(b.toString());
+                await Share.shareXFiles([XFile(out.path, mimeType: 'text/plain')], text: 'سجل الفحص');
+              } catch (_) {
+                m.showSnackBar(const SnackBar(content: Text('مفيش سجل لسه. شغّل الفحص الأول.')));
+              }
+            },
+          ),
+          IconButton(
+            tooltip: tr('مسح السجل'),
+            icon: const Icon(Icons.delete_outline),
+            onPressed: autoLogG.isEmpty
+                ? null
+                : () async {
+                    final ok = await showDialog<bool>(
+                      context: context,
+                      builder: (c) => AlertDialog(
+                        title: const Text('مسح السجل؟'),
+                        actions: [
+                          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('إلغاء')),
+                          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('مسح')),
+                        ],
+                      ),
+                    );
+                    if (ok == true) {
+                      autoLogG.clear();
+                      _saveAutoLog();
+                      if (mounted) setState(() {});
+                    }
+                  },
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+            child: Row(
+              children: [
+                Expanded(child: w.Text(tr('النهارده: ${todayAll.length} سجل • $todayBad فيهم مشاكل'))),
+                FilterChip(
+                  label: const Text('مشاكل بس'),
+                  selected: onlyBad,
+                  onSelected: (v) => setState(() => onlyBad = v),
+                ),
+              ],
+            ),
+          ),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Row(
+              children: [
+                for (final k in const ['all', 'manual', 'auto', 'chain'])
+                  Padding(
+                    padding: const EdgeInsetsDirectional.only(end: 6),
+                    child: ChoiceChip(
+                      label: Text(k == 'all' ? 'الكل' : _kindLabel(k)),
+                      selected: kindF == k,
+                      onSelected: (_) => setState(() => kindF = k),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: list.isEmpty
+                ? const Center(child: Text('مفيش سجلات لسه.'))
+                : ListView.separated(
+                    itemCount: list.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (c, i) {
+                      final e = list[i];
+                      final d = today(e.t) ? '' : '${e.t.day}/${e.t.month}  ';
+                      return ListTile(
+                        leading: e.title.startsWith('▶')
+                            ? Icon(Icons.play_circle_outline, color: Theme.of(context).colorScheme.onSurfaceVariant)
+                            : (e.title.startsWith('⏹')
+                                ? Icon(Icons.stop_circle_outlined, color: Theme.of(context).colorScheme.onSurfaceVariant)
+                                : Icon(e.bad ? Icons.warning_amber : Icons.check_circle,
+                                    color: e.bad ? _tone(context, kReviewTone) : _tone(context, Colors.green))),
+                        title: w.Text(tr(e.title), maxLines: 2, overflow: TextOverflow.ellipsis),
+                        subtitle: w.Text('$d${_hm(e.t)} • ${tr(e.tab == 'mach' ? 'إيصالات الدفع' : 'التقفيل')} • ${tr(_kindLabel(e.kind))}'
+                            '${e.text.isEmpty ? '' : '\n${tr(e.text)}'}'),
+                        isThreeLine: e.text.isNotEmpty,
+                        trailing: e.payload != null ? const Icon(Icons.chevron_left) : null,
+                        onTap: e.payload == null
+                            ? null
+                            : () {
+                                Navigator.of(context).pop();
+                                requestOpenG(e.payload!);
+                              },
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String todayToken() {
+  final n = DateTime.now();
+  return '${n.day}.${n.month}';
+}
+
+String _normAr(String s) => s
+    .replaceAll(RegExp('[أإآ]'), 'ا')
+    .replaceAll('ة', 'ه')
+    .replaceAll('ى', 'ي')
+    .toLowerCase();
+
+// ملف PDF اسمه "الاسكندريه + تاريخ النهارده" (بيقبل 5.11 / 05.11 / 5-11 / 5_11)
+bool isTodayAlexPdf(String path) {
+  final name = _normAr(baseName(path));
+  if (!name.endsWith('.pdf')) return false;
+  if (!name.contains('اسكندري')) return false;
+  final n = DateTime.now();
+  final re = RegExp('(?<!\\d)0?${n.day}[._\\- ]0?${n.month}(?!\\d)');
+  return re.hasMatch(name);
+}
+
+List<File> findTodayAlexPdfs(List<String> dirs) {
+  final out = <File>[];
+  final seen = <String>{};
+  for (final d in dirs) {
+    if (d == outputDir) continue; // ما نقراش الملفات اللي التطبيق نفسه طلّعها
     try {
-      final c = await cleanUiImage(v, thermal: th);
-      if (!mounted || gen != _cleanGen || view != v) {
-        c.dispose();
-        return;
+      final dir = Directory(d);
+      if (!dir.existsSync()) continue;
+      for (final e in dir.listSync().whereType<File>()) {
+        if (isTodayAlexPdf(e.path) && seen.add(e.path)) out.add(e);
       }
-      final old = cleaned;
-      setState(() {
-        cleaned = c;
-        _cleanedThermal = th;
+    } catch (_) {}
+  }
+  out.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+  return out;
+}
+
+// ───────────────────── نموذج الإيصال ─────────────────────
+class ReceiptItem {
+  String path;
+  String? tid;
+  int? orderNum;
+  int? row;
+  String? unitName;
+  double amount;
+  String? date;
+  String key; // اسم الملف الأصلي + حجمه (لحفظ التصحيحات اليدوية)
+  bool ok; // المبلغ مؤكد؟
+  String how; // terminal | fuzzy | name/merchant | auto-number | conflict | extra-batch | manual
+  List<double> batches;
+  int? suffix;
+  String? origTid;
+  bool conflict;
+  bool skip;
+  double? alt; // قراءة تانية مختلفة للمبلغ (للمراجعة)
+  bool dupSuspect; // مشكوك إنه مكرر: بيدخل المراجعة ومش بيتحسب لحد ما تقرر
+  bool userExcluded; // انت استبعدته في المراجعة
+  String? dupDecision; // 'keep' | 'drop' (قرارك بيتحفظ للمرة الجاية)
+  int? dupOf; // رقم الماكينة اللي شبهه
+  String? unusual; // إجمالي بعيد عن المعتاد (للمراجعة)
+  bool ignoredDoc; // صورة اتجاهلها التطبيق (شكلها إيصال دفع/مستند): بتدخل المراجعة
+  String? ign; // 'keep' | 'drop' قرارك في الصورة المتجاهلة
+  bool dateOdd; // تاريخه مختلف عن أغلب الإيصالات
+  String? dateMain; // التاريخ الأغلب
+  String? dateFix; // التاريخ اللي انت أكدته
+  int? txn; // عدد معاملات الباتش المقروء من إيصال الإقفال
+  bool reprintSummary;
+  bool missingBatchClosed;
+  List<double> cands = <double>[]; // مبالغ مقترحة من الإيصال (للاختيار في المراجعة)
+
+  ReceiptItem({
+    required this.path,
+    this.tid,
+    this.orderNum,
+    this.row,
+    this.unitName,
+    this.amount = 0.0,
+    this.date,
+    this.key = '',
+    this.ok = false,
+    this.how = 'none',
+    List<double>? batches,
+    this.suffix,
+    this.origTid,
+    this.conflict = false,
+    this.skip = false,
+    this.alt,
+    this.dupSuspect = false,
+    this.userExcluded = false,
+    this.dupDecision,
+    this.dupOf,
+    this.ignoredDoc = false,
+    this.ign,
+    this.dateOdd = false,
+    this.reprintSummary = false,
+    this.missingBatchClosed = false,
+  }) : batches = batches ?? <double>[];
+
+  // داخل في الإجماليات والـ PDF؟
+  bool get counts => !skip && !dupSuspect && !userExcluded && !ignoredDoc;
+
+  // الماكينة/الوحدة متحددة بطريقة مش مؤكدة (تلقائي / بالاسم فقط)
+  bool get weakId =>
+      !(how == 'terminal' || how == 'new-terminal' || how == 'fuzzy' || how == 'manual' || how == 'extra-batch');
+
+  bool get needsReview =>
+      ignoredDoc ||
+      dupSuspect ||
+      dateOdd ||
+      reprintSummary ||
+      missingBatchClosed ||
+      (!userExcluded &&
+          (amount <= 0 ||
+              row == null ||
+              !ok ||
+              alt != null ||
+              unusual != null ||
+              weakId));
+}
+
+// ───────────────────── التصحيحات اليدوية (بتفضل محفوظة) ─────────────────────
+final String fixPath = '$baseDir/.app_fix.json';
+
+Map<String, dynamic> loadFixes() {
+  try {
+    return Map<String, dynamic>.from(jsonDecode(File(fixPath).readAsStringSync()) as Map);
+  } catch (_) {
+    return <String, dynamic>{};
+  }
+}
+
+void saveFix(ReceiptItem item) {
+  if (item.key.isEmpty) return;
+  try {
+    final m = loadFixes();
+    m[item.key] = {
+      'val': item.amount,
+      'tid': item.tid,
+      if (item.dupDecision != null) 'dup': item.dupDecision,
+      if (item.ign != null) 'ign': item.ign,
+      if (item.dateFix != null) 'date': item.dateFix,
+      'rep': item.reprintSummary,
+      'nobc': item.missingBatchClosed,
+    };
+    File(fixPath)
+      ..createSync(recursive: true)
+      ..writeAsStringSync(jsonEncode(m));
+  } catch (_) {}
+}
+
+// صورة كان التطبيق متجاهلها: ادخلها كباتش (هتكمّل المبلغ والماكينة بإيدك)
+void keepIgnored(ReceiptItem it) {
+  try {
+    if (!it.path.startsWith('$rawImagesDir/')) {
+      Directory(rawImagesDir).createSync(recursive: true);
+      final dst = '$rawImagesDir/wa_${baseName(it.path)}';
+      if (!File(dst).existsSync()) File(it.path).copySync(dst);
+      it.path = dst;
+    }
+  } catch (_) {}
+  it.ignoredDoc = false;
+  it.userExcluded = false;
+  it.ign = 'keep';
+  saveFix(it);
+}
+
+// احتساب إيصال (مشكوك أو مستبعد) كباتش إضافي للماكينة
+void keepAsExtraBatch(ReceiptItem it, List<ReceiptItem> all) {
+  var k = 2;
+  bool used(int n) => all.any((x) =>
+      !identical(x, it) && !x.skip && x.counts && x.orderNum == it.orderNum && (x.suffix ?? 1) == n);
+  while (used(k)) {
+    k++;
+  }
+  it.suffix = k;
+  it.how = 'extra-batch';
+  it.dupSuspect = false;
+  it.userExcluded = false;
+  it.dupDecision = 'keep';
+  try {
+    final cut = it.path.lastIndexOf('/');
+    final dot = it.path.lastIndexOf('.');
+    final ext = dot > cut ? it.path.substring(dot) : '.jpg';
+    final dst = '${it.path.substring(0, cut + 1)}${it.orderNum}_$k$ext';
+    if (dst != it.path && !File(dst).existsSync()) {
+      it.path = File(it.path).renameSync(dst).path;
+    }
+  } catch (_) {}
+  saveFix(it);
+}
+
+// إجمالي ماكينة بعيد جداً عن متوسط الأيام اللي فاتت = غالباً قراءة غلط -> مراجعة
+void checkUnusual(List<ReceiptItem> items, String reportDate) {
+  for (final r in items) {
+    r.unusual = null;
+  }
+  try {
+    final cfg = _readCfg();
+    final hist = <String, Map<String, dynamic>>{};
+    final raw = cfg['hist'];
+    if (raw is Map) {
+      raw.forEach((k, v) {
+        if (v is Map) hist[k.toString()] = Map<String, dynamic>.from(v);
       });
-      WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
-      _resharp();
-    } catch (e, st) {
-      AppLog.e('_makeClean', e, st);
     }
-  }
-
-  /// نسخة معاينة الحدة: بتتحسب على الصورة المعروضة في Isolate، ولما السلايدر يقف بس (مش مع كل حركة).
-  Future<void> _resharp() async {
-    final v = view;
-    if (v == null) return;
-    final k = effSharpness(filter, sharp);
-    final gen = ++_sharpGen;
-    if (k <= 0) {
-      final old = sharpImg;
-      if (old != null && mounted) {
-        setState(() {
-          sharpImg = null;
-          _sharpBase = null;
-        });
-        WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    final today = <int, double>{};
+    for (final r in items) {
+      if (r.orderNum != null && r.amount > 0) {
+        today[r.orderNum!] = (today[r.orderNum!] ?? 0) + r.amount;
       }
-      return;
     }
-    final b = _base;
-    try {
-      final bd = await b.toByteData(format: ui.ImageByteFormat.rawRgba);
-      if (bd == null) return;
-      final rgba = await compute(_sharpenJob,
-          <String, dynamic>{'src': _bytesOf(bd), 'w': b.width, 'h': b.height, 'k': k});
-      final img = await _imageFromRgba(rgba, b.width, b.height);
-      if (!mounted || gen != _sharpGen || !identical(b, _base)) {
-        img.dispose();
-        return;
-      }
-      final old = sharpImg;
-      setState(() {
-        sharpImg = img;
-        _sharpBase = b;
+    for (final e in today.entries) {
+      final prev = <double>[];
+      hist.forEach((d, m) {
+        if (d == reportDate) return;
+        final v = m['${e.key}'];
+        if (v is num && v > 0) prev.add(v.toDouble());
       });
-      WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
-    } catch (e, st) {
-      AppLog.e('_resharp', e, st);
-    }
-  }
-
-  /// مصفوفة المعاينة: لحد ما النسخة المنضّفة تجهز بنعرض الصورة من غير فلتر الإيصال (عشان مايظهرش أسود فجأة).
-  List<double> _matrixNow() => (_peek || (isCleanFilter(filter) && !_cleanReady))
-      ? editMatrix(ScanFilter.original, 0, 0)
-      : editMatrix(filter, contrast, brightness, levels);
-
-  Future<void> _makeLevels() async {
-    final p = src;
-    if (p == null) return;
-    try {
-      final lv = await autoLevelsOf(await File(p).readAsBytes());
-      if (!mounted || lv == null) return;
-      setState(() => levels = lv);
-    } catch (e, st) {
-      AppLog.e('_makeLevels', e, st);
-    }
-  }
-
-  void _onFilter(ScanFilter f) {
-    setState(() {
-      filter = f;
-      final fv = _favs[f]; // الإعداد المفضل للفلتر (لو محفوظ)
-      if (fv != null) {
-        contrast = fv[0];
-        brightness = fv[1];
-        sharp = fv[2];
-      }
-      if (f == ScanFilter.sharpen && sharp < 0.7) sharp = 0.7;
-    });
-    _afterFilter(f);
-    _mark();
-  }
-
-  void _afterFilter(ScanFilter f) {
-    if (isCleanFilter(f)) {
-      if (cleaned == null || _cleanedThermal != usesThermalClean(f)) {
-        _makeClean();
-      } else {
-        _resharp();
-      }
-    } else {
-      _resharp();
-      if (f == ScanFilter.auto && levels == null) _makeLevels();
-    }
-  }
-
-  Future<void> _loadView() async {
-    final gen = ++_viewGen;
-    try {
-      final lite = await Store.perfMode() == PerfMode.lite;
-      final img = await decodeImage(await File(src!).readAsBytes(), maxWidth: lite ? 700 : 1000);
-      final r = await _rotateUi(img, turns);
-      if (!mounted || gen != _viewGen) {
-        r.dispose();
-        return;
-      }
-      final old = view;
-      final oldClean = cleaned;
-      setState(() {
-        view = r;
-        cleaned = null;
-      });
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        old?.dispose();
-        oldClean?.dispose();
-      });
-      if (isCleanFilter(filter)) {
-        _makeClean();
-      } else {
-        _resharp();
-      }
-      if (filter == ScanFilter.auto && levels == null) _makeLevels();
-      _mark();
-    } catch (e, st) {
-      AppLog.e('_loadView', e, st);
-      if (mounted) {
-        snack(context, 'تعذر فتح الصورة');
-        Navigator.pop(context);
-      }
-    }
-  }
-
-  Future<void> _init() async {
-    try {
-      AppLog.i('editor open');
-      await _loadFavs();
-      final base = File(Store.baseOf(widget.path));
-      final s = await base.exists() ? base.path : widget.path;
-      final a = await imageAspect(s);
-      final e = await Store.editOf(widget.path);
-      if (!mounted) return;
-      setState(() {
-        src = s;
-        aspect = a;
-        if (e != null) {
-          turns = e.turns;
-          angle = e.angle;
-          filter = e.filter;
-          contrast = e.contrast;
-          brightness = e.brightness;
-          sharp = e.sharp;
-          levels = e.levels;
-          if (e.quad != null && _quadConvex(e.quad!)) quad = List.of(e.quad!);
+      if (prev.length < 3) continue;
+      final avg = prev.reduce((a, b) => a + b) / prev.length;
+      if (avg < 1) continue;
+      if (e.value > avg * 2.5 || e.value < avg / 2.5) {
+        final msg = 'إجمالي ماكينة ${e.key} (${e.value.toStringAsFixed(2)}) بعيد عن متوسط '
+            'الأيام اللي فاتت (${avg.toStringAsFixed(0)}) - اتأكد من المبلغ';
+        for (final r in items) {
+          if (r.orderNum == e.key && r.how != 'manual') r.unusual = msg;
         }
-      });
-      await _loadView();
-      _sig0 = _sig();
-      AppLog.i('editor view loaded');
-      WidgetsBinding.instance.addPostFrameCallback((_) => AppLog.i('editor first frame'));
-      if (mounted && (e == null || e.quad == null) && _lastScanManual) {
-        final live = widget.canRetake ? _shotQuad : null;
-        _shotQuad = null;
-        if (live != null && live.length == 4 && _quadConvex(live) && turns == 0) {
-          setState(() => quad = List.of(live)); // اقتراح فوري من المعاينة الحية
-          _mark();
-          unawaited(_refineQuad()); // الكشف الدقيق بيشتغل في الخلفية ويحدّث الإطار بهدوء
-        } else {
-          await _auto(silent: true);
-        }
-      }
-    } catch (e, st) {
-      AppLog.e('_init', e, st);
-      if (mounted) {
-        snack(context, 'تعذر فتح الصورة');
-        Navigator.pop(context);
       }
     }
+    if (reportDate != 'اليوم') {
+      hist[reportDate] = {for (final e in today.entries) '${e.key}': e.value};
+      while (hist.length > 30) {
+        hist.remove(hist.keys.first);
+      }
+      cfg['hist'] = hist;
+      _writeCfg(cfg);
+    }
+  } catch (_) {}
+}
+
+// ⚡ عدّ متوازي (تجريبي): عدد الصفحات اللي بتتقرا مع بعض (recognizer لكل صفحة)
+const int _kParWorkers = 2;
+
+// ───────── طرق العد (بتتحكم فيها من قايمة "طرق العد" في الشاشة) ─────────
+int _loadIntCfg(String k, int d, int lo, int hi) {
+  try {
+    final v = _readCfg()[k];
+    if (v is int && v >= lo && v <= hi) return v;
+  } catch (_) {}
+  return d;
+}
+
+bool _loadBoolCfg(String k, bool d) {
+  try {
+    final v = _readCfg()[k];
+    if (v is bool) return v;
+  } catch (_) {}
+  return d;
+}
+
+void _saveCfgKey(String k, Object v) {
+  try {
+    final m = _readCfg();
+    m[k] = v;
+    _writeCfg(m);
+  } catch (_) {}
+}
+
+// محرك العد: 0 = سريع متوازي (الأسرع - الافتراضي) • 1 = سريع عادي • 2 = دقيق (raster + شرائح، الأبطأ)
+int countEngine = _loadIntCfg('countEngine', 0, 0, 1); // الدقيق (2) اتشال من الاختيارات: أبطأ ونتيجته غلط
+bool get fastCount => countEngine != 2;
+bool get parallelCount => countEngine == 0;
+void setCountEngine(int e) {
+  countEngine = e;
+  _saveCfgKey('countEngine', e);
+}
+
+// الطريقة اللي منها العدد المعروض: 3 = تسلسل رأسي (الأساسية) • 2 = علامات الدفع بس • 1 = أكبر علامة
+int countMethod = _loadIntCfg('countMethod', 1, 1, 3);
+void setCountMethod(int m) {
+  countMethod = m;
+  _saveCfgKey('countMethod', m);
+}
+
+// إعادة فحص الصفحات المشكوك فيها (إزالة الخط الأحمر + عدّ المستطيلات)
+bool redFixCount = _loadBoolCfg('redFixCount', false);
+void setRedFixCount(bool v) {
+  redFixCount = v;
+  _saveCfgKey('redFixCount', v);
+}
+
+// حماية الزيادة: صفحة كاملة (مش آخر صفحة) عددها أكتر من باقي الصفحات بواحد والعلامات متفقة على العدد الأقل = الزيادة قراءة مكررة
+bool consensusGuard = _loadBoolCfg('consensusGuard', false);
+void setConsensusGuard(bool v) {
+  consensusGuard = v;
+  _saveCfgKey('consensusGuard', v);
+}
+
+void resetCountDefaults() {
+  setCountEngine(0);
+  setCountMethod(1);
+  setRedFixCount(false);
+  setConsensusGuard(false);
+  dualCount = false;
+  _saveCfgKey('dualCount', false);
+}
+
+bool _loadDual() {
+  try {
+    return _readCfg()['dualCount'] == true; // الديفولت مقفول (الأسرع)
+  } catch (_) {
+    return false;
+  }
+}
+
+// التدقيق المزدوج (اختياري، أبطأ شوية): قراءة تانية بصورة محسّنة لآخر صفحة في كل ملف (والصفحات المشكوك فيها)
+bool dualCount = _loadDual();
+
+// ⚠️ لازم تتنده من دالة top-level: لو Isolate.run اتكتبت جوه ميثود في الـ State، الـ closure بتشيل معاها
+// الـ context كله (MResult + TextEditingController...) فالإرسال بيفشل والعد السريع بيقع على الطريقة البطيئة.
+Future<List<List<int>>> _pdfJpegRangesAsync(Uint8List b) => Isolate.run(() => _pdfJpegRanges(b));
+
+// بيطلّع صور الصفحات (JPEG) جاهزة من PDF ممسوح (CamScanner وغيره): من غير raster ولا PNG
+List<List<int>> _pdfJpegRanges(Uint8List b) {
+  final out = <List<int>>[];
+  int find(String pat, int from) {
+    final p = pat.codeUnits;
+    final n = b.length - p.length;
+    for (var i = from; i <= n; i++) {
+      if (b[i] != p[0]) continue;
+      var ok = true;
+      for (var j = 1; j < p.length; j++) {
+        if (b[i + j] != p[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return i;
+    }
+    return -1;
   }
 
-  // ---------- اللمس ----------
+  var pos = 0;
+  while (true) {
+    final i = find('/DCTDecode', pos);
+    if (i < 0) break;
+    final sIdx = find('stream', i);
+    if (sIdx < 0) break;
+    var st = sIdx + 6;
+    if (st < b.length && b[st] == 13) st++;
+    if (st < b.length && b[st] == 10) st++;
+    final e = find('endstream', st);
+    if (e < 0) break;
+    var en = e;
+    while (en > st && (b[en - 1] == 10 || b[en - 1] == 13 || b[en - 1] == 32)) {
+      en--;
+    }
+    if (en - st > 20000 && b[st] == 0xFF && b[st + 1] == 0xD8 && b[en - 2] == 0xFF && b[en - 1] == 0xD9) {
+      out.add([st, en]);
+    }
+    pos = e + 9;
+  }
+  return out;
+}
 
-  String _sig() =>
-      '${quad.map((o) => '${o.dx.toStringAsFixed(4)},${o.dy.toStringAsFixed(4)}').join(';')}|$turns|${angle.toStringAsFixed(2)}|${filter.name}|${contrast.toStringAsFixed(2)}|${brightness.toStringAsFixed(2)}|${sharp.toStringAsFixed(2)}';
+class _SA {
+  final String t;
+  final double cx, cy, l, r;
+  double? v; // مبلغ الإيصال (لعلامة amount بس)
+  _SA(this.t, this.cx, this.cy, this.l, this.r);
+}
 
-  bool _quadFull() {
-    for (var i = 0; i < 4; i++) {
-      if ((quad[i] - _full[i]).distance > 0.002) return false;
+// مبلغ بصيغة 1,234.56 أو 12.50. بنرفض الرقم لو لازق في حرف قبله (S21.57 = غالباً 521.57 اتقرا غلط) علشان ما نحسبش مبلغ غلط
+final RegExp _amtRe = RegExp(r'(?<![\dA-Za-z.,])(\d{1,3}(?:,\d{3})*|\d+)\.(\d{2})(?!\d)');
+double? _amtIn(String t) {
+  final m = _amtRe.firstMatch(t);
+  if (m == null) return null;
+  return double.tryParse('${m.group(1)!.replaceAll(',', '')}.${m.group(2)}');
+}
+
+class _StructPage {
+  int sm = 0, mx = 0;
+  int sm2 = 0; // الطريقة التانية: علامات إيصال الدفع بس (من غير الشعار/Terminal)
+  int sm3 = 0; // الطريقة 3 (الأساسية): عدّ بالتسلسل الرأسي للعلامات جوه كل عمود
+  int vote = 0, voteN = 0; // التصويت: العدد اللي أكتر أنواع علامات متفقة عليه (voteN = كام نوع اتفق)
+  double h = 3000;
+  final Map<String, int> types = {};
+  final List<double> amts = []; // مبالغ الإيصالات اللي اتقرت بوضوح في الصفحة
+  final List<String> dbgAmt = []; // تشخيص: سطور AMOUNT اللي اتعدّت (نص@مكانها%)
+}
+
+// الطريقة 3: عدّ بالتسلسل الرأسي. كل إيصال علاماته بالترتيب من فوق لتحت: شعار ← Terminal ← RRN ← AMOUNT ← Approved.
+// بنمشي على علامات العمود من فوق، وكل ما الترتيب يرجع للأول (رتبة أقل أو زي اللي قبلها) يبقى ده إيصال جديد.
+// علامة ناقصة (قلم/تغطية/OCR) مش بتغيّر العدد، وعلامة زيادة قريبة جداً من نفس النوع (أقل من 0.7 من المسافة بين إيصالين) بتتدمج.
+int _seqCountCol(List<_SA> col, double h) {
+  const rank = <String, int>{'logo': 0, 'term': 1, 'rrn': 2, 'amount': 3, 'appr': 4};
+  final c = [...col]..sort((a, b) => a.cy.compareTo(b.cy));
+  final strong = <double>[
+    for (final a in c)
+      if (a.t == 'logo' || a.t == 'amount' || a.t == 'appr') a.cy
+  ]..sort();
+  final gaps = <double>[];
+  for (var i = 1; i < strong.length; i++) {
+    final g = strong[i] - strong[i - 1];
+    if (g > 0.03 * h) gaps.add(g);
+  }
+  var pitch = 0.1 * h;
+  if (gaps.isNotEmpty) {
+    gaps.sort();
+    final m = gaps.length ~/ 2;
+    pitch = gaps.length.isOdd ? gaps[m] : (gaps[m - 1] + gaps[m]) / 2;
+  }
+  final minP = 0.7 * pitch;
+  var n = 0, last = -1;
+  final lastCy = <String, double>{};
+  for (final a in c) {
+    final rk = rank[a.t] ?? 0;
+    if (last < 0) {
+      n = 1;
+    } else if (rk <= last) {
+      final prev = lastCy[a.t];
+      if (prev != null && a.cy - prev < minP) continue;
+      n++;
+    }
+    last = rk;
+    lastCy[a.t] = a.cy;
+  }
+  return n;
+}
+
+// ورقة تعريف صغيرة (اسم + وحدة + TID + تاريخ) بتكون جوه الملف: مش إيصال دفع فمتتعدّش
+bool _isIdSlip(RecognizedText res) {
+  final lines = toLines(res);
+  if (lines.isEmpty || lines.length > 16) return false;
+  final all = lines.map((l) => l.text.toUpperCase()).join('\n');
+  // أي علامة من علامات إيصال الدفع = مش ورقة تعريف
+  if (RegExp(r'TERMINAL|RRN|AMOUNT|APPROVED|NATIONAL|BANK\s*OF\s*EGYPT|BATCH|TOTAL|SALE|GRAND|CARD|REPRINT')
+      .hasMatch(all)) {
+    return false;
+  }
+  // رقم RRN (12 رقم) معناه إيصال حقيقي
+  if (RegExp(r'(?<!\d)\d{12}(?!\d)').hasMatch(all.replaceAll(RegExp(r'[ \t]'), ''))) return false;
+  // TID بقراءة متساهلة (TID:50335987 أو T1D أو TlD ...)
+  final hasTid = RegExp(r'\bT\s?[I1L|]\s?D\b\W{0,4}[\dOo]{7,9}').hasMatch(all) ||
+      RegExp(r'\bT\s?[I1L|]\s?D\b').hasMatch(all);
+  if (hasTid) return true;
+  // لو كلمة TID اتقرت غلط: رقم ماكينة معروف + تاريخ، من غير أي علامات إيصال
+  final hasDate = RegExp(r'\d{2}\s?[/.\-]\s?\d{2}\s?[/.\-]\s?20\d{2}').hasMatch(all);
+  return hasDate && lines.length <= 8 && findTerminalIn([all]) != null;
+}
+
+// عدّ الإيصالات بالهيكل: كل إيصال له شعار + Terminal ID + RRN + AMOUNT + Approved (مرة واحدة)
+// بنجمع العلامات دي ونقسمها أعمدة، وفي كل عمود أكتر علامة متكررة = عدد الإيصالات
+_StructPage _structCount(RecognizedText res) {
+  final out = _StructPage();
+  final lines = toLines(res);
+  if (lines.isEmpty) return out;
+  var h = 0.0, w = 0.0;
+  for (final l in lines) {
+    if (l.bottom > h) h = l.bottom;
+    if (l.right > w) w = l.right;
+  }
+  out.h = h;
+  final all = <_SA>[];
+  final nameRe = RegExp(r'NATIONAL|BANK\s*OF\s*EGYPT');
+  final rrnRe = RegExp(r'(?<![A-Z])R{1,2}N\W{0,3}\d');
+  final amtRe = RegExp(r'^\s*AMOUNT\b');
+  final amtBad = RegExp(r'FROM|ACCOUNT|CONFIRM|DEBIT|\bMY\b');
+  // "AMOUNT" اللي في نص التوقيع (I AUTHORIZE TO DEBIT THE ABOVE AMOUNT...) لو OCR غلط في FROM/MY بتتعدّ إيصال وهمي.
+  // AMOUNT الحقيقي بييجي قبل Approved، فلو فوقه Approved في نفس العمود ومفيش بينهم شعار/Terminal/RRN يبقى ده ذيل الإيصال.
+  bool isTailAmount(OcrLine l) {
+    final lcx = (l.left + l.right) / 2;
+    OcrLine? ap;
+    for (final o in lines) {
+      if (identical(o, l)) continue;
+      if (o.cy >= l.cy || l.cy - o.cy > 0.25 * h) continue;
+      if (((o.left + o.right) / 2 - lcx).abs() > 0.1 * w) continue;
+      if (!o.text.toUpperCase().contains('APPROVED')) continue;
+      if (ap == null || o.cy > ap.cy) ap = o;
+    }
+    if (ap == null) return false;
+    for (final o in lines) {
+      if (o.cy <= ap.cy || o.cy >= l.cy) continue;
+      if (((o.left + o.right) / 2 - lcx).abs() > 0.1 * w) continue;
+      final t = o.text.toUpperCase();
+      if (nameRe.hasMatch(t) || t.contains('TERMINAL') || t.contains('MERCHANT ID') || rrnRe.hasMatch(t)) return false;
     }
     return true;
   }
-
-  /// انتقال لصفحة تانية (dir: next / prev) مع حفظ التعديل الحالي لو اتغيّر.
-  Future<void> _nav(String dir) async {
-    if (busy || widget.pageCount <= 0 || aspect == null) return;
-    if (dir == 'prev' && widget.pageIndex <= 0) return;
-    if (_sig() == _sig0) {
-      Navigator.pop(context, '$kNavPrefix|$dir|${widget.path}');
-      return;
-    }
-    await _apply(nav: dir);
-  }
-
-  Future<void> _confirmDelete() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (c) => AlertDialog(
-        title: const Text('حذف الصفحة؟'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('إلغاء')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('حذف')),
-        ],
-      ),
-    );
-    if (ok == true && mounted) Navigator.pop(context, kDelete);
-  }
-
-  Offset _clampPan(Offset p, Size s) => Offset(
-        p.dx.clamp(s.width - s.width * _zm, 0.0).toDouble(),
-        p.dy.clamp(s.height - s.height * _zm, 0.0).toDouble(),
-      );
-
-  /// p: إحداثيات على الشاشة (جوه منطقة العرض).
-  void _down(Offset p, Size s) {
-    final pan = _clampPan(_pan, s);
-    final pts = [
-      for (final q in quad) Offset(q.dx * s.width * _zm + pan.dx, q.dy * s.height * _zm + pan.dy)
-    ];
-    var best = -1;
-    var bd = 44.0;
-    for (var i = 0; i < 4; i++) {
-      final d = (pts[i] - p).distance;
-      if (d < bd) {
-        bd = d;
-        best = i;
-      }
-    }
-    if (best == -1) {
-      bd = 34.0;
-      for (var i = 0; i < 4; i++) {
-        final d = ((pts[i] + pts[(i + 1) % 4]) / 2 - p).distance;
-        if (d < bd) {
-          bd = d;
-          best = 4 + i;
+  for (final l in lines) {
+    final u = l.text.toUpperCase();
+    void add(String t, [double? v]) => all.add(_SA(t, (l.left + l.right) / 2, l.cy, l.left, l.right)..v = v);
+    if (nameRe.hasMatch(u)) add('logo');
+    if (u.contains('TERMINAL')) add('term');
+    if (rrnRe.hasMatch(u)) add('rrn');
+    if (amtRe.hasMatch(u) && !amtBad.hasMatch(u) && !isTailAmount(l)) {
+      // المبلغ: في نفس السطر، أو في سطر جنبه على نفس الارتفاع جوه نفس الإيصال
+      var av = _amtIn(l.text);
+      if (av == null) {
+        OcrLine? nb;
+        var nd = double.infinity;
+        for (final o in lines) {
+          if (identical(o, l)) continue;
+          if ((o.cy - l.cy).abs() > l.h * 0.7) continue;
+          final gap = o.left - l.right;
+          if (gap < -l.h || gap > w * 0.2) continue;
+          if (gap < nd && _amtIn(o.text) != null) {
+            nd = gap;
+            nb = o;
+          }
         }
+        if (nb != null) av = _amtIn(nb.text);
+      }
+      add('amount', av);
+      out.dbgAmt.add('${l.text.length > 22 ? l.text.substring(0, 22) : l.text}@${h > 0 ? (l.cy * 100 / h).round() : 0}%');
+    }
+    if (u.contains('APPROVED')) add('appr');
+  }
+  // إزالة التكرار (نفس العلامة اتقرت مرتين)
+  final ded = <_SA>[];
+  for (final a in all) {
+    var dup = false;
+    for (final o in ded) {
+      if (o.t == a.t && o.l < a.r && a.l < o.r && (o.cy - a.cy).abs() < h * 0.02) {
+        dup = true;
+        break;
       }
     }
-    if (best == -1 && _inside(p, pts)) best = 8;
-    if (best != -1) _quadTouched = true;
-    setState(() => drag = best);
+    if (!dup) ded.add(a);
   }
-
-  bool _inside(Offset p, List<Offset> v) {
-    var c = false;
-    for (var i = 0, j = v.length - 1; i < v.length; j = i++) {
-      if (((v[i].dy > p.dy) != (v[j].dy > p.dy)) &&
-          (p.dx < (v[j].dx - v[i].dx) * (p.dy - v[i].dy) / (v[j].dy - v[i].dy) + v[i].dx)) {
-        c = !c;
-      }
+  for (final a in ded) {
+    out.types[a.t] = (out.types[a.t] ?? 0) + 1;
+    if (a.t == 'amount' && a.v != null) out.amts.add(a.v!);
+  }
+  if (ded.isEmpty) return out;
+  out.mx = out.types.values.reduce((a, b) => a > b ? a : b);
+  final freqV = <int, int>{};
+  for (final v in out.types.values) {
+    if (v > 0) freqV[v] = (freqV[v] ?? 0) + 1;
+  }
+  freqV.forEach((v, c) {
+    if (c > out.voteN || (c == out.voteN && v < out.vote)) {
+      out.vote = v;
+      out.voteN = c;
     }
-    return c;
-  }
-
-  void _move(Offset delta, Size s) {
-    if (drag < 0) return;
-    final idx = drag < 4
-        ? <int>[drag]
-        : drag < 8
-            ? <int>[drag - 4, (drag - 3) % 4]
-            : <int>[0, 1, 2, 3];
-    var dx = delta.dx / s.width, dy = delta.dy / s.height;
-    for (final i in idx) {
-      dx = dx.clamp(-quad[i].dx, 1 - quad[i].dx).toDouble();
-      dy = dy.clamp(-quad[i].dy, 1 - quad[i].dy).toDouble();
-    }
-    final q = List.of(quad);
-    for (final i in idx) {
-      q[i] = q[i] + Offset(dx, dy);
-    }
-    setState(() => quad = q);
-  }
-
-  void _ptrDown(PointerDownEvent e, Offset origin, Size s) {
-    final p = e.localPosition - origin;
-    _ptrs[e.pointer] = p;
-    if (_ptrs.length == 1) {
-      _pinched = false;
-      _movedFar = false;
-      _downPos = p;
-      _lastPtr = p;
-      _downAt = DateTime.now();
-      _down(p, s);
-      _swipeOk = widget.pageCount > 0 && !busy && _zm <= 1.001 && (drag == -1 || (drag == 8 && _quadFull()));
-    } else if (_ptrs.length == 2) {
-      // إصبعين: تكبير/تصغير (وبنوقف سحب الزوايا)
-      if (drag != -1) setState(() => drag = -1);
-      _pinched = true;
-      final v = _ptrs.values.toList();
-      _pinchD0 = math.max((v[0] - v[1]).distance, 1);
-      _pinchZ0 = _zm;
-      final mid = (v[0] + v[1]) / 2;
-      final pan = _clampPan(_pan, s);
-      _pinchFocalImg = Offset((mid.dx - pan.dx) / _zm, (mid.dy - pan.dy) / _zm);
-    }
-  }
-
-  void _ptrMove(PointerMoveEvent e, Offset origin, Size s) {
-    if (!_ptrs.containsKey(e.pointer)) return;
-    final p = e.localPosition - origin;
-    _ptrs[e.pointer] = p;
-    if (_ptrs.length >= 2) {
-      final v = _ptrs.values.toList();
-      final mid = (v[0] + v[1]) / 2;
-      final z = (_pinchZ0 * (v[0] - v[1]).distance / _pinchD0).clamp(1.0, _maxZoom).toDouble();
-      setState(() {
-        _zm = z;
-        _pan = _clampPan(Offset(mid.dx - _pinchFocalImg.dx * z, mid.dy - _pinchFocalImg.dy * z), s);
-      });
-      return;
-    }
-    final delta = p - _lastPtr;
-    _lastPtr = p;
-    if ((p - _downPos).distance > 12) _movedFar = true;
-    if (_pinched) {
-      // آخر إصبع بعد القرصة: بيحرك الصورة بس
-      if (_zm > 1.001) setState(() => _pan = _clampPan(_pan + delta, s));
-      return;
-    }
-    if (drag >= 0 && drag < 8) {
-      _move(delta / _zm, s);
-    } else if (_zm > 1.001) {
-      setState(() => _pan = _clampPan(_pan + delta, s)); // سحب الصورة وهي مكبّرة
-    } else if (drag == 8) {
-      _move(delta / _zm, s);
-    }
-  }
-
-  void _ptrUp(PointerEvent e, Size s, {bool cancel = false}) {
-    final lastP = _ptrs.remove(e.pointer);
-    if (lastP == null) return;
-    if (_ptrs.isNotEmpty) {
-      _lastPtr = _ptrs.values.first;
-      return;
-    }
-    final wasDrag = drag;
-    if (drag != -1) setState(() => drag = -1);
-    if (wasDrag != -1 && !cancel) _mark();
-    if (cancel || _pinched) return;
-    if (_swipeOk) {
-      // سويب أفقي: يمين = الصفحة اللي بعدها (أو إضافة صورة)، شمال = اللي قبلها
-      final d = lastP - _downPos;
-      if (d.dx.abs() > 80 &&
-          d.dx.abs() > d.dy.abs() * 2 &&
-          DateTime.now().difference(_downAt).inMilliseconds < 900) {
-        _nav(d.dx > 0 ? 'next' : 'prev');
-        return;
-      }
-    }
-    if (_movedFar) return;
-    // نقرة سريعة: نقرتين ورا بعض = تكبير/رجوع
-    final now = DateTime.now();
-    if (now.difference(_downAt).inMilliseconds > 300) return;
-    final onHandle = wasDrag >= 0 && wasDrag < 8;
-    if (onHandle) return;
-    final pos = _downPos;
-    if (now.difference(_lastTapAt).inMilliseconds < 350 && (pos - _lastTapPos).distance < 40) {
-      _lastTapAt = DateTime(2000);
-      setState(() {
-        if (_zm > 1.05) {
-          _zm = 1;
-          _pan = Offset.zero;
-        } else {
-          final pan = _clampPan(_pan, s);
-          final fi = Offset((pos.dx - pan.dx) / _zm, (pos.dy - pan.dy) / _zm);
-          _zm = 2.5;
-          _pan = _clampPan(Offset(pos.dx - fi.dx * _zm, pos.dy - fi.dy * _zm), s);
-        }
-      });
-    } else {
-      _lastTapAt = now;
-      _lastTapPos = pos;
-    }
-  }
-
-  Offset? _focus(Size s) {
-    if (drag < 0 || drag > 7) return null;
-    final n = drag < 4 ? quad[drag] : (quad[drag - 4] + quad[(drag - 3) % 4]) / 2;
-    return Offset(n.dx * s.width, n.dy * s.height);
-  }
-
-  // ---------- العرض ----------
-
-  Widget _img(double w, double h) => view == null
-      ? SizedBox(width: w, height: h)
-      : CustomPaint(
-          size: Size(w, h),
-          painter: _ViewPainter(_shownNow, Size(w, h), angle * math.pi / 180,
-              _matrixNow()),
-        );
-
-  /// عدسة مكبّرة بتظهر فوق الإصبع وقت سحب الزاوية.
-  Widget _loupe(Offset f, Size s) {
-    const d = 112.0, z = 2.6;
-    final fx = f.dx * _zm + _clampPan(_pan, s).dx;
-    final left = fx < s.width / 2 ? s.width - d - 6 : 6.0;
-    return Positioned(
-      left: left,
-      top: 6,
-      width: d,
-      height: d,
-      child: IgnorePointer(
-        child: Container(
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            border: Border.all(color: Colors.white, width: 3),
-            boxShadow: const [BoxShadow(blurRadius: 6, color: Colors.black45)],
-          ),
-          child: ClipOval(
-            child: Stack(children: [
-              if (view != null)
-                CustomPaint(
-                  size: const Size(d, d),
-                  painter: _ViewPainter(_shownNow, s, angle * math.pi / 180,
-                      _matrixNow(),
-                      focus: f, zoom: z),
-                ),
-              const Center(child: Icon(Icons.add_rounded, size: 22, color: Colors.redAccent)),
-            ]),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// تحسين هادي للإطار بعد ما الاقتراح الفوري ظهر: من غير مؤشر انتظار، ومبيلمسش لو الموظف عدّل بإيده.
-  Future<void> _refineQuad() async {
-    try {
-      final q = await detectDocQuad(src!);
-      if (!mounted || _quadTouched || q == null) return;
-      var r = q;
-      for (var i = 0; i < turns; i++) {
-        r = _turnCw(r);
-      }
-      setState(() => quad = r);
-      _mark();
-    } catch (e, st) {
-      AppLog.e('_refineQuad', e, st);
-    }
-  }
-
-  Future<void> _auto({bool silent = false}) async {
-    if (!silent) _quadTouched = false;
-    setState(() => busy = true);
-    try {
-      final q = await detectDocQuad(src!);
-      if (!mounted) return;
-      if (silent && _quadTouched) return;
-      if (q == null) {
-        if (!silent) snack(context, 'مقدرتش أحدد حدود الورقة تلقائياً، حددها بإيدك');
-      } else {
-        var r = q;
-        for (var i = 0; i < turns; i++) {
-          r = _turnCw(r);
-        }
-        setState(() {
-          quad = r;
-          angle = 0;
-        });
-        _mark();
-      }
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> _apply({String? nav, bool all = false}) async {
-    if (!_quadConvex(quad)) {
-      snack(context, 'حدود القص متداخلة، عدّل الزوايا');
-      return;
-    }
-    setState(() => busy = true);
-    try {
-      final ep = EditParams(
-          quad: quad,
-          turns: turns,
-          angle: angle,
-          filter: filter,
-          contrast: contrast,
-          brightness: brightness,
-          sharp: sharp,
-          levels: levels);
-      final np = await renderEditedPage(widget.path, widget.prefix, ep);
-      if (mounted) {
-        final style =
-            EditParams(filter: filter, contrast: contrast, brightness: brightness, sharp: sharp);
-        Navigator.pop(
-            context,
-            all
-                ? '$kAllPrefix|${style.encode()}|$np'
-                : (nav == null ? np : '$kNavPrefix|$nav|$np'));
-      }
-    } catch (e, st) {
-      AppLog.e('editor._apply', e, st);
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> _confirmApplyAll() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (c) => AlertDialog(
-        title: const Text('تطبيق على كل الصفحات'),
-        content: const Text(
-            'هيتطبق الفلتر والسطوع والتباين والحدة على كل الصفحات. القص والتدوير بتاع كل صفحة هيفضلوا زي ما هما.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('إلغاء')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('طبّق')),
-        ],
-      ),
-    );
-    if (ok == true && mounted) await _apply(all: true);
-  }
-
-  // ---------- لوحات التحكم ----------
-
-  Widget _panel() {
-    switch (tab) {
-      case 0:
-        return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          const Text('اسحب الزوايا أو منتصف الحواف، واسحب جوه الإطار لتحريكه',
-              textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: Colors.grey)),
-          const SizedBox(height: 8),
-          Row(children: [
-            Expanded(
-              child: OutlinedButton.icon(
-                onPressed: busy ? null : _auto,
-                icon: const Icon(Icons.auto_fix_high_rounded),
-                label: const Text('تلقائي'),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: OutlinedButton.icon(
-                onPressed: busy
-                    ? null
-                    : () {
-                        HapticFeedback.selectionClick();
-                        setState(() {
-                          _quadTouched = true;
-                          angle = 0;
-                          quad = List.of(_full);
-                        });
-                        _mark();
-                      },
-                icon: const Icon(Icons.crop_free_rounded),
-                label: const Text('الصورة كلها'),
-              ),
-            ),
-          ]),
-        ]);
-      case 1:
-        return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            IconButton.filledTonal(
-              tooltip: 'لفّ يسار',
-              icon: const Icon(Icons.rotate_left_rounded),
-              onPressed: busy
-                  ? null
-                  : () => setState(() {
-                        turns = (turns + 3) % 4;
-                        quad = _turnCcw(quad);
-                        _loadView();
-                      }),
-            ),
-            const SizedBox(width: 16),
-            IconButton.filledTonal(
-              tooltip: 'لفّ يمين',
-              icon: const Icon(Icons.rotate_right_rounded),
-              onPressed: busy
-                  ? null
-                  : () => setState(() {
-                        turns = (turns + 1) % 4;
-                        quad = _turnCw(quad);
-                        _loadView();
-                      }),
-            ),
-          ]),
-          Row(children: [
-            const Icon(Icons.straighten_rounded),
-            Expanded(
-              child: Slider(
-                value: angle,
-                min: -20,
-                max: 20,
-                divisions: 80,
-                label: '${angle.toStringAsFixed(1)}°',
-                onChanged: busy ? null : (v) => setState(() => angle = v),
-                onChangeEnd: busy ? null : (_) => _mark(),
-              ),
-            ),
-            TextButton(
-              onPressed: (busy || angle == 0)
-                  ? null
-                  : () {
-                      setState(() => angle = 0);
-                      _mark();
-                    },
-              child: const Text('0°'),
-            ),
-          ]),
-        ]);
-      default:
-        return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Row(children: [
-            _peekBtn(),
-            Expanded(child: FilterBar(selected: filter, onChanged: busy ? null : _onFilter)),
-          ]),
-          Row(children: [
-            const Icon(Icons.brightness_6_rounded, size: 20),
-            Expanded(
-              child: Slider(
-                value: brightness,
-                min: -1,
-                max: 1,
-                onChanged: busy ? null : (v) => setState(() => brightness = v),
-                onChangeEnd: busy ? null : (_) => _mark(),
-              ),
-            ),
-            const Icon(Icons.contrast_rounded, size: 20),
-            Expanded(
-              child: Slider(
-                value: contrast,
-                min: -0.5,
-                max: 1,
-                onChanged: busy ? null : (v) => setState(() => contrast = v),
-                onChangeEnd: busy ? null : (_) => _mark(),
-              ),
-            ),
-            IconButton(
-              tooltip: 'إعادة ضبط',
-              icon: const Icon(Icons.restart_alt_rounded),
-              onPressed: busy
-                  ? null
-                  : () {
-                      setState(() {
-                        brightness = 0;
-                        contrast = 0;
-                        sharp = 0;
-                      });
-                      _resharp();
-                      _mark();
-                    },
-            ),
-          ]),
-          Row(children: [
-            const Icon(Icons.deblur_rounded, size: 20),
-            Expanded(
-              child: Slider(
-                value: sharp,
-                min: 0,
-                max: 1,
-                onChanged: busy ? null : (v) => setState(() => sharp = v),
-                onChangeEnd: busy
-                    ? null
-                    : (_) {
-                        _resharp();
-                        _mark();
-                      },
-              ),
-            ),
-            const Text('حدة', style: TextStyle(fontSize: 12, color: Colors.grey)),
-            _favBtn(),
-          ]),
-        ]);
-    }
-  }
-
-  Widget _barBtn(IconData i, String label, bool on, VoidCallback? onTap) {
-    final col = on ? kAccent : Theme.of(context).colorScheme.onSurface;
-    return InkResponse(
-      onTap: onTap,
-      radius: 36,
-      child: SizedBox(
-        width: 62,
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Icon(i, color: onTap == null ? Colors.grey : col, size: 27),
-          const SizedBox(height: 3),
-          Text(label,
-              maxLines: 1,
-              style: TextStyle(fontSize: 11, color: onTap == null ? Colors.grey : col)),
-        ]),
-      ),
-    );
-  }
-
-  Widget _pagerBtn(IconData i, VoidCallback? onTap) => InkResponse(
-        onTap: onTap,
-        radius: 26,
-        child: Container(
-          width: 40,
-          height: 40,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: onTap == null ? Colors.black12 : Colors.black26,
-          ),
-          child: Icon(i, size: 24, color: onTap == null ? Colors.grey : null),
-        ),
-      );
-
-  /// عداد الصفحات (زي كام اسكنر): < 1/3 >. السهم اليمين في آخر صفحة = إضافة صورة.
-  Widget _pager() {
-    final last = widget.pageIndex >= widget.pageCount - 1;
-    return Directionality(
-      textDirection: TextDirection.ltr,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          _pagerBtn(Icons.chevron_left_rounded, (busy || widget.pageIndex <= 0) ? null : () => _nav('prev')),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
-            child: Text('${widget.pageIndex + 1}/${widget.pageCount}',
-                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
-          ),
-          _pagerBtn(last ? Icons.add_a_photo_rounded : Icons.chevron_right_rounded, busy ? null : () => _nav('next')),
-        ]),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('تعديل الصورة'),
-        actions: [
-          IconButton(
-            tooltip: 'تراجع',
-            icon: const Icon(Icons.undo_rounded),
-            onPressed: (busy || !_canUndo) ? null : _undo,
-          ),
-          IconButton(
-            tooltip: 'إعادة',
-            icon: const Icon(Icons.redo_rounded),
-            onPressed: (busy || !_canRedo) ? null : _redo,
-          ),
-          if (widget.pageCount > 1)
-            PopupMenuButton<String>(
-              tooltip: 'المزيد',
-              enabled: !busy,
-              onSelected: (_) => _confirmApplyAll(),
-              itemBuilder: (_) => const [
-                PopupMenuItem<String>(value: 'all', child: Text('طبّق الفلتر على كل الصفحات')),
-              ],
-            ),
-          if (widget.canDelete)
-            IconButton(
-              tooltip: 'حذف الصفحة',
-              icon: const Icon(Icons.delete_outline_rounded),
-              onPressed: busy ? null : _confirmDelete,
-            ),
-        ],
-      ),
-      body: (aspect == null || view == null)
-          ? const Center(child: CircularProgressIndicator())
-          : Column(children: [
-              Expanded(
-                child: Padding(
-                  padding: EdgeInsets.zero,
-                  child: LayoutBuilder(builder: (ctx, cons) {
-                    const pad = 14.0;
-                    final asp = turns.isOdd ? 1 / aspect! : aspect!;
-                    final maxW = cons.maxWidth - 2 * pad, maxH = cons.maxHeight - 2 * pad;
-                    var w = maxW, h = w * asp;
-                    if (h > maxH) {
-                      h = maxH;
-                      w = h / asp;
-                    }
-                    final size = Size(w, h);
-                    final focus = _focus(size);
-                    final pan = _clampPan(_pan, size);
-                    final zoomed = _zm > 1.001;
-                    const origin = Offset(pad, pad);
-                    return Center(
-                      child: SizedBox(
-                        width: w + 2 * pad,
-                        height: h + 2 * pad,
-                        child: Listener(
-                          behavior: HitTestBehavior.opaque,
-                          onPointerDown: (e) => _ptrDown(e, origin, size),
-                          onPointerMove: (e) => _ptrMove(e, origin, size),
-                          onPointerUp: (e) => _ptrUp(e, size),
-                          onPointerCancel: (e) => _ptrUp(e, size, cancel: true),
-                          child: Padding(
-                            padding: const EdgeInsets.all(pad),
-                            child: Stack(clipBehavior: zoomed ? Clip.hardEdge : Clip.none, children: [
-                              Transform(
-                                transform: Matrix4.translationValues(pan.dx, pan.dy, 0) *
-                                    Matrix4.diagonal3Values(_zm, _zm, 1),
-                                child: RepaintBoundary(child: _img(w, h)),
-                              ),
-                              Positioned.fill(child: CustomPaint(painter: _QuadPainter(quad, _zm, pan))),
-                              if (focus != null) _loupe(focus, size),
-                              if (zoomed)
-                                Positioned(
-                                  left: 6,
-                                  bottom: 6,
-                                  child: GestureDetector(
-                                    onTap: () => setState(() {
-                                      _zm = 1;
-                                      _pan = Offset.zero;
-                                    }),
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                      decoration: BoxDecoration(
-                                          color: Colors.black54, borderRadius: BorderRadius.circular(16)),
-                                      child: Row(mainAxisSize: MainAxisSize.min, children: [
-                                        const Icon(Icons.zoom_out_map_rounded, size: 16, color: Colors.white),
-                                        const SizedBox(width: 4),
-                                        Text('×${_zm.toStringAsFixed(1)}',
-                                            style: const TextStyle(color: Colors.white, fontSize: 12)),
-                                      ]),
-                                    ),
-                                  ),
-                                ),
-                            ]),
-                          ),
-                        ),
-                      ),
-                    );
-                  }),
-                ),
-              ),
-              if (widget.pageCount > 0) _pager(),
-              SizedBox(
-                height: tab == 2 ? 150 : 112,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: _panel(),
-                ),
-              ),
-              SafeArea(
-                top: false,
-                child: Container(
-                  color: Colors.black12,
-                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-                  child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                    if (widget.canRetake)
-                      _barBtn(Icons.cameraswitch_rounded, 'إعادة أخذ', false,
-                          busy ? null : () => Navigator.pop(context, kRetake)),
-                    _barBtn(Icons.rotate_left_rounded, 'يسار', tab == 1, busy
-                        ? null
-                        : () => setState(() {
-                              tab = 1;
-                              turns = (turns + 3) % 4;
-                              quad = _turnCcw(quad);
-                              _loadView();
-                            })),
-                    _barBtn(Icons.auto_awesome_rounded, 'فلتر', tab == 2, () => setState(() => tab = 2)),
-                    _barBtn(Icons.crop_rounded, 'قص', tab == 0, () => setState(() => tab = 0)),
-                    InkResponse(
-                      onTap: (busy || aspect == null) ? null : _apply,
-                      radius: 40,
-                      child: Container(
-                        width: 78,
-                        height: 46,
-                        decoration: BoxDecoration(
-                          color: kAccent,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: busy
-                            ? Center(
-                                child: SizedBox(
-                                    width: 22,
-                                    height: 22,
-                                    child: CircularProgressIndicator(strokeWidth: 2.5, color: pal.onAccent)))
-                            : Icon(Icons.check_rounded, color: pal.onAccent, size: 30),
-                      ),
-                    ),
-                  ]),
-                ),
-              ),
-            ]),
-    );
-  }
-}
-
-/// بيرسم الصورة (تدوير دقيق + ألوان) من غير ColorFiltered ولا Image.file، فالذاكرة قليلة.
-/// لو focus موجود بيرسم عدسة مكبّرة حوالين النقطة دي.
-class _ViewPainter extends CustomPainter {
-  final ui.Image img;
-  final Size box;
-  final double angle; // راديان
-  final List<double> m;
-  final Offset? focus;
-  final double zoom;
-  _ViewPainter(this.img, this.box, this.angle, this.m, {this.focus, this.zoom = 1});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    canvas.save();
-    if (focus != null) {
-      canvas.translate(size.width / 2 - focus!.dx * zoom, size.height / 2 - focus!.dy * zoom);
-      canvas.scale(zoom);
-    }
-    final r = Offset.zero & box;
-    canvas.clipRect(r);
-    canvas.drawRect(
-        r,
-        Paint()
-          ..color = Colors.white
-          ..colorFilter = ColorFilter.matrix(m));
-    canvas.translate(box.width / 2, box.height / 2);
-    canvas.rotate(angle);
-    canvas.translate(-box.width / 2, -box.height / 2);
-    canvas.drawImageRect(
-        img,
-        Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
-        r,
-        Paint()
-          ..colorFilter = ColorFilter.matrix(m)
-          ..filterQuality = FilterQuality.medium);
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(_ViewPainter o) =>
-      !identical(o.img, img) ||
-      o.box != box ||
-      o.angle != angle ||
-      o.focus != focus ||
-      o.zoom != zoom ||
-      !listEquals(o.m, m);
-}
-
-class _QuadPainter extends CustomPainter {
-  final List<Offset> q;
-  final double zm;
-  final Offset pan;
-  _QuadPainter(this.q, [this.zm = 1, this.pan = Offset.zero]);
-
-  @override
-  void paint(Canvas canvas, Size s) {
-    final pts = [for (final p in q) Offset(p.dx * s.width * zm + pan.dx, p.dy * s.height * zm + pan.dy)];
-    final poly = Path()..addPolygon(pts, true);
-    canvas.drawPath(
-        Path.combine(PathOperation.difference, Path()..addRect(Offset.zero & s), poly),
-        Paint()..color = Colors.black54);
-    canvas.drawPath(
-        poly,
-        Paint()
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2
-          ..color = Colors.white);
-    final fill = Paint()..color = Colors.white;
-    final ring = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2
-      ..color = pal.mid;
-    for (var i = 0; i < 4; i++) {
-      final m = (pts[i] + pts[(i + 1) % 4]) / 2;
-      canvas.drawCircle(m, 7, fill);
-      canvas.drawCircle(m, 7, ring);
-    }
-    for (final p in pts) {
-      canvas.drawCircle(p, 11, fill);
-      canvas.drawCircle(p, 11, ring);
-    }
-  }
-
-  @override
-  bool shouldRepaint(_QuadPainter o) => o.q != q || o.zm != zm || o.pan != pan;
-}
-
-// =====================================================================
-//  معاينة ملف الـ PDF بعد إنشائه (كل الصفحات) + مشاركة PDF / صور
-// =====================================================================
-
-class PdfResultScreen extends StatefulWidget {
-  final Session session;
-  final File pdf;
-  final List<String> imgs; // نفس ترتيب صفحات الـ PDF
-  const PdfResultScreen({super.key, required this.session, required this.pdf, required this.imgs});
-  @override
-  State<PdfResultScreen> createState() => _PdfResultScreenState();
-}
-
-class _PdfResultScreenState extends State<PdfResultScreen> {
-  Tag? tag;
-  final Set<String> noTags = {};
-  bool busy = false;
-  bool shared = false; // اتبعت PDF أو الصور فعلاً
-  String? progress;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    try {
-      final t = await receiptTag(1000, widget.session);
-      final nts = <String>{};
-      for (final x in widget.imgs) {
-        if (await Store.noTag(x)) nts.add(x);
-      }
-      if (!mounted) return;
-      setState(() {
-        tag = t;
-        noTags
-          ..clear()
-          ..addAll(nts);
-      });
-    } catch (e, st) {
-      AppLog.e('PdfResultScreen._load', e, st);
-      if (mounted) snack(context, 'تعذر تجهيز المعاينة');
-    }
-  }
-
-  void _markShared() {
-    HapticFeedback.mediumImpact();
-    if (!mounted) return;
-    setState(() => shared = true);
-    snack(context, 'اتبعت ✓ اضغط "تم" لما تخلص');
-  }
-
-  Future<void> _sharePdf() async {
-    if (busy) return;
-    final ok = await shareFiles(context, [widget.pdf.path]);
-    if (ok) _markShared();
-  }
-
-  Future<void> _shareImages() async {
-    if (busy) return;
-    final n = widget.imgs.length;
-    setState(() {
-      busy = true;
-      progress = '0/$n';
-    });
-    final files = <String>[];
-    try {
-      final dir = await getTemporaryDirectory();
-      for (var i = 0; i < n; i++) {
-        final bytes = await composeReceiptImage(widget.imgs[i], widget.session);
-        final f = File('${dir.path}/${widget.session.pdfName}_${i + 1}.jpg');
-        await f.writeAsBytes(bytes, flush: true);
-        files.add(f.path);
-        if (mounted) setState(() => progress = '${i + 1}/$n');
-      }
-    } catch (e, st) {
-      AppLog.e('PdfResultScreen._shareImages', e, st);
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-      files.clear();
-    } finally {
-      if (mounted) {
-        setState(() {
-          busy = false;
-          progress = null;
-        });
-      }
-    }
-    if (files.isEmpty || !mounted) return;
-    final ok = await shareFiles(context, files);
-    if (ok) _markShared();
-  }
-
-  Future<void> _done() async {
-    await Store.afterPdfSent();
-    if (mounted) Navigator.pop(context, true);
-  }
-
-  Widget _page(int i) {
-    final path = widget.imgs[i];
-    final show = !noTags.contains(path);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 14),
-      child: Column(children: [
-        Padding(
-          padding: const EdgeInsets.only(bottom: 4),
-          child: Text('صفحة ${i + 1} من ${widget.imgs.length}',
-              style: const TextStyle(color: Colors.grey, fontSize: 12)),
-        ),
-        GestureDetector(
-          onTap: () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                  builder: (_) => ZoomPage(
-                      child: ReceiptPreview(path: path, tag: tag!, showTag: show)))),
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.white,
-              border: Border.all(color: Colors.black26),
-              boxShadow: const [BoxShadow(blurRadius: 4, color: Colors.black12)],
-            ),
-            child: ReceiptPreview(path: path, tag: tag!, cacheWidth: 900, showTag: show),
-          ),
-        ),
-      ]),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final n = widget.imgs.length;
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('معاينة الملف ($n صفحة)'),
-        actions: [
-          if (shared)
-            TextButton.icon(
-              onPressed: busy ? null : _done,
-              icon: const Icon(Icons.check_rounded),
-              label: const Text('تم'),
-            ),
-        ],
-      ),
-      body: Column(children: [
-        Expanded(
-          child: tag == null
-              ? const Center(child: CircularProgressIndicator())
-              : ListView.builder(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: n,
-                  itemBuilder: (_, i) => _page(i),
-                ),
-        ),
-        SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-            child: Row(children: [
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: busy ? null : _sharePdf,
-                  icon: const Icon(Icons.picture_as_pdf_rounded),
-                  label: const Text('مشاركة PDF'),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: FilledButton.tonalIcon(
-                  onPressed: busy ? null : _shareImages,
-                  icon: busy
-                      ? const SizedBox(
-                          width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Icon(Icons.image_rounded),
-                  label: Text(progress != null ? 'تجهيز $progress' : 'مشاركة صور'),
-                ),
-              ),
-            ]),
-          ),
-        ),
-      ]),
-    );
-  }
-}
-
-// =====================================================================
-//  شاشة إيصالات الدفع
-// =====================================================================
-
-// =====================================================================
-//  كاميرا التطبيق (شكل كام اسكنر): كل الأدوات أيقونات تحت، وعداد الصور على المصغّرة
-// =====================================================================
-
-/// حالة الكاميرا بعد ما الشاشة اللي فوقها (تعديل / معرض) تخلص.
-class A2RCamState {
-  final int count; // عدد الصور المحفوظة لحد دلوقتي
-  final String? thumb; // آخر صورة (للمصغّرة)
-  final bool close; // اقفل الكاميرا (الباتش بعد أول صورة)
-  const A2RCamState({this.count = 0, this.thumb, this.close = false});
-}
-
-class A2RCameraScreen extends StatefulWidget {
-  final String title; // مكتوب تحت المعاينة (إيصالات / باتش)
-  final bool single; // true: تقفل بعد أول صورة (الباتش)
-  final int count;
-  final String? thumb;
-  final Future<A2RCamState?> Function(String path) onShot;
-  final Future<A2RCamState?> Function()? onGallery;
-  const A2RCameraScreen({
-    super.key,
-    required this.title,
-    required this.onShot,
-    this.onGallery,
-    this.single = false,
-    this.count = 0,
-    this.thumb,
   });
-  @override
-  State<A2RCameraScreen> createState() => _A2RCameraScreenState();
+  // أعمدة
+  ded.sort((a, b) => a.cx.compareTo(b.cx));
+  final cols = <List<_SA>>[];
+  var cur = <_SA>[ded.first];
+  for (var i = 1; i < ded.length; i++) {
+    if (ded[i].cx - cur.last.cx > w * 0.07) {
+      cols.add(cur);
+      cur = <_SA>[];
+    }
+    cur.add(ded[i]);
+  }
+  cols.add(cur);
+  // لكل عمود: كل علامة بتظهر مرة واحدة في كل إيصال، فأكبر عدد لأي علامة = عدد الإيصالات في العمود
+  // (لو علامة اتقرت ناقصة التانية بتعوّض، ومش بيتأثر بميل الإيصال ولا بترتيب القراءة)
+  // الطريقة 1 (القديمة): أكبر عدد لأي علامة (شعار/Terminal/RRN/AMOUNT/APPROVED).
+  // الطريقة 2: علامات إيصال الدفع بس (rrn/amount/appr)، لأن الشعار و Terminal موجودين كمان في إيصال الإقفال فبيزوّدوا إيصال.
+  // الاتنين من نفس قراءة الـ OCR (من غير أي وقت زيادة).
+  var n = 0, n2 = 0, n3 = 0;
+  for (final c in cols) {
+    final cnt = <String, int>{};
+    for (final a in c) {
+      cnt[a.t] = (cnt[a.t] ?? 0) + 1;
+    }
+    n += cnt.values.reduce((a, b) => a > b ? a : b);
+    var pay = 0;
+    for (final k in const ['rrn', 'amount', 'appr']) {
+      final v = cnt[k] ?? 0;
+      if (v > pay) pay = v;
+    }
+    n2 += pay;
+    n3 += _seqCountCol(c, h);
+  }
+  // صفحة فيها إيصال أو اتنين كبار (غالباً آخر صفحة): علامات الإيصال الواحد (الشعار / Terminal / AMOUNT)
+  // بتتوزع على أعمدة غلط فالعدد بيزيد (إيصال واحد اتعدّ 4). لو 3 علامات أو أكتر اتفقوا على نفس العدد
+  // الكلي للصفحة، يبقى ده العدد الصح ومفيش طريقة تعدّي فوقه.
+  var strongTypes = 0;
+  for (final v in out.types.values) {
+    if (v == out.mx) strongTypes++;
+  }
+  if (strongTypes >= 3) {
+    if (n > out.mx) n = out.mx;
+    if (n2 > out.mx) n2 = out.mx;
+    if (n3 > out.mx) n3 = out.mx;
+  }
+  out.sm = n;
+  out.sm2 = n2;
+  out.sm3 = n3;
+  return out;
 }
 
-class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingObserver {
-  cam.CameraController? _c;
-  String? _err;
-  bool _ready = false;
-  bool _starting = false; // يمنع تشغيل الكاميرا مرتين في نفس الوقت
-  bool _shooting = false;
-  bool _hd = true;
-  int _flash = 0; // 0 مقفول، 1 تلقائي، 2 فلاش، 3 كشاف
-  bool _grid = false; // شبكة الأثلاث للمحاذاة
-  late int _count = widget.count;
-  String? _thumb;
-  double _minZoom = 1, _maxZoom = 1, _zoom = 1, _zoom0 = 1;
-  Offset? _focusAt;
-  List<Offset>? _liveQuad; // التحديد التلقائي الحي فوق المعاينة
-  bool _live = false, _liveBusy = false;
-  int _lastLive = 0, _liveMiss = 0;
+bool sameDay(ReceiptItem a, ReceiptItem b) =>
+    a.date == null || b.date == null || a.date == b.date;
 
-  static const _flashIcons = [Icons.flash_off_rounded, Icons.flash_auto_rounded, Icons.flash_on_rounded, Icons.highlight_rounded];
-  static const _flashNames = ['الفلاش مقفول', 'فلاش تلقائي', 'فلاش', 'كشاف'];
+// بيجيب كل التطبيقات اللي تقدر تفتح فولدر (مدير ملفات) بأيقوناتها ويخلّيك تختار (وتحفظ الافتراضي لو عايز)
+Future<bool> chooseAndOpenFolder(BuildContext context, String path) async {
+  var handlers = <Map<String, String>>[];
+  try {
+    handlers = _toHandlers(await _chan.invokeMethod<List<dynamic>>('folderHandlers', {'path': path}));
+  } catch (_) {}
+  handlers = handlers.where((h) => h['pkg'] != 'com.termux').toList();
+  _numberVariants(handlers);
+  if (!context.mounted) return false;
+  final picked = await chooseHandler(
+    context,
+    title: 'افتح الفولدر بواسطة',
+    handlers: handlers,
+    prefKey: 'defFolder',
+    systemOption: <String, String>{'pkg': '', 'cls': '', 'kind': 'tree', 'label': 'متصفح ملفات النظام'},
+  );
+  if (picked == null) return true; // المستخدم قفل القايمة
+  try {
+    final ok = await _chan.invokeMethod<bool>('openFolderWith', {
+      'path': path,
+      'pkg': picked['pkg'] ?? '',
+      'cls': picked['cls'] ?? '',
+      'kind': picked['kind'] ?? '',
+    });
+    return ok == true;
+  } catch (_) {
+    return false;
+  }
+}
+
+Map<String, String>? _loadDefaultHandler(String key) {
+  try {
+    final v = _readCfg()[key];
+    if (v is Map) return {for (final e in v.entries) e.key.toString(): e.value.toString()};
+  } catch (_) {}
+  return null;
+}
+
+void _saveDefaultHandler(String key, Map<String, String>? h) {
+  try {
+    final cfg = _readCfg();
+    if (h == null) {
+      cfg.remove(key);
+    } else {
+      cfg[key] = h;
+    }
+    _writeCfg(cfg);
+  } catch (_) {}
+}
+
+// بيمسح الاختيارات المحفوظة (المعرض / ملفات PDF) علشان تختار من جديد
+void resetDefaultHandlers(BuildContext context) {
+  for (final k in ['defFolder', 'defImage', 'defPdf']) {
+    _saveDefaultHandler(k, null);
+  }
+  ScaffoldMessenger.of(context).showSnackBar(
+    const SnackBar(content: w.Text('اتمسحت التطبيقات الافتراضية. هتختار من جديد المرة الجاية.')),
+  );
+}
+
+List<Map<String, String>> _toHandlers(dynamic r) {
+  final out = <Map<String, String>>[];
+  if (r is List) {
+    for (final e in r) {
+      if (e is Map) out.add({for (final en in e.entries) en.key.toString(): en.value.toString()});
+    }
+  }
+  return out;
+}
+
+// لو نفس التطبيق ظهر بأكتر من طريقة فتح، بنسيب الأولى بس
+void _numberVariants(List<Map<String, String>> hs) {
+  final seen = <String>{};
+  hs.removeWhere((h) => !seen.add(h['pkg'] ?? ''));
+}
+
+Widget _handlerTile(Widget icon, String label, VoidCallback onTap) => InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: onTap,
+      child: SizedBox(
+        width: 84,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              icon,
+              const SizedBox(height: 4),
+              Text(label,
+                  maxLines: 2,
+                  textAlign: TextAlign.center,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ),
+    );
+
+// بيعرض التطبيقات المتاحة وانت تختار. لو اخترت "الافتراضي" بيتحفظ وبعدها بيفتح علطول
+Future<Map<String, String>?> chooseHandler(
+  BuildContext context, {
+  required String title,
+  required List<Map<String, String>> handlers,
+  required String prefKey,
+  Map<String, String>? systemOption,
+}) async {
+  final saved = _loadDefaultHandler(prefKey);
+  if (saved != null) {
+    if (systemOption != null && saved['kind'] == systemOption['kind'] && (saved['pkg'] ?? '').isEmpty) {
+      return saved;
+    }
+    if (handlers.any((h) => h['pkg'] == saved['pkg'] && h['cls'] == saved['cls'] && h['kind'] == saved['kind'])) {
+      return saved;
+    }
+  }
+  if (!context.mounted) return null;
+  var makeDefault = false;
+  return showModalBottomSheet<Map<String, String>>(
+    context: context,
+    isScrollControlled: true,
+    builder: (c) => StatefulBuilder(
+      builder: (c, setS) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            ListTile(
+              title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+            ),
+            CheckboxListTile(
+              value: makeDefault,
+              controlAffinity: ListTileControlAffinity.leading,
+              onChanged: (v) => setS(() => makeDefault = v ?? false),
+              title: const Text('خليه الافتراضي (يفتح علطول المرة الجاية)'),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 4, 8, 12),
+              child: Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 6,
+                runSpacing: 10,
+                children: [
+                  for (final h in handlers)
+                    _handlerTile(
+                      h['icon'] != null && h['icon']!.isNotEmpty
+                          ? Image.memory(base64Decode(h['icon']!), width: 52, height: 52)
+                          : const Icon(Icons.apps, size: 52),
+                      h['label'] ?? h['pkg'] ?? '',
+                      () {
+                        if (makeDefault) _saveDefaultHandler(prefKey, h);
+                        Navigator.pop(c, h);
+                      },
+                    ),
+                  if (systemOption != null)
+                    _handlerTile(
+                      const Icon(Icons.folder_special, size: 52),
+                      systemOption['label'] ?? 'النظام',
+                      () {
+                        if (makeDefault) _saveDefaultHandler(prefKey, systemOption);
+                        Navigator.pop(c, systemOption);
+                      },
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+// اختيار صور/ملفات من أي تطبيق معرض أو ملفات (انت اللي تختار وتحفظ الافتراضي).
+// بترجع null لو الطريقة دي مش متاحة (الجزء الـ native ناقص)، ولستة فاضية لو لغيت.
+Future<List<String>?> pickFilesViaChooser(
+  BuildContext context, {
+  required String mime,
+  required String title,
+  required String prefKey,
+}) async {
+  try {
+    var handlers = _toHandlers(await _chan.invokeMethod<List<dynamic>>('pickHandlers', {'mime': mime}));
+    _numberVariants(handlers);
+    if (!context.mounted) return null;
+    final picked = await chooseHandler(
+      context,
+      title: title,
+      handlers: handlers,
+      prefKey: prefKey,
+      systemOption: <String, String>{'pkg': '', 'cls': '', 'kind': 'system', 'label': 'منتقي ملفات النظام'},
+    );
+    if (picked == null) return <String>[];
+    final r = await _chan.invokeMethod<List<dynamic>>('pickWith', {
+      'mime': mime,
+      'pkg': picked['pkg'] ?? '',
+      'cls': picked['cls'] ?? '',
+      'kind': picked['kind'] ?? '',
+    });
+    if (r == null) return null;
+    return [for (final e in r) e.toString()];
+  } catch (e) {
+    _dbg('pickFilesViaChooser error: $e');
+    return null;
+  }
+}
+
+// بيطلب إعفاء التطبيق من توفير البطارية علشان يفضل شغال في الخلفية (مرة واحدة، أو بالقوة من القايمة)
+Future<void> askBatteryExempt({bool force = false}) async {
+  try {
+    final ok = await _chan.invokeMethod<bool>('batteryExempt');
+    if (ok == true) return;
+    final cfg = _readCfg();
+    if (!force && cfg['batteryAsked'] == true) return;
+    cfg['batteryAsked'] = true;
+    _writeCfg(cfg);
+    await _chan.invokeMethod('requestBatteryExempt');
+  } catch (_) {}
+}
+
+// لو إذن الإشعارات مقفول: مفيش إشعار هيظهر وانت برا التطبيق. بنقولك وبنفتحلك الإعدادات
+Future<void> ensureNotifPerm(BuildContext context) async {
+  try {
+    var st = await Permission.notification.status;
+    if (!st.isGranted) st = await Permission.notification.request();
+    if (st.isGranted) return;
+  } catch (_) {
+    return;
+  }
+  if (!context.mounted) return;
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+    content: w.Text(tr('الإشعارات مقفولة للتطبيق، فمش هيجيلك إشعار النتيجة وانت برا التطبيق. فعّلها من الإعدادات.')),
+    duration: const Duration(seconds: 12),
+    action: SnackBarAction(
+        label: tr('الإعدادات'),
+        onPressed: () {
+          openAppSettings();
+        }),
+  ));
+}
+
+String _periodLabelOf(int d) => d == 0 ? 'اليوم' : d == 1 ? 'يومين' : d == 2 ? '3 أيام' : 'الكل';
+
+// كارت إحصائية صغير (أيقونة + رقم + اسم) بيتوزع بالتساوي جوه Row
+Widget _statCard(IconData icon, String label, String value, Color c,
+        {VoidCallback? onTap, bool compact = false}) =>
+    Expanded(
+      child: Builder(builder: (ctx) {
+        final dim = value == '0';
+        final cs = Theme.of(ctx).colorScheme;
+        final ic = dim ? cs.onSurfaceVariant.withAlpha(120) : c;
+        return Card(
+          margin: const EdgeInsets.symmetric(horizontal: 2),
+          clipBehavior: Clip.antiAlias,
+          color: dim ? null : c.withAlpha(_isDark(ctx) ? 40 : 28),
+          child: InkWell(
+            onTap: onTap,
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: compact ? 5 : 8, horizontal: 4),
+              child: Column(
+                children: [
+                  Icon(icon, size: compact ? 16 : 18, color: ic),
+                  const SizedBox(height: 1),
+                  FittedBox(
+                      child: w.Text(value,
+                          style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: compact ? 14 : 15,
+                              color: dim ? cs.onSurfaceVariant.withAlpha(160) : null))),
+                  Text(label, style: TextStyle(fontSize: compact ? 10.5 : 11, color: cs.onSurfaceVariant)),
+                ],
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+
+// فلتر مضغوط (شيبس صغيرة على نفس سطر "عرض"). شيب المراجعة رمادي لو مفيش مراجعة
+Widget _filterRowCompact(bool reviewOnly, int all, int review, void Function(bool) onPick) {
+  const tight = VisualDensity(horizontal: -3, vertical: -3);
+  const fs = TextStyle(fontSize: 12);
+  return Row(
+    children: [
+      const Text('عرض', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+      const SizedBox(width: 8),
+      ChoiceChip(
+        label: Text('الكل ($all)', style: fs),
+        visualDensity: tight,
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        selected: !reviewOnly,
+        onSelected: (_) => onPick(false),
+      ),
+      const SizedBox(width: 6),
+      ChoiceChip(
+        label: Text('مراجعة ($review)', style: fs),
+        visualDensity: tight,
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        selected: reviewOnly,
+        onSelected: review == 0 ? null : (_) => onPick(true),
+      ),
+    ],
+  );
+}
+
+// لون ثابت لكل وحدة (حسب رقم الصف) علشان تتميز بالنظر
+Color _unitColor(int? row) {
+  const p = [
+    Colors.blue, Colors.teal, Colors.purple, Colors.orange, Colors.pink, Colors.indigo,
+    Colors.green, Colors.brown, Colors.cyan, Colors.red, Colors.lime, Colors.deepPurple,
+  ];
+  if (row == null) return Colors.grey;
+  return p[row % p.length];
+}
+
+// ───────────────────── الشاشة الرئيسية ─────────────────────
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
+  AppLifecycleState _life = AppLifecycleState.resumed;
+  int days = 0;
+  String? customDir;
+  String? customOut;
+  bool busy = false;
+  double progress = 0;
+  String status = 'اضغط "فحص التقفيل" لسحب الصور وتوليد الإكسيل والـ PDF.';
+  final List<ReceiptItem> processedItems = [];
+  final List<SysTotal> sysReads = []; // صور السيستم اللي اتقرت
+  String? standardXlsxPath;
+  String? generatedPdfPath;
+  List<String> extraPdfPaths = [];
+  List<int> missingTerminals = [];
+  final List<String> warnings = [];
+  final List<String> excludedPay = [];
+  bool autoRotate = false; // أبطأ: بيجرّب تدوير كل صورة مش إيصال
+  String sourceNote = '';
+  bool reviewOnly = false;
+  String _q = '';
+  int _sort = 0;
+  final TextEditingController _searchCtl = TextEditingController();
+  bool stopReq = false;
+  bool autoScan = false;
+  bool settingsOpen = false;
+  Timer? _autoTimer;
+  Set<String> _quickPend = <String>{}; // ملفات جديدة لسه حجمها بيتغير (التنزيل ما خلصش)
+  bool _fullRunning = false; // فحص يدوي كامل شغال أو بيبدأ: الفحص الخفيف يستنى
 
   @override
   void initState() {
     super.initState();
-    _thumb = widget.thumb;
     WidgetsBinding.instance.addObserver(this);
-    SharedPreferences.getInstance().then((p) {
-      _hd = p.getBool('camHd') ?? true;
-      _flash = p.getInt('camFlash') ?? 0;
-      _grid = p.getBool('camGrid') ?? false;
-      _start();
-    }).catchError((Object e, StackTrace st) {
-      AppLog.e('cam.prefs', e, st);
-      _start();
+    // الفحص الخفيف مقفول افتراضياً في كل تشغيل: مفيش مراقبة ولا خدمة خلفية إلا لما تفعّله بإيدك
+    autoScan = false;
+    homeAutoG = false;
+    final cfg0 = _readCfg();
+    if (cfg0['autoScan'] == true) {
+      cfg0['autoScan'] = false;
+      _writeCfg(cfg0);
+    }
+    homeRunG = () => runFullPipeline();
+    homeSumG = _countLine;
+    openReqG.addListener(_onOpenReqHome);
+    stopKeepAliveSafe();
+    days = sharedDays.value;
+    sharedDays.addListener(_syncDays);
+    wipeSignal.addListener(_onWipe);
+    settingsResetSignal.addListener(_onSettingsReset);
+    customDir = loadFolder();
+    customOut = loadOutDir();
+    if (customOut != null && customOut!.isNotEmpty) outputDir = customOut!;
+  }
+
+  void _syncDays() {
+    if (!mounted || busy || days == sharedDays.value) return;
+    setState(() => days = sharedDays.value);
+  }
+
+  // "رجّع كل الإعدادات للافتراضي": الفولدرات والفترة والفحص التلقائي والصور المقلوبة
+  void _onSettingsReset() {
+    if (!mounted) return;
+    if (autoScan) _setAuto(false);
+    setState(() {
+      customDir = null;
+      customOut = null;
+      outputDir = defaultOutputDir;
+      autoRotate = false;
+      days = 0;
     });
+  }
+
+  void _onWipe() {
+    if (!mounted) return;
+    setState(() {
+      processedItems.clear();
+      sysReads.clear();
+      missingTerminals = [];
+      warnings.clear();
+      excludedPay.clear();
+      standardXlsxPath = null;
+      generatedPdfPath = null;
+      extraPdfPaths = [];
+      reviewOnly = false;
+      sourceNote = '';
+      status = 'تم مسح كل حاجة. اضغط "فحص التقفيل" لبدء يوم جديد.';
+    });
+  }
+
+  // أثناء الفحص: نحدّث الشاشة بس (الملفات بتتبني في آخر المعالجة). بعد الفحص: إعادة بناء الإكسيل والـ PDF
+  Future<void> _refresh() async {
+    if (busy) {
+      if (mounted) setState(() {});
+    } else {
+      await rebuildFiles();
+    }
+  }
+
+  Future<void> _onSwipe(ReceiptItem it, bool approve) async {
+    if (approve) {
+      if (it.dupSuspect) {
+        keepAsExtraBatch(it, processedItems);
+        await _refresh();
+      } else if (it.dateOdd) {
+        it.dateFix = it.date;
+        it.dateOdd = false;
+        saveFix(it);
+        await _refresh();
+      } else {
+        if (it.amount <= 0 || it.row == null) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: w.Text(_l(context, 'كمّل المبلغ والماكينة من زر القلم الأول.',
+                  'Fill in the amount and machine with the pencil button first.'))));
+          return;
+        }
+        it.ok = true;
+        it.alt = null;
+        it.unusual = null;
+        it.userExcluded = false;
+        it.ignoredDoc = false;
+        it.reprintSummary = false;
+        it.missingBatchClosed = false;
+        if (it.how != 'extra-batch') it.how = 'manual';
+        saveFix(it);
+        await _refresh();
+      }
+    } else {
+      if (it.dupSuspect) {
+        it.dupSuspect = false;
+        it.userExcluded = true;
+        it.dupDecision = 'drop';
+        saveFix(it);
+        await _refresh();
+      } else if (it.dateOdd) {
+        if (it.dateMain != null) it.date = it.dateMain;
+        it.dateFix = it.date;
+        it.dateOdd = false;
+        saveFix(it);
+        await _refresh();
+      } else {
+        it.userExcluded = true;
+        it.ok = false;
+        saveFix(it);
+        await _refresh();
+      }
+    }
+  }
+
+  // سحب إيصال المراجعة: صح ✓ / غلط ✗ (غلط = استبعاد لو مكرر، وإلا بيفتح التصحيح)
+  Widget _swipeWrap(ReceiptItem item, Widget card) {
+    final okLabel = item.dupSuspect
+        ? _l(context, 'احتسبه باتش ✓', 'Count it ✓')
+        : (item.dateOdd ? _l(context, 'سيب تاريخه ✓', 'Keep date ✓') : _l(context, 'صح ✓', 'OK ✓'));
+    final badLabel = item.dupSuspect
+        ? _l(context, 'مكرر - استبعده ✗', 'Duplicate ✗')
+        : (item.dateOdd ? _l(context, 'تاريخ الأغلب ✗', 'Use main date ✗') : _l(context, 'غلط (استبعاد) ✗', 'Wrong (Exclude) ✗'));
+    return Dismissible(
+      key: ValueKey('sw_${item.path}_${item.userExcluded}_${item.ok}'),
+      direction: DismissDirection.horizontal,
+      confirmDismiss: (dir) async {
+        HapticFeedback.lightImpact();
+        await _onSwipe(item, dir == DismissDirection.startToEnd);
+        return false;
+      },
+      background: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        color: _tintBg(context, Colors.green, strong: true),
+        alignment: AlignmentDirectional.centerStart,
+        padding: const EdgeInsets.symmetric(horizontal: 20),
+        child: w.Text(okLabel, style: const TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      secondaryBackground: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        color: _tintBg(context, Colors.red, strong: true),
+        alignment: AlignmentDirectional.centerEnd,
+        padding: const EdgeInsets.symmetric(horizontal: 20),
+        child: w.Text(badLabel, style: const TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      child: card,
+    );
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _life = state;
+    // رجعت للتطبيق: نعرض هل المراقبة كانت شغالة وانت برا (تشخيص)
+    if (state == AppLifecycleState.resumed && autoScan && !busy && _lastTickAt != null && mounted) {
+      final ago = DateTime.now().difference(_lastTickAt!).inSeconds;
+      setState(() => status = ago <= 30
+          ? 'المراقبة شغالة ✓ (آخر مرور على المجلد من $ago ثانية).'
+          : '⚠️ المراقبة كانت واقفة وانت برا التطبيق (آخر مرور من ${ago ~/ 60} دقيقة). النظام وقّف التطبيق في الخلفية.');
+    }
   }
 
   @override
   void dispose() {
+    _autoTimer?.cancel();
+    homeRunG = null;
+    homeSumG = null;
+    homeAutoG = false;
+    openReqG.removeListener(_onOpenReqHome);
+    sharedDays.removeListener(_syncDays);
+    wipeSignal.removeListener(_onWipe);
+    settingsResetSignal.removeListener(_onSettingsReset);
     WidgetsBinding.instance.removeObserver(this);
-    _c?.dispose();
+    super.dispose();
+  }
+
+  void _onOpenReqHome() {
+    final key = openKeyOf(openReqG.value, 'home|');
+    if (key != null) _openByKeyHome(key, 0);
+  }
+
+  // بيفتح شاشة تعديل الإيصال اللي جه عنه الإشعار (لو الفحص لسه شغال بيستنى يخلص)
+  Future<void> _openByKeyHome(String key, int tries) async {
+    if (!mounted) return;
+    ReceiptItem? it;
+    for (final e in processedItems) {
+      if (e.key == key) {
+        it = e;
+        break;
+      }
+    }
+    if (it == null || busy) {
+      if (tries < 15) {
+        await Future.delayed(const Duration(milliseconds: 600));
+        return _openByKeyHome(key, tries + 1);
+      }
+      return;
+    }
+    await editReceipt(it);
+  }
+
+  // ───── فحص تلقائي خفيف: بيفحص الملف الجديد بس وبيبعتلك إشعار بالنتيجة (من غير ما تفتح التطبيق) ─────
+  // صور الفترة المحددة اللي لسه ما اتفحصتش (مفتاح كل ملف "الاسم:الحجم")، مرتبة بوقت التعديل
+  Map<String, File> _quickCandidates() {
+    final dirs = customDir != null ? [Directory(customDir!)] : findWhatsAppImageDirs();
+    final now = DateTime.now();
+    final cutoff = days < 0
+        ? DateTime(2000)
+        : DateTime(now.year, now.month, now.day).subtract(Duration(days: days));
+    final have = loadQuickSeen();
+    final found = <File>[];
+    final keyOf = <String, String>{};
+    for (final d in dirs) {
+      try {
+        for (final e in d.listSync().whereType<File>()) {
+          final lower = e.path.toLowerCase();
+          if (!(lower.endsWith('.jpg') ||
+              lower.endsWith('.jpeg') ||
+              lower.endsWith('.png') ||
+              lower.endsWith('.webp'))) {
+            continue;
+          }
+          final b = baseName(e.path);
+          if (b.startsWith('.') || b.startsWith('dup_')) continue;
+          if (fileDate(e).isBefore(cutoff)) continue;
+          final k = quickKeyOf(e);
+          if (k.endsWith(':0') || have.contains(k)) continue;
+          keyOf[e.path] = k;
+          found.add(e);
+        }
+      } catch (_) {}
+    }
+    found.sort((x, y) {
+      try {
+        return x.lastModifiedSync().compareTo(y.lastModifiedSync());
+      } catch (_) {
+        return 0;
+      }
+    });
+    final out = <String, File>{};
+    for (final f in found) {
+      out[keyOf[f.path]!] = f;
+    }
+    return out;
+  }
+
+  // أول تشغيل: الملفات الموجودة دلوقتي تعتبر اتفحصت (baseline)، والإشعارات للجديد بس
+  void _quickEnsureBaseline() {
+    if (quickHasBaseline()) return;
+    final keys = <String>[];
+    try {
+      keys.addAll(_quickCandidates().keys);
+    } catch (_) {}
+    quickMarkSeen(keys);
+  }
+
+  Future<void> _watchService(bool on) async {
+    try {
+      if (on) {
+        await _chan.invokeMethod('startKeepAlive',
+            {'title': 'A2R POS', 'text': 'مراقبة الإيصالات الجديدة...'});
+      } else {
+        await stopKeepAliveSafe();
+      }
+    } catch (_) {}
+  }
+
+  void _startAuto() {
+    _autoTimer?.cancel();
+    _quickPend = <String>{};
+    _quickEnsureBaseline();
+    _autoTimer = Timer.periodic(const Duration(seconds: 2), (_) => _autoTick());
+    _watchService(true);
+  }
+
+  void _stopAuto() {
+    _autoTimer?.cancel();
+    _autoTimer = null;
+    _watchService(false);
+  }
+
+  DateTime? _lastTickAt; // آخر مرة المراقبة اشتغلت (لتشخيص: هل كانت شغالة وانت برا التطبيق؟)
+  String _lastDirSig = '';
+  int _idleTicks = 0;
+
+  // توقيع خفيف للمجلدات (وقت تعديل المجلد نفسه): لو ما اتغيرش مفيش داعي نلف على آلاف الملفات
+  String _dirSig() {
+    try {
+      final dirs = customDir != null ? [Directory(customDir!)] : findWhatsAppImageDirs();
+      return dirs.map((d) => '${d.path}:${d.statSync().modified.millisecondsSinceEpoch}').join('|');
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<void> _autoTick() async {
+    _lastTickAt = DateTime.now();
+    if (!mounted || !autoScan || busy || _fullRunning || chainRunning || machBusyG || quickBusyG) return;
+    final ds = _dirSig();
+    if (ds.isNotEmpty && ds == _lastDirSig && _quickPend.isEmpty && ++_idleTicks < 15) return; // فحص كامل كل 30 ثانية على الأقل
+    _idleTicks = 0;
+    _lastDirSig = ds;
+    if (!quickHasBaseline()) {
+      _quickEnsureBaseline();
+      return;
+    }
+    final Map<String, File> cur;
+    try {
+      cur = _quickCandidates();
+    } catch (_) {
+      return;
+    }
+    // الملف جاهز لما مفتاحه (الاسم:الحجم) يتكرر في دورتين ورا بعض = التنزيل خلص
+    final ready = cur.entries.where((e) => _quickPend.contains(e.key)).toList();
+    _quickPend = cur.keys.toSet();
+    if (ready.isEmpty) return;
+    if (ready.length > _kQuickBulk) {
+      quickMarkSeen(ready.map((e) => e.key));
+      _quickPend.removeAll(ready.map((e) => e.key));
+      await _quickNotify(['⚠️ ظهر ${ready.length} ملف مرة واحدة (غالباً الفترة أو الفولدر اتغيّر) - ما فحصتهمش تلقائي، افحصهم بإيدك']);
+      return;
+    }
+    await _liteScan(ready);
+  }
+
+  // الفحص الخفيف = نفس فحص التقفيل بالظبط (نفس القراءة والتكرار والترقيم والتسمية والمراجعة)
+  // من غير بناء الإكسيل والـ PDF. الصور القديمة بتتاخد من الكاش فمبتتقراش تاني، فالمستهلك بس الصور الجديدة.
+  Future<void> _liteScan(List<MapEntry<String, File>> ready) async {
+    if (quickBusyG) return;
+    quickBusyG = true;
+    final lines = <String>[];
+    String? openKey;
+    var openBad = false;
+    try {
+      final keys = ready.map((e) => e.key).toSet();
+      await runFullPipeline(auto: true, lite: true);
+      quickMarkSeen(keys);
+      if (!mounted) return;
+      for (final en in ready) {
+        final name = baseName(en.value.path);
+        if (warnings.any((x) => x.startsWith('$name: فشلت القراءة'))) {
+          lines.add('⚠️ فشل الفحص التلقائي ($name) - افحصه بإيدك');
+        }
+      }
+      for (final it in processedItems) {
+        if (!keys.contains(it.key)) continue;
+        final l = _liteLine(it);
+        if (l != null) {
+          lines.add(l);
+          final isBad = l.startsWith('⚠️');
+          if (openKey == null || (isBad && !openBad)) {
+            openKey = it.key;
+            openBad = isBad;
+          }
+        }
+      }
+      // صور السيستم الجديدة (A2R Operations Console): مش باتش فمش في processedItems، فبنعمل لها سطر إشعار لوحدها
+      final newNames = ready.map((e) => baseName(e.value.path)).toSet();
+      for (final sy in sysReads) {
+        if (!newNames.contains(sy.file)) continue;
+        final t = sy.tid != null ? terminals[sy.tid] : null;
+        final label = t != null ? machineLabel(t.orderNum, t.unitName) : (sy.tid != null ? 'ترمنل ${sy.tid}' : sy.file);
+        if (sy.amount == null) {
+          lines.add('⚠️ صورة سيستم ($label): مش قادر أقرا المبلغ - راجعها');
+          continue;
+        }
+        var tot = 0.0;
+        var has = false;
+        if (t != null) {
+          for (final x in processedItems) {
+            if (x.counts && x.amount > 0 && x.orderNum == t.orderNum) {
+              tot += x.amount;
+              has = true;
+            }
+          }
+        }
+        final amt = sy.amount!.toStringAsFixed(2);
+        if (!has) {
+          lines.add('🖥️ صورة سيستم $label: $amt ج.م (لسه مفيش باتش للمقارنة)');
+        } else {
+          final d = round2(tot - sy.amount!);
+          lines.add(d == 0
+              ? '✅ صورة سيستم $label: $amt ج.م - مطابق للباتشات'
+              : '⚠️ صورة سيستم $label: $amt ج.م - فرق ${d.toStringAsFixed(2)} عن مجموع الباتشات');
+        }
+      }
+    } catch (e) {
+      _dbg('LITE_FAIL $e');
+    } finally {
+      quickBusyG = false;
+    }
+    if (lines.isNotEmpty) await _quickNotify(lines, openKey: openKey);
+  }
+
+  // سطر النتيجة لكل إيصال جديد (من نتيجة فحص التقفيل نفسها)
+  String? _liteLine(ReceiptItem it) {
+    if (it.userExcluded) return null;
+    final name = baseName(it.path);
+    if (it.ignoredDoc) return '⚠️ $name: شكله إيصال دفع/مستند مش باتش - راجعه';
+    final label = it.orderNum != null
+        ? '${machineLabel(it.orderNum, it.unitName)}${it.suffix != null ? ' (باتش ${it.suffix})' : ''}'
+        : (it.unitName ?? name);
+    final why = <String>[];
+    if (it.reprintSummary) why.add('REPRINT/SUMMARY (إعادة طباعة/ملخص)');
+    if (it.missingBatchClosed && !it.reprintSummary) why.add('مش مكتوب BATCH CLOSED');
+    if (it.row == null) {
+      why.add('الماكينة/الوحدة مش معروفة');
+    } else if (it.weakId) {
+      why.add('الماكينة اتحددت تلقائي - اتأكد منها');
+    }
+    if (it.how == 'extra-batch') why.add('الماكينة ظهرت قبل كده بمبلغ مختلف - اتحسبت باتش إضافي');
+    if (it.amount <= 0) {
+      why.add('مش قادر أقرا المبلغ');
+    } else if (it.alt != null) {
+      why.add('قراءتين مختلفتين للمبلغ (${it.amount.toStringAsFixed(2)} و ${it.alt!.toStringAsFixed(2)})');
+    } else if (!it.ok) {
+      why.add('المبلغ غير مؤكد');
+    }
+    if (it.dupSuspect) why.add('مشكوك إنه مكرر (نفس الماكينة ونفس المبلغ)');
+    if (it.dateOdd) why.add('تاريخه ${it.date} والأغلب ${it.dateMain}');
+    if (it.unusual != null) why.add(it.unusual!);
+    final amt = it.amount > 0 ? ' (${it.amount.toStringAsFixed(2)} ج.م)' : '';
+    if (why.isEmpty) return '✅ $label تمام$amt';
+    return '⚠️ $label$amt: ${why.join('، ')}';
+  }
+
+  // لو التطبيق على الشاشة: SnackBar. غير كده: إشعار. ودايماً آخر نتيجة في مربع الحالة.
+  Future<void> _quickNotify(List<String> lines, {String? openKey}) async {
+    final text = lines.join('\n');
+    final bad = lines.any((l) => l.startsWith('⚠️'));
+    final now = DateTime.now();
+    final hm = '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+    if (mounted && !busy) {
+      setState(() => status = 'آخر فحص تلقائي ($hm):\n$text');
+    }
+    // داخل التطبيق: SnackBar لو التطبيق ظاهر، وإشعار التليفون دايماً (ظاهر أو لأ)
+    if (mounted && _life == AppLifecycleState.resumed) {
+      try {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: w.Text(tr(text)),
+          duration: Duration(seconds: bad ? 8 : 4),
+        ));
+      } catch (_) {}
+    }
+    await postAutoNotify(
+      tab: 'home',
+      title: '${bad ? '⚠️' : '✅'} A2R POS - فحص تلقائي${lines.length > 1 ? ' (${lines.length} ملفات)' : ''}',
+      text: text,
+      bad: bad,
+      openKey: openKey,
+    );
+  }
+
+  Future<void> _setAuto(bool v) async {
+    homeAutoG = v;
+    setState(() => autoScan = v);
+    final cfg = _readCfg();
+    cfg['autoScan'] = v;
+    _writeCfg(cfg);
+    if (v) {
+      await ensureNotifPerm(context);
+      try {
+        final st = await Permission.manageExternalStorage.status;
+        if (!st.isGranted) await Permission.manageExternalStorage.request();
+      } catch (_) {}
+      await askBatteryExempt(force: true);
+      if (!mounted || !autoScan) return;
+      _startAuto();
+      if (!busy) {
+        setState(() => status = 'الفحص التلقائي شغال: أي إيصال جديد هيتفحص لوحده وهيجيلك إشعار بالنتيجة.');
+      }
+    } else {
+      _stopAuto();
+    }
+  }
+
+  String _periodLabel() => days == 0 ? 'اليوم' : days == 1 ? 'يومين' : days == 2 ? '3 أيام' : 'الكل';
+
+  Widget _statsRow() {
+    final counted = processedItems
+        .where((e) => !e.userExcluded && !e.ignoredDoc && e.ign != 'drop' && e.amount > 0)
+        .toList();
+    final total = counted.fold<double>(0, (a, e) => a + e.amount);
+    final rv = processedItems.where((e) => e.needsReview).length;
+    return Row(
+      children: [
+        _statCard(Icons.receipt_long, 'إيصالات', '${counted.length}', Colors.blueGrey, compact: true),
+        _statCard(Icons.payments, 'الإجمالي', total.toStringAsFixed(2), Colors.blueGrey, compact: true),
+        _statCard(Icons.warning_amber, 'ناقص', '${missingTerminals.length}', Colors.amber,
+            compact: true, onTap: missingTerminals.isEmpty ? null : openClosingReport),
+        _statCard(Icons.fact_check, 'مراجعة', '$rv', kReviewTone,
+            compact: true, onTap: rv == 0 ? null : openReview),
+      ],
+    );
+  }
+
+  Widget _quickBtn(IconData icon, String label, VoidCallback? onTap) =>
+      _quickBtnG(context, icon, label, onTap);
+
+  Future<void> pickFolder() async {
+    final perm = await Permission.manageExternalStorage.request();
+    if (!perm.isGranted) {
+      setState(() => status = 'لازم تسمح بالوصول لكل الملفات الأول.');
+      return;
+    }
+    if (!mounted) return;
+    final res = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => FolderPicker(start: customDir ?? root)),
+    );
+    if (res != null) {
+      saveFolder(res);
+      setState(() => customDir = res);
+    }
+  }
+
+  Future<void> pickOutFolder() async {
+    final perm = await Permission.manageExternalStorage.request();
+    if (!perm.isGranted) {
+      setState(() => status = 'لازم تسمح بالوصول لكل الملفات الأول.');
+      return;
+    }
+    if (!mounted) return;
+    final res = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => FolderPicker(start: customOut ?? root)),
+    );
+    if (res != null) {
+      try {
+        final t = File('$res/.write_test')..writeAsStringSync('x');
+        t.deleteSync();
+      } catch (_) {
+        setState(() => status = 'مش قادر أكتب في الفولدر ده: $res');
+        return;
+      }
+      saveOutDir(res);
+      setState(() {
+        customOut = res;
+        outputDir = res;
+      });
+    }
+  }
+
+  Future<void> pickManualImages() async {
+    try {
+      final paths = await pickFilesViaChooser(context,
+          mime: 'image/*', title: 'اختر تطبيق المعرض', prefKey: 'defImage');
+      if (paths == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: w.Text('منتقي الصور مش متاح في النسخة دي (الجزء الـ native ناقص).')),
+          );
+        }
+        return;
+      }
+      if (paths.isNotEmpty) await runFullPipeline(manualPaths: paths);
+    } catch (e) {
+      _dbg('pickManualImages error: $e');
+    }
+  }
+
+  void useDefaultOut() {
+    saveOutDir(null);
+    setState(() {
+      customOut = null;
+      outputDir = defaultOutputDir;
+    });
+  }
+
+  Future<void> openFolder(String path) async {
+    try {
+      Directory(path).createSync(recursive: true);
+    } catch (_) {}
+    try {
+      if (await chooseAndOpenFolder(context, path)) return;
+    } catch (_) {}
+    await Clipboard.setData(ClipboardData(text: path));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('مقدرتش أفتح الفولدر. المسار اتنسخ: $path')),
+    );
+  }
+
+  // إرسال الإكسيل والـ PDF (المستخدم بيختار واتساب من قايمة المشاركة)
+  Future<void> sendToWhatsApp() async {
+    final x = latestOutput('.xlsx');
+    final p = latestOutput('.pdf');
+    final files = <XFile>[if (x != null) XFile(x), if (p != null) XFile(p)];
+    if (files.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('لم يتم إنشاء ملفات بعد لمشاركتها.')),
+      );
+      return;
+    }
+    if (!await confirmSend(context,
+        review: processedItems.where((e) => e.needsReview).length, missing: missingTerminals.length)) {
+      return;
+    }
+    await Share.shareXFiles(files, text: 'تقرير إيصالات الإسكندرية');
+  }
+
+  // أحدث ملف إخراج (إكسيل/PDF): من آخر معالجة، أو آخر ملف "الاسكندريه ..." في فولدر الإخراج
+  String? latestOutput(String ext) {
+    final cur = ext == '.xlsx' ? standardXlsxPath : generatedPdfPath;
+    if (cur != null && File(cur).existsSync()) return cur;
+    try {
+      final d = Directory(outputDir);
+      if (!d.existsSync()) return null;
+      final fs = d
+          .listSync()
+          .whereType<File>()
+          .where((f) {
+            final n = _normAr(baseName(f.path));
+            return n.endsWith(ext) && n.contains('اسكندري');
+          })
+          .toList()
+        ..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+      return fs.isEmpty ? null : fs.first.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> openFile(String? path, String mime) async {
+    if (path == null || !File(path).existsSync()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('الملف مش موجود. شغّل المعالجة الأول.')),
+      );
+      return;
+    }
+    try {
+      final ok = await _chan.invokeMethod<bool>('openFile', {'path': path, 'mime': mime});
+      if (ok == true) return;
+    } catch (_) {}
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('مفيش برنامج يفتح الملف ده.')),
+    );
+  }
+
+  bool _isAppOutput(String path) {
+    final n = baseName(path);
+    final l = n.toLowerCase();
+    return n == 'review_report.txt' ||
+        n == 'ocr_debug.txt' ||
+        ((l.endsWith('.xlsx') || l.endsWith('.pdf')) && _normAr(n).contains('اسكندري'));
+  }
+
+  Future<bool> _confirm(String title, String body) async {
+    final r = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(body),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('مسح')),
+        ],
+      ),
+    );
+    return r == true;
+  }
+
+  // مسح الكل: ملفات فولدر الإخراج + الصور المرتبة
+  Future<void> clearAll() async {
+    final protectedDirs = <String>{
+      root,
+      baseDir,
+      '$root/Download',
+      '$root/Documents',
+      '$root/DCIM',
+      '$root/Pictures',
+    };
+    final isProtected = protectedDirs.contains(outputDir);
+    final outFiles = <File>[];
+    try {
+      final d = Directory(outputDir);
+      if (d.existsSync()) {
+        for (final e in d.listSync().whereType<File>()) {
+          if (!isProtected || _isAppOutput(e.path)) outFiles.add(e);
+        }
+      }
+    } catch (_) {}
+    final rawFiles = <File>[];
+    try {
+      final d = Directory(rawImagesDir);
+      if (d.existsSync()) rawFiles.addAll(d.listSync().whereType<File>());
+    } catch (_) {}
+    if (outFiles.isEmpty && rawFiles.isEmpty) {
+      setState(() => status = 'مفيش حاجة للمسح.');
+      return;
+    }
+    final ok = await _confirm(
+      'مسح الكل',
+      'هتتمسح ${outFiles.length} ملف من الإخراج:\n$outputDir\n\n'
+          'و ${rawFiles.length} صورة من الصور المرتبة.'
+          '${isProtected ? '\n\n(فولدر الإخراج ده عام، فهيتمسح بس ملفات التطبيق منه)' : ''}',
+    );
+    if (!ok) return;
+    var n = 0;
+    for (final f in [...outFiles, ...rawFiles]) {
+      try {
+        f.deleteSync();
+        n++;
+      } catch (_) {}
+    }
+    try {
+      Directory('$baseDir/.scans').deleteSync(recursive: true);
+    } catch (_) {}
+    await clearScanCache();
+    setState(() {
+      processedItems.clear();
+      sysReads.clear();
+      missingTerminals = [];
+      warnings.clear();
+      standardXlsxPath = null;
+      generatedPdfPath = null;
+      extraPdfPaths = [];
+      status = 'تم مسح $n ملف.';
+    });
+  }
+
+  Future<void> openReview() async {
+    final list = processedItems.where((e) => e.needsReview).toList();
+    if (list.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('مفيش إيصالات محتاجة مراجعة.')),
+      );
+      return;
+    }
+    final changed = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(builder: (_) => ReviewPage(items: list, allItems: processedItems)),
+    );
+    if (changed == true) {
+      await _refresh();
+    } else if (mounted) {
+      setState(() {});
+    }
+  }
+
+  // القلم: شاشة كاملة فيها الإيصال بزوم + تعديل المبلغ والماكينة
+  Future<void> editReceipt(ReceiptItem item) async {
+    // القايمة اللي ظاهرة قدامك (بنفس الفلتر والبحث والترتيب) علشان تسحب يمين/شمال بين الباتشات
+    final rvCount = processedItems.where((e) => e.needsReview).length;
+    var list = _visibleItems(reviewOnly && rvCount > 0);
+    var at = list.indexOf(item);
+    if (at < 0) {
+      list = List<ReceiptItem>.from(processedItems);
+      at = list.indexOf(item);
+    }
+    if (at < 0) {
+      list = [item];
+      at = 0;
+    }
+    final changed = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ReviewPage(
+            items: list, allItems: processedItems, single: true, initialIndex: at, sysLineOf: _sysLineOf),
+      ),
+    );
+    if (changed == true) {
+      await _refresh();
+    } else if (mounted) {
+      setState(() {});
+    }
+  }
+
+  // إعادة قراءة الترمنل يدوي (من قايمة التلات نقط): بيجرّب الصورة زي ما هي، محسّنة، ومدوّرة
+  // الاتجاهات الأربعة. لو لقى ترمنل معروف بيثبّته للباتش ويدوّر الصورة لو لزم.
+  Future<void> reReadTerminal(ReceiptItem item) async {
+    if (busy) return;
+    final msg = ScaffoldMessenger.of(context);
+    msg.hideCurrentSnackBar();
+    msg.showSnackBar(SnackBar(
+        duration: const Duration(seconds: 30),
+        content: w.Text(_l(context, 'بعيد قراءة الترمنل...', 'Re-reading terminal...'))));
+    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+    Analysis? found;
+    var foundDeg = 0;
+    try {
+      Directory(tmpDir).createSync(recursive: true);
+      for (final deg in const [0, 90, 270, 180]) {
+        for (final enhance in const [false, true]) {
+          final tp = '$tmpDir/retid_$deg.jpg';
+          try {
+            if (!await fixImageAsync(item.path, tp, deg)) continue;
+            var rp = tp;
+            if (enhance) {
+              rp = '$tmpDir/retid_${deg}_enh.jpg';
+              await enhanceImageAsync(tp, rp);
+            }
+            final res = await recognizer.processImage(InputImage.fromFilePath(rp));
+            final a = analyzeLines(toLines(res));
+            if (a.tid == null || a.how == 'name/merchant' || terminals[a.tid] == null) continue;
+            // لازم نفس الوحدة اللي التطبيق حدّدها قبل كده (لو كانت متحددة)
+            if (item.row != null && terminals[a.tid]!.excelRow != item.row) continue;
+            found = a;
+            foundDeg = deg;
+            break;
+          } catch (_) {}
+        }
+        if (found != null) break;
+      }
+    } finally {
+      await recognizer.close();
+    }
+    if (!mounted) return;
+    msg.hideCurrentSnackBar();
+    final f = found;
+    if (f == null) {
+      msg.showSnackBar(SnackBar(
+          content: w.Text(_l(context, 'مقدرتش أقرا الترمنل. افتح الباتش واختار الماكينة يدوي.',
+              'Could not read the terminal. Open the batch and pick the machine manually.'))));
+      return;
+    }
+    final info = terminals[f.tid]!;
+    final clash = processedItems.any((x) =>
+        x != item && x.counts && x.suffix == null && x.tid == f.tid && x.orderNum == info.orderNum);
+    if (clash) {
+      msg.showSnackBar(SnackBar(
+          content: w.Text(_l(
+              context,
+              'الترمنل ${f.tid} (ماكينة ${info.orderNum}) اتقرا، بس ماكينة ${info.orderNum} موجودة في إيصال تاني. افتح الباتش وراجعه.',
+              'Terminal ${f.tid} (machine ${info.orderNum}) was read, but that machine is already used by another receipt. Open the batch to review.'))));
+      return;
+    }
+    if (foundDeg != 0) {
+      try {
+        await fixImageAsync(item.path, item.path, foundDeg);
+        await FileImage(File(item.path)).evict();
+        imageCache.clear();
+      } catch (_) {}
+    }
+    item.tid = f.tid;
+    item.orderNum = info.orderNum;
+    item.row = info.excelRow;
+    item.unitName = info.unitName;
+    item.how = 'terminal';
+    saveFix(item);
+    msg.showSnackBar(SnackBar(
+        content: w.Text(_l(context, '✅ الترمنل ${f.tid} - ماكينة ${info.orderNum} (${info.unitName})',
+            '✅ Terminal ${f.tid} - machine ${info.orderNum} (${info.unitName})'))));
+    await _refresh();
+  }
+
+  void useWhatsApp() {
+    saveFolder(null);
+    setState(() => customDir = null);
+  }
+
+  // نقل ملفات التقفيل (الإكسيل والـ PDF) لفولدر أختاره من التليفون
+  Future<void> transferOutputs() async {
+    final paths = <String>[
+      if (latestOutput('.xlsx') != null) latestOutput('.xlsx')!,
+      if (latestOutput('.pdf') != null) latestOutput('.pdf')!,
+      ...extraPdfPaths,
+    ];
+    final moved = await transferFilesViaPicker(context, paths.toSet().toList());
+    if (moved == null || !mounted) return;
+    setState(() {
+      if (moved[standardXlsxPath] != null) standardXlsxPath = moved[standardXlsxPath];
+      if (moved[generatedPdfPath] != null) generatedPdfPath = moved[generatedPdfPath];
+      extraPdfPaths = extraPdfPaths.map((p) => moved[p] ?? p).toList();
+    });
+  }
+
+  // ملخص العد (زي رسالة "اكتمل العد" في إيصالات الدفع): صور، اتسمّى، إجمالي
+  String _countLine() {
+    final counted = processedItems
+        .where((e) => !e.userExcluded && !e.ignoredDoc && e.ign != 'drop' && e.amount > 0)
+        .toList();
+    final total = counted.fold<double>(0, (a, e) => a + e.amount);
+    final named = processedItems.where((e) => e.tid != null && e.orderNum != null && !e.userExcluded).length;
+    final rv = processedItems.where((e) => e.needsReview).length;
+    return '${processedItems.length} صورة، $named اتسمّى، إجمالي ${total.toStringAsFixed(2)}'
+        '${missingTerminals.isNotEmpty ? ' (ناقص ${missingTerminals.length} ماكينة)' : ''}'
+        '${rv > 0 ? ' ($rv للمراجعة)' : ''}';
+  }
+
+  // "الباقي صح": يعلّم كل إيصالات المراجعة صح مرة واحدة (زي إيصالات الدفع)
+  Future<void> _markRestOk() async {
+    final list = processedItems.where((e) => e.needsReview).toList();
+    if (list.isEmpty) return;
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('الباقي صح'),
+        content: Text('هتعلّم ${list.length} إيصال على إنهم صح؟'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('لا')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('تمام')),
+        ],
+      ),
+    );
+    if (yes != true) return;
+    var skipped = 0;
+    for (final it in list) {
+      if (it.dupSuspect) {
+        keepAsExtraBatch(it, processedItems);
+      } else if (it.dateOdd) {
+        it.dateFix = it.date;
+        it.dateOdd = false;
+        saveFix(it);
+      } else if (it.amount <= 0 || it.row == null) {
+        skipped++;
+      } else {
+        it.ok = true;
+        it.alt = null;
+        it.unusual = null;
+        it.userExcluded = false;
+        it.ignoredDoc = false;
+        it.reprintSummary = false;
+        it.missingBatchClosed = false;
+        if (it.how != 'extra-batch') it.how = 'manual';
+        saveFix(it);
+      }
+    }
+    await _refresh();
+    if (skipped > 0 && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: w.Text(_l(context, '$skipped إيصال ناقصه مبلغ أو ماكينة، كمّلهم من القلم.',
+              '$skipped receipt(s) are missing an amount or machine; fill them in with the pencil.'))));
+    }
+  }
+
+  Future<void> shareOneReceipt(ReceiptItem item) async {
+    if (!File(item.path).existsSync()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('الصورة مش موجودة.')),
+      );
+      return;
+    }
+    await Share.shareXFiles([XFile(item.path)],
+        text: item.orderNum != null ? machineLabel(item.orderNum, item.unitName) : baseName(item.path));
+  }
+
+  Future<void> rebuildFiles({bool lite = false}) async {
+    setState(() => status = lite ? 'جاري تحديث النتائج (فحص خفيف)...' : 'جاري توليد الملفات وتحديث الشيتات...');
+    final dateCounts = <String, int>{};
+    for (final r in processedItems) {
+      if (r.date != null) {
+        dateCounts[r.date!] = (dateCounts[r.date!] ?? 0) + 1;
+      }
+    }
+    String reportDate = "اليوم";
+    if (dateCounts.isNotEmpty) {
+      reportDate = dateCounts.entries.reduce((a, b) => a.value > b.value ? a : b).key;
+    }
+
+    // 1. ملفات الـ PDF المجمعة: واحد ليوم التقفيل، وواحد لكل يوم تاني لو فيه إيصالات بتاريخ مختلف
+    processedItems.sort((a, b) {
+      final c = (a.orderNum ?? 99).compareTo(b.orderNum ?? 99);
+      return c != 0 ? c : (a.suffix ?? 1).compareTo(b.suffix ?? 1);
+    });
+    final mainItems = processedItems
+        .where((r) => r.counts && (r.date == null || r.date == reportDate))
+        .toList();
+    checkUnusual(mainItems, reportDate);
+    final otherByDate = <String, List<ReceiptItem>>{};
+    for (final r in processedItems) {
+      if (r.counts && r.date != null && r.date != reportDate) {
+        otherByDate.putIfAbsent(r.date!, () => <ReceiptItem>[]).add(r);
+      }
+    }
+    // الفحص الخفيف: نفس الحسابات (الناقص + التقرير + غير المعتاد) من غير بناء الـ PDF ولا الإكسيل
+    if (lite) {
+      final ignoreL = <int>{};
+      try {
+        for (final m in RegExp(r'\d+').allMatches(File('$baseDir/ignore.txt').readAsStringSync())) {
+          ignoreL.add(int.parse(m.group(0)!));
+        }
+      } catch (_) {}
+      final foundL = mainItems.where((e) => e.amount > 0).map((e) => e.orderNum).whereType<int>().toSet();
+      missingTerminals = [
+        for (var i = 1; i <= kMainMachines; i++)
+          if (!foundL.contains(i) && !ignoreL.contains(i)) i
+      ];
+      writeReport(reportDate);
+      setState(() => status = 'تم فحص خفيف: ${_countLine()}\n'
+          '• من غير بناء الإكسيل والـ PDF (اضغط "فحص التقفيل" لبنائهم).' +
+          (sourceNote.isEmpty ? '' : '\n$sourceNote'));
+      return;
+    }
+    var pageNo = 0;
+    Future<bool> buildPdf(List<ReceiptItem> items, File out) async {
+      final pdf = pw.Document();
+      var pages = 0;
+      for (final r in items) {
+        pageNo++;
+        if (!File(r.path).existsSync()) continue;
+        setState(() => status = 'جاري تجهيز صفحات الـ PDF ($pageNo / ${processedItems.length})...');
+        // سكانر: قص الباتش بس + فرد المنظور + تحسين. لو فشل نستخدم الصورة الأصلية.
+        var srcs = <String>[];
+        try {
+          srcs = await scanReceiptAsync(r.path);
+        } catch (_) {}
+        if (srcs.isEmpty) srcs = <String>[r.path];
+        // أكتر من باتش في نفس الصورة: صفحة واحدة والباتشات جنب بعض (شمال ليمين زي ما هما في الصورة)
+        if (srcs.length > 1) {
+          try {
+            final ims = <pw.MemoryImage>[];
+            final dims = <List<int>>[];
+            for (final p in srcs) {
+              final b = File(p).readAsBytesSync();
+              final d = _jpegSize(b);
+              if (d == null) throw Exception('not jpeg');
+              ims.add(pw.MemoryImage(b));
+              dims.add(d);
+            }
+            const mg = 6.0, gap = 8.0;
+            final n = ims.length;
+            final pageW = 420.0 + 140.0 * (n - 1);
+            final contentW = pageW - 2 * mg - gap * (n - 1);
+            final sumW = dims.fold<int>(0, (a, d) => a + d[0]);
+            final k = contentW / sumW;
+            final maxH = dims.map((d) => d[1] * k).reduce((a, b) => a > b ? a : b);
+            pdf.addPage(
+              pw.Page(
+                pageFormat: PdfPageFormat(pageW, maxH + 2 * mg),
+                margin: const pw.EdgeInsets.all(mg),
+                build: (pw.Context ctx) => pw.Directionality(
+                  textDirection: pw.TextDirection.ltr,
+                  child: pw.Row(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [
+                      for (var i = 0; i < n; i++) ...[
+                        if (i > 0) pw.SizedBox(width: gap),
+                        pw.SizedBox(
+                          width: dims[i][0] * k,
+                          height: dims[i][1] * k,
+                          child: pw.Image(ims[i], fit: pw.BoxFit.fill),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            );
+            pages++;
+            continue;
+          } catch (_) {
+            // لو فشل التركيب نرجع للطريقة القديمة: صفحة لكل باتش
+          }
+        }
+        for (final p in srcs) {
+          try {
+            final bytes = File(p).readAsBytesSync();
+            final imgWidget = pw.MemoryImage(bytes);
+            final sz = kFitPageToReceipt ? _jpegSize(bytes) : null;
+            if (sz != null) {
+              // صفحة بنسبة الباتش نفسه: العرض ثابت والارتفاع على قد الصورة
+              const pageW = 420.0, mg = 6.0;
+              final pageH = (pageW - 2 * mg) * sz[1] / sz[0] + 2 * mg;
+              pdf.addPage(
+                pw.Page(
+                  pageFormat: PdfPageFormat(pageW, pageH),
+                  margin: const pw.EdgeInsets.all(mg),
+                  build: (pw.Context ctx) =>
+                      pw.Center(child: pw.Image(imgWidget, fit: pw.BoxFit.contain)),
+                ),
+              );
+            } else {
+              pdf.addPage(
+                pw.Page(
+                  pageFormat: PdfPageFormat.a4,
+                  margin: const pw.EdgeInsets.all(20),
+                  build: (pw.Context ctx) =>
+                      pw.Center(child: pw.Image(imgWidget, fit: pw.BoxFit.contain)),
+                ),
+              );
+            }
+            pages++;
+          } catch (_) {}
+        }
+      }
+      if (pages == 0) return false;
+      await out.writeAsBytes(await pdf.save());
+      return true;
+    }
+
+    final pdfOutFile = File('$outputDir/الاسكندريه $reportDate.pdf');
+    await buildPdf(mainItems, pdfOutFile);
+    generatedPdfPath = pdfOutFile.path;
+    extraPdfPaths = [];
+    for (final e in otherByDate.entries) {
+      final f = File('$outputDir/الاسكندريه ${e.key}.pdf');
+      if (await buildPdf(e.value, f)) extraPdfPaths.add(f.path);
+    }
+
+    // حساب إجماليات كل وحدة
+    final unitTotals = <int, double>{};
+    for (var r = 2; r <= 11; r++) {
+      unitTotals[r] = 0.0;
+    }
+    // عدد الأجهزة الفعلي لكل وحدة: كل جهاز بيتعدّ مرة واحدة حتى لو عمل أكتر من باتش في اليوم
+    final unitDevices = <int, Set<String>>{};
+    for (final item in mainItems) {
+      if (item.row != null && item.amount > 0) {
+        unitTotals[item.row!] = (unitTotals[item.row!] ?? 0.0) + item.amount;
+        unitDevices
+            .putIfAbsent(item.row!, () => <String>{})
+            .add('${item.orderNum ?? item.tid ?? item.path}');
+      }
+    }
+    final unitCounts = <int, int>{for (final e in unitDevices.entries) e.key: e.value.length};
+
+    // الإكسيل: نفس القالب بالظبط، بنكتب بس عمود C (عدد الأجهزة) و D (مبلغ كل وحدة) و F (الإجمالي)
+    var xlsxLine = '• تم توليد الإكسيل: الاسكندريه $reportDate.xlsx';
+    standardXlsxPath = null;
+    final tpl = await loadTemplateBytes();
+    if (tpl == null) {
+      xlsxLine = '⚠️ قالب "الاسكندريه 00.xlsx" مش موجود في فولدر all (ولا مضاف للتطبيق)، فمتعملش إكسيل.';
+    } else {
+      try {
+        final outBytes = fillTemplate(tpl, unitTotals, unitCounts);
+        final stdFile = File('$outputDir/الاسكندريه $reportDate.xlsx');
+        stdFile.createSync(recursive: true);
+        stdFile.writeAsBytesSync(outBytes);
+        standardXlsxPath = stdFile.path;
+      } catch (e) {
+        xlsxLine = '⚠️ فشل ملء القالب: $e';
+      }
+    }
+
+    final ignore = <int>{};
+    try {
+      for (final m in RegExp(r'\d+').allMatches(File('$baseDir/ignore.txt').readAsStringSync())) {
+        ignore.add(int.parse(m.group(0)!));
+      }
+    } catch (_) {}
+    final foundOrders =
+        mainItems.where((e) => e.amount > 0).map((e) => e.orderNum).whereType<int>().toSet();
+    missingTerminals = [
+      for (var i = 1; i <= kMainMachines; i++)
+        if (!foundOrders.contains(i) && !ignore.contains(i)) i
+    ];
+    writeReport(reportDate);
+
+    setState(() => status = 'اكتمل العد: ${_countLine()}\n'
+        '$xlsxLine\n'
+        '• تم توليد ملف الـ PDF المجمع.' +
+        (extraPdfPaths.isEmpty
+            ? ''
+            : '\n• فيه إيصالات بتواريخ تانية (${otherByDate.keys.join(' ، ')}): اتعمل لها PDF منفصل لكل يوم، ومش داخلة في إجماليات يوم $reportDate.') +
+        (sourceNote.isEmpty ? '' : '\n$sourceNote'));
+  }
+
+  // مبلغ السيستم الخاص بترمنل الباتش ده (أحدث صورة لنفس الترمنل وتاريخ الباتش)
+  SysTotal? _sysOf(ReceiptItem r) {
+    final tid = r.tid ?? r.origTid;
+    if (tid == null) return null;
+    final d = r.date ?? r.dateMain;
+    SysTotal? best;
+    for (final s in sysReads) {
+      if (s.tid != tid || s.amount == null) continue;
+      if (d != null && s.date != null && s.date != d) continue;
+      if (best == null || s.printed.compareTo(best.printed) > 0) best = s;
+    }
+    return best;
+  }
+
+  // تقرير التقفيل: مبالغ السيستم + الماكينات الناقصة + كل الملاحظات + الإيصالات اللي محتاجة مراجعة
+  Future<void> openClosingReport() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ClosingReportPage(
+          items: processedItems,
+          sysReads: sysReads,
+          missing: missingTerminals,
+          warnings: List<String>.from(warnings),
+          subtitleOf: subtitleOf,
+          onOpen: editReceipt,
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
+  }
+
+  // فرق مبلغ السيستم عن مجموع باتشات نفس الماكينة (null = مفيش صورة سيستم). مقياس بس
+  double? _sysDiffOf(ReceiptItem item) {
+    if (item.ignoredDoc || item.userExcluded) return null;
+    final sys = _sysOf(item);
+    if (sys == null) return null;
+    var tot = 0.0;
+    for (final x in processedItems) {
+      if (x.counts && x.amount > 0 && x.orderNum != null && x.orderNum == item.orderNum) tot += x.amount;
+    }
+    return round2(tot - sys.amount!);
+  }
+
+  // شريط تنبيهات صغير (ناقص / ملاحظات): التفاصيل في زر التقرير
+  List<ReceiptItem> _visibleItems(bool reviewOnlyEff) {
+    var l = processedItems.where((e) => !reviewOnlyEff || e.needsReview).toList();
+    final q = _q.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      l = l
+          .where((e) => [e.unitName ?? '', '${e.orderNum ?? ''}', e.tid ?? '', e.amount.toStringAsFixed(2), baseName(e.path)]
+              .any((t) => t.toLowerCase().contains(q)))
+          .toList();
+    }
+    switch (_sort) {
+      case 1:
+        _stableSort<ReceiptItem>(l, (a, b) => (a.orderNum ?? 999).compareTo(b.orderNum ?? 999));
+        break;
+      case 2:
+        _stableSort<ReceiptItem>(l, (a, b) => (b.needsReview ? 1 : 0).compareTo(a.needsReview ? 1 : 0));
+        break;
+      case 3:
+        _stableSort<ReceiptItem>(l, (a, b) => b.amount.compareTo(a.amount));
+        break;
+    }
+    return l;
+  }
+
+  Widget _alertStrip() {
+    final nm = missingTerminals.length, nw = warnings.length;
+    if (nm == 0 && nw == 0) return const SizedBox.shrink();
+    Widget chip(String label, MaterialColor c) => ActionChip(
+          label: w.Text(label, style: TextStyle(fontSize: 12, color: _tintFg(context, c))),
+          backgroundColor: _tintBg(context, c, soft: true),
+          side: BorderSide(color: _tintBorder(context, c)),
+          visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
+          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          onPressed: openClosingReport,
+        );
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 4,
+        children: [
+          if (nm > 0)
+            InkWell(
+              onTap: openClosingReport,
+              borderRadius: BorderRadius.circular(12),
+              child: _flagChip(
+                  context,
+                  '⚠️ ${_l(context, 'ماكينات ناقصة', 'Missing machines')} ($nm): '
+                  '${missingTerminals.map((n) {
+                    final t = numToTid[n] != null ? terminals[numToTid[n]] : null;
+                    return t != null ? '$n ${t.unitName}' : '$n';
+                  }).join(' ، ')}',
+                  Colors.amber),
+            ),
+          if (nw > 0) chip(_l(context, '📝 ملاحظات $nw', '📝 Notes $nw'), kReviewTone),
+        ],
+      ),
+    );
+  }
+
+  // السطر التحتاني للكارت من غير المبلغ (المبلغ بيتعرض كبير لوحده)
+  // التحذيرات كشارات صغيرة ملونة بدل سطور نص طويلة (التفاصيل الكاملة في شاشة التقرير)
+  Widget _warnChips(ReceiptItem item) {
+    final chips = <Widget>[];
+    void add(String t, MaterialColor c) => chips.add(_flagChip(context, t, c));
+    if (item.reprintSummary) add('🚨 REPRINT / SUMMARY', Colors.red);
+    if (item.missingBatchClosed && !item.reprintSummary && !item.ignoredDoc) add('⚠️ BATCH CLOSED ناقص', kReviewTone);
+    if (item.ignoredDoc) add('📄 مستند متجاهل - راجعه', Colors.grey);
+    if (item.dupSuspect) {
+      add('⚠️ مشكوك مكرر${item.dupOf != null ? ' (ماكينة ${item.dupOf})' : ''}', kReviewTone);
+    } else if (item.userExcluded) {
+      add('🚫 مستبعد (مكرر)', Colors.grey);
+    }
+    if (item.alt != null) add('⚠️ قراءة تانية: ${item.alt!.toStringAsFixed(2)}', Colors.amber);
+    if (item.dateOdd) add('📅 تاريخ ${item.date} (الأغلب ${item.dateMain})', Colors.amber);
+    if (!item.ignoredDoc && !item.userExcluded && !item.dupSuspect && item.weakId && item.row != null) {
+      add('❓ ماكينة تلقائية - اتأكد', Colors.blue);
+    }
+    if (item.unusual != null) add('📊 ${item.unusual}', Colors.blue);
+    if (chips.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Wrap(spacing: 6, runSpacing: 4, children: chips),
+    );
+  }
+
+  // سطر المبلغ + سطر صغير (TID / المعاملات / مطابقة السيستم) + شارات للمشاكل بس.
+  // الفرق مع السيستم بيتكتب بالمبلغ (زيادة / ناقص) بدل علامة تحذير من غير شرح.
+  Widget _receiptSubtitle(ReceiptItem item) {
+    final cs = Theme.of(context).colorScheme;
+    final small = TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant);
+    final sfx = item.suffix != null ? ' (باتش ${item.suffix})' : '';
+    final parts = <String>['TID: ${item.tid ?? 'غير محدد'}$sfx'];
+    if (item.txn != null) parts.add('${_l(context, 'المعاملات', 'Txns')}: ${item.txn}');
+    final sl = _sysLineOf(item);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (!item.ignoredDoc && item.amount > 0)
+          w.Text('${item.amount.toStringAsFixed(2)} ج.م',
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        w.Text(parts.join(' | '), maxLines: 1, overflow: TextOverflow.ellipsis, style: small),
+        if (item.batches.length > 1)
+          w.Text('= ${item.batches.map((b) => b.toStringAsFixed(2)).join(' + ')}', style: small),
+        // سطر السيستم كامل (المبلغ + مطابق/الفرق) من غير قطع
+        if (sl != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: _flagChip(context, sl.text, sl.ok ? Colors.green : Colors.red),
+          ),
+        _warnChips(item),
+      ],
+    );
+  }
+
+  // سطر السيستم للماكينة: المبلغ + مطابق أو الفرق (null = مفيش صورة سيستم)
+  SysLine? _sysLineOf(ReceiptItem item) {
+    if (item.ignoredDoc || item.userExcluded) return null;
+    final sys = _sysOf(item);
+    final diff = _sysDiffOf(item);
+    if (sys == null || sys.amount == null || diff == null) return null;
+    final head = '🖥️ ${_l(context, 'السيستم', 'System')}: ${_fmtMoney(sys.amount!)} ج.م';
+    if (diff == 0) return SysLine('$head ✓ ${_l(context, 'مطابق', 'Matches')}', true);
+    return SysLine(
+        '$head | ${_l(context, 'فرق', 'Gap')}: '
+        '${diff > 0 ? _l(context, 'زيادة', 'Extra') : _l(context, 'ناقص', 'Missing')} '
+        '${diff.abs().toStringAsFixed(2)} ج.م',
+        false);
+  }
+
+  String subtitleOf(ReceiptItem item, {bool flags = true}) {
+    final sfx = item.suffix != null ? ' (باتش ${item.suffix})' : '';
+    final bt = item.batches.length > 1
+        ? '\n= ${item.batches.map((b) => b.toStringAsFixed(2)).join(' + ')}'
+        : '';
+    final alt = item.alt != null ? '\n⚠️ قراءة تانية: ${item.alt!.toStringAsFixed(2)}' : '';
+    final txnStr = item.txn != null ? ' | المعاملات: ${item.txn}' : '';
+    final extra = StringBuffer();
+    if (item.reprintSummary) {
+      extra.write('\n🚨 تحذير شديد: الإيصال ده REPRINT أو SUMMARY (ممكن يكون مكرر)!');
+    } else if (item.missingBatchClosed && !item.ignoredDoc) {
+      extra.write('\n⚠️ مش مكتوب فيه BATCH CLOSED SUCCESSFULLY - اتأكد منه');
+    }
+    if (item.ignoredDoc) {
+      extra.write('\n📄 اتجاهلته: شكله إيصال دفع/مستند مش باتش - راجعه');
+    }
+    if (item.dateOdd) {
+      extra.write('\n📅 تاريخه ${item.date} والأغلب ${item.dateMain}');
+    }
+    if (!item.ignoredDoc && !item.userExcluded && !item.dupSuspect && item.weakId && item.row != null) {
+      extra.write('\n❓ الماكينة/الوحدة اتحددت تلقائياً - اتأكد');
+    }
+    var sysStr = '';
+    final sys = (item.ignoredDoc || item.userExcluded) ? null : _sysOf(item);
+    if (sys != null) {
+      var tot = 0.0;
+      var n = 0;
+      for (final x in processedItems) {
+        if (x.counts && x.amount > 0 && x.orderNum != null && x.orderNum == item.orderNum) {
+          tot += x.amount;
+          n++;
+        }
+      }
+      final diff = round2(tot - sys.amount!);
+      final multi = n > 1 ? ' (مجموع $n باتشات)' : '';
+      final res = diff == 0 ? '✅ مطابق$multi' : '⚠️ فرق ${diff > 0 ? '+' : ''}${diff.toStringAsFixed(2)}$multi';
+      sysStr = '\n🖥️ السيستم: ${_fmtMoney(sys.amount!)} ج.م | $res';
+    }
+    final unu = item.unusual != null ? '\n📊 ${item.unusual}' : '';
+    final dup = item.dupSuspect
+        ? '\n⚠️ مشكوك إنه مكرر (نفس مبلغ ماكينة ${item.dupOf ?? ''}) - مش محسوب لحد ما تراجعه'
+        : item.userExcluded
+            ? '\n🚫 مستبعد (مكرر)'
+            : '';
+    return 'TID: ${item.tid ?? 'غير محدد'}$sfx | المبلغ: ${item.amount.toStringAsFixed(2)} ج.م$txnStr$bt$sysStr${flags ? '$alt$dup$unu$extra' : ''}';
+  }
+
+  void writeReport(String date) {
+    try {
+      final line = '=' * 50;
+      final sb = StringBuffer('تقرير المراجعة - $date\n$line\n');
+      var total = 0.0;
+      for (final r in processedItems) {
+        final flags = <String>[];
+        if (r.dupSuspect) flags.add('مشكوك إنه مكرر - مش محسوب لحد ما تراجعه');
+        if (r.userExcluded) flags.add('مستبعد');
+        if (r.ignoredDoc) flags.add('صورة متجاهلة - محتاجة قرار');
+        if (r.dateOdd) flags.add('تاريخ مختلف ${r.date}');
+        if (r.unusual != null) flags.add('إجمالي بعيد عن المعتاد');
+        if (r.amount <= 0) flags.add('المبلغ غير مقروء');
+        if (r.row == null) flags.add('الوحدة غير معروفة');
+        if (!r.ok && r.amount > 0) flags.add('المبلغ يحتاج مراجعة');
+        if (r.how == 'auto-number' || r.how == 'conflict' || r.how == 'extra-batch') {
+          flags.add('رقم الماكينة: ${r.how}');
+        }
+        if (r.batches.length > 1) flags.add('${r.batches.length} باتشات');
+        if (r.alt != null) flags.add('قراءة تانية: ${r.alt!.toStringAsFixed(2)}');
+        if (r.reprintSummary) flags.add('تحذير: REPRINT أو SUMMARY');
+        if (r.missingBatchClosed) flags.add('غير مكتوب BATCH CLOSED');
+        if (r.amount > 0 && r.row != null && r.counts) total += r.amount;
+        final mark = flags.isEmpty ? '✓' : '⚠️';
+        final extra = flags.isEmpty ? '' : '   [${flags.join(' | ')}]';
+        final txnStr = r.txn != null ? ' | معاملات: ${r.txn}' : '';
+        final sy = (r.ignoredDoc || r.userExcluded) ? null : _sysOf(r);
+        final sysTxt = sy != null ? ' | السيستم: ${_fmtMoney(sy.amount!)}' : '';
+        sb.writeln('$mark ${baseName(r.path)}  ${r.unitName ?? '??'}  '
+            '${r.amount.toStringAsFixed(2)}$txnStr$sysTxt$extra');
+      }
+      sb.writeln(line);
+      sb.writeln('الإجمالي العام: ${total.toStringAsFixed(2)} ج.م');
+      if (missingTerminals.isNotEmpty) {
+        sb.writeln('ماكينات ناقصة: ${missingTerminals.join(' ، ')}');
+      }
+      for (final w in warnings) {
+        sb.writeln('- $w');
+      }
+      File('$outputDir/review_report.txt')
+        ..createSync(recursive: true)
+        ..writeAsStringSync(sb.toString());
+    } catch (_) {}
+  }
+
+  // lite = الفحص الخفيف: نفس خطوات فحص التقفيل بالظبط (قراءة + تكرار + ترقيم + تسمية + مراجعة)
+  // لكن من غير بناء الإكسيل والـ PDF، ومن غير طلب أذونات ولا إبقاء الشاشة شغالة
+  Future<void> runFullPipeline({List<String>? manualPaths, bool auto = false, bool lite = false}) async {
+    _fullRunning = true;
+    if (!lite) await waitQuickIdle(); // لو الفحص الخفيف شغال نستناه يخلص
+    if (!lite && !auto && !chainRunning) {
+      try {
+        await Permission.notification.request();
+      } catch (_) {}
+      await askBatteryExempt();
+    }
+    if (!lite) {
+      try {
+        await _chan.invokeMethod('startKeepAlive',
+            {'title': 'A2R POS', 'text': 'جاري فحص الإيصالات...'});
+      } catch (_) {}
+      try {
+        await _chan.invokeMethod('keepScreenOn', {'on': true});
+      } catch (_) {}
+    }
+    final sw = Stopwatch()..start();
+    final logKind = auto ? 'auto' : (chainRunning ? 'chain' : 'manual');
+    Object? runErr;
+    if (!lite) {
+      logScan(
+          tab: 'home',
+          title: '▶ بدأ فحص التقفيل',
+          text: manualPaths != null ? 'صور محددة يدوياً (${manualPaths.length})' : (chainRunning ? 'ضمن الفحص الشامل' : ''),
+          kind: logKind);
+    }
+    try {
+      await _runPipelineInner(manualPaths: manualPaths, lite: lite);
+    } catch (e) {
+      runErr = e;
+      rethrow;
+    } finally {
+      _fullRunning = false;
+      sw.stop();
+      if (!lite) {
+        try {
+          final rvL = processedItems.where((e) => e.needsReview).toList();
+          final wl = <String>[
+            for (final x in warnings.take(10)) '• $x',
+            if (warnings.length > 10) '• ... و${warnings.length - 10} ملاحظة تانية',
+          ];
+          if (runErr != null) {
+            logScan(tab: 'home', title: '⚠️ فحص التقفيل وقف بخطأ', text: runErr.toString().split('\n').first, bad: true, kind: logKind);
+          } else if (status.startsWith('اتوقف')) {
+            logScan(
+                tab: 'home',
+                title: '⏹ اتوقف فحص التقفيل',
+                text: '⏱ ${fmtElapsed(sw.elapsed)}',
+                kind: logKind);
+          } else {
+            final bad = rvL.isNotEmpty || missingTerminals.isNotEmpty;
+            logScan(
+                tab: 'home',
+                title: '${bad ? '⚠️' : '✅'} انتهى فحص التقفيل',
+                text: [
+                  '${processedItems.length} إيصال/صورة${rvL.isNotEmpty ? ' • ${rvL.length} للمراجعة' : ''}'
+                      '${missingTerminals.isNotEmpty ? ' • ناقص ${missingTerminals.length} ماكينة' : ''}'
+                      ' • ⏱ ${fmtElapsed(sw.elapsed)}',
+                  ...wl,
+                ].join('\n'),
+                bad: bad,
+                kind: logKind);
+            for (final it in processedItems) {
+              final ln = _liteLine(it);
+              if (ln == null) continue;
+              logScan(tab: 'home', title: ln, bad: ln.startsWith('⚠️'), kind: logKind, openKey: it.key);
+            }
+          }
+        } catch (_) {}
+      }
+      if (mounted && sw.elapsed.inSeconds >= 1 && _isFinalScanStatus(status)) {
+        setState(() => status = '$status\n⏱ الوقت المستغرق: ${fmtElapsed(sw.elapsed)}');
+      }
+      if (autoScan) {
+        await _watchService(true); // نفضل شغالين نراقب الإيصالات الجديدة
+      } else if (!chainRunning) {
+        await stopKeepAliveSafe(); // ما نقفلش الخدمة لو تاب تاني فيه فحص تلقائي
+      }
+      if (!lite && !chainRunning) {
+        try {
+          await _chan.invokeMethod('keepScreenOn', {'on': false});
+        } catch (_) {}
+      }
+      if (!lite && _life != AppLifecycleState.resumed && !chainRunning) {
+        final rv = processedItems.where((e) => e.needsReview).length;
+        final txt = 'تم فحص ${processedItems.length} إيصال'
+            '${missingTerminals.isNotEmpty ? ' - ناقص ${missingTerminals.length} ماكينة' : ''}'
+            '${rv > 0 ? ' - $rv للمراجعة' : ''}'
+            ' - ⏱ ${fmtElapsed(sw.elapsed)}';
+        try {
+          await _chan.invokeMethod('notify', {'title': tr('A2R POS - انتهى الفحص'), 'text': tr(txt)});
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<void> _runPipelineInner({List<String>? manualPaths, bool lite = false}) async {
+    final granted = lite
+        ? await Permission.manageExternalStorage.isGranted
+        : (await Permission.manageExternalStorage.request()).isGranted;
+    if (!granted) {
+      setState(() => status = 'يجب منح إذن الوصول إلى جميع الملفات للمتابعة.');
+      return;
+    }
+    await prepareDefaultFiles();
+
+    await loadScanCache();
+    setState(() {
+      busy = true;
+      stopReq = false;
+      progress = 0;
+      processedItems.clear();
+      sysReads.clear();
+      missingTerminals.clear();
+      warnings.clear();
+      excludedPay.clear();
+      status = 'جاري البحث عن مجلدات الصور...';
+    });
+
+    final dirs = customDir != null ? [Directory(customDir!)] : findWhatsAppImageDirs();
+    if (manualPaths != null) dirs.clear();
+
+    final now = DateTime.now();
+    final cutoff = days < 0
+        ? DateTime(2000)
+        : DateTime(now.year, now.month, now.day).subtract(Duration(days: days));
+    final todo = <File>[];
+    for (final d in dirs) {
+      try {
+        for (final e in d.listSync().whereType<File>()) {
+          final lower = e.path.toLowerCase();
+          if (!(lower.endsWith('.jpg') ||
+              lower.endsWith('.jpeg') ||
+              lower.endsWith('.png') ||
+              lower.endsWith('.webp'))) {
+            continue;
+          }
+          if (baseName(e.path).startsWith('.') || baseName(e.path).startsWith('dup_')) continue;
+          if (fileDate(e).isBefore(cutoff)) continue;
+          todo.add(e);
+        }
+      } catch (_) {}
+    }
+    todo.sort((a, b) => baseName(a.path).compareTo(baseName(b.path)));
+    sourceNote = '';
+    if (manualPaths != null) {
+      todo.addAll(manualPaths.map((p) => File(p)));
+      sourceNote = '• المصدر: صور محددة يدوياً (${todo.length} صورة)';
+    }
+
+    // فولدر اخترته بإيدك (مش واتساب): أي ملف PDF جواه بيتفحص، بأي اسم وبأي تاريخ
+    if (manualPaths == null && customDir != null && customDir != outputDir) {
+      final cpdfs = <File>[];
+      try {
+        for (final e in Directory(customDir!).listSync().whereType<File>()) {
+          final n = baseName(e.path);
+          if (!n.startsWith('.') && n.toLowerCase().endsWith('.pdf')) cpdfs.add(e);
+        }
+      } catch (_) {}
+      cpdfs.sort((a, b) => baseName(a.path).compareTo(baseName(b.path)));
+      var pdfPages = 0;
+      final used = <String>[];
+      for (final pf in cpdfs) {
+        if (stopReq) break;
+        setState(() => status = 'بقرأ صفحات ملف PDF: ${baseName(pf.path)}...');
+        final pages = await extractPdfPages(pf);
+        if (pages.isEmpty) continue;
+        todo.addAll(pages);
+        pdfPages += pages.length;
+        used.add(baseName(pf.path));
+      }
+      if (used.isNotEmpty) {
+        sourceNote = '• المصدر: ملف PDF ${used.take(3).join(' ، ')}${used.length > 3 ? ' ...' : ''} ($pdfPages صفحة)';
+      }
+    }
+
+    // مفيش صور؟ دوّر على PDF اسمه "الاسكندريه + تاريخ النهارده"
+    if (todo.isEmpty) {
+      setState(() => status = 'مفيش صور. بدوّر على ملف PDF اسمه "الاسكندريه ${todayToken()}"...');
+      final searchDirs = <String>[];
+      if (customDir != null) searchDirs.add(customDir!);
+      for (final d in findWhatsAppImageDirs()) {
+        final p = d.path;
+        if (p.endsWith('WhatsApp Images')) {
+          searchDirs.add(p.substring(0, p.length - 'WhatsApp Images'.length) + 'WhatsApp Documents');
+        }
+      }
+      searchDirs.addAll([baseDir, '$root/Download', '$root/Documents']);
+      final pdfs = findTodayAlexPdfs(searchDirs);
+      if (pdfs.isNotEmpty) {
+        final pages = await extractPdfPages(pdfs.first);
+        if (pages.isNotEmpty) {
+          todo.addAll(pages);
+          sourceNote = '• المصدر: ملف PDF ${baseName(pdfs.first.path)} (${pages.length} صفحة)';
+        }
+      }
+    }
+
+    if (todo.isEmpty) {
+      setState(() {
+        busy = false;
+        status = customDir != null
+            ? 'مفيش صور (في الفترة المحددة) ولا ملفات PDF في المجلد المختار.'
+            : (dirs.isEmpty
+                    ? 'تعذر العثور على مجلد صور الواتساب تلقائياً.'
+                    : 'لا توجد صور في مجلد الواتساب بالفترة المحددة.') +
+                '\nولا يوجد ملف PDF باسم "الاسكندريه ${todayToken()}".';
+      });
+      return;
+    }
+
+    // الفحص التلقائي الخفيف: الملفات دي هتتفحص هنا، فنعتبرها اتفحصت علشان ما يجيش عنها إشعار تاني
+    try {
+      quickMarkSeen(todo.where((f) => dirs.any((d) => f.parent.path == d.path)).map(quickKeyOf));
+    } catch (_) {}
+
+    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+    Directory(rawImagesDir).createSync(recursive: true);
+    Directory(outputDir).createSync(recursive: true);
+    try {
+      File('$outputDir/ocr_debug.txt').writeAsStringSync('');
+    } catch (_) {}
+    final fixes = loadFixes();
+    final rawReceipts = <ReceiptItem>[];
+    final ignoredItems = <ReceiptItem>[];
+    // تصحيح يدوي محفوظ من مرة سابقة (بيتطبق على القراءة الجديدة وعلى المحفوظة)
+    void applyFix(ReceiptItem item, String key) {
+          final fx = fixes[key];
+          if (fx is Map) {
+            final v = fx['val'];
+            if (v is num && v > 0) {
+              item.amount = round2(v.toDouble());
+              item.batches = [item.amount];
+            }
+            final ft = fx['tid'];
+            if (ft is String && terminals.containsKey(ft)) {
+              final t = tidAlias[ft] ?? ft;
+              final info = terminals[t]!;
+              item.tid = t;
+              item.orderNum = info.orderNum;
+              item.row = info.excelRow;
+              item.unitName = info.unitName;
+            }
+            item.ok = true;
+            item.alt = null;
+            item.how = 'manual';
+            final dd = fx['dup'];
+            if (dd is String) item.dupDecision = dd;
+            final ig = fx['ign'];
+            if (ig is String) item.ign = ig;
+            final fd = fx['date'];
+            if (fd is String) {
+              item.date = fd;
+              item.dateFix = fd;
+            }
+            if (fx['rep'] == true || fx['rep'] == false) item.reprintSummary = fx['rep'];
+            if (fx['nobc'] == true || fx['nobc'] == false) item.missingBatchClosed = fx['nobc'];
+          }
+    }
+
+    // تسريع: نسخ/تصحيح صور الإيصالات المحفوظة في الكاش بيتجهز بالتوازي (3 مع بعض) قبل ما اللفة توصل لها
+    final preFix = <String, Future<bool>>{};
+    {
+      var running = 0;
+      final waiters = <Completer<void>>[];
+      Future<bool> limited(Future<bool> Function() job) async {
+        while (running >= 3) {
+          final c = Completer<void>();
+          waiters.add(c);
+          await c.future;
+        }
+        running++;
+        try {
+          return await job();
+        } catch (_) {
+          return false;
+        } finally {
+          running--;
+          if (waiters.isNotEmpty) waiters.removeAt(0).complete();
+        }
+      }
+
+      final usedDst = <String>{};
+      for (final f in todo) {
+        try {
+          final ck = '${baseName(f.path)}:${f.lengthSync()}';
+          final c = _scanCache[ck];
+          if (c is! Map || c['v'] != _kScanVer || c['k'] != 'receipt' || c['rot'] is! int) continue;
+          final ct = c['tid'];
+          if (ct is String && !terminals.containsKey(ct)) continue;
+          final inRaw = f.path.startsWith('$rawImagesDir/');
+          final dst = inRaw ? f.path : '$rawImagesDir/wa_${baseName(f.path)}';
+          final noExt = dst.contains('.') ? dst.substring(0, dst.lastIndexOf('.')) : dst;
+          final jd = '$noExt.jpg';
+          if (!usedDst.add(jd)) continue; // نفس الاسم من مصدرين: يتعمل بالترتيب زي الأول
+          final rot = c['rot'] as int;
+          final src = f.path;
+          preFix[src] = limited(() => fixImageAsync(src, jd, rot));
+        } catch (_) {}
+      }
+    }
+
+    // ═════════ المرحلة 1: قراءة الصور ═════════
+    for (var i = 0; i < todo.length; i++) {
+      if (stopReq) break;
+      final f = todo[i];
+      try {
+        Directory(tmpDir).createSync(recursive: true);
+        var workPath = f.path;
+        int? rotDeg;
+        // نتيجة محفوظة لنفس الصورة؟ ما نقراهاش تاني
+        final ckey = '${baseName(f.path)}:${f.lengthSync()}';
+        final fxPre = fixes[ckey];
+        final ignPre = (fxPre is Map && fxPre['ign'] is String) ? fxPre['ign'] as String : null;
+        final ce = _scanCache[ckey];
+        if (ce is Map && ce['v'] == _kScanVer) {
+          final kind = ce['k'];
+          var hit = true;
+          if (ignPre == 'keep' && kind != 'receipt') hit = false;
+          if (kind == 'none' && autoRotate && ce['ar'] != true) hit = false;
+          if (hit && kind == 'receipt') {
+            final ct = ce['tid'];
+            if (ct is String && !terminals.containsKey(ct)) hit = false;
+          }
+          if (hit) {
+            if (kind == 'console') {
+              sysReads.add(SysTotal.fromJson(ce));
+            } else if (kind == 'pay') {
+              excludedPay.add(baseName(f.path));
+              if (ignPre != 'drop') {
+                final igItem = ReceiptItem(path: f.path, key: ckey, how: 'none', ignoredDoc: true);
+                ignoredItems.add(igItem);
+                processedItems.add(igItem);
+              }
+            } else if (kind == 'receipt') {
+              final rot = ce['rot'];
+              final inRawC = f.path.startsWith('$rawImagesDir/');
+              final dstC = inRawC ? f.path : '$rawImagesDir/wa_${baseName(f.path)}';
+              File lf;
+              if (rot is int) {
+                final noExtC = dstC.contains('.') ? dstC.substring(0, dstC.lastIndexOf('.')) : dstC;
+                final jdC = '$noExtC.jpg';
+                await (preFix[f.path] ?? fixImageAsync(f.path, jdC, rot));
+                if (jdC != dstC && inRawC) {
+                  try {
+                    File(dstC).deleteSync();
+                  } catch (_) {}
+                }
+                lf = File(jdC);
+              } else if (inRawC || File(dstC).existsSync()) {
+                lf = File(dstC);
+              } else {
+                await fixImageAsync(f.path, dstC, 0);
+                lf = File(dstC);
+              }
+              final cItem = _receiptFromCache(Map<String, dynamic>.from(ce), ckey, lf.path);
+              applyFix(cItem, ckey);
+              rawReceipts.add(cItem);
+              processedItems.add(cItem);
+            }
+            if (!mounted) return;
+            if (i % 10 == 0 || i == todo.length - 1) {
+              setState(() {
+                progress = ((i + 1) / todo.length) * 0.5;
+                status = 'فحص OCR: ${i + 1} من ${todo.length} (محفوظ)';
+              });
+            }
+            continue;
+          }
+        }
+        var res = await recognizer.processImage(InputImage.fromFilePath(workPath));
+        if (stopReq) break;
+        final fkey = '${baseName(f.path)}:${f.lengthSync()}';
+        final fxm = fixes[fkey];
+        final ign = (fxm is Map && fxm['ign'] is String) ? fxm['ign'] as String : null;
+        // صورة السيستم (A2R Operations Console): مش باتش، بناخد منها الترمنل والإجمالي بس
+        if (ign != 'keep') {
+          final sp = parseSysConsole(res.text, baseName(f.path), rt: res);
+          if (sp != null) {
+            sysReads.add(sp);
+            _cachePut(fkey, {'k': 'console', ...sp.toJson()});
+            if (!mounted) return;
+            setState(() {
+              progress = ((i + 1) / todo.length) * 0.5;
+              status = 'فحص OCR: ${i + 1} من ${todo.length} (صورة سيستم)';
+            });
+            continue;
+          }
+        }
+        if (ign != 'keep' && _isIdSlip(res)) {
+          _cachePut(fkey, {'k': 'slip'});
+          if (!mounted) return;
+          setState(() {
+            progress = ((i + 1) / todo.length) * 0.5;
+            status = 'فحص OCR: ${i + 1} من ${todo.length}';
+          });
+          continue; // ورقة تعريف: مش باتش
+        }
+        var isReceipt = receiptScore(res.text) >= 2 || findTerminalIn([res.text]) != null;
+        if (ign == 'keep') isReceipt = true; // قررت قبل كده إنها باتش
+        // إيصال دفع أو مستند مش باتش/ملخص/ري برنت: بيدخل المراجعة (مش بيتتجاهل نهائي)
+        var skipPay = false;
+        if (isReceipt && ign != 'keep' && classifyReceipt(res.text) == 'payment') {
+          isReceipt = false;
+          skipPay = true;
+        }
+
+        // صورة مقلوبة؟ جرّب EXIF ثم 90 / 270 / 180
+        if (!isReceipt && !skipPay && autoRotate) {
+          for (final deg in const [0, 90, 270, 180]) {
+            if (stopReq) break;
+            final tp = '$tmpDir/rot_$deg.jpg';
+            try {
+              final wrote = await fixImageAsync(f.path, tp, deg);
+              if (!wrote) continue;
+              final r2 = await recognizer.processImage(InputImage.fromFilePath(tp));
+              if ((receiptScore(r2.text) >= 2 || findTerminalIn([r2.text]) != null) &&
+                  classifyReceipt(r2.text) != 'payment') {
+                res = r2;
+                workPath = tp;
+                rotDeg = deg;
+                isReceipt = true;
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+
+        if (stopReq) break;
+        if (isReceipt) {
+          final key = '${baseName(f.path)}:${f.lengthSync()}';
+          final a = analyzeLines(toLines(res));
+
+          // قراءة تانية بتنسيق مختلف (صورة محسّنة) علشان نكشف الأخطاء
+          double? alt;
+          bool hasBatchClosed = RegExp(r'BATCH\s*CLOS', caseSensitive: false).hasMatch(res.text.toUpperCase());
+          bool hasReprint = RegExp(r'REPRINT|SUMMARY|DUPLICATE', caseSensitive: false).hasMatch(res.text.toUpperCase());
+
+          // القراءة التانية بس للإيصالات اللي القراءة الأولى فيها مش مؤكدة (علشان السرعة)
+          final needSecond = !a.ok || a.tid == null || a.row == null || a.val <= 0 || !hasBatchClosed || hasReprint;
+          if (needSecond && !stopReq) {
+            try {
+            final ep = '$tmpDir/enh.jpg';
+            await enhanceImageAsync(workPath, ep);
+            final res2 = await recognizer.processImage(InputImage.fromFilePath(ep));
+            final a2 = analyzeLines(toLines(res2));
+            if (RegExp(r'BATCH\s*CLOS', caseSensitive: false).hasMatch(res2.text.toUpperCase())) hasBatchClosed = true;
+            if (RegExp(r'REPRINT|SUMMARY|DUPLICATE', caseSensitive: false).hasMatch(res2.text.toUpperCase())) hasReprint = true;
+            try {
+              File('$outputDir/ocr_debug.txt').writeAsStringSync(
+                  '##### ${baseName(f.path)} (2nd read) total=${a2.val} ok=${a2.ok}\n',
+                  mode: FileMode.append);
+            } catch (_) {}
+            alt = mergeSecondRead(a, a2);
+            } catch (_) {}
+          }
+
+          if (a.tid == null) {
+            final fnNum = int.tryParse(baseName(f.path).split('.').first);
+            final ft = fnNum != null ? numToTid[fnNum] : null;
+            if (ft != null && (a.row == null || terminals[ft]!.excelRow == a.row)) {
+              a.tid = ft;
+              a.row = terminals[ft]!.excelRow;
+              a.unitName = terminals[ft]!.unitName;
+              a.how = 'file-number';
+            }
+          }
+          try {
+            File('$outputDir/ocr_debug.txt').writeAsStringSync(
+                '##### ${baseName(f.path)} => tid=${a.tid} how=${a.how} total=${a.val} ok=${a.ok} alt=$alt rotated=${workPath != f.path}\n'
+                '${a.debug}\n--- raw ML Kit ---\n${res.text}\n\n',
+                mode: FileMode.append);
+          } catch (_) {}
+
+          // نسخة الصورة اللي هتدخل الـ PDF (متظبطة الاتجاه)
+          final inRaw = f.path.startsWith('$rawImagesDir/');
+          final dst = inRaw ? f.path : '$rawImagesDir/wa_${baseName(f.path)}';
+          File localFile;
+          if (workPath != f.path) {
+            final noExt = dst.contains('.') ? dst.substring(0, dst.lastIndexOf('.')) : dst;
+            final jd = '$noExt.jpg';
+            File(workPath).copySync(jd);
+            if (jd != dst && inRaw) {
+              try {
+                File(dst).deleteSync();
+              } catch (_) {}
+            }
+            localFile = File(jd);
+          } else if (inRaw || File(dst).existsSync()) {
+            localFile = File(dst);
+          } else {
+            await fixImageAsync(f.path, dst, 0); // نسخ + تصحيح EXIF لو لازم
+            localFile = File(dst);
+          }
+
+          final item = ReceiptItem(
+            path: localFile.path,
+            tid: a.tid,
+            orderNum: a.tid != null ? terminals[a.tid]!.orderNum : null,
+            row: a.row,
+            unitName: a.unitName,
+            amount: a.val,
+            date: a.date,
+            key: key,
+            ok: a.ok,
+            how: a.how,
+            batches: a.batches,
+            alt: alt,
+            reprintSummary: hasReprint,
+            missingBatchClosed: !hasBatchClosed,
+          );
+          item.txn = a.txn;
+          item.cands = a.cands;
+
+          _cachePut(key, _receiptToCache(item, workPath != f.path ? rotDeg : null));
+          applyFix(item, key);
+          rawReceipts.add(item);
+          processedItems.add(item); // يظهر فوراً (مؤقت) ويتنظّم في آخر المعالجة
+        } else if (skipPay) {
+          excludedPay.add(baseName(f.path));
+          _cachePut(fkey, {'k': 'pay'});
+          if (ign != 'drop') {
+            final igItem = ReceiptItem(
+              path: f.path,
+              key: fkey,
+              how: 'none',
+              ignoredDoc: true,
+            );
+            ignoredItems.add(igItem);
+            processedItems.add(igItem); // يظهر فوراً (مؤقت)
+          }
+        } else {
+          _cachePut(fkey, {'k': 'none', 'ar': autoRotate});
+        }
+      } catch (e) {
+        warnings.add('${baseName(f.path)}: فشلت القراءة (${e.toString().split('\n').first})');
+      }
+
+      if (_scanCacheDirty >= 25) await saveScanCache();
+      if (!mounted) return;
+      setState(() {
+        progress = ((i + 1) / todo.length) * 0.5;
+        status = 'فحص OCR: ${i + 1} من ${todo.length}';
+      });
+    }
+
+    await saveScanCache();
+    for (final s in sysReads) {
+      if (s.amount == null) {
+        warnings.add('${s.file}: صورة سيستم (A2R Operations Console) بس مش قادر أقرا المبلغ - مش محسوبة كباتش');
+      }
+    }
+    await recognizer.close();
+
+    // العناصر المؤقتة اللي ظهرت أثناء القراءة: بتتشال هنا وبتتضاف تاني مرتبة في آخر المعالجة
+    void dropProvisional() =>
+        processedItems.removeWhere((e) => rawReceipts.contains(e) || ignoredItems.contains(e));
+
+    if (stopReq) {
+      dropProvisional();
+      if (mounted) {
+        setState(() {
+          busy = false;
+          status = 'اتوقف الفحص. اضغط "فحص التقفيل" لو عايز تبدأ من جديد.';
+        });
+      }
+      return;
+    }
+
+    if (rawReceipts.isEmpty) {
+      dropProvisional();
+      processedItems.addAll(ignoredItems);
+      setState(() {
+        busy = false;
+        status = 'تم فحص ${todo.length} صورة، ولم يتم العثور على إيصالات مطابقة.';
+      });
+      return;
+    }
+
+    // ═════════ المرحلة 2: التكرار وترقيم الماكينات ═════════
+    setState(() => status = 'مراجعة التكرار وترقيم الماكينات...');
+    final prio = <String, int>{'manual': 0, 'terminal': 0, 'new-terminal': 0, 'fuzzy': 1, 'file-number': 2};
+    final withTid = rawReceipts.where((r) => r.tid != null && !r.userExcluded).toList();
+    withTid.sort((a, b) {
+      final c = (prio[a.how] ?? 3).compareTo(prio[b.how] ?? 3);
+      return c != 0 ? c : rawReceipts.indexOf(a).compareTo(rawReceipts.indexOf(b));
+    });
+
+    final taken = <int, ReceiptItem>{};
+    for (final r in withTid) {
+      final n = r.orderNum!;
+      final prev = taken[n];
+      if (prev == null) {
+        taken[n] = r;
+      } else if (r.amount > 0 &&
+          (prev.amount - r.amount).abs() < 0.005 &&
+          sameDay(prev, r)) {
+        if (r.dupDecision == 'drop') {
+          r.userExcluded = true; // انت قررت قبل كده إنه مكرر (بيفضل ظاهر وتقدر ترجّعه)
+          r.dupOf = n;
+          warnings.add('${baseName(r.path)}: إيصال مكرر للماكينة $n (استبعدته قبل كده - تقدر ترجّعه)');
+        } else if (r.dupDecision == 'keep') {
+          r.origTid = r.tid; // انت قررت قبل كده إنه باتش تاني حقيقي
+          r.tid = null;
+          r.conflict = true;
+        } else {
+          // نفس الماكينة ونفس المبلغ = مشكوك إنه مكرر: بيدخل المراجعة (مش بيتستبعد)
+          r.dupSuspect = true;
+          r.dupOf = n;
+          warnings.add('${baseName(r.path)}: نفس الماكينة $n ونفس المبلغ '
+              '${r.amount.toStringAsFixed(2)} (مشكوك إنه مكرر) - راجعه من زر المراجعة');
+        }
+      } else {
+        r.origTid = r.tid;
+        r.tid = null;
+        r.conflict = true;
+      }
+    }
+
+    final usedSuffix = <String>{};
+    void giveSuffix(ReceiptItem r) {
+      var k = 2;
+      while (usedSuffix.contains('${r.origTid}:$k')) {
+        k++;
+      }
+      usedSuffix.add('${r.origTid}:$k');
+      r.tid = r.origTid;
+      r.suffix = k;
+      r.how = 'extra-batch';
+    }
+
+    for (final r in rawReceipts) {
+      if (r.skip || r.userExcluded || r.tid != null || r.row == null) continue;
+      if (r.conflict &&
+          (r.how == 'terminal' || r.how == 'new-terminal' || r.how == 'fuzzy' || r.dupDecision == 'keep')) {
+        giveSuffix(r); // نفس الماكينة بمبلغ مختلف = باتش إضافي
+        continue;
+      }
+      final free = <int>[];
+      for (var n = 1; n <= machineCount; n++) {
+        if (terminals[numToTid[n]!]!.excelRow == r.row && !taken.containsKey(n)) {
+          free.add(n);
+        }
+      }
+      if (free.isNotEmpty) {
+        final n = free.first;
+        final t = numToTid[n]!;
+        r.tid = t;
+        r.orderNum = n;
+        r.unitName = terminals[t]!.unitName;
+        taken[n] = r;
+        r.how = r.conflict ? 'conflict' : 'auto-number';
+      } else if (r.origTid != null) {
+        giveSuffix(r);
+      }
+    }
+
+    final kept = rawReceipts.where((r) => !r.skip).toList();
+
+    // التاريخ الأكثر تكراراً + تحذيرات
+    final dateVotes = <String, int>{};
+    for (final r in kept) {
+      if (r.date != null) dateVotes[r.date!] = (dateVotes[r.date!] ?? 0) + 1;
+    }
+    final mainDate = mostCommon(dateVotes.keys.expand((k) => List.filled(dateVotes[k]!, k)).toList())?.key;
+
+    for (final r in kept) {
+      final nm = baseName(r.path);
+      if (mainDate != null && r.date != null && r.date != mainDate && r.dateFix == null) {
+        r.dateOdd = true; // بيدخل المراجعة
+        r.dateMain = mainDate;
+      }
+      if (r.row != null && r.amount > 0) {
+        if (!r.ok) warnings.add('$nm: ${r.unitName} = ${r.amount.toStringAsFixed(2)} (راجع المبلغ يدوياً)');
+        if (r.alt != null) {
+          warnings.add('$nm: القراءة التانية للمبلغ ${r.alt!.toStringAsFixed(2)} مختلفة عن ${r.amount.toStringAsFixed(2)} - راجع الصورة');
+        }
+        if (r.how == 'extra-batch') {
+          warnings.add('$nm: الماكينة ${r.orderNum} ظهرت في صورة تانية بمبلغ مختلف - اتحسبت كباتش إضافي ${r.suffix}');
+        } else if (r.how == 'auto-number' || r.how == 'conflict') {
+          warnings.add('$nm: رقم الماكينة اتحدد تلقائياً (${r.orderNum}) - اتأكد منه');
+        } else if (!(r.how == 'terminal' || r.how == 'new-terminal' || r.how == 'fuzzy' || r.how == 'manual')) {
+          warnings.add('$nm: الوحدة اتحددت بالاسم/الميرشانت فقط');
+        }
+      } else {
+        warnings.add('$nm: مش قادر أقرا المبلغ أو الوحدة - اضغط تعديل');
+      }
+    }
+
+    if (stopReq) {
+      dropProvisional();
+      if (mounted) {
+        setState(() {
+          busy = false;
+          status = 'اتوقف الفحص. اضغط "فحص التقفيل" لو عايز تبدأ من جديد.';
+        });
+      }
+      return;
+    }
+
+    // ═════════ المرحلة 3: إعادة التسمية (على مرحلتين عشان التعارض) ═════════
+    setState(() => status = 'إعادة تسمية الصور وترتيبها...');
+    final moves = <ReceiptItem>[];
+    final newNames = <ReceiptItem, String>{};
+    var dupN = 0;
+    for (final r in kept) {
+      if (r.tid == null || r.orderNum == null) continue;
+      final ext = r.path.split('.').last;
+      final sfx = r.suffix != null
+          ? '_${r.suffix}'
+          : ((r.dupSuspect || r.userExcluded) ? '_dup${++dupN}' : '');
+      final target = '$rawImagesDir/${r.orderNum}$sfx.$ext';
+      if (r.path != target) {
+        moves.add(r);
+        newNames[r] = target;
+      }
+    }
+    for (var k = 0; k < moves.length; k++) {
+      final r = moves[k];
+      final tmp = '$rawImagesDir/__tmp$k.${r.path.split('.').last}';
+      try {
+        r.path = File(r.path).renameSync(tmp).path;
+      } catch (_) {}
+    }
+    for (final r in moves) {
+      try {
+        final dst = newNames[r]!;
+        if (File(dst).existsSync()) File(dst).deleteSync();
+        r.path = File(r.path).renameSync(dst).path;
+      } catch (_) {}
+    }
+
+    dropProvisional();
+    processedItems.addAll(kept);
+    processedItems.addAll(ignoredItems);
+    await rebuildFiles(lite: lite);
+    try {
+      Directory(tmpDir).deleteSync(recursive: true);
+    } catch (_) {}
+
+    if (!mounted) return;
+    setState(() {
+      busy = false;
+      progress = 1.0;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: !busy,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (!didPop && busy) {
+          // الفحص شغال: نرجّع التطبيق للخلفية بس علشان الفحص يكمّل
+          try {
+            await _chan.invokeMethod('moveToBack');
+          } catch (_) {}
+        }
+      },
+      child: _buildScaffold(context),
+    );
+  }
+
+  Widget _buildScaffold(BuildContext context) {
+    AppSettings.of(context);
+    final xlsx = latestOutput('.xlsx');
+    final pdf = latestOutput('.pdf');
+    final reviewCount = processedItems.where((e) => e.needsReview).length;
+    final reviewOnlyEff = reviewOnly && reviewCount > 0;
+    final visItems = _visibleItems(reviewOnlyEff);
+    _syncBadge(homeBadge, reviewCount);
+    _publishClosing(processedItems, sysReads);
+    homeBusyG = busy;
+    return Scaffold(
+      appBar: AppBar(
+        toolbarHeight: 54,
+        titleSpacing: 12,
+        title: const AppTitle(),
+        actions: [
+          const HeaderButtons(),
+          _moreMenu(context, busy: busy),
+        ],
+      ),
+      bottomNavigationBar: _scanBar(
+        busy: busy,
+        stopReq: stopReq,
+        onStop: () => setState(() {
+          chainAbort = true;
+          stopReq = true;
+        }),
+        thisLabel: 'فحص التقفيل',
+        onScanThis: () => runFullPipeline(),
+        progress: progress,
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+        children: [
+          _settingsCollapsed(
+              context,
+              '${customDir != null ? baseName(customDir!) : _l(context, 'واتساب', 'WhatsApp')} • ${_periodLabel()}'
+              ' • ${_l(context, 'المخرجات', 'Output')}: ${customOut == null ? _l(context, 'الافتراضي', 'Default') : baseName(customOut!)}'
+              '${autoScan ? ' • ${_l(context, 'فحص تلقائي ✓', 'Auto-scan ✓')}' : ''}',
+              [
+            _switchRow('فحص تلقائي خفيف (يفحص الإيصال الجديد لوحده ويبعتلك إشعار بالنتيجة)', autoScan, (v) => _setAuto(v)),
+            const Divider(height: 4),
+            _sourceChips(context,
+                busy: busy,
+                days: days,
+                onDays: (d) {
+                  setState(() => days = d);
+                  sharedDays.value = d;
+                },
+                periodLabel: _periodLabel(),
+                sourcePath: customDir,
+                onPickSource: pickFolder,
+                onUseWhatsApp: useWhatsApp),
+            _outputCard(context,
+                busy: busy,
+                outPath: customOut ?? defaultOutputDir,
+                outIsDefault: customOut == null,
+                onPickOut: pickOutFolder,
+                onUseDefaultOut: useDefaultOut,
+                onOpenOut: () => openFolder(outputDir)),
+            _switchRow('فحص الصور المقلوبة (أبطأ)', autoRotate,
+                busy ? null : (v) => setState(() => autoRotate = v)),
+          ]),
+          _runAllCard(),
+          _statusBox(status),
+          const SizedBox(height: 6),
+          _statsRow(),
+          const SizedBox(height: 6),
+          _actionRow([
+            _quickBtn(Icons.insights, _l(context, 'التقرير', 'Report'),
+                processedItems.isEmpty && sysReads.isEmpty ? null : openClosingReport),
+            _quickBtn(
+                Icons.table_chart,
+                'إكسيل',
+                xlsx == null
+                    ? null
+                    : () => openFile(xlsx,
+                        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')),
+            _quickBtn(Icons.picture_as_pdf, 'PDF',
+                pdf == null ? null : () => openFile(pdf, 'application/pdf')),
+            _quickBtn(Icons.chat, 'إرسال الكل', busy ? null : sendToWhatsApp),
+            _quickBtn(Icons.drive_file_move, _l(context, 'نقل', 'Move'), busy ? null : transferOutputs),
+            _quickBtn(Icons.add_photo_alternate, 'يدوي', busy ? null : pickManualImages),
+          ]),
+          if (processedItems.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            _filterRowCompact(reviewOnlyEff, processedItems.length, reviewCount, (v) => setState(() => reviewOnly = v)),
+            _reviewTools(context,
+                hint: reviewCount > 0
+                    ? _l(context, '💡 اسحب إيصال المراجعة: صح ✓ في ناحية وغلط ✗ في الناحية التانية',
+                        '💡 Swipe a review receipt: OK ✓ one way, wrong ✗ the other')
+                    : '',
+                count: reviewCount,
+                reviewOnly: reviewOnlyEff,
+                busy: busy,
+                onRestOk: _markRestOk),
+            _listTools(context,
+                remaining: reviewCount,
+                total: processedItems.length,
+                controller: _searchCtl,
+                onQuery: (v) => setState(() => _q = v),
+                sort: _sort,
+                sortLabels: [
+                  _l(context, 'الترتيب الأصلي', 'Original order'),
+                  _l(context, 'رقم الماكينة', 'Machine number'),
+                  _l(context, 'المراجعة أولاً', 'Review first'),
+                  _l(context, 'المبلغ الأكبر', 'Largest amount'),
+                ],
+                onSort: (v) => setState(() => _sort = v)),
+          ],
+          _alertStrip(),
+          const SizedBox(height: 10),
+          if (processedItems.isEmpty && busy) const _SkeletonList(),
+          if (processedItems.isEmpty && !busy)
+            _emptyState(context, Icons.receipt_long, _l(context, 'مفيش إيصالات لسه', 'No receipts yet'),
+                _l(context, 'اضغط "فحص التقفيل" علشان نقرا الباتشات وصور السيستم.',
+                    'Tap "Scan closing" to read the batches and system images.'),
+                actionLabel: _l(context, 'فحص التقفيل', 'Scan closing'), onAction: () => runFullPipeline()),
+          if (processedItems.isNotEmpty && visItems.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(24),
+              child: Center(child: w.Text(_l(context, 'مفيش نتايج.', 'No results.'))),
+            ),
+          for (final item in visItems)
+            _swipeWrap(item, Card(
+              margin: const EdgeInsets.symmetric(vertical: 2),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: BorderSide(
+                  color: item.reprintSummary
+                      ? _tone(context, Colors.red)
+                      : (item.missingBatchClosed ? kReviewTone : Theme.of(context).colorScheme.outlineVariant),
+                  width: item.reprintSummary ? 2.0 : (item.missingBatchClosed ? 1.5 : 1.0),
+                ),
+              ),
+              clipBehavior: Clip.antiAlias,
+              color: item.reprintSummary ? _tintBg(context, Colors.red, soft: true) : null,
+              child: AnimatedContainer(
+               duration: const Duration(milliseconds: 350),
+               decoration: BoxDecoration(
+                 border: BorderDirectional(start: BorderSide(color: _itemStatusColor(item), width: 4)),
+               ),
+               child: ListTile(
+                dense: true,
+                visualDensity: VisualDensity.compact,
+                contentPadding: const EdgeInsetsDirectional.fromSTEB(10, 0, 2, 0),
+                onTap: () => editReceipt(item),
+                leading: Image.file(
+                  File(item.path),
+                  width: 40,
+                  height: 40,
+                  fit: BoxFit.cover,
+                ),
+                title: Row(
+                  children: [
+                    Container(
+                      width: 10,
+                      height: 10,
+                      margin: const EdgeInsetsDirectional.only(end: 8),
+                      decoration: BoxDecoration(shape: BoxShape.circle, color: _unitColor(item.row)),
+                    ),
+                    Flexible(
+                      child: Text(
+                        item.ignoredDoc || item.ign == 'drop'
+                            ? 'مستند متجاهل - ${baseName(item.path)}'
+                            : (item.orderNum != null ? machineLabel(item.orderNum, item.unitName) : (item.unitName ?? 'وحدة غير معروفة')),
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                    if (item.needsReview)
+                      Padding(
+                        padding: const EdgeInsetsDirectional.only(start: 6),
+                        child: Icon(Icons.swipe, size: 14, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                      ),
+                  ],
+                ),
+                subtitle: _receiptSubtitle(item),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (item.userExcluded)
+                      IconButton(
+                        tooltip: tr('رجّعه (احتسبه)'),
+                        icon: Icon(Icons.undo, color: _tone(context, Colors.red)),
+                        onPressed: busy
+                            ? null
+                            : () async {
+                                if (item.ign == 'drop') {
+                                  keepIgnored(item);
+                                  setState(() {});
+                                } else {
+                                  keepAsExtraBatch(item, processedItems);
+                                  await rebuildFiles();
+                                }
+                              },
+                      ),
+                    if (item.needsReview)
+                      Icon(Icons.warning_amber, color: _tintBorder(context, kReviewTone))
+                    else if (item.ignoredDoc || item.ign == 'drop' || item.userExcluded)
+                      Icon(Icons.remove_circle_outline, color: Theme.of(context).colorScheme.outline)
+                    else if (item.tid != null && item.amount > 0)
+                      Icon(Icons.check_circle, color: _tone(context, Colors.green))
+                    else
+                      Icon(Icons.cancel, color: _tone(context, Colors.red)),
+                    PopupMenuButton<String>(
+                      tooltip: tr('المزيد'),
+                      padding: EdgeInsets.zero,
+                      onSelected: (v) {
+                        if (v == 'edit') {
+                          editReceipt(item);
+                        } else if (v == 'open') {
+                          openFile(item.path, 'image/*');
+                        } else if (v == 'share') {
+                          shareOneReceipt(item);
+                        } else if (v == 'retid') {
+                          reReadTerminal(item);
+                        }
+                      },
+                      itemBuilder: (_) => [
+                        PopupMenuItem(value: 'edit', child: w.Text(_l(context, 'تعديل', 'Edit'))),
+                        PopupMenuItem(value: 'open', child: w.Text(_l(context, 'فتح الصورة', 'Open image'))),
+                        PopupMenuItem(value: 'share', child: w.Text(_l(context, 'إرسال الصورة', 'Send image'))),
+                        PopupMenuItem(
+                            value: 'retid',
+                            enabled: !busy,
+                            child: w.Text(_l(context, 'إعادة قراءة الترمنل', 'Re-read terminal'))),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              ),
+            )),
+          const SizedBox(height: 64),
+        ],
+      ),
+    );
+  }
+}
+
+// ───────────────────── متصفح الفولدرات ─────────────────────
+class FolderPicker extends StatefulWidget {
+  final String start;
+  const FolderPicker({super.key, required this.start});
+
+  @override
+  State<FolderPicker> createState() => _FolderPickerState();
+}
+
+String? _lastPickedFolder; // آخر فولدر اتختار (في الجلسة دي)
+
+class _FolderPickerState extends State<FolderPicker> {
+  late String path = widget.start;
+  List<Directory> dirs = [];
+  String? error;
+  String q = '';
+  final TextEditingController _search = TextEditingController();
+  final ScrollController _crumbs = ScrollController();
+  final List<List<Object>> shortcuts = []; // [أيقونة، اسم، مسار]
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+    _buildShortcuts();
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    _crumbs.dispose();
+    super.dispose();
+  }
+
+  void _buildShortcuts() {
+    void add(IconData ic, String name, String p) {
+      try {
+        if (Directory(p).existsSync() && !shortcuts.any((e) => e[2] == p)) shortcuts.add([ic, name, p]);
+      } catch (_) {}
+    }
+
+    try {
+      for (final d in findWhatsAppDocDirs()) {
+        add(Icons.chat, 'واتساب - مستندات', d.path);
+        break;
+      }
+      for (final d in findWhatsAppImageDirs()) {
+        add(Icons.photo_library_outlined, 'واتساب - صور', d.path);
+        break;
+      }
+    } catch (_) {}
+    add(Icons.download, 'Download', '$root/Download');
+    add(Icons.description_outlined, 'Documents', '$root/Documents');
+    if (_lastPickedFolder != null) add(Icons.history, 'آخر اختيار', _lastPickedFolder!);
+  }
+
+  void load() {
+    try {
+      final l = Directory(path)
+          .listSync()
+          .whereType<Directory>()
+          .where((d) => !baseName(d.path).startsWith('.'))
+          .toList();
+      l.sort((a, b) =>
+          baseName(a.path).toLowerCase().compareTo(baseName(b.path).toLowerCase()));
+      dirs = l;
+      error = null;
+    } catch (_) {
+      dirs = [];
+      error = 'مش قادر أفتح الفولدر ده.';
+    }
+  }
+
+  void go(String p) {
+    setState(() {
+      path = p;
+      q = '';
+      _search.clear();
+      load();
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_crumbs.hasClients) _crumbs.jumpTo(_crumbs.position.maxScrollExtent);
+    });
+  }
+
+  List<List<String>> _crumbList() {
+    final out = <List<String>>[];
+    var base = '';
+    var rest = path;
+    if (path == root || path.startsWith('$root/')) {
+      out.add(['الذاكرة', root]);
+      base = root;
+      rest = path.substring(root.length);
+    }
+    var cur = base;
+    for (final seg in rest.split('/').where((e) => e.isNotEmpty)) {
+      cur = '$cur/$seg';
+      out.add([seg, cur]);
+    }
+    if (out.isEmpty) out.add(['/', '/']);
+    return out;
+  }
+
+  Future<void> _newFolder() async {
+    final ctl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('فولدر جديد'),
+        content: TextField(
+          controller: ctl,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'اسم الفولدر'),
+          onSubmitted: (v) => Navigator.pop(c, v),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(c, ctl.text), child: const Text('إنشاء')),
+        ],
+      ),
+    );
+    final n = name?.trim() ?? '';
+    if (n.isEmpty || n.contains('/')) return;
+    try {
+      Directory('$path/$n').createSync();
+      go('$path/$n');
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: w.Text('مش قادر أعمل الفولدر ده هنا.')));
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final canUp = path.length > root.length;
+    final shown = q.trim().isEmpty
+        ? dirs
+        : dirs.where((d) => baseName(d.path).toLowerCase().contains(q.trim().toLowerCase())).toList();
+    final crumbs = _crumbList();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_crumbs.hasClients) _crumbs.jumpTo(_crumbs.position.maxScrollExtent);
+    });
+    return Scaffold(
+      appBar: AppBar(
+        toolbarHeight: 54,
+        title: const Text('اختيار فولدر'),
+        actions: [
+          const HeaderButtons(),
+          IconButton(
+            tooltip: 'فولدر جديد',
+            icon: const Icon(Icons.create_new_folder_outlined),
+            onPressed: _newFolder,
+          ),
+        ],
+      ),
+      bottomNavigationBar: Material(
+        elevation: 8,
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+            child: FilledButton.icon(
+              onPressed: () {
+                _lastPickedFolder = path;
+                Navigator.pop(context, path);
+              },
+              icon: const Icon(Icons.check),
+              label: w.Text('اختيار "${baseName(path)}"', maxLines: 1, overflow: TextOverflow.ellipsis),
+              style: FilledButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 50), textStyle: const TextStyle(fontSize: 16)),
+            ),
+          ),
+        ),
+      ),
+      body: Column(
+        children: [
+          // مسار قابل للضغط (breadcrumb)
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: SizedBox(
+              height: 44,
+              child: ListView(
+                controller: _crumbs,
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                children: [
+                  for (var i = 0; i < crumbs.length; i++) ...[
+                    if (i > 0) Icon(Icons.chevron_right, size: 18, color: cs.onSurfaceVariant),
+                    Center(
+                      child: ActionChip(
+                        label: w.Text(crumbs[i][0], style: const TextStyle(fontSize: 13)),
+                        visualDensity: VisualDensity.compact,
+                        backgroundColor: i == crumbs.length - 1 ? cs.primaryContainer : null,
+                        onPressed: i == crumbs.length - 1 ? null : () => go(crumbs[i][1]),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (shortcuts.isNotEmpty)
+            SizedBox(
+              height: 42,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                children: [
+                  for (final sc in shortcuts)
+                    Padding(
+                      padding: const EdgeInsetsDirectional.only(end: 6),
+                      child: ActionChip(
+                        avatar: Icon(sc[0] as IconData, size: 18),
+                        label: w.Text(sc[1] as String, style: const TextStyle(fontSize: 13)),
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => go(sc[2] as String),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          if (dirs.length > 6 || q.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+              child: SizedBox(
+                height: 40,
+                child: TextField(
+                  controller: _search,
+                  onChanged: (v) => setState(() => q = v),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    hintText: 'بحث في الفولدرات',
+                    prefixIcon: const Icon(Icons.search, size: 20),
+                    contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
+                  ),
+                ),
+              ),
+            ),
+          if (error != null)
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: w.Text(error!, style: TextStyle(color: cs.error)),
+            ),
+          Expanded(
+            child: ListView(
+              children: [
+                if (canUp)
+                  ListTile(
+                    leading: const Icon(Icons.arrow_upward),
+                    title: const Text('..'),
+                    onTap: () => go(Directory(path).parent.path),
+                  ),
+                for (final d in shown)
+                  ListTile(
+                    leading: const Icon(Icons.folder),
+                    title: Text(baseName(d.path), textDirection: TextDirection.ltr),
+                    onTap: () => go(d.path),
+                  ),
+                if (shown.isEmpty && error == null)
+                  Padding(
+                    padding: const EdgeInsets.all(32),
+                    child: Column(children: [
+                      Icon(Icons.folder_open, size: 48, color: cs.onSurfaceVariant),
+                      const SizedBox(height: 8),
+                      w.Text(q.isEmpty ? 'مفيش فولدرات جوه الفولدر ده' : 'مفيش نتايج للبحث',
+                          style: TextStyle(color: cs.onSurfaceVariant)),
+                    ]),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ───────────────────── شاشة المراجعة ─────────────────────
+// ───────── صورة بتتكبّر (قرصة بصباعين + دبل تاب) علشان تشوف تفاصيل الباتش ─────────
+class ZoomableImage extends StatefulWidget {
+  final String path;
+  final ValueChanged<bool>? onZoom; // بيبلّغ لما الصورة تتكبّر/ترجع (علشان السحب بين الباتشات)
+  const ZoomableImage({super.key, required this.path, this.onZoom});
+
+  @override
+  State<ZoomableImage> createState() => _ZoomableImageState();
+}
+
+class _ZoomableImageState extends State<ZoomableImage> {
+  final _tc = TransformationController();
+  Offset _tap = Offset.zero;
+  bool _zoomedNow = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _tc.addListener(_onTc);
+  }
+
+  void _onTc() {
+    final z = _tc.value.getMaxScaleOnAxis() > 1.05;
+    if (z != _zoomedNow) {
+      _zoomedNow = z;
+      widget.onZoom?.call(z);
+    }
+  }
+
+  @override
+  void dispose() {
+    _tc.removeListener(_onTc);
+    _tc.dispose();
+    super.dispose();
+  }
+
+  void _toggle() {
+    if (_tc.value.getMaxScaleOnAxis() > 1.05) {
+      _tc.value = Matrix4.identity();
+    } else {
+      const s = 3.0;
+      final tx = -_tap.dx * (s - 1);
+      final ty = -_tap.dy * (s - 1);
+      _tc.value = Matrix4(s, 0, 0, 0, 0, s, 0, 0, 0, 0, 1, 0, tx, ty, 0, 1);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onDoubleTapDown: (d) => _tap = d.localPosition,
+      onDoubleTap: _toggle,
+      child: InteractiveViewer(
+        transformationController: _tc,
+        minScale: 1,
+        maxScale: 12,
+        child: Center(
+          child: Image.file(
+            File(widget.path),
+            fit: BoxFit.contain,
+            filterQuality: FilterQuality.high,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ReceiptZoomPage extends StatelessWidget {
+  final String path;
+  final String title;
+  const ReceiptZoomPage({super.key, required this.path, required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        title: Text(title, style: const TextStyle(fontSize: 15)),
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+      ),
+      body: SafeArea(child: ZoomableImage(path: path)),
+    );
+  }
+}
+
+class SysLine {
+  final String text;
+  final bool ok;
+  const SysLine(this.text, this.ok);
+}
+
+class ReviewPage extends StatefulWidget {
+  final List<ReceiptItem> items;
+  final List<ReceiptItem>? allItems; // كل الإيصالات (لحساب رقم الباتش الإضافي)
+  final bool single; // فتحناها من القلم: الحفظ بيقفل الشاشة (والسحب يمين/شمال بيتنقل بين الباتشات)
+  final int initialIndex;
+  final SysLine? Function(ReceiptItem)? sysLineOf; // سطر مطابقة السيستم (من التقفيل)
+  const ReviewPage(
+      {super.key,
+      required this.items,
+      this.allItems,
+      this.single = false,
+      this.initialIndex = 0,
+      this.sysLineOf});
+
+  @override
+  State<ReviewPage> createState() => _ReviewPageState();
+}
+
+class _ReviewPageState extends State<ReviewPage> {
+  int idx = 0;
+  bool changed = false;
+  int rev = 0; // بيتغير لما الصورة تتدوّر علشان تتحدّث
+  final done = <ReceiptItem>{};
+  late TextEditingController amt;
+  int? order;
+  late PageController _pc;
+  final ValueNotifier<bool> _zoomed = ValueNotifier<bool>(false);
+
+  ReceiptItem get item => widget.items[idx];
+
+  @override
+  void initState() {
+    super.initState();
+    idx = widget.initialIndex.clamp(0, widget.items.length - 1).toInt();
+    _pc = PageController(initialPage: idx);
+    amt = TextEditingController();
+    load();
+  }
+
+  @override
+  void dispose() {
+    amt.dispose();
+    _pc.dispose();
+    _zoomed.dispose();
+    super.dispose();
+  }
+
+  void load() {
+    amt.text = item.amount > 0 ? item.amount.toStringAsFixed(2) : '';
+    order = item.orderNum;
+  }
+
+  void go(int i) {
+    if (i < 0 || i >= widget.items.length) return;
+    if (_pc.hasClients) {
+      // onPageChanged بيحدّث idx والنموذج
+      _pc.animateToPage(i, duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
+    } else {
+      setState(() {
+        idx = i;
+        load();
+      });
+    }
+  }
+
+  void save({bool next = true}) {
+    final v = double.tryParse(amt.text.replaceAll(',', '.'));
+    if (v == null || v <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('اكتب مبلغ صحيح.')),
+      );
+      return;
+    }
+    final it = item;
+    it.amount = round2(v);
+    it.batches = [it.amount];
+    it.ok = true;
+    it.alt = null;
+    if (it.ignoredDoc) keepIgnored(it);
+    it.how = 'manual';
+    it.unusual = null;
+    it.reprintSummary = false;
+    it.missingBatchClosed = false;
+    if (order != null) {
+      it.orderNum = order;
+      it.tid = numToTid[order];
+      it.row = terminals[it.tid]!.excelRow;
+      it.unitName = terminals[it.tid]!.unitName;
+    }
+    saveFix(it);
+    changed = true;
+    done.add(it);
+    if (widget.single) {
+      Navigator.pop(context, true);
+    } else if (next && idx < widget.items.length - 1) {
+      go(idx + 1);
+    } else {
+      setState(() {});
+    }
+  }
+
+  // صورة متجاهلة: ادخلها كباتش، أو تجاهلها نهائي
+  void resolveIgnored(bool keep) {
+    final it = item;
+    if (keep) {
+      keepIgnored(it);
+      changed = true;
+      setState(() {});
+      return;
+    }
+    it.ignoredDoc = false;
+    it.userExcluded = true;
+    it.ign = 'drop';
+    saveFix(it);
+    changed = true;
+    done.add(it);
+    if (widget.single) {
+      Navigator.pop(context, true);
+    } else if (idx < widget.items.length - 1) {
+      go(idx + 1);
+    } else {
+      setState(() {});
+    }
+  }
+
+  // تاريخ مختلف: سيبه بتاريخه، أو انقله لتاريخ الأغلب
+  void resolveDate(bool toMain) {
+    final it = item;
+    if (toMain && it.dateMain != null) it.date = it.dateMain;
+    it.dateFix = it.date;
+    it.dateOdd = false;
+    saveFix(it);
+    changed = true;
+    done.add(it);
+    if (widget.single) {
+      Navigator.pop(context, true);
+    } else if (idx < widget.items.length - 1) {
+      go(idx + 1);
+    } else {
+      setState(() {});
+    }
+  }
+
+  // قرار الإيصال المشكوك إنه مكرر: استبعده، أو احتسبه كباتش إضافي
+  void resolveDup(bool keep) {
+    final it = item;
+    final all = widget.allItems ?? widget.items;
+    if (keep) {
+      keepAsExtraBatch(it, all);
+    } else {
+      it.dupSuspect = false;
+      it.userExcluded = true;
+      it.dupDecision = 'drop';
+      saveFix(it);
+    }
+    changed = true;
+    done.add(it);
+    if (widget.single) {
+      Navigator.pop(context, true);
+    } else if (idx < widget.items.length - 1) {
+      go(idx + 1);
+    } else {
+      setState(() {});
+    }
+  }
+
+  Future<void> rotate() async {
+    try {
+      await fixImageAsync(item.path, item.path, 90);
+      await FileImage(File(item.path)).evict();
+      imageCache.clear();
+      changed = true;
+      setState(() => rev++);
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('مقدرتش أدوّر الصورة.')),
+      );
+    }
+  }
+
+  // ملخص المشاكل في أول الشاشة: اللي ملهوش بلوك قرار تحته + مطابقة السيستم، أو "مفيش مشاكل"
+  Widget _problemsBox(ReceiptItem it) {
+    final bad = <String>[];
+    if (it.reprintSummary) {
+      bad.add(_l(context, '🚨 الإيصال REPRINT أو SUMMARY (ممكن يكون مكرر)', '🚨 Receipt is REPRINT or SUMMARY (may be a duplicate)'));
+    } else if (it.missingBatchClosed && !it.ignoredDoc) {
+      bad.add(_l(context, '⚠️ مش مكتوب BATCH CLOSED SUCCESSFULLY - اتأكد منه', '⚠️ BATCH CLOSED SUCCESSFULLY is missing - verify'));
+    }
+    if (!it.userExcluded && !it.ignoredDoc) {
+      if (it.amount <= 0) {
+        bad.add(_l(context, '⚠️ المبلغ غير مقروء', '⚠️ Amount not readable'));
+      } else if (!it.ok) {
+        bad.add(_l(context, '⚠️ المبلغ المقروء محتاج تأكيد', '⚠️ Read amount needs confirmation'));
+      }
+      if (it.row == null) bad.add(_l(context, '⚠️ الوحدة غير معروفة', '⚠️ Unit unknown'));
+    }
+    final sl = (it.ignoredDoc || it.userExcluded) ? null : widget.sysLineOf?.call(it);
+    final good = !it.needsReview && bad.isEmpty && (sl == null || sl.ok);
+    final lines = <Widget>[
+      for (final b in bad)
+        Text(b, style: TextStyle(color: _tintFg(context, kReviewTone), fontSize: 13)),
+      if (sl != null)
+        Text(sl.text,
+            style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.bold,
+                color: _tintFg(context, sl.ok ? Colors.green : Colors.red))),
+      if (good && sl == null)
+        Text(_l(context, '✅ مفيش مشاكل', '✅ No problems'),
+            style: TextStyle(color: _tintFg(context, Colors.green), fontSize: 13)),
+    ];
+    if (lines.isEmpty) return const SizedBox.shrink();
+    final tone = good ? Colors.green : (bad.isEmpty && sl != null && !sl.ok ? Colors.red : kReviewTone);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: _tintBg(context, tone, soft: true),
+        border: Border.all(color: _tintBorder(context, tone)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        for (var k = 0; k < lines.length; k++)
+          Padding(padding: EdgeInsets.only(top: k == 0 ? 0 : 3), child: lines[k]),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    AppSettings.of(context);
+    final it = item;
+    final image = Container(
+      color: Colors.black12,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: ValueListenableBuilder<bool>(
+              valueListenable: _zoomed,
+              builder: (c, z, _) => PageView.builder(
+                controller: _pc,
+                // لما الصورة مكبّرة السحب بيحرّك الصورة، ولما ترجع 1x السحب يقلب للباتش اللي بعده/قبله
+                physics: z ? const NeverScrollableScrollPhysics() : const PageScrollPhysics(),
+                itemCount: widget.items.length,
+                onPageChanged: (i) {
+                  _zoomed.value = false;
+                  setState(() {
+                    idx = i;
+                    load();
+                  });
+                },
+                itemBuilder: (c, i) => ZoomableImage(
+                  key: ValueKey('${widget.items[i].path}#${i == idx ? rev : 0}'),
+                  path: widget.items[i].path,
+                  onZoom: (zz) {
+                    if (i == idx) _zoomed.value = zz;
+                  },
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            top: 4,
+            left: 4,
+            child: IconButton.filledTonal(
+              tooltip: tr('ملء الشاشة'),
+              icon: const Icon(Icons.fullscreen),
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => ReceiptZoomPage(
+                    path: it.path,
+                    title: it.orderNum != null ? machineLabel(it.orderNum, it.unitName) : (it.unitName ?? '؟'),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    final form = SingleChildScrollView(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _problemsBox(it),
+          if (it.dupSuspect || it.userExcluded)
+            Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: _tintBg(context, kReviewTone, soft: true),
+                border: Border.all(color: _tintBorder(context, kReviewTone)),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    it.userExcluded
+                        ? '🚫 الإيصال ده مستبعد (مكرر).'
+                        : '⚠️ مشكوك إنه مكرر: نفس الماكينة ${it.orderNum ?? ''} ونفس المبلغ. '
+                            'مش محسوب في الإجمالي لحد ما تقرر. زوّم على الباتش وقارن.',
+                    style: TextStyle(color: _tintFg(context, kReviewTone), fontSize: 13),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: () => resolveDup(true),
+                          child: const Text('مش مكرر - احتسبه باتش إضافي',
+                              textAlign: TextAlign.center, style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                      if (!it.userExcluded) ...[
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () => resolveDup(false),
+                            child: const Text('مكرر - استبعده',
+                                textAlign: TextAlign.center, style: TextStyle(fontSize: 12)),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          if (it.ignoredDoc)
+            Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: _tintBg(context, kReviewTone, soft: true),
+                border: Border.all(color: _tintBorder(context, kReviewTone)),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    '📄 التطبيق اتجاهل الصورة دي لأن شكلها إيصال دفع أو مستند مش باتش. '
+                    'زوّم وشوف: لو باتش حقيقي ادخله وكمّل المبلغ والماكينة.',
+                    style: TextStyle(color: _tintFg(context, kReviewTone), fontSize: 13),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: () => resolveIgnored(true),
+                          child: const Text('ده باتش - ادخله',
+                              textAlign: TextAlign.center, style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => resolveIgnored(false),
+                          child: const Text('مش باتش - تجاهله',
+                              textAlign: TextAlign.center, style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          if (it.dateOdd)
+            Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: _tintBg(context, kReviewTone, soft: true),
+                border: Border.all(color: _tintBorder(context, kReviewTone)),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    '📅 تاريخ الإيصال ${it.date} بينما أغلب الإيصالات ${it.dateMain}.',
+                    style: TextStyle(color: _tintFg(context, kReviewTone), fontSize: 13),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: () => resolveDate(true),
+                          child: Text('خليه بتاريخ ${it.dateMain}',
+                              textAlign: TextAlign.center, style: const TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => resolveDate(false),
+                          child: const Text('التاريخ صح - سيبه',
+                              textAlign: TextAlign.center, style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          if (it.weakId && !it.ignoredDoc && !it.dupSuspect && !it.userExcluded && it.row != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                it.how == 'auto-number' || it.how == 'conflict'
+                    ? '❓ رقم الماكينة اتحدد تلقائياً (${it.orderNum}) - اتأكد منه واضغط حفظ.'
+                    : '❓ الوحدة اتحددت بالاسم/الميرشانت فقط - اتأكد من الماكينة واضغط حفظ.',
+                style: TextStyle(color: _tintFg(context, kReviewTone), fontSize: 13),
+              ),
+            ),
+          if (it.unusual != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text('⚠️ ${it.unusual}  (لو المبلغ صح اضغط حفظ)',
+                  style: TextStyle(color: _tintFg(context, kReviewTone), fontSize: 13)),
+            ),
+          Text(
+            'المقروء: ${it.amount > 0 ? it.amount.toStringAsFixed(2) : 'غير مقروء'} ج.م'
+            '${it.batches.length > 1 ? '  (= ${it.batches.map((b) => b.toStringAsFixed(2)).join(' + ')})' : ''}',
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+          if (it.alt != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text('⚠️ القراءة التانية: ${it.alt!.toStringAsFixed(2)}',
+                        style: TextStyle(color: _tintFg(context, kReviewTone))),
+                  ),
+                  TextButton(
+                    onPressed: () => setState(() => amt.text = it.alt!.toStringAsFixed(2)),
+                    child: const Text('استخدمها'),
+                  ),
+                ],
+              ),
+            ),
+          if ((it.alt != null || !it.ok || it.amount <= 0 || it.unusual != null) &&
+              it.cands.where((v) => (v - it.amount).abs() >= 0.005).isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('مبالغ لقيتها في الإيصال (اضغط على الصح):',
+                      style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                  const SizedBox(height: 4),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 4,
+                    children: [
+                      for (final v in it.cands.where((v) => (v - it.amount).abs() >= 0.005))
+                        ActionChip(
+                          label: Text(v.toStringAsFixed(2)),
+                          onPressed: () => setState(() => amt.text = v.toStringAsFixed(2)),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: amt,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: InputDecoration(
+              labelText: tr('المبلغ الإجمالي'),
+              border: const OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<int>(
+            value: order,
+            isExpanded: true,
+            hint: const Text('اختر الماكينة (1..25)'),
+            selectedItemBuilder: (c) => [
+              for (var i = 1; i <= machineCount; i++)
+                Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text('ماكينة $i - ${rowNames[terminals[numToTid[i]]!.excelRow]}${terminals[numToTid[i]]!.spare ? ' (احتياطي)' : ''}'),
+                ),
+            ],
+            items: [
+              for (var i = 1; i <= machineCount; i++)
+                DropdownMenuItem(
+                  value: i,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('ماكينة $i - ${rowNames[terminals[numToTid[i]]!.excelRow]}${terminals[numToTid[i]]!.spare ? ' (احتياطي)' : ''}'),
+                      Text(
+                        'TID: ${numToTid[i]}  •  MID: ${merchantIdOfRow(terminals[numToTid[i]]!.excelRow) ?? '—'}',
+                        style: TextStyle(fontSize: 11.5, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+            onChanged: (v) => setState(() => order = v),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              OutlinedButton.icon(
+                onPressed: rotate,
+                icon: const Icon(Icons.rotate_right),
+                label: const Text('تدوير'),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton(
+                  onPressed: () => save(),
+                  child: Text(!widget.single && idx < widget.items.length - 1 ? 'حفظ والتالي' : 'حفظ'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) Navigator.pop(context, changed);
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text('مراجعة ${idx + 1} / ${widget.items.length}'
+              '${done.contains(it) ? '  ✓' : ''}'
+              '  •  ${it.needsReview ? _l(context, '⚠️ محتاج مراجعة', '⚠️ Needs review') : _l(context, '✅ سليم', '✅ OK')}',
+              style: const TextStyle(fontSize: 16)),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.pop(context, changed),
+          ),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.navigate_before),
+              tooltip: tr('السابق'),
+              onPressed: idx > 0 ? () => go(idx - 1) : null,
+            ),
+            IconButton(
+              icon: const Icon(Icons.navigate_next),
+              tooltip: tr('التالي'),
+              onPressed: idx < widget.items.length - 1 ? () => go(idx + 1) : null,
+            ),
+          ],
+        ),
+        body: SafeArea(
+          child: LayoutBuilder(
+            builder: (context, c) {
+              if (c.maxWidth > 600) {
+                return Row(
+                  children: [
+                    Expanded(flex: 3, child: image),
+                    Expanded(flex: 2, child: form),
+                  ],
+                );
+              }
+              return Column(
+                children: [
+                  Expanded(flex: 5, child: image),
+                  Expanded(flex: 3, child: form),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ───────────────────── ملفات الماكينات (PDF لكل ماكينة) ─────────────────────
+String? loadPdfDir() => _readCfg()['pdfDir'] as String?;
+
+// فولدرات مستندات واتساب (جنب فولدرات الصور)
+List<Directory> findWhatsAppDocDirs() {
+  final out = <Directory>[];
+  for (final d in findWhatsAppImageDirs()) {
+    final p = d.path;
+    if (p.endsWith('WhatsApp Images')) {
+      final dd = Directory('${p.substring(0, p.length - 'WhatsApp Images'.length)}WhatsApp Documents');
+      for (final sub in ['', '/Sent', '/Private']) {
+        final x = Directory('${dd.path}$sub');
+        if (x.existsSync() && !out.any((o) => o.path == x.path)) out.add(x);
+      }
+    }
+  }
+  return out;
+}
+
+void savePdfDir(String? f) {
+  final m = _readCfg();
+  m['pdfDir'] = f;
+  _writeCfg(m);
+}
+
+// اسم الماكينة للعرض: "أبيس 1" / "برج العرب 2" (من غير كلمة ماكينة). الوحدة اللي فيها ماكينة واحدة بس بتظهر باسمها
+String machineLabel(int? orderNum, [String? unitName]) {
+  if (orderNum == null) return unitName ?? '؟';
+  final tid = numToTid[orderNum];
+  final info = tid != null ? terminals[tid] : null;
+  if (info == null) return unitName ?? '$orderNum';
+  final same = terminals.values.where((t) => t.excelRow == info.excelRow).toList()
+    ..sort((a, b) => a.orderNum.compareTo(b.orderNum));
+  final unit = info.unitName.trim();
+  if (same.length <= 1) return unit;
+  final k = same.indexWhere((t) => t.orderNum == info.orderNum) + 1;
+  return '$unit $k';
+}
+
+// الاسم الجديد: "1.أبيس.1.يوم.4.11" (وحدة فيها أكتر من ماكينة) أو "17.مديرية.الأمن.يوم.4.11"
+String machineNewName(TerminalInfo info, String day, String month) {
+  final same = terminals.values.where((t) => t.excelRow == info.excelRow).toList()
+    ..sort((a, b) => a.orderNum.compareTo(b.orderNum));
+  final unit = info.unitName.trim().replaceAll(RegExp(r'\s+'), '.');
+  final k = same.indexWhere((t) => t.orderNum == info.orderNum) + 1;
+  return [
+    info.orderNum.toString(),
+    unit,
+    if (same.length > 1) '$k',
+    'يوم',
+    day,
+    month,
+  ].join('.');
+}
+
+// ───────── عدّ إيصالات الدفع: كل إيصال دفع ليه سطر RRN (12 رقم، بيبدأ بـ 63) ─────────
+// بنقرا الصفحة على شرائح رأسية ضيقة (القراءة أدق من الصفحة كلها)، وبنجمع "نقاط ارتكاز"
+// (سطر RRN) لكل إيصال. إيصالات الإقفال والملخص ما فيهاش RRN فمبتتعدّش.
+final RegExp _dateRe = RegExp(r'(20\d{2})[^\d\n]{1,3}(\d{2})[^\d\n]{1,3}(\d{2})');
+
+String? _dayKey(String text) {
+  for (final m in _dateRe.allMatches(text)) {
+    final mo = int.parse(m.group(2)!), d = int.parse(m.group(3)!);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return '$d.$mo';
+  }
+  return null;
+}
+
+// null = مفيش RRN في السطر | 12 رقم = RRN كامل | 'P' = RRN مقروء ناقص
+String? _anchorOf(String t) {
+  final m = RegExp(r'R{1,2}N\W{0,3}((?:\d\s?){9,12})', caseSensitive: false).firstMatch(t) ??
+      RegExp(r'(?<!\d)(63(?:\d\s?){7,10})(?!\d)').firstMatch(t);
+  if (m == null) return null;
+  final d = m.group(1)!.replaceAll(RegExp(r'\s'), '');
+  if (d.length < 9) return null;
+  if (d.length == 12 && d.startsWith('63')) return d;
+  return 'P';
+}
+
+const double _stripScale = 1.5;
+
+// بيقص الصفحة لـ 5 شرائح رأسية (أعمدة) متداخلة ويكبّرها. بيرجّع [عرض، ارتفاع، x0 لكل شريحة...]
+List<int> _makeStrips(String src, String prefix) {
+  final im = img.decodeImage(File(src).readAsBytesSync());
+  if (im == null) return [];
+  final w = im.width, h = im.height;
+  // التحسين الأقصى للسرعة والدقة: 4 شرائح عريضة بدلاً من 5 أو 6.
+  const n = 4;
+  final sw = w * 0.40; // 40% من العرض
+  final step = (w - sw) / (n - 1); // مسافة التحرك
+  final out = <int>[w, h];
+  
+  for (var i = 0; i < n; i++) {
+    final x0 = (i * step).round();
+    final x1 = math.min(w, (x0 + sw).round());
+    var c = img.copyCrop(im, x: x0, y: 0, width: x1 - x0, height: h);
+    c = img.copyResize(c,
+        width: (c.width * _stripScale).round(), interpolation: img.Interpolation.linear);
+    File('${prefix}_$i.jpg').writeAsBytesSync(img.encodeJpg(c, quality: 90));
+    out.add(x0);
+  }
+  return out;
+}
+
+class Anchor {
+  String? rrn;
+  String? day;
+  int pg = 0; // رقم الصفحة اللي اتقرا منها (للكشف عن الإيصال المكرر)
+  final double l, r, cy;
+  Anchor(this.rrn, this.day, this.l, this.r, this.cy);
+}
+
+class MCollector {
+  final List<List<Anchor>> pages = [];
+  int slips = 0; // أوراق تعريف اتجاهلت
+  final StringBuffer text = StringBuffer();
+  double pageH = 3000;
+  int curPage = 0; // رقم صفحة الـ PDF الحالية (بيتحدد في العد السريع بس)
+  bool trackDups = false; // كشف الإيصال المكرر شغال في العد السريع بس (قراءة واحدة لكل صفحة)
+
+  void add(Anchor n) {
+    n.pg = curPage > 0 ? curPage : pages.length;
+    final list = pages.last;
+    for (final a in list) {
+      // نفس الإيصال اتقرا من شريحتين متداخلتين: نفس المكان على الصفحة
+      if (a.l < n.r && n.l < a.r && (a.cy - n.cy).abs() < pageH * 0.012) {
+        a.rrn ??= n.rrn;
+        a.day ??= n.day;
+        return;
+      }
+    }
+    list.add(n);
+  }
+
+  MScan finish() {
+    final r = MScan();
+    final seen = <String>{};
+    final firstPg = <String, int>{};
+    final numPg = <int, int>{};
+    final days = <String, int>{};
+    final partialDays = <String>[];
+    for (final a in pages.expand((p) => p)) {
+      if (a.rrn != null) {
+        if (!seen.contains(a.rrn!)) {
+          firstPg[a.rrn!] = a.pg;
+        } else if (trackDups) {
+          // نفس رقم الإيصال (RRN) ظهر تاني: للمعرفة بس، مش بيتخصم من العدد
+          r.dups.putIfAbsent(a.rrn!, () => <int>[firstPg[a.rrn!] ?? 0]).add(a.pg);
+        }
+        if (!seen.contains(a.rrn!)) {
+          final nn = a.rrn!.length > 6 ? int.tryParse(a.rrn!.substring(6)) : null;
+          if (nn != null) numPg[nn] = a.pg;
+        }
+        if (seen.add(a.rrn!)) {
+          r.full++;
+          r.rrnDay[a.rrn!] = a.day;
+          if (a.day != null) days[a.day!] = (days[a.day!] ?? 0) + 1;
+        }
+      } else {
+        r.partial++;
+        if (a.day != null) {
+          partialDays.add(a.day!);
+          days[a.day!] = (days[a.day!] ?? 0) + 1;
+        }
+      }
+    }
+    final all = text.toString();
+    r.nonPayment = RegExp(
+            r'GRAND\s*TOTAL|TOTAL\s*NET\s*AMOUNT|BATCH\s*CLOS|SUMMARY|REPRINT|DUPLICATE|SUCCESSF',
+            caseSensitive: false)
+        .hasMatch(all);
+
+    // الماكينة: أكتر Terminal ID متكرر
+    final tc = <String, int>{};
+    for (final m in RegExp(r'(?<!\d)(\d{8})(?!\d)').allMatches(all)) {
+      var c = m.group(1)!;
+      c = tidFix[c] ?? c;
+      if (terminals.containsKey(c)) tc[c] = (tc[c] ?? 0) + 1;
+    }
+    r.tid = tc.isNotEmpty
+        ? tc.entries.reduce((a, b) => a.value >= b.value ? a : b).key
+        : (findTerminalIn([all]) ?? discoverTerminal([all]));
+
+    // اليوم الأغلب + الإيصالات اللي مش تبع نفس اليوم
+    if (days.isEmpty) {
+      for (final m in _dateRe.allMatches(all)) {
+        final k = _dayKey(m.group(0)!);
+        if (k != null) days[k] = (days[k] ?? 0) + 1;
+      }
+    }
+    if (days.isNotEmpty) {
+      final best = days.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+      final p = best.split('.');
+      r.day = p[0];
+      r.month = p[1];
+      r.rrnDay.forEach((rrn, d) {
+        if (d != null && d != best) r.otherDay.add('إيصال ${rrn.substring(6)} بتاريخ $d');
+      });
+      for (final d in partialDays) {
+        if (d != best) r.otherDay.add('إيصال (رقمه مش واضح) بتاريخ $d');
+      }
+    }
+
+    // تسلسل أرقام الإيصالات (آخر 6 أرقام من الـ RRN): أكبر مجموعة متتالية
+    final nums = r.rrnDay.keys.map((k) => int.parse(k.substring(6))).toList()..sort();
+    if (nums.length >= 2) {
+      var bestStart = 0, bestLen = 1, start = 0;
+      for (var i = 1; i <= nums.length; i++) {
+        if (i == nums.length || nums[i] - nums[i - 1] > 15) {
+          if (i - start > bestLen) {
+            bestLen = i - start;
+            bestStart = start;
+          }
+          start = i;
+        }
+      }
+      final cl = nums.sublist(bestStart, bestStart + bestLen);
+      r.seqMin = cl.first;
+      r.seqMax = cl.last;
+      final have = cl.toSet();
+      for (var n = cl.first; n <= cl.last; n++) {
+        if (!have.contains(n)) {
+          r.seqMissing.add(n);
+          // الصفحة = صفحة أقرب رقم أصغر موجود (الإيصالات متتالية بترتيب الصفحات)
+          var prev = n - 1;
+          while (prev >= cl.first && !have.contains(prev)) {
+            prev--;
+          }
+          final pg = numPg[prev];
+          if (pg != null && pg > 0) r.seqMissingByPage.putIfAbsent(pg, () => <int>[]).add(n);
+        }
+      }
+    }
+    return r;
+  }
+}
+
+class MScan {
+  int full = 0, partial = 0;
+  final Map<String, List<int>> dups = {}; // RRN -> الصفحات اللي ظهر فيها (أول مرة + التكرارات)
+  final Map<int, List<int>> seqMissingByPage = {}; // رقم الصفحة -> أرقام إيصالات ناقصة غالباً في الصفحة دي
+  final Map<String, String?> rrnDay = {};
+  bool nonPayment = false;
+  String? tid, day, month;
+  final List<String> otherDay = [];
+  int? seqMin, seqMax;
+  final List<int> seqMissing = [];
+
+  int get count => full + partial;
+  int? get rangeLen => seqMin == null ? null : seqMax! - seqMin! + 1;
+  bool get agree => rangeLen == null || count == rangeLen;
+  String get rangeText =>
+      seqMin == null ? '' : ' • التسلسل ${seqMin.toString().padLeft(6, '0')}-${seqMax.toString().padLeft(6, '0')} ($rangeLen)';
+  String get seqNote {
+    final miss = seqMissing.take(10).map((n) => n.toString().padLeft(6, '0')).join(' - ');
+    return 'العدد $count بس التسلسل $rangeLen'
+        '${seqMissing.isNotEmpty ? '\nأرقام مش لاقيها: [ $miss ]${seqMissing.length > 10 ? ' ...' : ''}' : ''}'
+        '\n(ممكن إيصالات ناقصة أو مش اتقرت، راجع الملف)';
+  }
+}
+
+void _collect(RecognizedText res, double x0, double scale, MCollector col) {
+  col.text.writeln(res.text);
+  final lines = toLines(res);
+  final dates = lines.where((l) => _dayKey(l.text) != null).toList();
+  for (final l in lines) {
+    final a = _anchorOf(l.text);
+    if (a == null) continue;
+    var day = _dayKey(l.text);
+    if (day == null) {
+      OcrLine? best;
+      var bd = double.infinity;
+      for (final d in dates) {
+        final dy = (d.cy - l.cy).abs();
+        if (dy > l.h * 5) continue;
+        if (!(d.left < l.right + 60 && l.left < d.right + 60)) continue;
+        if (dy < bd) {
+          bd = dy;
+          best = d;
+        }
+      }
+      if (best != null) day = _dayKey(best.text);
+    }
+    col.add(Anchor(a == 'P' ? null : a, day, x0 + l.left / scale, x0 + l.right / scale,
+        l.cy / scale));
+  }
+}
+
+// قراءة الصفحة كلها + قراءة شرائح مكبّرة، وبعدين دمج النتايج (نفس الإيصال بيتعدّ مرة)
+int _tmStrips = 0, _tmOcr = 0; // تشخيص: مجموع الوقت (ms) لعمل الشرائح وللـ OCR
+
+Future<void> ocrPageStrips(
+    TextRecognizer rec, String pngPath, String prefix, MCollector col) async {
+  final sw = Stopwatch()..start();
+  // تقطيع الشرائح (Dart صرف وبطيء) بيشتغل في isolate بالتوازي مع OCR الصفحة الكاملة
+  final stripsF = Isolate.run(() => _makeStrips(pngPath, prefix))
+      .then<List<int>>((v) => v, onError: (_) => <int>[]);
+  RecognizedText? whole;
+  try {
+    whole = await _ocr(rec, pngPath);
+  } catch (_) {}
+  final tWhole = sw.elapsedMilliseconds;
+  final info = await stripsF;
+  _tmStrips += sw.elapsedMilliseconds - tWhole;
+  col.pageH = info.length >= 2 ? info[1].toDouble() : 3000;
+  col.pages.add(<Anchor>[]);
+  if (whole != null && _isIdSlip(whole)) {
+    col.slips++;
+    for (var i = 2; i < info.length; i++) {
+      try {
+        File('${prefix}_${i - 2}.jpg').deleteSync();
+      } catch (_) {}
+    }
+    _tmOcr += tWhole;
+    return;
+  }
+  if (whole != null) _collect(whole, 0, 1, col);
+  final t1 = sw.elapsedMilliseconds;
+  for (var i = 2; i < info.length; i++) {
+    final fp = '${prefix}_${i - 2}.jpg';
+    try {
+      final res = await _ocr(rec, fp);
+      _collect(res, info[i].toDouble(), _stripScale, col);
+    } catch (_) {}
+    try {
+      File(fp).deleteSync();
+    } catch (_) {}
+  }
+  _tmOcr += tWhole + (sw.elapsedMilliseconds - t1);
+}
+
+// ───────── حالة فحص إيصالات الدفع: بتتحفظ بعد كل ملف علشان لو التطبيق اتقفل يكمّل من مكانه ─────────
+final String mStatePath = '$baseDir/.app_machines.json';
+final String defaultMDest = '$baseDir/وحدات';
+
+String loadMOut() => (_readCfg()['mOut'] as String?) ?? defaultMDest;
+
+void saveMOut(String? f) {
+  final m = _readCfg();
+  m['mOut'] = f;
+  _writeCfg(m);
+}
+
+// عدد الإيصالات الإلكترونية من صورة السيستم لكل ماكينة (رقم الماكينة -> العدد). مقياس بس
+Map<int, int> sysTxnByNum = <int, int>{};
+Map<int, int> batchTxnByNum = <int, int>{}; // رقم الماكينة -> عدد الباتش فقط (من غير السيستم)
+Map<int, double> batchAmtByNum = <int, double>{}; // رقم الماكينة -> إجمالي مبلغ الباتش (من إيصال الإقفال، لو مؤكد)
+
+// لو عدد الـ PDF = عدد السيستم (إلكترونية): ملاحظة التسلسل (RRN) متتحسبش مراجعة. ده القرار الوحيد اللي السيستم بيحسمه
+bool _sysCntMatch(MResult r) {
+  final n = r.orderNum;
+  if (n == null || r.count < 0) return false;
+  return sysTxnByNum[n] == r.count;
+}
+
+// الفرق (في عدد الإيصالات) الأقل من الرقم ده = تحذير بس، مش مراجعة. لملفات إيصالات الدفع فقط
+const int kSoftGap = 6;
+
+class MResult {
+  final String pdfName;
+  String srcPath = '';
+  int size = 0;
+  String? openPath;
+  int? orderNum;
+  String? newName;
+  int count = -1; // -1 = لسه ما اتعدّش
+  int tries = 0;
+  String detail = '';
+  final List<String> idNotes = [];
+  final List<String> cntNotes = [];
+  List<String> altTids = []; // مرشحين تانيين للماكينة (مش بيتحفظوا)
+  Map<String, double> votes = {};
+  Map<int, int> pageCounts = {}; // رقم الصفحة -> عدد الإيصالات فيها (من العد السريع)
+  Set<int> pageWarn = {}; // صفحات طرق العد اختلفت فيها
+  Map<int, String> pageNote = {}; // رقم الصفحة -> شرح (اتصحّحت / رقم ناقص / تعارض)
+  double amtSum = 0; // مجموع المبالغ المقروءة من الإيصالات
+  int amtRead = 0; // عدد الإيصالات اللي مبلغها اتقرا بوضوح
+  String? tidUsed, dayUsed, monthUsed;
+  bool idOk = true;
+  bool cntOk = true;
+  int verdict = 0; // 0 = لسه ما اتراجعش، 1 = صح (يفضل مع ملفات اليوم)، -1 = غلط (مستبعد)
+  final TextEditingController ctl = TextEditingController();
+  MResult(this.pdfName);
+
+  bool get excluded => verdict < 0;
+  bool get pending => count < 0 && !excluded;
+  bool seqBad = false; // العدد مختلف عن تسلسل الـ RRN بـ kSoftGap إيصالات أو أكتر
+  bool get ok => verdict != 0 || (idOk && cntOk && (!seqBad || _sysCntMatch(this)));
+  // فرق بسيط (أقل من kSoftGap إيصالات، ناقص أو زيادة): الملف سليم ومش بيدخل المراجعة، بس عليه علامة تحذير ⚠️
+  bool get softWarn {
+    if (excluded || pending || verdict != 0 || !ok) return false;
+    final sl = _statsOf(this).seqLen;
+    final g = sl == null ? null : count - sl;
+    final d = _batchDiff(this);
+    return (g != null && g != 0 && g.abs() < kSoftGap) || (d != null && d != 0 && d.abs() < kSoftGap);
+  }
+  String get key => '$pdfName:$size';
+  List<String> get notes => [...idNotes, ...cntNotes];
+
+  Map<String, dynamic> toJson() => {
+        'pdfName': pdfName,
+        'srcPath': srcPath,
+        'size': size,
+        'openPath': openPath,
+        'orderNum': orderNum,
+        'tidUsed': tidUsed,
+        'newName': newName,
+        'count': count,
+        'tries': tries,
+        'detail': detail,
+        'idNotes': idNotes,
+        'cntNotes': cntNotes,
+        'idOk': idOk,
+        'cntOk': cntOk,
+        'seqBad': seqBad,
+        'verdict': verdict,
+        'exp': ctl.text,
+        'pageCounts': pageCounts.map((k, v) => MapEntry('$k', v)),
+        'pageWarn': pageWarn.toList(),
+        'pageNote': pageNote.map((k, v) => MapEntry('$k', v)),
+        'amtSum': amtSum,
+        'amtRead': amtRead,
+      };
+
+  static MResult fromJson(Map<String, dynamic> j) {
+    final r = MResult((j['pdfName'] ?? '').toString());
+    r.srcPath = (j['srcPath'] ?? '').toString();
+    r.size = (j['size'] as num?)?.toInt() ?? 0;
+    r.openPath = j['openPath'] as String?;
+    r.orderNum = (j['orderNum'] as num?)?.toInt();
+    r.tidUsed = j['tidUsed'] as String?;
+    r.newName = j['newName'] as String?;
+    r.count = (j['count'] as num?)?.toInt() ?? -1;
+    r.tries = (j['tries'] as num?)?.toInt() ?? 0;
+    r.detail = (j['detail'] ?? '').toString();
+    r.idNotes.addAll(((j['idNotes'] as List?) ?? const []).map((e) => e.toString()));
+    r.cntNotes.addAll(((j['cntNotes'] as List?) ?? const []).map((e) => e.toString()));
+    r.idOk = j['idOk'] != false;
+    r.cntOk = j['cntOk'] != false;
+    r.seqBad = j['seqBad'] == true;
+    r.verdict = (j['verdict'] as num?)?.toInt() ?? 0;
+    r.ctl.text = (j['exp'] ?? '').toString();
+    final pc = j['pageCounts'];
+    if (pc is Map) {
+      pc.forEach((k, v) {
+        final kk = int.tryParse('$k');
+        final vv = (v as num?)?.toInt();
+        if (kk != null && vv != null) r.pageCounts[kk] = vv;
+      });
+    }
+    final pw = j['pageWarn'];
+    if (pw is List) r.pageWarn.addAll(pw.map((e) => (e as num).toInt()));
+    final pn = j['pageNote'];
+    if (pn is Map) {
+      pn.forEach((k, v) {
+        final kk = int.tryParse('$k');
+        if (kk != null) r.pageNote[kk] = '$v';
+      });
+    }
+    r.amtSum = ((j['amtSum'] as num?) ?? 0).toDouble();
+    r.amtRead = (j['amtRead'] as num?)?.toInt() ?? 0;
+    return r;
+  }
+}
+
+List<MResult> loadMState() {
+  try {
+    final f = File(mStatePath);
+    if (!f.existsSync()) return [];
+    final l = jsonDecode(f.readAsStringSync());
+    if (l is! List) return [];
+    return l
+        .whereType<Map>()
+        .map((e) => MResult.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  } catch (_) {
+    return [];
+  }
+}
+
+void saveMState(List<MResult> rs) {
+  try {
+    File(mStatePath)
+      ..createSync(recursive: true)
+      ..writeAsStringSync(jsonEncode(rs.map((r) => r.toJson()).toList()));
+  } catch (_) {}
+}
+
+// تعريف سريع: الماكينة (Terminal ID) + اليوم من نص صفحة أو أكتر
+class MIdent {
+  String? tid, day, month;
+}
+
+MIdent _identify(String all) {
+  final r = MIdent();
+  final tc = <String, int>{};
+  for (final m in RegExp(r'(?<!\d)(\d{8})(?!\d)').allMatches(all)) {
+    var c = m.group(1)!;
+    c = tidFix[c] ?? c;
+    if (terminals.containsKey(c)) tc[c] = (tc[c] ?? 0) + 1;
+  }
+  r.tid = tc.isNotEmpty
+      ? tc.entries.reduce((a, b) => a.value >= b.value ? a : b).key
+      : (findTerminalIn([all]) ?? discoverTerminal([all]));
+  final days = <String, int>{};
+  for (final m in _dateRe.allMatches(all)) {
+    final k = _dayKey(m.group(0)!);
+    if (k != null) days[k] = (days[k] ?? 0) + 1;
+  }
+  if (days.isNotEmpty) {
+    final best = days.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+    final p = best.split('.');
+    r.day = p[0];
+    r.month = p[1];
+  }
+  return r;
+}
+
+// ───────── تعريف الماكينة من جوه الـ PDF بس (تصويت بين الصفحات) — مفيش اعتماد على اسم الملف ─────────
+// أصوات صفحة واحدة: "TERMINAL ID" بوزن 3، أي رقم 8 خانات معروف بوزن 1، وتقريبي (غلطة رقم) بوزن 0.5
+Map<String, double> _tidVotes(String text) {
+  final v = <String, double>{};
+  final lab = _tidLabeled(text);
+  if (lab != null) v[lab] = (v[lab] ?? 0) + 3;
+  for (final m in RegExp(r'(?<!\d)(\d{8})(?!\d)').allMatches(text)) {
+    final c0 = m.group(1)!;
+    final c = tidFix[c0] ?? c0;
+    if (terminals.containsKey(c)) v[c] = (v[c] ?? 0) + 1;
+  }
+  if (v.isEmpty) {
+    final f = findTerminalFuzzyIn([text], null);
+    if (f != null) v[f] = 0.5;
+  }
+  return v;
+}
+
+List<MapEntry<String, double>> _rankVotes(Map<String, double> votes) {
+  final l = votes.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+  return l;
+}
+
+int _cmpM(MResult a, MResult b) {
+  final c = (a.orderNum ?? 99).compareTo(b.orderNum ?? 99);
+  return c != 0 ? c : (a.newName ?? a.pdfName).compareTo(b.newName ?? b.pdfName);
+}
+
+// ───────────────────── تقرير إيصالات الدفع ─────────────────────
+String _l(BuildContext c, String ar, String en) => AppSettings.of(c).isAr ? ar : en;
+
+class _NoteKind {
+  final String key;
+  final int sev; // 2 = لازم تراجع، 1 = انتبه، 0 = معلومة
+  final IconData icon;
+  final String titleAr, titleEn, whyAr, whyEn, fixAr, fixEn;
+  const _NoteKind(this.key, this.sev, this.icon, this.titleAr, this.titleEn, this.whyAr, this.whyEn,
+      this.fixAr, this.fixEn);
+}
+
+const List<_NoteKind> _kNoteKinds = [
+  _NoteKind(
+      'seq',
+      2,
+      Icons.format_list_numbered,
+      'العدد مش مطابق لتسلسل الإيصالات',
+      'Count does not match the receipt sequence',
+      'أرقام الإيصالات (RRN) متتالية، فالعدد المتوقع هو من أول رقم لآخر رقم. العدد اللي اتعدّ مختلف عنه، يعني غالباً فيه إيصال ناقص في الملف أو التطبيق ما قراش إيصال.',
+      'Receipt numbers (RRN) are consecutive, so the expected count is first-to-last number. The counted number differs, so a receipt is probably missing from the file or was not read.',
+      'افتح الملف وراجع الأرقام اللي مش لاقيها (مكتوبة تحت)، وسجّل العدد الصح في خانة "الصح" لو اتأكدت.',
+      'Open the file and check the missing numbers listed below, then enter the right count in the "Correct" field if you are sure.'),
+  _NoteKind(
+      'otherday',
+      2,
+      Icons.event_busy,
+      'فيه إيصالات من يوم تاني',
+      'Receipts from another day',
+      'تاريخ بعض الإيصالات مختلف عن يوم باقي الملف، فممكن تكون اتضافت بالغلط أو الملف فيه أكتر من يوم.',
+      'Some receipts have a different date from the rest of the file; they may have been added by mistake or the file spans more than one day.',
+      'راجع التواريخ المذكورة، ولو الملف مش بتاع اليوم علّمه غلط ✗.',
+      'Check the dates listed; if the file is not for this day, mark it wrong ✗.'),
+  _NoteKind(
+      'machconf',
+      2,
+      Icons.compare_arrows,
+      'تعارض في رقم الماكينة',
+      'Machine mismatch',
+      'اسم الملف اتحدد لماكينة، لكن الإيصالات جواه بتقول إنها ماكينة تانية.',
+      'The file was named for one machine, but the receipts inside belong to another machine.',
+      'استخدم "تحديد الماكينة" من القايمة واختار الماكينة الصح.',
+      'Use "Assign machine" from the menu and pick the right machine.'),
+  _NoteKind(
+      'readfail',
+      2,
+      Icons.error_outline,
+      'فشل في قراءة صفحات',
+      'Pages failed to read',
+      'التطبيق ما قدرش يقرا صفحة أو أكتر (أو اتقفل أثناء العد)، فالعدد ممكن يكون ناقص.',
+      'The app could not read one or more pages (or it closed during counting), so the count may be incomplete.',
+      'اضغط "إعادة العد" وبعدين "فحص إيصالات الدفع". لو اتكرر راجع الملف بنفسك.',
+      'Tap "Recount" then "Scan payment receipts". If it repeats, check the file yourself.'),
+  _NoteKind(
+      'emptypages',
+      1,
+      Icons.insert_drive_file_outlined,
+      'صفحات من غير إيصالات',
+      'Pages without receipts',
+      'فيه صفحات في الملف التطبيق ما لقاش فيها أي إيصال (ممكن تكون صفحة فاضية أو صورة مش واضحة).',
+      'Some pages had no receipts detected (they may be blank or unclear).',
+      'افتح الصفحات المذكورة وتأكد إنها فعلاً فاضية.',
+      'Open the listed pages and make sure they are really empty.'),
+  _NoteKind(
+      'methoddiff',
+      1,
+      Icons.difference_outlined,
+      'تضارب بين طريقتين للعد',
+      'Two counting methods disagree',
+      'التطبيق بيعد بطريقتين للتأكد، وفي صفحات معينة النتيجة اختلفت.',
+      'The app counts with two methods to double-check, and on some pages the results differ.',
+      'راجع الصفحات المذكورة لو العدد مهم ليك.',
+      'Check the listed pages if the exact count matters.'),
+  _NoteKind(
+      'dup',
+      0,
+      Icons.content_copy,
+      'إيصال متكرر (للمعرفة)',
+      'Duplicate receipt (info)',
+      'نفس رقم الإيصال (RRN) ظهر أكتر من مرة في الملف، يعني غالباً اتصوّر مرتين أو اتحط مرتين. التطبيق ما خصمهوش من العدد. بيتكشف بس لو رقم الإيصال اتقرا في النسختين.',
+      'The same receipt number (RRN) appears more than once in the file, so it was probably photographed or inserted twice. It is NOT subtracted from the count. Only detected when the number was read on both copies.',
+      'افتح الصفحات المذكورة وشوف الإيصال. لو فعلاً مكرر احسب الفرق بنفسك أو امسح الصفحة.',
+      'Open the listed pages and look. If it really is a duplicate, adjust the count yourself or remove the page.'),
+  _NoteKind(
+      'nonpay',
+      0,
+      Icons.info_outline,
+      'مستند إقفال أو ملخص',
+      'Closing or summary document',
+      'الملف فيه إيصال إقفال أو ملخص أو إعادة طباعة. التطبيق تجاهله ومش محسوب في العدد.',
+      'The file contains a closing, summary or reprint receipt. The app ignored it and it is not counted.',
+      'مفيش حاجة مطلوبة، ده طبيعي.',
+      'Nothing to do, this is normal.'),
+  _NoteKind(
+      'nofile',
+      2,
+      Icons.folder_off_outlined,
+      'الملف الأصلي مش موجود',
+      'Original file not found',
+      'الملف اتمسح أو اتنقل من مكانه، فالتطبيق مش قادر يعدّه.',
+      'The file was deleted or moved, so the app cannot count it.',
+      'رجّع الملف مكانه أو اعمل فحص من جديد.',
+      'Put the file back or scan again.'),
+  _NoteKind(
+      'datefail',
+      1,
+      Icons.calendar_month_outlined,
+      'التاريخ مش واضح',
+      'Date not clear',
+      'التطبيق ما قدرش يقرا تاريخ اليوم من الملف.',
+      'The app could not read the date from the file.',
+      'افتح الملف وتأكد من التاريخ بنفسك.',
+      'Open the file and check the date yourself.'),
+  _NoteKind(
+      'namefail',
+      2,
+      Icons.drive_file_rename_outline,
+      'فشلت التسمية',
+      'Naming failed',
+      'التطبيق ما قدرش يتعرف على الماكينة فمسمّاش الملف.',
+      'The app could not identify the machine so it did not rename the file.',
+      'استخدم "تحديد الماكينة" من القايمة.',
+      'Use "Assign machine" from the menu.'),
+  _NoteKind(
+      'idweak',
+      2,
+      Icons.help_outline,
+      'الماكينة مش مؤكدة',
+      'Machine not confirmed',
+      'رقم الماكينة (Terminal ID) ما اتقراش بوضوح، فالتطبيق خمّن الماكينة من بيانات تانية أو لقاها في أكتر من ملف.',
+      'The Terminal ID was not read clearly, so the app guessed the machine from other data or found it in more than one file.',
+      'اتأكد من الماكينة، ولو غلط استخدم "تحديد الماكينة".',
+      'Verify the machine; if wrong, use "Assign machine".'),
+  _NoteKind(
+      'other',
+      1,
+      Icons.report_problem_outlined,
+      'ملاحظة تانية',
+      'Other note',
+      'ملاحظة من التطبيق مش متصنفة.',
+      'An unclassified note from the app.',
+      'اقراها وقرر لو محتاجة مراجعة.',
+      'Read it and decide whether it needs review.'),
+];
+
+final List<List<Object>> _noteRules = [
+  [RegExp(r'^العدد \d+ بس التسلسل'), 'seq'],
+  [RegExp(r'مش تبع نفس اليوم'), 'otherday'],
+  [RegExp(r'العد لقى ماكينة'), 'machconf'],
+  [RegExp(r'صفحة فشلت قراءتها|فشل العد|العد وقف'), 'readfail'],
+  [RegExp(r'صفحات ما لقيتش فيها إيصالات'), 'emptypages'],
+  [RegExp(r'^إيصال متكرر'), 'dup'],
+  [RegExp(r'الطريقتين اختلفوا|طرق العد اختلفت'), 'methoddiff'],
+  [RegExp(r'إقفال/ملخص'), 'nonpay'],
+  [RegExp(r'الملف الأصلي مش موجود'), 'nofile'],
+  [RegExp(r'مش قادر أعرف التاريخ'), 'datefail'],
+  [RegExp(r'فشل التسمية|فشل التعريف'), 'namefail'],
+  [RegExp(r'Terminal ID|مش واضح|مش قادر أعرف الماكينة|نفس ماكينة|اتعرفت كمان|الوحدة اتحددت'), 'idweak'],
+];
+
+_NoteKind _noteKindOf(String n) {
+  for (final r in _noteRules) {
+    if ((r[0] as RegExp).hasMatch(n)) {
+      return _kNoteKinds.firstWhere((k) => k.key == r[1]);
+    }
+  }
+  return _kNoteKinds.last;
+}
+
+class _MStats {
+  int? pages, full, partial, seqMin, seqMax, seqLen;
+}
+
+_MStats _statsOf(MResult r) {
+  final s = _MStats();
+  final d = r.detail;
+  int? g(RegExp re) {
+    final m = re.firstMatch(d);
+    return m == null ? null : int.tryParse(m.group(1)!);
+  }
+
+  s.pages = g(RegExp(r'(\d+)\s*صفحة'));
+  s.full = g(RegExp(r'RRN\s*(?:مقروء|كامل)\s*(\d+)'));
+  s.partial = g(RegExp(r'ناقص القراءة\s*(\d+)'));
+  final m = RegExp(r'التسلسل\s*(\d+)-(\d+)\s*\((\d+)\)').firstMatch(d);
+  if (m != null) {
+    s.seqMin = int.tryParse(m.group(1)!);
+    s.seqMax = int.tryParse(m.group(2)!);
+    s.seqLen = int.tryParse(m.group(3)!);
+  }
+  return s;
+}
+
+class _St {
+  final String ar, en;
+  final MaterialColor color;
+  const _St(this.ar, this.en, this.color);
+}
+
+_St _statusOf(MResult r) {
+  if (r.excluded) return const _St('مستبعد', 'Excluded', Colors.grey);
+  if (r.pending) return const _St('لسه ما اتعدّش', 'Not counted yet', Colors.blueGrey);
+  if (r.verdict > 0) return const _St('اتراجع: صح', 'Reviewed: OK', Colors.green);
+  if (r.ok && r.softWarn) return const _St('سليم ⚠️ فرق بسيط', 'OK ⚠️ small difference', Colors.amber);
+  if (r.ok) return const _St('سليم', 'OK', Colors.green);
+  return const _St('محتاج مراجعة', 'Needs review', kReviewTone);
+}
+
+// الباتش = العدد اللي مكتوب في خانة "الصح" (من إيصال الباتش)، والفعلي = العدد اللي التطبيق عدّه
+int? _batchManual(MResult r) => int.tryParse(r.ctl.text.trim());
+int? _batchAutoOf(MResult r) => r.orderNum == null ? null : closingTxn.value[r.orderNum!];
+int? _batchOf(MResult r) => _batchManual(r) ?? _batchAutoOf(r);
+bool _batchIsAuto(MResult r) => _batchManual(r) == null && _batchAutoOf(r) != null;
+
+// مطابقة الباتش: لو انت راجعت الملف يدوي وعلّمته صح ✓ يتحسب مطابق (أخضر) حتى لو العدد المقروء مختلف عن رقم الباتش.
+// null = مفيش حاجة نقارنها. الرقم اللي بتكتبه بإيدك في خانة "الصح" بيغلب الرقم التلقائي من التقفيل.
+bool? _batchMatch(MResult r) {
+  if (r.excluded || r.pending) return null;
+  if (r.verdict > 0) return true;
+  final d = _batchDiff(r);
+  return d == null ? null : d == 0;
+}
+
+int? _batchDiff(MResult r) {
+  final b = _batchOf(r);
+  if (b == null || r.pending || r.excluded) return null;
+  return b - r.count;
+}
+
+String _diffText(BuildContext c, int d) => d == 0
+    ? _l(c, 'مطابق ✓', 'Match ✓')
+    : (d > 0 ? _l(c, 'ناقص $d', 'Missing $d') : _l(c, 'زيادة ${-d}', 'Extra ${-d}'));
+
+MaterialColor _diffColor(int d) =>
+    d == 0 ? Colors.green : (d.abs() < kSoftGap ? Colors.amber : (d > 0 ? Colors.red : kReviewTone));
+
+// فرق الباتش بسيط (أقل من kSoftGap): تحذير أصفر بدل الأحمر
+bool _batchSoft(MResult r) {
+  if (r.verdict != 0) return false;
+  final d = _batchDiff(r);
+  return d != null && d != 0 && d.abs() < kSoftGap;
+}
+
+String _mSummary(BuildContext c, MResult r) {
+  if (r.excluded) return _l(c, 'مستبعد (علامة غلط)', 'Excluded (marked wrong)');
+  if (r.pending) return _l(c, 'لسه ما اتعدّش (اضغط فحص إيصالات الدفع)', 'Not counted yet (tap Scan payment receipts)');
+  // الأرقام دايماً إنجليزي (Dart بيكتب الأرقام ASCII حتى لو الواجهة عربي)
+  final manual = _batchManual(r);
+  final n = r.orderNum;
+  final batch = manual ?? (n == null ? null : batchTxnByNum[n]);
+  final sys = n == null ? null : sysTxnByNum[n];
+  String v(int? x) => x == null ? '—' : '$x';
+  // ملاحظة: رسالة "فرق بسيط - سليم" بقت بتظهر جوه تفاصيل الكارت بس
+  return '${_l(c, 'عدد الإيصالات', 'Receipts')}: ${r.count}\n'
+      '${_l(c, 'الباتش', 'Batch')}: ${v(batch)}\n'
+      '${_l(c, 'السيستم', 'System')}: ${v(sys)}';
+}
+
+// ───────── كارت الماكينة (تاب إيصالات الدفع): مربعات أرقام + شارات ─────────
+int? _mBatchShown(MResult r) {
+  final manual = _batchManual(r);
+  final n = r.orderNum;
+  return manual ?? (n == null ? null : batchTxnByNum[n]);
+}
+
+int? _mSysShown(MResult r) => r.orderNum == null ? null : sysTxnByNum[r.orderNum!];
+
+class _MName {
+  final String order, unit, date;
+  final String? idx;
+  const _MName(this.order, this.unit, this.idx, this.date);
+}
+
+// اسم الملف: رقم.الوحدة[.ترتيب].يوم.يوم.شهر  ←  بنفصله علشان نعرضه على سطرين
+_MName? _splitMName(String? name) {
+  if (name == null) return null;
+  final parts = name.split('.');
+  final di = parts.lastIndexOf('يوم');
+  if (di < 2 || parts.length - di < 3) return null;
+  var head = parts.sublist(1, di);
+  String? idx;
+  if (head.length >= 2 && RegExp(r'^\d+$').hasMatch(head.last)) {
+    idx = head.last;
+    head = head.sublist(0, head.length - 1);
+  }
+  return _MName(parts.first, head.join(' '), idx, '${parts[di + 1]}.${parts[di + 2]}');
+}
+
+Widget _mTitle(BuildContext c, MResult r) {
+  final n = _splitMName(r.newName);
+  final cs = Theme.of(c).colorScheme;
+  final main = n == null ? (r.newName ?? '؟ ${r.pdfName}') : '${n.unit}${n.idx != null ? ' ${n.idx}' : ''}';
+  // سطر واحد: الاسم + (ماكينة • التاريخ) بخط صغير جنبه
+  return Row(children: [
+    if (r.softWarn)
+      Padding(
+        padding: const EdgeInsetsDirectional.only(end: 4),
+        child: Icon(Icons.warning_amber, size: 16, color: _tintBorder(c, Colors.amber)),
+      ),
+    Flexible(
+      child: w.Text.rich(
+        TextSpan(children: [
+          TextSpan(
+              text: tr(main),
+              style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 15,
+                  decoration: r.excluded ? TextDecoration.lineThrough : null)),
+          if (n != null)
+            TextSpan(
+                text: '   ${_l(c, 'ماكينة', 'Machine')} ${n.order} • ${n.date}',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+        ]),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+    ),
+    if (!r.ok && !r.excluded)
+      Padding(
+        padding: const EdgeInsetsDirectional.only(start: 6),
+        child: Icon(Icons.swipe, size: 14, color: cs.onSurfaceVariant),
+      ),
+  ]);
+}
+
+Widget _statBox(BuildContext c, String label, String value, MaterialColor? tone) {
+  final cs = Theme.of(c).colorScheme;
+  return Expanded(
+    child: Container(
+      padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 4),
+      decoration: BoxDecoration(
+        color: tone == null ? cs.surfaceContainerHighest.withAlpha(120) : _tintBg(c, tone),
+        borderRadius: BorderRadius.circular(8),
+        border: tone == null ? null : Border.all(color: _tintBorder(c, tone), width: 0.8),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(value,
+              style: TextStyle(
+                  fontSize: 14.5, fontWeight: FontWeight.bold, color: tone == null ? null : _tintFg(c, tone))),
+          Text(label, style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
+        ],
+      ),
+    ),
+  );
+}
+
+// شارة تحذير صغيرة (بدل سطور النص الطويلة)
+Widget _flagChip(BuildContext c, String text, MaterialColor col) => Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: _tintBg(c, col),
+        border: Border.all(color: _tintBorder(c, col), width: 0.8),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(text,
+          style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: _tintFg(c, col))),
+    );
+
+Widget _mSubtitle(BuildContext c, MResult r, bool busy) {
+  final cs = Theme.of(c).colorScheme;
+  if (r.excluded || r.pending) {
+    return Text(
+        r.pending && busy
+            ? _l(c, 'بيتعدّ...', 'Counting...')
+            : (r.pending ? _l(c, 'لسه ما اتعدّش', 'Not counted yet') : _mSummary(c, r)),
+        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant));
+  }
+  final match = _batchMatch(r);
+  final soft = _batchSoft(r);
+  final batch = _mBatchShown(r);
+  final sys = _mSysShown(r);
+  final seqLen = _statsOf(r).seqLen;
+  String v(int? x) => x == null ? '—' : '$x';
+  MaterialColor? gap(int? x) {
+    if (r.verdict > 0 || x == null || x == r.count) return null;
+    return (x - r.count).abs() < kSoftGap ? Colors.amber : Colors.red;
+  }
+
+  // الزيادة والنقص بالرقم: المتوقع - الفعلي (موجب = ناقص، سالب = زيادة)
+  final gaps = <Widget>[];
+  if (r.verdict <= 0) {
+    void addGap(String src, int? expected) {
+      if (expected == null) return;
+      final d = expected - r.count;
+      if (d == 0) return;
+      gaps.add(_flagChip(c, '$src: ${_diffText(c, d)}', d.abs() < kSoftGap ? Colors.amber : Colors.red));
+    }
+
+    addGap(_l(c, 'عن الباتش', 'vs batch'), batch);
+    addGap(_l(c, 'عن السيستم', 'vs system'), sys);
+    addGap(_l(c, 'عن التسلسل', 'vs sequence'), seqLen);
+  }
+  final hasNotes = r.notes.any((n) => _noteKindOf(n).sev > 0);
+
+  final MaterialColor? cTone = r.verdict > 0
+      ? Colors.green
+      : (match == null ? null : (match ? Colors.green : (soft ? Colors.amber : Colors.red)));
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Padding(
+        padding: const EdgeInsets.only(top: 3),
+        child: Row(children: [
+          _statBox(c, _l(c, 'الإيصالات', 'Receipts'), '${r.count}', cTone),
+          const SizedBox(width: 6),
+          _statBox(c, _l(c, 'الباتش', 'Batch'), v(batch), gap(batch)),
+          const SizedBox(width: 6),
+          _statBox(c, _l(c, 'السيستم', 'System'), v(sys), gap(sys)),
+        ]),
+      ),
+      // نفس الشكل لكل الكروت: المربعات التلاتة + صف شارات دايماً (شارة "سليم" لو مفيش حاجة)
+      Padding(
+        padding: const EdgeInsets.only(top: 4),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 22),
+          child: Wrap(spacing: 6, runSpacing: 4, children: [
+            ...gaps,
+            if (r.verdict > 0) _flagChip(c, _l(c, '✓ اتراجع: صح', '✓ Reviewed: OK'), Colors.green),
+            if (gaps.isEmpty && !hasNotes && r.ok && r.verdict <= 0) _flagChip(c, _l(c, '✓ سليم', '✓ OK'), Colors.green),
+            if (hasNotes)
+              _flagChip(
+                  c,
+                  _l(c, '⚠️ ${r.notes.where((n) => _noteKindOf(n).sev > 0).length} ملاحظة',
+                      '⚠️ ${r.notes.where((n) => _noteKindOf(n).sev > 0).length} note(s)'),
+                  kReviewTone),
+          ]),
+        ),
+      ),
+    ],
+  );
+}
+
+Color _mStripColor(MResult r) {
+  if (r.excluded) return Colors.grey;
+  if (r.pending) return Colors.blueGrey;
+  final m = _batchMatch(r);
+  if (r.verdict > 0 || m == true) return Colors.green;
+  if (m == false) return _batchSoft(r) ? Colors.amber : Colors.red;
+  return r.ok ? Colors.green : kReviewTone;
+}
+
+Color _itemStatusColor(ReceiptItem i) {
+  if (i.reprintSummary) return Colors.red;
+  if (i.needsReview) return kReviewTone;
+  if (i.ignoredDoc || i.ign == 'drop' || i.userExcluded) return Colors.grey;
+  if (i.tid != null && i.amount > 0) return Colors.green;
+  return Colors.red;
+}
+
+// ───────── أدوات القوائم: عدّاد المراجعة + بحث + ترتيب + حالة فاضية + هيكل تحميل ─────────
+// true = كل صفحة في الـ PDF بنسبة الباتش نفسه (بتملا عرض الشاشة من غير تكبير).
+// false = رجوع لصفحات A4 زي الأول.
+const bool kFitPageToReceipt = true;
+
+// بيقرا أبعاد صورة JPEG من الهيدر من غير ما يفكها. null لو مش JPEG.
+List<int>? _jpegSize(Uint8List b) {
+  if (b.length < 4 || b[0] != 0xFF || b[1] != 0xD8) return null;
+  var i = 2;
+  while (i + 9 < b.length) {
+    if (b[i] != 0xFF) {
+      i++;
+      continue;
+    }
+    final m = b[i + 1];
+    if (m == 0xFF) {
+      i++;
+      continue;
+    }
+    if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) {
+      i += 2;
+      continue;
+    }
+    if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+      final h = (b[i + 5] << 8) | b[i + 6];
+      final w0 = (b[i + 7] << 8) | b[i + 8];
+      return (w0 > 0 && h > 0) ? <int>[w0, h] : null;
+    }
+    i += 2 + ((b[i + 2] << 8) | b[i + 3]);
+  }
+  return null;
+}
+
+void _stableSort<T>(List<T> l, int Function(T, T) cmp) {
+  final idx = <T, int>{for (var i = 0; i < l.length; i++) l[i]: i};
+  l.sort((a, b) {
+    final c = cmp(a, b);
+    return c != 0 ? c : idx[a]!.compareTo(idx[b]!);
+  });
+}
+
+Widget _listTools(
+  BuildContext context, {
+  required int remaining,
+  required int total,
+  required TextEditingController controller,
+  required void Function(String) onQuery,
+  required int sort,
+  required List<String> sortLabels,
+  required void Function(int) onSort,
+}) {
+  final cs = Theme.of(context).colorScheme;
+  final done = total - remaining;
+  final allOk = remaining == 0;
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      if (total > 0)
+        Padding(
+          padding: const EdgeInsets.only(top: 6, bottom: 6),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(children: [
+                Expanded(
+                  child: w.Text(
+                      allOk
+                          ? _l(context, '✅ كله تمام - مفيش حاجة للمراجعة', '✅ All good - nothing to review')
+                          : _l(context, 'فاضل $remaining للمراجعة من $total', '$remaining left to review of $total'),
+                      style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: allOk ? _tintFg(context, Colors.green) : _tintFg(context, kReviewTone))),
+                ),
+                w.Text('${(done * 100 / total).round()}%',
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+              ]),
+              const SizedBox(height: 4),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: LinearProgressIndicator(
+                  value: done / total,
+                  minHeight: 6,
+                  color: allOk ? _tone(context, Colors.green) : _tone(context, kReviewTone),
+                ),
+              ),
+            ],
+          ),
+        ),
+      Row(children: [
+        Expanded(
+          child: SizedBox(
+            height: 40,
+            child: TextField(
+              controller: controller,
+              onChanged: onQuery,
+              style: const TextStyle(fontSize: 14),
+              decoration: InputDecoration(
+                isDense: true,
+                hintText: _l(context, 'بحث: وحدة / رقم ماكينة / مبلغ', 'Search: unit / machine / amount'),
+                prefixIcon: const Icon(Icons.search, size: 20),
+                suffixIcon: controller.text.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.close, size: 18),
+                        onPressed: () {
+                          controller.clear();
+                          onQuery('');
+                        },
+                      ),
+                contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
+              ),
+            ),
+          ),
+        ),
+        PopupMenuButton<int>(
+          tooltip: _l(context, 'ترتيب', 'Sort'),
+          icon: Icon(Icons.sort, color: sort == 0 ? null : cs.primary),
+          onSelected: onSort,
+          itemBuilder: (_) => [
+            for (var i = 0; i < sortLabels.length; i++)
+              CheckedPopupMenuItem<int>(value: i, checked: sort == i, child: w.Text(sortLabels[i])),
+          ],
+        ),
+      ]),
+      const SizedBox(height: 4),
+    ],
+  );
+}
+
+Widget _emptyState(BuildContext context, IconData icon, String title, String sub,
+    {String? actionLabel, VoidCallback? onAction}) {
+  final cs = Theme.of(context).colorScheme;
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 36, horizontal: 24),
+    child: Column(
+      children: [
+        CircleAvatar(
+          radius: 40,
+          backgroundColor: cs.primaryContainer,
+          child: Icon(icon, size: 40, color: cs.onPrimaryContainer),
+        ),
+        const SizedBox(height: 16),
+        w.Text(title, textAlign: TextAlign.center, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 6),
+        w.Text(sub, textAlign: TextAlign.center, style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant)),
+        if (actionLabel != null && onAction != null) ...[
+          const SizedBox(height: 18),
+          FilledButton.icon(
+            onPressed: onAction,
+            icon: const Icon(Icons.play_arrow),
+            label: w.Text(actionLabel),
+            style: FilledButton.styleFrom(minimumSize: const Size(0, 48), padding: const EdgeInsets.symmetric(horizontal: 24)),
+          ),
+        ],
+      ],
+    ),
+  );
+}
+
+// هيكل تحميل نابض أثناء أول فحص (بدل قائمة فاضية)
+class _SkeletonList extends StatefulWidget {
+  const _SkeletonList();
+  @override
+  State<_SkeletonList> createState() => _SkeletonListState();
+}
+
+class _SkeletonListState extends State<_SkeletonList> with SingleTickerProviderStateMixin {
+  late final AnimationController _c =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final base = cs.surfaceContainerHighest;
+    Widget bar(double wd, double h) => Container(
+          width: wd,
+          height: h,
+          decoration: BoxDecoration(color: base, borderRadius: BorderRadius.circular(6)),
+        );
+    return FadeTransition(
+      opacity: Tween<double>(begin: 0.35, end: 1).animate(_c),
+      child: Column(
+        children: [
+          for (var i = 0; i < 4; i++)
+            Card(
+              margin: const EdgeInsets.symmetric(vertical: 4),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(children: [
+                  Container(
+                      width: 48,
+                      height: 48,
+                      decoration: BoxDecoration(color: base, borderRadius: BorderRadius.circular(8))),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [bar(140, 14), const SizedBox(height: 8), bar(double.infinity, 28)],
+                    ),
+                  ),
+                ]),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// أزرار كبيرة لتقرير الإيصال (صح / غلط) + أزرار ثانوية
+Widget _bigVerdict(BuildContext c, IconData icon, String label, MaterialColor col, VoidCallback? onTap,
+        {bool selected = false}) =>
+    FilledButton.icon(
+      onPressed: onTap,
+      icon: Icon(icon, size: 24),
+      label: w.Text(label),
+      style: FilledButton.styleFrom(
+        minimumSize: const Size(0, 58),
+        textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        backgroundColor: selected ? col.shade700 : _tintBg(c, col, strong: true),
+        foregroundColor: selected ? Colors.white : _tintFg(c, col),
+      ),
+    );
+
+Widget _bigAct(IconData icon, String label, VoidCallback? onTap) => FilledButton.tonalIcon(
+      onPressed: onTap,
+      icon: Icon(icon, size: 22),
+      label: w.Text(label),
+      style: FilledButton.styleFrom(
+        minimumSize: const Size(0, 50),
+        padding: const EdgeInsets.symmetric(horizontal: 20),
+        textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+      ),
+    );
+
+Widget _statusChip(BuildContext c, _St st) => Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+      decoration: BoxDecoration(
+        color: _tintBg(c, st.color),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: _tintBorder(c, st.color)),
+      ),
+      child: w.Text(_l(c, st.ar, st.en),
+          style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: _tintFg(c, st.color))),
+    );
+
+class ReceiptReportPage extends StatefulWidget {
+  final MResult r;
+  final bool canEdit;
+  final VoidCallback onChanged;
+  final VoidCallback onOpenPdf;
+  final VoidCallback onRecount;
+  final void Function(int) onVerdict;
+  const ReceiptReportPage({
+    super.key,
+    required this.r,
+    required this.canEdit,
+    required this.onChanged,
+    required this.onOpenPdf,
+    required this.onRecount,
+    required this.onVerdict,
+  });
+
+  @override
+  State<ReceiptReportPage> createState() => _ReceiptReportPageState();
+}
+
+class _ReceiptReportPageState extends State<ReceiptReportPage> {
+  @override
+  Widget build(BuildContext context) {
+    AppSettings.of(context);
+    final r = widget.r;
+    final cs = Theme.of(context).colorScheme;
+    final st = _statusOf(r);
+    final stats = _statsOf(r);
+    final bd = _batchDiff(r);
+    final bt = _batchOf(r);
+    final can = widget.canEdit;
+    final groups = <String, List<String>>{};
+    for (final n in r.notes) {
+      groups.putIfAbsent(_noteKindOf(n).key, () => <String>[]).add(n);
+    }
+    final kinds = groups.keys.map((k) => _kNoteKinds.firstWhere((e) => e.key == k)).toList()
+      ..sort((a, b) => b.sev.compareTo(a.sev));
+    final attention = kinds.where((k) => k.sev > 0).toList();
+    final infos = kinds.where((k) => k.sev == 0).toList();
+
+    Widget section(String t, List<Widget> kids) => Card(
+          margin: const EdgeInsets.only(bottom: 8),
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                w.Text(t, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                const SizedBox(height: 8),
+                ...kids,
+              ],
+            ),
+          ),
+        );
+    Widget kv(String k, String v, {Color? color}) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 3),
+          child: Row(
+            children: [
+              Expanded(child: w.Text(k, style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant))),
+              w.Text(v, style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: color)),
+            ],
+          ),
+        );
+    String pad6(int? n) => (n ?? 0).toString().padLeft(6, '0');
+
+    // مربع رقم كبير في الخلاصة
+    Widget big(String label, String value, MaterialColor c, {double size = 22}) => Expanded(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+            decoration: BoxDecoration(
+              color: _tintBg(context, c, soft: true),
+              border: Border.all(color: _tintBorder(context, c)),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Column(
+              children: [
+                w.Text(value,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: size, fontWeight: FontWeight.bold, color: _tintFg(context, c))),
+                const SizedBox(height: 2),
+                w.Text(label, style: TextStyle(fontSize: 11, color: _tintFg(context, c))),
+              ],
+            ),
+          ),
+        );
+
+    // جملة واحدة بسيطة تقول الوضع إيه
+    final String plain;
+    if (r.pending) {
+      plain = _l(context, 'الملف لسه ما اتعدّش.', 'This file has not been counted yet.');
+    } else if (r.verdict > 0) {
+      plain = _l(context, 'انت راجعته وعلّمته صح ✓.', 'You reviewed it and marked it OK ✓.');
+    } else if (bt == null || bd == null) {
+      plain = _l(context, 'مفيش باتش للمقارنة. اكتب الباتش تحت لو عايز تقارن.',
+          'No batch to compare with. Enter the batch below to compare.');
+    } else if (bd == 0) {
+      plain = _l(context, 'العدد مطابق للباتش، مفيش حاجة مطلوبة.', 'The count matches the batch. Nothing to do.');
+    } else if (attention.isEmpty) {
+      plain = _l(context, 'فيه فرق عن الباتش. افتح الملف وراجع.', 'There is a difference from the batch. Open the file and check.');
+    } else {
+      plain = _l(context, 'فيه فرق عن الباتش، وتحت ${attention.length} حاجة تستاهل تبص عليها.',
+          'There is a difference from the batch; see the ${attention.length} item(s) below.');
+    }
+    final MaterialColor diffCol = r.verdict > 0 ? Colors.green : (bd == null ? Colors.blueGrey : _diffColor(bd));
+
+    Widget noteCard(_NoteKind k) {
+      final MaterialColor col = k.sev == 2 ? Colors.red : (k.sev == 1 ? kReviewTone : Colors.blue);
+      return Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.fromLTRB(10, 10, 10, 4),
+        decoration: BoxDecoration(
+          color: _tintBg(context, col, soft: true),
+          border: Border.all(color: _tintBorder(context, col)),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(k.icon, size: 20, color: _tintFg(context, col)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: w.Text(_l(context, k.titleAr, k.titleEn),
+                      style: TextStyle(fontWeight: FontWeight.bold, color: _tintFg(context, col))),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            for (final n in groups[k.key]!)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: Text('• $n', style: const TextStyle(fontSize: 13)),
+              ),
+            const SizedBox(height: 4),
+            w.Text('${_l(context, 'تعمل إيه؟', 'What to do')}: ${_l(context, k.fixAr, k.fixEn)}',
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+            Theme(
+              data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: const EdgeInsets.only(bottom: 8),
+                dense: true,
+                title: w.Text(_l(context, 'ليه الملاحظة دي؟', 'Why this note?'), style: const TextStyle(fontSize: 12)),
+                children: [
+                  Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: w.Text(_l(context, k.whyAr, k.whyEn), style: const TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final numbers = <Widget>[
+      kv(_l(context, 'عدد المعاملات المعدودة', 'Counted transactions'), r.pending ? '—' : '${r.count}'),
+      if (stats.pages != null) kv(_l(context, 'عدد الصفحات', 'Pages'), '${stats.pages}'),
+      if (stats.full != null) kv(_l(context, 'إيصالات مقروءة كاملة', 'Fully read receipts'), '${stats.full}'),
+      if (stats.partial != null)
+        kv(_l(context, 'إيصالات ناقصة القراءة', 'Partially read receipts'), '${stats.partial}',
+            color: stats.partial! > 0 ? kReviewTone : null),
+      if (stats.seqMin != null)
+        kv(_l(context, 'تسلسل الإيصالات', 'Receipt sequence'), '${pad6(stats.seqMin)} ... ${pad6(stats.seqMax)}',
+            color: _tone(context, Colors.blue)),
+      if (stats.seqLen != null)
+        kv(_l(context, 'العدد المتوقع من التسلسل', 'Expected from sequence'), '${stats.seqLen}'),
+      if (stats.seqLen != null && !r.pending)
+        kv(
+            _l(context, 'الفرق عن التسلسل', 'Difference from sequence'),
+            r.count == stats.seqLen ? _l(context, 'مطابق ✓', 'Match ✓') : '${r.count - stats.seqLen!}  (الفعلي - المتوقع)',
+            color: r.count == stats.seqLen ? _tone(context, Colors.green) : _tone(context, kReviewTone)),
+    ];
+
+    return Scaffold(
+      appBar: AppBar(
+          toolbarHeight: 54,
+          title: w.Text(_l(context, 'تقرير الإيصال', 'Receipt report')),
+          actions: const [HeaderButtons()]),
+      body: ListView(
+        padding: const EdgeInsets.all(8),
+        children: [
+          // 1) مين الملف وحالته
+          Card(
+            margin: const EdgeInsets.only(bottom: 8),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(r.newName ?? '؟ ${r.pdfName}',
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                      ),
+                      const SizedBox(width: 8),
+                      _statusChip(context, st),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  w.Text('${_l(context, 'الملف الأصلي', 'Original file')}: ${r.pdfName}',
+                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                ],
+              ),
+            ),
+          ),
+          // 2) الخلاصة: التلات أرقام + جملة واحدة
+          Card(
+            margin: const EdgeInsets.only(bottom: 8),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      big(_l(context, 'العدد الفعلي', 'Actual'), r.pending ? '—' : '${r.count}', Colors.blue),
+                      const SizedBox(width: 8),
+                      big(_l(context, 'الباتش', 'Batch'), bt == null ? '—' : '$bt', Colors.blueGrey),
+                      const SizedBox(width: 8),
+                      big(_l(context, 'الفرق', 'Difference'),
+                          r.pending || bd == null ? '—' : _diffText(context, bd), diffCol,
+                          size: 15),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  w.Text(plain, style: const TextStyle(fontSize: 14)),
+                ],
+              ),
+            ),
+          ),
+          // 3) القرار
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: _bigVerdict(context, Icons.check_circle_outline, _l(context, 'صح ✓', 'OK ✓'), Colors.green,
+                          !can ? null : () { HapticFeedback.lightImpact(); widget.onVerdict(1); setState(() {}); },
+                          selected: r.verdict > 0),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _bigVerdict(context, Icons.highlight_off, _l(context, 'غلط ✗', 'Wrong ✗'), Colors.red,
+                          !can ? null : () { HapticFeedback.lightImpact(); widget.onVerdict(-1); setState(() {}); },
+                          selected: r.verdict < 0),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  alignment: WrapAlignment.center,
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    _bigAct(Icons.picture_as_pdf, _l(context, 'فتح الملف', 'Open file'), widget.onOpenPdf),
+                    if (r.verdict != 0)
+                      _bigAct(Icons.undo, _l(context, 'إلغاء العلامة', 'Clear mark'),
+                          !can ? null : () { widget.onVerdict(0); setState(() {}); }),
+                    _bigAct(Icons.refresh, _l(context, 'إعادة العد', 'Recount'), !can ? null : () {
+                      widget.onRecount();
+                      setState(() {});
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: w.Text(_l(context, 'اتعلّم للعد. ارجع واضغط "فحص إيصالات الدفع".', 'Marked for counting. Go back and tap "Scan payment receipts".'))));
+                    }),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          // 4) اللي محتاج انتباه (لو فيه)
+          if (attention.isNotEmpty) ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(4, 4, 4, 6),
+              child: w.Text(_l(context, 'محتاج انتباه', 'Needs attention'),
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            ),
+            for (final k in attention) noteCard(k),
+          ],
+          // 5) معلومات للمعرفة بس (زي الإيصال المكرر)
+          if (infos.isNotEmpty) ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(4, 4, 4, 6),
+              child: w.Text(_l(context, 'للمعرفة بس', 'For information'),
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            ),
+            for (final k in infos) noteCard(k),
+          ],
+          if (kinds.isEmpty)
+            Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: _tintBg(context, Colors.green, soft: true),
+                border: Border.all(color: _tintBorder(context, Colors.green)),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: w.Text(_l(context, 'مفيش ملاحظات ✓', 'No notes ✓'),
+                  style: TextStyle(fontWeight: FontWeight.bold, color: _tintFg(context, Colors.green))),
+            ),
+          // 6) الباتش اليدوي
+          section(_l(context, 'تعديل الباتش', 'Edit batch'), [
+            TextField(
+              controller: r.ctl,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                isDense: true,
+                labelText: _l(context, 'عدد معاملات الباتش (بيتقري من التقفيل، اكتب رقم لو عايز تغيّره)',
+                    'Batch transaction count (read from closing; type a number to override)'),
+                hintText: _batchAutoOf(r)?.toString(),
+              ),
+              onChanged: (_) {
+                widget.onChanged();
+                setState(() {});
+              },
+            ),
+            if (bt != null && _batchIsAuto(r))
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: w.Text(_l(context, 'الباتش ده اتقرا تلقائي من التقفيل/السيستم.', 'This batch was read automatically from closing/system.'),
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+              ),
+            if (r.softWarn)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: w.Text(
+                    _l(context, '⚠️ فرق بسيط (أقل من $kSoftGap إيصالات) - سليم ومش محتاج مراجعة',
+                        '⚠️ Small difference (under $kSoftGap receipts) - OK, no review needed'),
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              ),
+          ]),
+          // مقارنة المبالغ بمبلغ الباتش
+          if (!r.pending && r.amtRead > 0)
+            Builder(builder: (context) {
+              final ba = r.orderNum == null ? null : batchAmtByNum[r.orderNum!];
+              final all = r.amtRead >= r.count && r.count > 0;
+              final diff = ba == null ? null : ba - r.amtSum;
+              final okAmt = diff != null && diff.abs() < 0.005;
+              return section(_l(context, 'مقارنة المبالغ', 'Amount check'), [
+                kv(_l(context, 'مبالغ اتقرت بوضوح', 'Amounts read clearly'), '${r.amtRead} / ${r.count}'),
+                kv(_l(context, 'مجموعها', 'Their sum'), r.amtSum.toStringAsFixed(2)),
+                if (ba != null) kv(_l(context, 'مبلغ الباتش', 'Batch amount'), ba.toStringAsFixed(2)),
+                if (diff != null)
+                  kv(_l(context, 'الفرق', 'Difference'),
+                      okAmt ? _l(context, 'مطابق ✓', 'Match ✓') : diff.toStringAsFixed(2),
+                      color: okAmt ? _tone(context, Colors.green) : (all ? _tone(context, Colors.red) : _tone(context, kReviewTone))),
+                w.Text(
+                    ba == null
+                        ? _l(context, 'مفيش مبلغ باتش مؤكد للماكينة دي للمقارنة.', 'No confirmed batch amount for this machine to compare.')
+                        : (all
+                            ? (okAmt
+                                ? _l(context, 'كل المبالغ اتقرت والمجموع مطابق للباتش.', 'All amounts were read and the sum matches the batch.')
+                                : _l(context, 'كل المبالغ اتقرت والمجموع مختلف: غالباً إيصال ناقص أو زيادة بقيمة الفرق.', 'All amounts were read but the sum differs: likely a missing or extra receipt worth the difference.'))
+                            : _l(context, 'مبالغ كتير ما اتقراتش، فالفرق هنا مش دليل. المبلغ اللي ما اتقراش = ${diff!.toStringAsFixed(2)} لو كل الإيصالات موجودة.',
+                                'Some amounts were not read, so the difference is not proof. Unread amounts would total ${diff!.toStringAsFixed(2)} if all receipts are present.')),
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+              ]);
+            }),
+          // العدد لكل صفحة
+          if (r.pageCounts.isNotEmpty)
+            section(_l(context, 'العدد لكل صفحة', 'Count per page'), [
+              for (final e in r.pageCounts.entries)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      w.Text(
+                          _l(context, 'صفحة رقم ${e.key} العدد ${e.value}', 'Page ${e.key} count ${e.value}') +
+                              (r.pageWarn.contains(e.key) ? '  ⚠️' : ''),
+                          style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: r.pageWarn.contains(e.key) ? FontWeight.bold : FontWeight.normal,
+                              color: r.pageWarn.contains(e.key) ? kReviewTone : null)),
+                      if (r.pageNote[e.key] != null)
+                        w.Text(r.pageNote[e.key]!, style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                    ],
+                  ),
+                ),
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: w.Text(
+                    _l(context, 'المجموع: ${r.count}${r.pageWarn.isEmpty ? '' : '  •  ⚠️ = طرق العد اختلفت في الصفحة دي'}',
+                        'Total: ${r.count}${r.pageWarn.isEmpty ? '' : '  •  ⚠️ = counting methods disagreed on this page'}'),
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+              ),
+            ]),
+          // 7) تفاصيل فنية: مقفولة افتراضياً
+          Card(
+            margin: const EdgeInsets.only(bottom: 8),
+            child: Theme(
+              data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                title: w.Text(_l(context, 'تفاصيل فنية', 'Technical details'),
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                children: [
+                  ...numbers,
+                  if (r.detail.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(r.detail, style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+        ],
+      ),
+    );
+  }
+}
+
+class MachinesReportPage extends StatefulWidget {
+  final List<MResult> results;
+  final List<String> missing;
+  final Future<void> Function(MResult) openReport;
+  const MachinesReportPage({
+    super.key,
+    required this.results,
+    required this.missing,
+    required this.openReport,
+  });
+
+  @override
+  State<MachinesReportPage> createState() => _MachinesReportPageState();
+}
+
+class _MachinesReportPageState extends State<MachinesReportPage> {
+  int filter = 0; // 0 الكل، 1 مراجعة، 2 فروق الباتش
+
+  @override
+  Widget build(BuildContext context) {
+    AppSettings.of(context);
+    final cs = Theme.of(context).colorScheme;
+    final all = widget.results;
+    final counted = all.where((r) => !r.excluded && !r.pending).toList();
+    final totalTx = counted.fold<int>(0, (a, r) => a + r.count);
+    final reviewN = all.where((r) => !r.ok).length;
+    final excl = all.where((r) => r.excluded).length;
+    final pend = all.where((r) => r.pending).length;
+    final linked = counted.where((r) => _batchOf(r) != null).toList();
+    final matched = linked.where((r) => _batchMatch(r) == true).length;
+    final softN = linked.where(_batchSoft).length;
+    final diffs = linked.length - matched - softN;
+    final batchSum = linked.fold<int>(0, (a, r) => a + _batchOf(r)!);
+    final actualSum = linked.fold<int>(0, (a, r) => a + r.count);
+    final shown = all
+        .where((r) => filter == 0 || (filter == 1 && !r.ok) || (filter == 2 && _batchMatch(r) == false && !_batchSoft(r)))
+        .toList();
+
+    Widget stat(String label, String value, MaterialColor c) => Container(
+          width: 108,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+          decoration: BoxDecoration(
+            color: _tintBg(context, c, soft: true),
+            border: Border.all(color: _tintBorder(context, c)),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Column(
+            children: [
+              w.Text(value, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: _tintFg(context, c))),
+              const SizedBox(height: 2),
+              w.Text(label,
+                  textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: _tintFg(context, c))),
+            ],
+          ),
+        );
+    Widget kv(String k, String v, {Color? color}) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 3),
+          child: Row(
+            children: [
+              Expanded(child: w.Text(k, style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant))),
+              w.Text(v, style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: color)),
+            ],
+          ),
+        );
+
+    return Scaffold(
+      appBar: AppBar(
+          toolbarHeight: 54,
+          title: w.Text(_l(context, 'تقرير إيصالات الدفع', 'Payment receipts report')),
+          actions: const [HeaderButtons()]),
+      body: ListView(
+        padding: const EdgeInsets.all(8),
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              stat(_l(context, 'إجمالي المعاملات', 'Total transactions'), '$totalTx', Colors.blue),
+              stat(_l(context, 'ملفات', 'Files'), '${all.length}', Colors.blueGrey),
+              stat(_l(context, 'اتعدّت', 'Counted'), '${counted.length}', Colors.green),
+              stat(_l(context, 'محتاج مراجعة', 'Need review'), '$reviewN', reviewN > 0 ? kReviewTone : Colors.green),
+              stat(_l(context, 'مستبعد', 'Excluded'), '$excl', Colors.grey),
+              stat(_l(context, 'لسه ما اتعدّتش', 'Not counted'), '$pend', pend > 0 ? Colors.amber : Colors.green),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Card(
+            margin: EdgeInsets.zero,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  w.Text(_l(context, 'ربط الباتش', 'Batch link'),
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                  const SizedBox(height: 6),
+                  if (linked.isEmpty)
+                    w.Text(
+                        _l(context, 'عدد الباتش بيتقري تلقائي من إيصالات تاب التقفيل. لو ما ظهرش اكتبه في خانة "الصح" أو في تقرير الإيصال.',
+                            'The batch count is read automatically from the closing tab receipts. If it is missing, type it in the "Correct" field or in the receipt report.'),
+                        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant))
+                  else ...[
+                    kv(_l(context, 'ماكينات مربوطة', 'Linked machines'), '${linked.length} / ${counted.length}'),
+                    kv(_l(context, 'مطابقة', 'Matching'), '$matched', color: Colors.green),
+                    kv(_l(context, 'فيها فرق', 'With a difference'), '$diffs',
+                        color: diffs > 0 ? Colors.red : Colors.green),
+                    if (softN > 0)
+                      kv(_l(context, 'فرق بسيط (أقل من $kSoftGap) ⚠️', 'Small difference (under $kSoftGap) ⚠️'), '$softN',
+                          color: Colors.amber),
+                    kv(_l(context, 'إجمالي الباتشات', 'Batch total'), '$batchSum'),
+                    kv(_l(context, 'إجمالي الفعلي', 'Actual total'), '$actualSum'),
+                    kv(_l(context, 'صافي الفرق', 'Net difference'), _diffText(context, batchSum - actualSum),
+                        color: _tintFg(context, _diffColor(batchSum - actualSum))),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (widget.missing.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: _tintBg(context, Colors.amber),
+                border: Border.all(color: _tintBorder(context, Colors.amber)),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: w.Text(
+                  '⚠️ ${_l(context, 'ماكينات ما وصلش ملفها', 'Machines with no file')} (${widget.missing.length}): ${widget.missing.join(' ، ')}',
+                  style: const TextStyle(fontSize: 13)),
+            ),
+          ],
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 6,
+            children: [
+              for (final o in [
+                [0, _l(context, 'الكل', 'All')],
+                [1, _l(context, 'مراجعة ($reviewN)', 'Review ($reviewN)')],
+                [2, _l(context, 'فروق الباتش ($diffs)', 'Batch differences ($diffs)')],
+              ])
+                ChoiceChip(
+                  label: w.Text(o[1] as String, style: const TextStyle(fontSize: 13)),
+                  visualDensity: VisualDensity.compact,
+                  selected: filter == o[0],
+                  onSelected: (_) => setState(() => filter = o[0] as int),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          for (final r in shown)
+            Card(
+              margin: const EdgeInsets.symmetric(vertical: 2),
+              child: ListTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                onTap: () async {
+                  await widget.openReport(r);
+                  if (mounted) setState(() {});
+                },
+                title: Text(r.newName ?? '؟ ${r.pdfName}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: w.Text(_mSummary(context, r)),
+                trailing: _statusChip(context, _statusOf(r)),
+              ),
+            ),
+          if (shown.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Center(child: w.Text(_l(context, 'مفيش ملفات في الفلتر ده.', 'No files in this filter.'))),
+            ),
+          const SizedBox(height: 16),
+        ],
+      ),
+    );
+  }
+}
+
+class ClosingReportPage extends StatefulWidget {
+  final List<ReceiptItem> items;
+  final List<SysTotal> sysReads;
+  final List<int> missing;
+  final List<String> warnings;
+  final String Function(ReceiptItem) subtitleOf;
+  final Future<void> Function(ReceiptItem) onOpen;
+  const ClosingReportPage({
+    super.key,
+    required this.items,
+    required this.sysReads,
+    required this.missing,
+    required this.warnings,
+    required this.subtitleOf,
+    required this.onOpen,
+  });
+
+  @override
+  State<ClosingReportPage> createState() => _ClosingReportPageState();
+}
+
+class _ClosingReportPageState extends State<ClosingReportPage> {
+  @override
+  Widget build(BuildContext context) {
+    AppSettings.of(context);
+    final cs = Theme.of(context).colorScheme;
+    final items = widget.items;
+    final counted = items.where((e) => !e.userExcluded && !e.ignoredDoc && e.ign != 'drop' && e.amount > 0).toList();
+    final total = counted.fold<double>(0, (a, e) => a + e.amount);
+    final review = items.where((e) => e.needsReview).toList();
+
+    // أحدث صورة سيستم لكل (ترمنل + تاريخ)، ومقارنتها بمجموع باتشات الماكينة
+    final best = <String, SysTotal>{};
+    for (final s in widget.sysReads) {
+      if (s.tid == null || s.amount == null) continue;
+      final k = '${s.tid}|${s.date ?? ''}';
+      final p = best[k];
+      if (p == null || s.printed.compareTo(p.printed) > 0) best[k] = s;
+    }
+    final sysList = best.values.toList()
+      ..sort((a, b) => (terminals[a.tid]?.orderNum ?? 999).compareTo(terminals[b.tid]?.orderNum ?? 999));
+    var sysDiffs = 0;
+    final sysRows = <Widget>[];
+    for (final s in sysList) {
+      final t = terminals[s.tid];
+      final nm = t != null ? machineLabel(t.orderNum, t.unitName) : 'ترمنل ${s.tid}';
+      var tot = 0.0;
+      var n = 0;
+      if (t != null) {
+        for (final x in counted) {
+          if (x.counts && x.orderNum == t.orderNum) {
+            tot += x.amount;
+            n++;
+          }
+        }
+      }
+      final diff = round2(tot - s.amount!);
+      final okMatch = diff == 0;
+      if (!okMatch) sysDiffs++;
+      sysRows.add(Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: w.Text(
+                  '$nm${s.date != null ? ' (${s.date})' : ''}\n${_fmtMoney(s.amount!)} ج.م${n > 1 ? ' • مجموع $n باتشات' : ''}${s.txn != null ? '\nإيصالات إلكترونية: ${s.txn}${s.txnAll != null && s.txnAll != s.txn ? ' (إجمالي العمليات ${s.txnAll})' : ''}' : ''}',
+                  style: const TextStyle(fontSize: 13)),
+            ),
+            w.Text(okMatch ? '✅ مطابق' : '⚠️ فرق ${diff > 0 ? '+' : ''}${diff.toStringAsFixed(2)}',
+                style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: _tintFg(context, okMatch ? Colors.green : kReviewTone))),
+          ],
+        ),
+      ));
+    }
+
+    Widget stat(String label, String value, MaterialColor c) => Container(
+          width: 108,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+          decoration: BoxDecoration(
+            color: _tintBg(context, c, soft: true),
+            border: Border.all(color: _tintBorder(context, c)),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Column(
+            children: [
+              w.Text(value, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: _tintFg(context, c))),
+              const SizedBox(height: 2),
+              w.Text(label, textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: _tintFg(context, c))),
+            ],
+          ),
+        );
+
+    Widget box(MaterialColor c, List<Widget> kids, {bool soft = false}) => Container(
+          margin: const EdgeInsets.only(top: 8),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: _tintBg(context, c, soft: soft),
+            border: Border.all(color: _tintBorder(context, c)),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: kids),
+        );
+
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+      appBar: AppBar(
+        toolbarHeight: 54,
+        title: w.Text(_l(context, 'تقرير التقفيل', 'Closing report')),
+        actions: const [HeaderButtons()],
+        bottom: TabBar(tabs: [
+          Tab(text: _l(context, 'ملخص', 'Summary')),
+          Tab(text: '${_l(context, 'مراجعة', 'Review')} (${review.length + widget.warnings.length})'),
+        ]),
+      ),
+      body: TabBarView(children: [
+        ListView(
+        padding: const EdgeInsets.all(8),
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              stat(_l(context, 'إيصالات', 'Receipts'), '${counted.length}', Colors.blue),
+              stat(_l(context, 'الإجمالي', 'Total'), total.toStringAsFixed(2), Colors.green),
+              stat(_l(context, 'ناقص', 'Missing'), '${widget.missing.length}',
+                  widget.missing.isNotEmpty ? Colors.amber : Colors.green),
+              stat(_l(context, 'مراجعة', 'Review'), '${review.length}',
+                  review.isNotEmpty ? kReviewTone : Colors.green),
+              stat(_l(context, 'مبالغ السيستم', 'System amounts'), '${sysList.length}', Colors.blueGrey),
+              stat(_l(context, 'فروق السيستم', 'System differences'), '$sysDiffs',
+                  sysDiffs > 0 ? Colors.red : Colors.green),
+            ],
+          ),
+          if (sysList.isNotEmpty)
+            box(Colors.blue, [
+              w.Text('🖥️ ${_l(context, 'مبالغ السيستم', 'System amounts')} (${sysList.length})',
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              ...sysRows,
+            ], soft: true),
+          if (widget.missing.isNotEmpty)
+            box(Colors.amber, [
+              w.Text('⚠️ ${_l(context, 'ماكينات ناقصة', 'Missing machines')} (${widget.missing.length} ${_l(context, 'من', 'of')} $kMainMachines):',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: _tintFg(context, Colors.amber))),
+              const SizedBox(height: 4),
+              w.Text(
+                  widget.missing
+                      .map((n) {
+                        final tid = numToTid[n];
+                        return '$n (${tid == null ? '' : terminals[tid]?.unitName ?? ''})';
+                      })
+                      .join(' ، '),
+                  style: const TextStyle(fontSize: 13)),
+            ]),
+          const SizedBox(height: 16),
+        ],
+      ),
+      ListView(
+        padding: const EdgeInsets.all(8),
+        children: [
+          if (widget.warnings.isNotEmpty)
+            box(kReviewTone, [
+              w.Text('${_l(context, 'ملاحظات للمراجعة', 'Notes for review')} (${widget.warnings.length}):',
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              for (final x in widget.warnings)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: w.Text('• $x', style: const TextStyle(fontSize: 12)),
+                ),
+            ], soft: true),
+          const SizedBox(height: 10),
+          w.Text('${_l(context, 'إيصالات محتاجة مراجعة', 'Receipts needing review')} (${review.length})',
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+          const SizedBox(height: 4),
+          if (review.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Center(
+                  child: w.Text(_l(context, 'مفيش إيصالات محتاجة مراجعة.', 'No receipts need review.'),
+                      style: TextStyle(color: cs.onSurfaceVariant))),
+            ),
+          for (final it in review)
+            Card(
+              margin: const EdgeInsets.symmetric(vertical: 2),
+              child: ListTile(
+                onTap: () async {
+                  await widget.onOpen(it);
+                  if (mounted) setState(() {});
+                },
+                leading: Icon(Icons.warning_amber, color: _tintBorder(context, kReviewTone)),
+                title: w.Text(
+                    it.ignoredDoc || it.ign == 'drop'
+                        ? 'مستند متجاهل - ${baseName(it.path)}'
+                        : (it.orderNum != null ? machineLabel(it.orderNum, it.unitName) : (it.unitName ?? 'وحدة غير معروفة')),
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: w.Text(widget.subtitleOf(it), style: const TextStyle(fontSize: 12)),
+              ),
+            ),
+          const SizedBox(height: 16),
+        ],
+      ),
+      ]),
+      ),
+    );
+  }
+}
+
+class MachinesPage extends StatefulWidget {
+  const MachinesPage({super.key});
+
+  @override
+  State<MachinesPage> createState() => _MachinesPageState();
+}
+
+class _MachinesPageState extends State<MachinesPage> with WidgetsBindingObserver {
+  String? pdfDir; // null = مستندات واتساب (تلقائي)
+  int days = 0;
+  bool skipDone = true;
+  bool reviewOnly = false;
+  String _q = '';
+  int _sort = 0;
+  final TextEditingController _searchCtl = TextEditingController();
+  bool namingDone = false; // التسمية خلصت (حتى لو العد لسه شغال): زرار الإرسال يتفعل
+  bool busy = false;
+  bool stopReq = false;
+  bool settingsOpen = false;
+  double progressValue = 0;
+  String status = 'اضغط "فحص إيصالات الدفع" لفحص إيصالات الدفع من مستندات واتساب.';
+  final List<MResult> results = [];
+  AppLifecycleState _life = AppLifecycleState.resumed;
+  String destDir = loadMOut();
+  String _curLabel = ''; // اسم الملف اللي بيتعد دلوقتي (للتقدّم صفحة صفحة)
+  bool autoScan = false;
+  Timer? _autoTimer;
+  String _doneSig = '';
+  String _pendSig = '';
+
+  // ───── فحص تلقائي: بيراقب ملفات PDF الجديدة ويفحصها لوحده (زي التقفيل) ─────
+  String _scanSig() {
+    try {
+      final dirs = pdfDir != null ? [Directory(pdfDir!)] : findWhatsAppDocDirs();
+      final now = DateTime.now();
+      final cutoff = days < 0
+          ? DateTime(2000)
+          : DateTime(now.year, now.month, now.day).subtract(Duration(days: days));
+      final have = results.map((r) => r.key).toSet();
+      var n = 0, size = 0, latest = 0;
+      for (final d in dirs) {
+        if (d.path == destDir || d.path == defaultMDest) continue;
+        for (final e in d.listSync().whereType<File>()) {
+          final b = baseName(e.path);
+          if (b.startsWith('.')) continue;
+          final fd = fileDate(e);
+          if (fd.isBefore(cutoff)) continue;
+          var isPdf = b.toLowerCase().trim().endsWith('.pdf');
+          if (!isPdf && !b.substring(b.lastIndexOf('.') + 1).contains(RegExp(r'[A-Za-z0-9]'))) {
+            isPdf = _hasPdfHeader(e);
+          }
+          if (!isPdf || _isAppReportName(b)) continue;
+          final len = e.lengthSync();
+          if (skipDone && have.contains('$b:$len')) continue; // اتفحص قبل كده
+          n++;
+          size += len;
+          final ms = fd.millisecondsSinceEpoch;
+          if (ms > latest) latest = ms;
+        }
+      }
+      return n == 0 ? '' : '$n:$size:$latest';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<void> _watchService(bool on) async {
+    try {
+      if (on) {
+        await _chan.invokeMethod('startKeepAlive', {'title': 'A2R POS', 'text': 'مراقبة الإيصالات الجديدة...'});
+      } else {
+        await stopKeepAliveSafe();
+      }
+    } catch (_) {}
+  }
+
+  void _startAuto() {
+    _autoTimer?.cancel();
+    _autoTimer = Timer.periodic(const Duration(seconds: 2), (_) => _autoTick());
+    _watchService(true);
+  }
+
+  void _stopAuto() {
+    _autoTimer?.cancel();
+    _autoTimer = null;
+    _watchService(homeAutoG);
+  }
+
+  String _lastDirSigM = '';
+  int _idleTicksM = 0;
+
+  String _dirSigM() {
+    try {
+      final dirs = pdfDir != null ? [Directory(pdfDir!)] : findWhatsAppDocDirs();
+      return dirs.map((d) => '${d.path}:${d.statSync().modified.millisecondsSinceEpoch}').join('|');
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<void> _autoTick() async {
+    if (!mounted || !autoScan || busy || chainRunning || homeBusyG || quickBusyG) return;
+    final ds = _dirSigM();
+    if (ds.isNotEmpty && ds == _lastDirSigM && _pendSig.isEmpty && ++_idleTicksM < 15) return;
+    _idleTicksM = 0;
+    _lastDirSigM = ds;
+    final sig = _scanSig();
+    if (sig.isEmpty || sig == _doneSig) {
+      _pendSig = '';
+      return;
+    }
+    if (sig != _pendSig) {
+      _pendSig = sig; // لسه الملفات بتنزل: نستنى الدورة الجاية
+      return;
+    }
+    _pendSig = '';
+    await _liteCount();
+  }
+
+  Future<void> _setAuto(bool v) async {
+    machAutoG = v;
+    setState(() => autoScan = v);
+    final cfg = _readCfg();
+    cfg['autoScanM'] = v;
+    _writeCfg(cfg);
+    if (v) {
+      await ensureNotifPerm(context);
+      try {
+        final st = await Permission.manageExternalStorage.status;
+        if (!st.isGranted) await Permission.manageExternalStorage.request();
+      } catch (_) {}
+      await askBatteryExempt();
+      if (!mounted || !autoScan) return;
+      _doneSig = _scanSig(); // الملفات الموجودة دلوقتي مش هتتفحص تلقائي، الجديد بس
+      _pendSig = '';
+      _startAuto();
+      setState(() => status = 'الفحص التلقائي الخفيف شغال: أي PDF جديد هيتعدّ لوحده وهيجيلك إشعار بالنتيجة.');
+    } else {
+      _stopAuto();
+    }
+  }
+
+  // ───── الفحص الخفيف: بيعدّ الملفات الجديدة بس (تسمية + عدّ) ويبعتلك إشعار، من غير ما يلمس القديم ───────
+  List<MResult> _liteNew = <MResult>[];
+
+  Future<void> _liteCount() async {
+    if (quickBusyG || busy) return;
+    quickBusyG = true;
+    _liteNew = <MResult>[];
+    _doneSig = _scanSig();
+    try {
+      await start(count: true, lite: true);
+    } catch (e) {
+      _dbg('LITE_M_FAIL $e');
+    } finally {
+      quickBusyG = false;
+    }
+    if (!mounted || !autoScan) return;
+    final lines = <String>[];
+    String? openKey;
+    var openBad = false;
+    for (final r in _liteNew) {
+      final l = _liteLine(r);
+      if (l != null) {
+        lines.add(l);
+        final isBad = l.startsWith('⚠️');
+        if (openKey == null || (isBad && !openBad)) {
+          openKey = r.key;
+          openBad = isBad;
+        }
+      }
+    }
+    if (lines.isNotEmpty) await _liteNotify(lines, openKey: openKey);
+  }
+
+  String? _liteLine(MResult r) {
+    if (r.excluded) return null;
+    final nm = r.newName ?? r.pdfName;
+    final why = <String>[];
+    if (r.pending) why.add('لسه ما اتعدّش');
+    if (!r.ok) why.addAll(r.notes.take(2));
+    final d = _batchDiff(r);
+    if (d != null && d != 0) {
+      why.add(d > 0 ? 'ناقص $d عن عدد معاملات الباتش' : 'زيادة ${-d} عن عدد معاملات الباتش');
+    }
+    if (r.softWarn && why.isEmpty) why.add('فرق بسيط عن المتوقع - راجعه');
+    if (!r.ok && why.isEmpty) why.add(r.seqBad ? 'العدد مختلف عن تسلسل الإيصالات' : 'محتاج مراجعة');
+    final cnt = r.count >= 0 ? '${r.count} إيصال' : '';
+    if (why.isEmpty) return '✅ $nm: $cnt';
+    return '⚠️ $nm${cnt.isEmpty ? '' : ' ($cnt)'}: ${why.join('، ')}';
+  }
+
+  Future<void> _liteNotify(List<String> lines, {String? openKey}) async {
+    final text = lines.join('\n');
+    final bad = lines.any((l) => l.startsWith('⚠️'));
+    // داخل التطبيق: SnackBar لو التطبيق ظاهر، وإشعار التليفون دايماً (ظاهر أو لأ)
+    if (mounted && _life == AppLifecycleState.resumed) {
+      try {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: w.Text(tr(text)),
+          duration: Duration(seconds: bad ? 8 : 4),
+        ));
+      } catch (_) {}
+    }
+    await postAutoNotify(
+      tab: 'mach',
+      title: '${bad ? '⚠️' : '✅'} A2R POS - فحص إيصالات الدفع${lines.length > 1 ? ' (${lines.length} ملفات)' : ''}',
+      text: text,
+      bad: bad,
+      openKey: openKey,
+    );
+  }
+
+  // نفس زرار "فحص إيصالات الدفع": تسمية + عدّ كل الإيصالات (والتلقائي بيفحص الجديد بس)
+  List<MResult> _visibleResults() {
+    var l = results.where((r) => !reviewOnly || !r.ok).toList();
+    final q = _q.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      l = l
+          .where((r) => [r.newName ?? '', r.pdfName, '${r.orderNum ?? ''}'].any((t) => t.toLowerCase().contains(q)))
+          .toList();
+    }
+    switch (_sort) {
+      case 1:
+        _stableSort<MResult>(l, (a, b) => (a.orderNum ?? 999).compareTo(b.orderNum ?? 999));
+        break;
+      case 2:
+        _stableSort<MResult>(l, (a, b) => (_batchDiff(b)?.abs() ?? -1).compareTo(_batchDiff(a)?.abs() ?? -1));
+        break;
+      case 3:
+        _stableSort<MResult>(l, (a, b) => b.count.compareTo(a.count));
+        break;
+    }
+    return l;
+  }
+
+  Future<void> _startCountAll({bool auto = false}) async {
+    _doneSig = _scanSig();
+    if (!auto) {
+      for (final r in results) {
+        if (r.count <= 0 && r.verdict == 0) {
+          r.count = -1;
+          r.tries = 0; // من غير ده الملف اللي فشل قبل كده بيتخطّى على طول
+          r.cntNotes.clear();
+        }
+      }
+    }
+    await start(count: true);
+  }
+
+  // ملخص العد (نفس رسالة "اكتمل العد")
+  String _countLine() {
+    final pend = results.where((r) => r.pending).length;
+    final total = results.fold<int>(0, (a, r) => a + (r.count > 0 && !r.excluded ? r.count : 0));
+    final named = results.where((r) => r.newName != null && !r.excluded).length;
+    return '${results.length} ملف، $named اتسمّى، إجمالي $total إيصال${pend > 0 ? ' (فاضل $pend لسه)' : ''}';
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    pdfDir = loadPdfDir();
+    // الفحص الخفيف مقفول افتراضياً في كل تشغيل: مفيش مراقبة ولا خدمة خلفية إلا لما تفعّله بإيدك
+    autoScan = false;
+    machAutoG = false;
+    final cfgM = _readCfg();
+    if (cfgM['autoScanM'] == true) {
+      cfgM['autoScanM'] = false;
+      _writeCfg(cfgM);
+    }
+    machRunG = () => _startCountAll();
+    machSumG = _countLine;
+    openReqG.addListener(_onOpenReqM);
+    days = sharedDays.value;
+    sharedDays.addListener(_syncDays);
+    wipeSignal.addListener(_onWipe);
+    settingsResetSignal.addListener(_onSettingsReset);
+    closingTxn.addListener(_onClosing);
+    results.addAll(loadMState());
+    results.sort(_cmpM);
+    final pend = results.where((r) => r.pending).length;
+    if (results.isNotEmpty) {
+      status = pend > 0
+          ? 'فيه $pend ملف لسه ما اتعدّش. اضغط \"فحص إيصالات الدفع\" لما تحب.'
+          : 'آخر نتيجة: ${results.length} ملف.';
+    }
+  }
+
+  @override
+  void dispose() {
+    _autoTimer?.cancel();
+    machRunG = null;
+    machSumG = null;
+    machAutoG = false;
+    openReqG.removeListener(_onOpenReqM);
+    sharedDays.removeListener(_syncDays);
+    wipeSignal.removeListener(_onWipe);
+    settingsResetSignal.removeListener(_onSettingsReset);
+    closingTxn.removeListener(_onClosing);
+    WidgetsBinding.instance.removeObserver(this);
+    for (final r in results) {
+      r.ctl.dispose();
+    }
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      if (_c == null && !_starting) _start();
+    _life = state;
+    if (busy) _dbg('LIFECYCLE $state');
+  }
+
+  void _syncDays() {
+    if (!mounted || busy || days == sharedDays.value) return;
+    setState(() => days = sharedDays.value);
+  }
+
+  // "رجّع كل الإعدادات للافتراضي": الفولدرات والفترة والفحص التلقائي
+  void _onSettingsReset() {
+    if (!mounted) return;
+    if (autoScan) _setAuto(false);
+    setState(() {
+      pdfDir = null;
+      destDir = defaultMDest;
+      days = 0;
+    });
+  }
+
+  void _onWipe() {
+    if (!mounted) return;
+    for (final r in results) {
+      r.ctl.dispose();
+    }
+    setState(() {
+      results.clear();
+      progressValue = 0;
+      namingDone = false;
+      reviewOnly = false;
+      status = 'تم مسح كل حاجة. اضغط "فحص إيصالات الدفع" لبدء يوم جديد.';
+    });
+  }
+
+  void _onClosing() {
+    if (mounted) setState(() {});
+  }
+
+  void _onOpenReqM() {
+    final key = openKeyOf(openReqG.value, 'mach|');
+    if (key != null) _openByKeyM(key, 0);
+  }
+
+  Future<void> _openByKeyM(String key, int tries) async {
+    if (!mounted) return;
+    MResult? it;
+    for (final r in results) {
+      if (r.key == key) {
+        it = r;
+        break;
+      }
+    }
+    if (it == null || busy) {
+      if (tries < 15) {
+        await Future.delayed(const Duration(milliseconds: 600));
+        return _openByKeyM(key, tries + 1);
+      }
       return;
     }
-    final c = _c;
-    if (c == null) return;
-    if (state == AppLifecycleState.inactive) {
-      _c = null;
-      _live = false;
-      _liveQuad = null;
-      c.dispose();
-      if (mounted) setState(() => _ready = false);
+    await openPdf(it.openPath);
+  }
+
+  Future<void> openPdf(String? path) async {
+    if (path == null || !File(path).existsSync()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('الملف مش موجود.')),
+      );
+      return;
+    }
+    try {
+      final ok = await _chan.invokeMethod<bool>('openFile', {'path': path, 'mime': 'application/pdf'});
+      if (ok == true) return;
+    } catch (_) {}
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('مفيش برنامج يفتح الـ PDF.')),
+    );
+  }
+
+  Future<void> pickDir() async {
+    final perm = await Permission.manageExternalStorage.request();
+    if (!perm.isGranted) {
+      setState(() => status = 'لازم تسمح بالوصول لكل الملفات الأول.');
+      return;
+    }
+    if (!mounted) return;
+    final res = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => FolderPicker(start: pdfDir ?? root)),
+    );
+    if (res != null) {
+      savePdfDir(res);
+      setState(() => pdfDir = res);
     }
   }
 
-  Future<void> _start() async {
-    if (_starting) return;
-    _starting = true;
+  Future<void> pickManualPdfs() async {
     try {
-      final old = _c;
-      _c = null;
-      _live = false;
-      _liveQuad = null;
-      if (mounted) setState(() => _ready = false);
-      await old?.dispose();
-      final cams = await cam.availableCameras();
-      if (cams.isEmpty) throw Exception('مفيش كاميرا على الجهاز');
-      final back = cams.firstWhere((x) => x.lensDirection == cam.CameraLensDirection.back,
-          orElse: () => cams.first);
-      final perf = await Store.perfMode();
-      final slow = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
-      // الصورة بتتحفظ بحد أقصى 800/1400/2400، فمفيش داعي لـ 4K غير في الوضع "برو".
-      // الجهاز اللي التصوير فيه بطيء بيتنزّل له درجة تلقائياً.
-      late final cam.ResolutionPreset preset;
-      if (perf == PerfMode.pro) {
-        preset = _hd && !slow ? cam.ResolutionPreset.ultraHigh : cam.ResolutionPreset.veryHigh;
-      } else if (perf == PerfMode.balanced) {
-        preset = _hd && !slow ? cam.ResolutionPreset.veryHigh : cam.ResolutionPreset.high;
-      } else {
-        preset = cam.ResolutionPreset.high;
-      }
-      // YUV420 عشان نقدر نحلل الإطارات للتحديد الحي (التصوير نفسه لسه JPEG)
-      final c = cam.CameraController(back, preset,
-          enableAudio: false,
-          imageFormatGroup:
-              Platform.isAndroid ? cam.ImageFormatGroup.yuv420 : cam.ImageFormatGroup.bgra8888);
-      await c.initialize();
-      try {
-        await c.lockCaptureOrientation(DeviceOrientation.portraitUp);
-      } catch (_) {}
-      await _applyFlash(c);
-      try {
-        await c.setFocusMode(cam.FocusMode.auto);
-      } catch (_) {}
-      _minZoom = await c.getMinZoomLevel();
-      _maxZoom = math.min(await c.getMaxZoomLevel(), 6.0);
-      _zoom = _minZoom;
-      if (!mounted) {
-        await c.dispose();
+      final paths = await pickFilesViaChooser(context,
+          mime: 'application/pdf', title: 'اختر تطبيق الملفات', prefKey: 'defPdf');
+      if (paths == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: w.Text('منتقي الملفات مش متاح في النسخة دي (الجزء الـ native ناقص).')),
+          );
+        }
         return;
       }
-      setState(() {
-        _c = c;
-        _ready = true;
-        _err = null;
-      });
-      unawaited(_startLive(c));
-    } catch (e, st) {
-      AppLog.e('cam.start', e, st);
-      if (mounted) setState(() => _err = errText(e));
-    } finally {
-      _starting = false;
+      if (paths.isNotEmpty) await start(manualPaths: paths);
+    } catch (e) {
+      _dbg('pickManualPdfs error: $e');
     }
   }
 
-  Future<void> _startLive(cam.CameraController c) async {
-    if (_live || !mounted || !c.value.isInitialized || c.value.isStreamingImages) return;
-    try {
-      if (await Store.perfMode() == PerfMode.lite) return;
-      _liveMiss = 0;
-      await c.startImageStream(_onFrame);
-      _live = true;
-    } catch (e, st) {
-      AppLog.e('cam.live', e, st);
-    }
-  }
-
-  Future<void> _stopLive() async {
-    final c = _c;
-    _live = false;
-    _liveQuad = null;
-    if (c == null) return;
-    try {
-      if (c.value.isStreamingImages) await c.stopImageStream();
-    } catch (_) {}
-  }
-
-  void _onFrame(cam.CameraImage f) {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (!_live || _liveBusy || now - _lastLive < 200 || !mounted) return;
-    _liveBusy = true;
-    _lastLive = now;
-    try {
-      var q = _liveDetect(f, _c?.description.sensorOrientation ?? 90);
-      final prev = _liveQuad;
-      if (q == null) {
-        if (++_liveMiss <= 3) return; // نثبّت آخر تحديد شوية بدل ما يومض
-      } else {
-        _liveMiss = 0;
-        if (prev != null) {
-          q = [for (var i = 0; i < 4; i++) Offset.lerp(prev[i], q[i], 0.5)!];
-        }
-      }
-      if (mounted && _live) setState(() => _liveQuad = q);
-    } catch (e, st) {
-      AppLog.e('cam.liveFrame', e, st);
-    } finally {
-      _liveBusy = false;
-    }
-  }
-
-  Future<void> _applyFlash(cam.CameraController c) async {
-    try {
-      await c.setFlashMode(const [
-        cam.FlashMode.off,
-        cam.FlashMode.auto,
-        cam.FlashMode.always,
-        cam.FlashMode.torch,
-      ][_flash]);
-    } catch (_) {}
-  }
-
-  Future<void> _toggleGrid() async {
-    HapticFeedback.selectionClick();
-    setState(() => _grid = !_grid);
-    try {
-      (await SharedPreferences.getInstance()).setBool('camGrid', _grid);
-    } catch (_) {}
-  }
-
-  Future<void> _cycleFlash() async {
-    final c = _c;
-    if (c == null) return;
-    HapticFeedback.selectionClick();
-    setState(() => _flash = (_flash + 1) % 4);
-    await _applyFlash(c);
-    try {
-      (await SharedPreferences.getInstance()).setInt('camFlash', _flash);
-    } catch (_) {}
-    if (mounted) snack(context, _flashNames[_flash]);
-  }
-
-  Future<void> _toggleHd() async {
-    HapticFeedback.selectionClick();
-    setState(() => _hd = !_hd);
-    try {
-      final sp = await SharedPreferences.getInstance();
-      await sp.setBool('camHd', _hd);
-      await sp.remove('camSlow'); // اختيار الموظف بيلغي التنزيل التلقائي
-    } catch (_) {}
-    await _start();
-  }
-
-  void _apply(A2RCamState? s) {
-    if (s == null || !mounted) return;
-    if (s.close) {
-      Navigator.pop(context);
+  Future<void> pickOut() async {
+    final perm = await Permission.manageExternalStorage.request();
+    if (!perm.isGranted) {
+      setState(() => status = 'لازم تسمح بالوصول لكل الملفات الأول.');
       return;
     }
-    setState(() {
-      _count = s.count;
-      _thumb = s.thumb;
-    });
+    if (!mounted) return;
+    final res = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => FolderPicker(start: destDir)),
+    );
+    if (res != null) {
+      try {
+        final t = File('$res/.write_test')..writeAsStringSync('x');
+        t.deleteSync();
+      } catch (_) {
+        setState(() => status = 'مش قادر أكتب في الفولدر ده: $res');
+        return;
+      }
+      saveMOut(res);
+      setState(() => destDir = res);
+    }
   }
 
-  Future<void> _shot() async {
-    final c = _c;
-    if (c == null || !c.value.isInitialized || _shooting) return;
-    setState(() => _shooting = true);
+  void useDefaultOut() {
+    saveMOut(null);
+    setState(() => destDir = defaultMDest);
+  }
+
+  Future<void> openDest() async {
     try {
-      HapticFeedback.mediumImpact();
-      final lq = _liveQuad;
-      _shotQuad = lq == null ? null : List<Offset>.of(lq);
-      final swShot = Stopwatch()..start();
-      await _stopLive();
-      final x = await c.takePicture();
-      final shotMs = swShot.elapsedMilliseconds;
-      AppLog.i('t takePicture ${shotMs}ms');
-      if (shotMs > 2500) {
+      Directory(destDir).createSync(recursive: true);
+    } catch (_) {}
+    try {
+      if (await chooseAndOpenFolder(context, destDir)) return;
+    } catch (_) {}
+    await Clipboard.setData(ClipboardData(text: destDir));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('مقدرتش أفتح الفولدر. المسار اتنسخ: $destDir')),
+    );
+  }
+
+  // مسار الملف الفعلي للنقل: الملف المسمّى لو موجود، وإلا الأصلي (ملفات فيها مشكلة وما اتسمّتش)
+  String? _transferPathOf(MResult r) {
+    final op = r.openPath;
+    if (op != null && File(op).existsSync()) return op;
+    if (r.srcPath.isNotEmpty && File(r.srcPath).existsSync()) return r.srcPath;
+    return null;
+  }
+
+  // نقل كل ملفات الدفع (حتى اللي فيها مشكلة أو لسه متسمّتش) ما عدا المستبعد، لفولدر بتاريخ اليوم
+  Future<void> transferGood() async {
+    final items = <MResult, String>{};
+    for (final r in results) {
+      if (r.excluded) continue;
+      final p = _transferPathOf(r);
+      if (p != null) items[r] = p;
+    }
+    // النسخ متاح بعد التسمية (حتى لو العد شغال)، والنقل بس بعد ما العد يخلص
+    final countDone = !busy && !results.any((r) => !r.excluded && r.pending);
+    final moved = await transferFilesViaPicker(context, items.values.toSet().toList(), allowMove: countDone);
+    if (moved == null || moved.isEmpty || !mounted) return;
+    items.forEach((r, p) {
+      final np = moved[p];
+      if (np == null) return;
+      if (File(p).existsSync()) return; // نسخ: الأصل لسه موجود فالمسارات ما تتغيرش
+      if (r.srcPath == p) r.srcPath = np;
+      r.openPath = np;
+    });
+    saveMState(results);
+    setState(() {});
+  }
+
+  // ───── المشاركة: كل الملفات مرة واحدة، أو ملف ملف ─────
+  Future<void> shareAll() async {
+    final files = results
+        .where((r) => !r.excluded && r.newName != null && r.openPath != null && File(r.openPath!).existsSync())
+        .map((r) => XFile(r.openPath!, mimeType: 'application/pdf'))
+        .toList();
+    if (files.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('مفيش ملفات مسمّاة لمشاركتها.')),
+      );
+      return;
+    }
+    if (!await confirmSend(context,
+        review: results.where((r) => !r.ok).length,
+        missing: missingMachines().length,
+        pending: results.where((r) => r.pending).length)) {
+      return;
+    }
+    await Share.shareXFiles(files, text: 'إيصالات الدفع (${files.length} ملف)');
+  }
+
+  // صح = يفضل مع ملفات اليوم، غلط = يتشال من الإرسال والعد والفولدر. الضغط تاني بيلغي الاختيار
+  void setVerdict(MResult r, int v, {bool toggle = true}) {
+    final nv = (toggle && r.verdict == v) ? 0 : v;
+    final wasExcluded = r.excluded;
+    r.verdict = nv;
+    final op = r.openPath;
+    try {
+      if (nv < 0 && !wasExcluded) {
+        // مسح النسخة المتسمية بس (مش الأصلي أبداً)
+        if (op != null && op != r.srcPath && op.startsWith(destDir)) File(op).deleteSync();
+      } else if (nv >= 0 && wasExcluded && r.newName != null) {
+        final src = File(r.srcPath);
+        if (op != null && op != r.srcPath && src.existsSync()) {
+          if (File(op).existsSync()) {
+            r.openPath = r.srcPath; // فيه ملف تاني واخد الاسم ده
+          } else {
+            Directory(File(op).parent.path).createSync(recursive: true);
+            src.copySync(op);
+          }
+        }
+      }
+    } catch (_) {}
+    saveMState(results);
+    setState(() {});
+    // علّمته صح بس التطبيق مش عارف ماكينته: اسأل عليها وسمّيه وعدّه
+    if (nv > 0 && r.newName == null && r.tidUsed == null && !busy) assignMachine(r);
+  }
+
+  // تحديد الماكينة بإيدك لملف مش معروف: بيتسمّى وبيتعدّ وبيدخل في إيصالات اليوم
+  Future<void> assignMachine(MResult r) async {
+    if (busy) return;
+    int? guess = r.orderNum;
+    guess ??= int.tryParse(RegExp(r'^\s*(\d{1,2})').firstMatch(r.pdfName)?.group(1) ?? '');
+    if (guess != null && (guess < 1 || guess > machineCount)) guess = null;
+    int? sel = guess;
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => AlertDialog(
+          title: const Text('ده إيصال أنهي ماكينة؟'),
+          content: DropdownButton<int>(
+            isExpanded: true,
+            value: sel,
+            hint: const Text('اختار الماكينة'),
+            items: [
+              for (var i = 1; i <= machineCount; i++)
+                DropdownMenuItem(
+                  value: i,
+                  child: Text('ماكينة $i - ${terminals[numToTid[i]]?.unitName ?? ''}${terminals[numToTid[i]]?.spare == true ? ' (احتياطي)' : ''}'),
+                ),
+            ],
+            onChanged: (v) => setS(() => sel = v),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+            FilledButton(
+              onPressed: sel == null ? null : () => Navigator.pop(ctx, sel),
+              child: const Text('تمام'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked == null) return;
+    final tid = numToTid[picked];
+    String? day = r.dayUsed, month = r.monthUsed;
+    if (day == null || month == null) {
+      // التاريخ من اسم الملف (آخر شكل 7.11)، وإلا تاريخ النهاردة
+      final ms = RegExp(r'(\d{1,2})\.(\d{1,2})').allMatches(r.pdfName).toList();
+      for (final m in ms.reversed) {
+        final d = int.parse(m.group(1)!), mo = int.parse(m.group(2)!);
+        if (d >= 1 && d <= 31 && mo >= 1 && mo <= 12) {
+          day = '$d';
+          month = '$mo';
+          break;
+        }
+      }
+      day ??= '${DateTime.now().day}';
+      month ??= '${DateTime.now().month}';
+    }
+    final srcF = File(r.srcPath).existsSync() ? File(r.srcPath) : File(r.openPath ?? r.srcPath);
+    try {
+      await _applyName(r, srcF, tid, day, month);
+    } catch (e) {
+      r.idOk = false;
+      r.idNotes.add('فشل التسمية: ${e.toString().split('\n').first}');
+    }
+    r.verdict = 1;
+    r.cntNotes.clear();
+    r.count = -1; // يتعدّ من جديد
+    r.tries = 0;
+    r.detail = '';
+    saveMState(results);
+    if (!mounted) return;
+    setState(() => status = 'اتسمّى ماكينة $picked. اضغط \"فحص إيصالات الدفع\" لعدّ إيصالاته.');
+  }
+
+  Future<void> markRestOk() async {
+    final list = results.where((r) => !r.ok).toList();
+    if (list.isEmpty) return;
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('الباقي صح'),
+        content: Text('هتعلّم ${list.length} ملف على إنهم صح؟'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('لا')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('تمام')),
+        ],
+      ),
+    );
+    if (yes != true) return;
+    for (final r in list) {
+      r.verdict = 1;
+    }
+    saveMState(results);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> shareOne(MResult r) async {
+    final p = r.openPath;
+    if (p == null || !File(p).existsSync()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('الملف مش موجود.')),
+      );
+      return;
+    }
+    await Share.shareXFiles([XFile(p, mimeType: 'application/pdf')],
+        text: r.newName ?? r.pdfName);
+  }
+
+  Future<void> clearAll() async {
+    if (results.isEmpty) {
+      setState(() => status = 'مفيش حاجة للمسح.');
+      return;
+    }
+    final mine = results.where((r) => r.newName != null && r.openPath != null).toList();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('مسح الكل'),
+        content: Text('هيتمسح ${mine.length} ملف مسمّى من:\n$destDir\n\n'
+            'وهتتمسح نتيجة الفحص. (ملفات واتساب الأصلية مش هتتمس)'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('مسح')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    var n = 0;
+    for (final r in mine) {
+      try {
+        if (r.openPath!.startsWith(destDir) || r.openPath!.startsWith(defaultMDest)) {
+          File(r.openPath!).deleteSync();
+          n++;
+        }
+      } catch (_) {}
+    }
+    for (final r in results) {
+      r.ctl.dispose();
+    }
+    results.clear();
+    saveMState(results);
+    setState(() => status = 'تم مسح $n ملف ونتيجة الفحص.');
+  }
+
+  // ───── التشغيل ─────
+  // lite = الفحص الخفيف: من غير أذونات ولا إبقاء الشاشة شغالة ولا تغيير نص الخدمة، ومبيعدّش غير الملفات الجديدة
+  Future<void> start({bool resumeOnly = false, bool count = false, List<String>? manualPaths, bool lite = false}) async {
+    if (busy) return;
+    if (!lite) await waitQuickIdle(); // لو الفحص الخفيف شغال نستناه يخلص
+    final granted = lite
+        ? await Permission.manageExternalStorage.isGranted
+        : (await Permission.manageExternalStorage.request()).isGranted;
+    if (!granted) {
+      if (!lite) setState(() => status = 'لازم تسمح بالوصول لكل الملفات الأول.');
+      return;
+    }
+    if (!lite) {
+      try {
+        await Permission.notification.request();
+      } catch (_) {}
+      try {
+        await _chan.invokeMethod(
+            'startKeepAlive', {'title': 'A2R POS', 'text': 'جاري فحص إيصالات الدفع...'});
+      } catch (_) {}
+      try {
+        await _chan.invokeMethod('keepScreenOn', {'on': true});
+      } catch (_) {}
+    }
+    final sw = Stopwatch()..start();
+    final logKind = chainRunning ? 'chain' : 'manual';
+    if (!lite) {
+      logScan(
+          tab: 'mach',
+          title: '▶ بدأ فحص إيصالات الدفع',
+          text: manualPaths != null ? 'ملفات محددة يدوياً (${manualPaths.length})' : (chainRunning ? 'ضمن الفحص الشامل' : ''),
+          kind: logKind);
+    }
+    try {
+      await _run(resumeOnly, count, manualPaths: manualPaths, lite: lite);
+    } finally {
+      sw.stop();
+      if (!lite) {
         try {
-          (await SharedPreferences.getInstance()).setBool('camSlow', true);
+          final first = status.split('\n').first;
+          if (status.startsWith('اتوقف')) {
+            logScan(tab: 'mach', title: '⏹ اتوقف فحص إيصالات الدفع', text: '$first\n⏱ ${fmtElapsed(sw.elapsed)}', kind: logKind);
+          } else {
+            final failedRun = first.startsWith('حصل خطأ');
+            logScan(
+                tab: 'mach',
+                title: '${failedRun ? '⚠️' : '✅'} انتهى فحص إيصالات الدفع',
+                text: '$first\n⏱ ${fmtElapsed(sw.elapsed)}',
+                bad: failedRun,
+                kind: logKind);
+          }
         } catch (_) {}
       }
-      try {
-        await c.pausePreview();
-      } catch (_) {}
-      final s = await widget.onShot(x.path);
-      AppLog.i('t shot+edit total ${swShot.elapsedMilliseconds}ms');
-      if (!mounted) return;
-      try {
-        await c.resumePreview();
-      } catch (_) {}
-      if (widget.single && s == null) return; // الموظف رجع من التعديل: يصوّر تاني
-      _apply(s);
-    } catch (e, st) {
-      AppLog.e('cam.shot', e, st);
-      if (mounted) snack(context, 'تعذر التصوير: ${errText(e)}');
-    } finally {
-      if (mounted) {
-        setState(() => _shooting = false);
-        final cc = _c;
-        if (cc != null) unawaited(_startLive(cc));
+      if (mounted && sw.elapsed.inSeconds >= 1 && _isFinalScanStatus(status)) {
+        setState(() => status = '$status\n⏱ الوقت المستغرق: ${fmtElapsed(sw.elapsed)}');
+      }
+      if (autoScan) {
+        await _watchService(true); // نفضل شغالين نراقب الملفات الجديدة
+      } else if (!chainRunning) {
+        await stopKeepAliveSafe(); // ما نقفلش الخدمة لو تاب التقفيل فيه فحص تلقائي
+      }
+      if (!lite && !chainRunning) {
+        try {
+          await _chan.invokeMethod('keepScreenOn', {'on': false});
+        } catch (_) {}
+      }
+      if (!lite && _life != AppLifecycleState.resumed && !chainRunning) {
+        final total = results.fold<int>(0, (a, r) => a + (r.count > 0 && !r.excluded ? r.count : 0));
+        try {
+          await _chan.invokeMethod('notify', {
+            'title': tr('A2R POS - انتهى فحص إيصالات الدفع'),
+            'text': tr('${results.length} ملف، $total إيصال • ⏱ ${fmtElapsed(sw.elapsed)}')
+          });
+        } catch (_) {}
       }
     }
   }
 
-  /// لو كاميرا التطبيق مش شغالة على الموبايل ده: كاميرا النظام بدالها.
-  Future<void> _systemCamera() async {
-    try {
-      final x = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 2000, imageQuality: 90);
-      if (x == null || !mounted) return;
-      _apply(await widget.onShot(x.path));
-    } catch (e, st) {
-      AppLog.e('cam.system', e, st);
-      if (mounted) snack(context, 'تعذر فتح الكاميرا');
-    }
-  }
-
-  Future<void> _gallery() async {
-    final g = widget.onGallery;
-    if (g == null) return;
-    final c = _c;
-    await _stopLive();
-    try {
-      await c?.pausePreview();
-    } catch (_) {}
-    final s = await g();
-    if (!mounted) return;
-    try {
-      await c?.resumePreview();
-    } catch (_) {}
-    if (c != null && identical(c, _c)) unawaited(_startLive(c));
-    _apply(s);
-  }
-
-  Future<void> _tapFocus(TapDownDetails d, Size box) async {
-    final c = _c;
-    if (c == null || !c.value.isInitialized) return;
-    final p = Offset(d.localPosition.dx / box.width, d.localPosition.dy / box.height);
-    setState(() => _focusAt = d.localPosition);
-    try {
-      await c.setFocusPoint(p);
-      await c.setExposurePoint(p);
-    } catch (_) {}
-    Future.delayed(const Duration(milliseconds: 900), () {
-      if (mounted) setState(() => _focusAt = null);
-    });
-  }
-
-  Widget _icon(IconData i, String label, VoidCallback? onTap, {bool on = false}) {
-    final col = on ? kAccent : Colors.white;
-    return InkResponse(
-      onTap: onTap,
-      radius: 32,
-      child: SizedBox(
-        width: 64,
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Icon(i, color: col, size: 28),
-          const SizedBox(height: 2),
-          Text(label, style: TextStyle(color: col, fontSize: 11), maxLines: 1),
-        ]),
-      ),
-    );
-  }
-
-  Widget _thumbBox() {
-    final t = _thumb;
-    return GestureDetector(
-      onTap: (_count > 0 && !_shooting) ? () => Navigator.pop(context) : null,
-      child: SizedBox(
-        width: 64,
-        height: 64,
-        child: Stack(clipBehavior: Clip.none, children: [
-          Positioned.fill(
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.white54, width: 1.5),
-                color: Colors.white10,
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: t != null
-                  ? Image.file(File(t), fit: BoxFit.cover, cacheWidth: 160, errorBuilder: (_, __, ___) => const SizedBox())
-                  : const Icon(Icons.photo_library_rounded, color: Colors.white38),
-            ),
-          ),
-          if (_count > 0)
-            Positioned(
-              top: -8,
-              left: -8,
-              child: Container(
-                constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
-                padding: const EdgeInsets.symmetric(horizontal: 6),
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: const Color(0xFFFF6A4D),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.black, width: 1.5),
-                ),
-                child: Text('$_count',
-                    style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
-              ),
-            ),
-        ]),
-      ),
-    );
-  }
-
-  Widget _preview() {
-    if (_err != null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            const Icon(Icons.no_photography_rounded, color: Colors.white54, size: 48),
-            const SizedBox(height: 12),
-            Text('كاميرا التطبيق مش شغالة على الموبايل ده\n$_err',
-                textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)),
-            const SizedBox(height: 16),
-            FilledButton(onPressed: _systemCamera, child: const Text('استخدم كاميرا النظام')),
-            TextButton(onPressed: _start, child: const Text('حاول تاني')),
-          ]),
-        ),
-      );
-    }
-    final c = _c;
-    if (!_ready || c == null || !c.value.isInitialized) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    return LayoutBuilder(builder: (ctx, cons) {
-      final box = Size(cons.maxWidth, cons.maxHeight);
-      final ar = 1 / c.value.aspectRatio; // عرض/طول في الوضع الرأسي
-      final pw0 = ar * 1000, ph0 = 1000.0;
-      final sc = math.min(box.width / pw0, box.height / ph0);
-      final pvW = pw0 * sc, pvH = ph0 * sc;
-      final pvL = (box.width - pvW) / 2, pvT = (box.height - pvH) / 2;
-      return GestureDetector(
-        onTapDown: (d) => _tapFocus(d, box),
-        onScaleStart: (_) => _zoom0 = _zoom,
-        onScaleUpdate: (d) async {
-          if (d.pointerCount < 2) return;
-          final z = (_zoom0 * d.scale).clamp(_minZoom, _maxZoom).toDouble();
-          if ((z - _zoom).abs() < 0.02) return;
-          _zoom = z;
-          try {
-            await c.setZoomLevel(z);
-          } catch (_) {}
-        },
-        child: Stack(alignment: Alignment.center, children: [
-          ClipRect(
-            child: FittedBox(
-              fit: BoxFit.contain,
-              child: SizedBox(width: ar * 1000, height: 1000, child: cam.CameraPreview(c)),
-            ),
-          ),
-          if (_grid) const Positioned.fill(child: IgnorePointer(child: CustomPaint(painter: _GridPainter()))),
-          if (_liveQuad != null)
-            Positioned(
-              left: pvL,
-              top: pvT,
-              width: pvW,
-              height: pvH,
-              child: IgnorePointer(child: CustomPaint(painter: _LiveQuadPainter(_liveQuad!))),
-            ),
-          if (_focusAt != null)
-            Positioned(
-              left: _focusAt!.dx - 30,
-              top: _focusAt!.dy - 30,
-              child: IgnorePointer(
-                child: Container(
-                  width: 60,
-                  height: 60,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: kAccent, width: 2),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                ),
-              ),
-            ),
-        ]),
-      );
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Directionality(
-      textDirection: TextDirection.ltr,
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: SafeArea(
-          child: Column(children: [
-            Expanded(child: _preview()),
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Text(widget.title,
-                  style: TextStyle(color: kAccent, fontSize: 15, fontWeight: FontWeight.w600)),
-            ),
-            // صف الأيقونات: إغلاق، فلاش، جودة، معرض
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
-              child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                _icon(Icons.close_rounded, 'إغلاق', () => Navigator.pop(context)),
-                _icon(_flashIcons[_flash], 'فلاش', _cycleFlash, on: _flash != 0),
-                _icon(Icons.hd_rounded, _hd ? 'جودة عالية' : 'جودة عادية', _toggleHd, on: _hd),
-                _icon(Icons.grid_3x3_rounded, 'شبكة', _toggleGrid, on: _grid),
-                if (widget.onGallery != null) _icon(Icons.photo_library_rounded, 'معرض', _gallery),
-              ]),
-            ),
-            // صف التصوير: المصغّرة بالعداد، الزر، تم
-            Padding(
-              padding: const EdgeInsets.fromLTRB(28, 14, 28, 18),
-              child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                _thumbBox(),
-                GestureDetector(
-                  onTap: _shot,
-                  child: Container(
-                    width: 78,
-                    height: 78,
-                    padding: const EdgeInsets.all(5),
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      border: Border.all(color: kAccent, width: 4),
-                    ),
-                    child: Container(
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: _shooting ? Colors.white54 : Colors.white,
-                      ),
-                    ),
-                  ),
-                ),
-                SizedBox(
-                  width: 64,
-                  child: (!widget.single && _count > 0)
-                      ? InkResponse(
-                          onTap: _shooting ? null : () => Navigator.pop(context),
-                          radius: 36,
-                          child: Container(
-                            height: 48,
-                            decoration: BoxDecoration(
-                                color: kAccent, borderRadius: BorderRadius.circular(10)),
-                            child: Icon(Icons.check_rounded, color: pal.onAccent, size: 30),
-                          ),
-                        )
-                      : const SizedBox(),
-                ),
-              ]),
-            ),
-          ]),
-        ),
-      ),
-    );
-  }
-}
-
-class ReceiptsScreen extends StatefulWidget {
-  final Session session;
-  const ReceiptsScreen({super.key, required this.session});
-  @override
-  State<ReceiptsScreen> createState() => _ReceiptsScreenState();
-}
-
-class _ReceiptsScreenState extends State<ReceiptsScreen> {
-  List<String> imgs = [];
-  Tag? tag;
-  File? built;
-  bool busy = false;
-  bool loaded = false;
-  bool continuous = true;
-  ScanFilter filter = ScanFilter.receipt;
-  String? progress;
-  final Set<String> noTags = {}; // إيصالات من غير ورقة
-
-  Future<void> _toggleTag(String path) async {
-    final hide = !noTags.contains(path);
-    await Store.setNoTag(path, hide);
-    if (built != null) await Store.clearPdf(); // الـ PDF القديم مبقاش مظبوط
-    if (!mounted) return;
+  Future<void> _run(bool resumeOnly, bool count, {List<String>? manualPaths, bool lite = false}) async {
+    await prepareDefaultFiles();
     setState(() {
-      if (hide) {
-        noTags.add(path);
-      } else {
-        noTags.remove(path);
-      }
-      built = null;
+      busy = true;
+      stopReq = false;
+      progressValue = 0;
+      status = 'جاري البحث عن ملفات PDF...';
     });
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    final d = await Store.draft();
-    final t = await receiptTag(1000, widget.session);
-    final f = await Store.pdf();
-    final used = await Store.pdfImgs();
-    final fl = await Store.filter();
-    final co = await Store.continuous();
-    final nts = <String>{};
-    for (final x in d) {
-      if (await Store.noTag(x)) nts.add(x);
-    }
-    File? b;
-    if (f != null && d.isNotEmpty && used.length == d.length) {
-      var same = true;
-      for (var i = 0; i < d.length; i++) {
-        if (d[i] != used[i]) same = false;
-      }
-      if (same) b = f.file;
-    }
-    if (!mounted) return;
-    setState(() {
-      noTags
-        ..clear()
-        ..addAll(nts);
-      imgs = d;
-      tag = t;
-      built = b;
-      filter = fl;
-      continuous = co;
-      loaded = true;
-    });
-    final lost = await takeLostPick('receipts');
-    if (lost != null && mounted) {
-      await _saveAll([lost]);
-      _lastScanManual = true;
-      if (mounted && imgs.isNotEmpty) await _edit(imgs.length - 1, tab: 2);
-      return;
-    }
-    if (d.isEmpty && mounted) await _chooseSource();
-  }
-
-  /// أول ما تفتح إيصالات الدفع وهي فاضية: اختار كاميرا ولا معرض.
-  Future<void> _chooseSource() async {
-    final c = await showModalBottomSheet<String>(
-      context: context,
-      showDragHandle: true,
-      builder: (ctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          ListTile(
-            leading: const Icon(Icons.add_a_photo_rounded),
-            title: const Text('كاميرا'),
-            onTap: () => Navigator.pop(ctx, 'camera'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.photo_library_rounded),
-            title: const Text('معرض'),
-            onTap: () => Navigator.pop(ctx, 'gallery'),
-          ),
-          const SizedBox(height: 8),
-        ]),
-      ),
-    );
-    if (!mounted) return;
-    if (c == 'camera') {
-      await _add();
-    } else if (c == 'gallery') {
-      await _addGallery();
-    }
-  }
-
-  A2RCamState _camState({bool close = false}) =>
-      A2RCamState(count: imgs.length, thumb: imgs.isEmpty ? null : imgs.last, close: close);
-
-  /// كاميرا التطبيق (شكل كام اسكنر): كل صورة بتتحفظ وتتفتح للتعديل، والكاميرا تفضل مفتوحة والعداد بيزيد.
-  Future<void> _add() async {
-    if (!await ensureCamera(context)) return;
-    if (!mounted) return;
-    await Navigator.push<void>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => A2RCameraScreen(
-          title: 'إيصالات الدفع',
-          single: !continuous,
-          count: imgs.length,
-          thumb: imgs.isEmpty ? null : imgs.last,
-          onShot: (p) async {
-            _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
-            final before = imgs.length;
-            await _saveAll([p]);
-            if (mounted && imgs.length > before) {
-              final retake = await _edit(imgs.length - 1, tab: 2, fromCam: true);
-              if (retake && mounted) return _camState(); // إعادة أخذ: الصفحة اتمسحت والكاميرا مفتوحة
-            }
-            return _camState(close: !continuous && imgs.length > before);
-          },
-          onGallery: () async {
-            await _addGallery();
-            return _camState();
-          },
-        ),
-      ),
-    );
-  }
-
-  /// من المعرض: منتقي الصور بتاع النظام مباشرة وتقدر تحدد أكتر من صورة.
-  /// كل صورة بتتحفظ الأول، وبعدين شاشة التعديل بتفتح لكل واحدة (ارجع لتتخطاها وتفضل محفوظة).
-  Future<void> _addGallery() async {
-    await markPickTarget('receipts');
-    List<XFile> xs;
     try {
-      xs = await ImagePicker().pickMultiImage(maxWidth: 2000, imageQuality: 90);
+      Directory(destDir).createSync(recursive: true);
+      Directory(mTmpDir).createSync(recursive: true);
+    } catch (_) {}
+
+    var rec = TextRecognizer(script: TextRecognitionScript.latin);
+    var recClosed = false;
+    Future<void> closeRec() async {
+      if (recClosed) return;
+      recClosed = true;
+      try {
+        await rec.close();
+      } catch (_) {}
+    }
+
+    String? idle;
+    String? crashed;
+    try {
+      // المرحلة 1 (سريعة): تعريف الوحدة وتسمية كل الملفات
+      try {
+        final lf = File('$baseDir/id_debug.txt');
+        if (!resumeOnly && lf.existsSync() && lf.lengthSync() > 300000) lf.deleteSync();
+      } catch (_) {}
+      _dbg('PHASE1 start resumeOnly=$resumeOnly');
+      namingDone = resumeOnly;
+      final beforeKeys = results.map((r) => r.key).toSet();
+      if (!resumeOnly) idle = await _identifyAll(rec, manualPaths: manualPaths);
+      if (lite) _liteNew = results.where((r) => !beforeKeys.contains(r.key)).toList();
+      _dbg('PHASE1 done');
+      if (mounted) setState(() => namingDone = true);
+
+      await closeRec();
+
+      // المرحلة 2 (بطيئة): عدّ الإيصالات جوه كل ملف
+      if (count) {
+        _dbg('PHASE2 start');
+        rec = TextRecognizer(script: TextRecognitionScript.latin);
+        recClosed = false;
+        await _countAll(rec, only: lite ? _liteNew.toSet() : null);
+        _dbg('PHASE2 done');
+      }
+      _flagDuplicates();
     } catch (e, st) {
-      AppLog.e('_addGallery', e, st);
-      if (mounted) snack(context, 'تعذر فتح المعرض');
-      return;
-    }
-    if (xs.isEmpty || !mounted) return;
-    _lastScanManual = true; // صور من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
-    final start = imgs.length;
-    await _saveAll(xs.map((e) => e.path).toList());
-    for (var i = start; i < imgs.length; i++) {
-      if (!mounted) break;
-      await _edit(i, tab: 2);
-    }
-  }
-
-  Future<void> _saveAll(List<String> r) async {
-    setState(() => busy = true);
-    var added = 0;
-    try {
-      for (final p in r) {
-        final saved = await persistImage(
-            p, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
-            filter: filter);
-        await Store.addToDraft(saved);
-        imgs.add(saved);
-        added++;
-      }
-      built = null;
-      HapticFeedback.lightImpact();
-      if (imgs.isNotEmpty) {
-        unawaited(qualityWarning(imgs.last).then((warn) {
-          if (warn != null && mounted) snack(context, warn);
-        }));
-      }
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+      // أي خطأ غير متوقع: نسجّله ونفك حالة "busy" علشان الزرار ما يفضلش واقف
+      crashed = e.toString().split('\n').first;
+      _dbg('RUN_ERROR $e\n$st');
     } finally {
-      if (mounted) setState(() => busy = false);
+      await closeRec();
+      _curLabel = '';
+      try {
+        Directory(mTmpDir).deleteSync(recursive: true);
+      } catch (_) {}
     }
-    if (added > 0 && mounted && r.length > 1) snack(context, 'اتضاف $added إيصال');
-  }
-
-  /// مسح مع "تراجع": الملف بيتمسح فعلاً بعد ما الرسالة تختفي من غير ما تضغط تراجع.
-  Future<void> _remove(int i) async {
-    if (i < 0 || i >= imgs.length) return;
-    final path = imgs[i];
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.hideCurrentSnackBar();
-    await Store.unlistFromDraft(path);
+    results.sort(_cmpM);
+    saveMState(results);
+    final pend = results.where((r) => r.pending).length;
+    final total = results.fold<int>(0, (a, r) => a + (r.count > 0 && !r.excluded ? r.count : 0));
+    final named = results.where((r) => r.newName != null && !r.excluded).length;
     if (!mounted) {
-      await Store.del(path);
+      busy = false;
       return;
     }
     setState(() {
-      imgs.remove(path);
-      built = null;
-    });
-    final ctrl = messenger.showSnackBar(SnackBar(
-      content: const Text('اتمسح الإيصال'),
-      duration: const Duration(seconds: 6),
-      action: SnackBarAction(
-        label: 'تراجع',
-        onPressed: () async {
-          await Store.relistInDraft(path, i);
-          if (!mounted) return;
-          setState(() {
-            if (!imgs.contains(path)) imgs.insert(i.clamp(0, imgs.length), path);
-            built = null;
-          });
-        },
-      ),
-    ));
-    final reason = await ctrl.closed;
-    if (reason != SnackBarClosedReason.action) await Store.del(path);
-  }
-
-  Future<void> _reorder(int oldI, int newI) async {
-    if (newI > oldI) newI -= 1;
-    setState(() {
-      final x = imgs.removeAt(oldI);
-      imgs.insert(newI, x);
-      built = null;
-    });
-    await Store.setDraft(imgs);
-  }
-
-  Future<void> _create() async {
-    setState(() {
-      busy = true;
-      progress = '0/${imgs.length}';
-    });
-    try {
-      final f = await buildReceiptsPdf(widget.session, imgs, onProgress: (d, t) {
-        if (mounted) setState(() => progress = '$d/$t');
-      });
-      await Store.setPdf(f, List.of(imgs));
-      HapticFeedback.mediumImpact();
-      if (mounted) setState(() => built = f);
-    } catch (e) {
-      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-    } finally {
-      if (mounted) {
-        setState(() {
-          busy = false;
-          progress = null;
-        });
+      busy = false;
+      progressValue = 0;
+      if (crashed != null) {
+        status = 'حصل خطأ أثناء الفحص ($crashed). اتحفظ اللي خلص، اضغط \"فحص إيصالات الدفع\" وهيكمّل من مكانه.';
+      } else if (stopReq) {
+        status = 'اتوقف. فاضل $pend ملف لسه ما اتعدّش، اضغط "فحص إيصالات الدفع" وهيكمّل من مكانه.';
+      } else if (results.isEmpty && idle != null) {
+        status = idle;
+      } else if (!count) {
+        status = 'تمت التسمية: ${results.length} ملف، $named اتسمّى واتنسخ.'
+            '${pend > 0 ? ' اضغط \"فحص إيصالات الدفع\" لعدّ إيصالات $pend ملف.' : ''}';
+      } else {
+        status = 'اكتمل العد: ${results.length} ملف، $named اتسمّى، إجمالي $total إيصال.'
+            '${pend > 0 ? ' (فاضل $pend لسه)' : ''}';
       }
-    }
-  }
-
-  /// ضغطة واحدة: يجهّز الـ PDF وبعدها يفتح شاشة المعاينة (مشاركة PDF / مشاركة صور).
-  Future<void> _createAndSend() async {
-    await _create();
-    if (!mounted || built == null) return;
-    await _send();
-  }
-
-  Future<void> _send() async {
-    final f = built;
-    if (f == null) return;
-    final done = await Navigator.push<bool>(
-        context,
-        MaterialPageRoute(
-            builder: (_) =>
-                PdfResultScreen(session: widget.session, pdf: f, imgs: List.of(imgs))));
-    if (done == true && mounted) Navigator.pop(context);
-  }
-
-  /// تطبيق الفلتر والسطوع والتباين والحدة على كل الصفحات (القص والتدوير بتاع كل صفحة زي ما هما).
-  Future<void> _applyToAll(EditParams style, String exceptPath) async {
-    if (!mounted) return;
-    setState(() {
-      busy = true;
-      progress = '0/${imgs.length}';
     });
-    var failed = 0;
-    try {
-      for (var i = 0; i < imgs.length; i++) {
-        final p = imgs[i];
-        if (p == exceptPath) continue;
-        if (mounted) setState(() => progress = '${i + 1}/${imgs.length}');
-        try {
-          final old = await Store.editOf(p);
-          final ep = EditParams(
-            quad: old?.quad,
-            turns: old?.turns ?? 0,
-            angle: old?.angle ?? 0,
-            filter: style.filter,
-            contrast: style.contrast,
-            brightness: style.brightness,
-            sharp: style.sharp,
-          );
-          final np = await renderEditedPage(p, 'r_', ep);
-          await Store.replaceInDraft(p, np);
-          if (mounted) {
-            setState(() {
-              imgs[i] = np;
-              built = null;
-            });
+  }
+
+  // بيرجّع رسالة لو مفيش حاجة جديدة يفحصها
+  Future<String?> _identifyAll(TextRecognizer rec, {List<String>? manualPaths}) async {
+    final dirs = pdfDir != null ? [Directory(pdfDir!)] : findWhatsAppDocDirs();
+    if (manualPaths != null) dirs.clear();
+    final now = DateTime.now();
+    final cutoff = days < 0
+        ? DateTime(2000)
+        : DateTime(now.year, now.month, now.day).subtract(Duration(days: days));
+    final have = results.map((r) => r.key).toSet();
+    _dbg('DIRS: ${dirs.map((d) => d.path).join(' | ')}');
+    final pdfs = <File>[];
+    var skipped = 0;
+    for (final d in dirs) {
+      if (d.path == destDir || d.path == defaultMDest) continue; // ناتج التطبيق نفسه
+      try {
+        for (final e in d.listSync().whereType<File>()) {
+          final n = baseName(e.path);
+          final fd = fileDate(e);
+          var isPdf = n.toLowerCase().trim().endsWith('.pdf');
+          if (!isPdf && !fd.isBefore(cutoff) && !n.substring(n.lastIndexOf('.') + 1).contains(RegExp(r'[A-Za-z0-9]'))) {
+            isPdf = _hasPdfHeader(e); // ملفات واتساب DOC-... من غير امتداد
           }
-        } catch (e, st) {
-          failed++;
-          AppLog.e('applyToAll', e, st);
+          if (!isPdf) {
+            if (!fd.isBefore(cutoff)) _dbg('SKIP(مش PDF) $n  size=${e.lengthSync()}');
+            continue;
+          }
+          // إخراج التقفيل بتاع التطبيق بس (الاسكندريه 5.11.pdf)، أي اسم تاني بيتفحص عادي
+          if (_isAppReportName(n)) {
+            _dbg('SKIP(تقرير التطبيق) $n');
+            continue;
+          }
+          if (fd.isBefore(cutoff)) {
+            if (fd.isAfter(cutoff.subtract(const Duration(days: 14)))) {
+              _dbg('SKIP(أقدم من الفترة: $fd) $n');
+            }
+            continue;
+          }
+          if (have.contains('$n:${e.lengthSync()}') && skipDone) {
+            skipped++;
+            _dbg('SKIP(اتفحص قبل كده) $n');
+            continue;
+          }
+          pdfs.add(e);
         }
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          busy = false;
-          progress = null;
-        });
+      } catch (_) {}
+    }
+    pdfs.sort((a, b) => baseName(a.path).compareTo(baseName(b.path)));
+    if (manualPaths != null) pdfs.addAll(manualPaths.map((p) => File(p)));
+    if (pdfs.isEmpty) {
+      if (dirs.isEmpty) return 'مش لاقي فولدر مستندات واتساب. اختار فولدر بإيدك.';
+      return skipped > 0
+          ? 'كل الملفات في الفترة دي اتفحصت قبل كده ($skipped ملف).'
+          : 'مفيش ملفات PDF في الفترة دي.';
+    }
+    // امسح كل النتايج/النسخ القديمة للملفات اللي هنفحصها دلوقتي *قبل* التسمية،
+    // علشان أسماء قديمة متعملش تضارب وتطلّع "_2" من غير ما يكون فيه ملف مكرر.
+    for (final pf in pdfs) {
+      final pn = baseName(pf.path);
+      final ps = pf.lengthSync();
+      for (final o in results.where((x) => x.key == '$pn:$ps' || x.srcPath == pf.path).toList()) {
+        try {
+          if (o.newName != null && o.openPath != null && o.openPath != o.srcPath) {
+            File(o.openPath!).deleteSync();
+          }
+        } catch (_) {}
+        o.ctl.dispose();
+        results.remove(o);
       }
     }
-    if (mounted) {
-      snack(context, failed == 0 ? 'اتطبق على كل الصفحات' : 'اتطبق، و$failed صفحة فشلت');
+    for (var i = 0; i < pdfs.length; i++) {
+      if (stopReq) break;
+      final f = pdfs[i];
+      final name = baseName(f.path);
+      final size = f.lengthSync();
+      // لو الملف ده اتفحص قبل كده وإحنا بنعيد: امسح الإدخال القديم ونسخته
+      for (final o in results.where((x) => x.key == '$name:$size').toList()) {
+        try {
+          if (o.newName != null && o.openPath != null) File(o.openPath!).deleteSync();
+        } catch (_) {}
+        o.ctl.dispose();
+        results.remove(o);
+      }
+      final r = MResult(name)
+        ..srcPath = f.path
+        ..size = size;
+      setState(() => status = 'تعريف الملفات ${i + 1} / ${pdfs.length}: $name');
+      try {
+        await _identifyOne(r, f, rec);
+      } on ScanStopped {
+        r.ctl.dispose();
+        break; // الملف ده ما اتسجلش: هيتعرّف تاني في الفحص الجاي
+      } catch (e, st) {
+        r.idOk = false;
+        r.idNotes.add('فشل التعريف: ${e.toString().split('\n').first}');
+        final ss = st.toString();
+        _dbg('ERROR(تعريف) $name size=$size: $e\n${ss.substring(0, ss.length > 600 ? 600 : ss.length)}');
+      }
+      r.openPath ??= f.path;
+      results.add(r);
+      saveMState(results);
+      _dbg('FILE ${i + 1}/${pdfs.length} done: $name  RSS=${ProcessInfo.currentRss ~/ 1048576}MB');
+      if (!mounted) return null;
+      setState(() => progressValue = (i + 1) / pdfs.length);
+    }
+    _dbg('resolveDuplicates start');
+    await _resolveDuplicates();
+    _flagDuplicates();
+    results.sort(_cmpM);
+    saveMState(results);
+    _dbg('resolveDuplicates done');
+    return null;
+  }
+
+  // قراءة صفحات الـ PDF (لحد 6) وتصويت على Terminal ID، وبعدين مطابقتها باسم الملف الأصلي
+  Future<void> _identifyOne(MResult r, File f, TextRecognizer rec) async {
+    final bytes = await f.readAsBytes();
+    final sb = StringBuffer();
+    final votes = <String, double>{};
+    var id = MIdent();
+    for (var pi = 0; pi < 25; pi++) {
+      if (stopReq) throw const ScanStopped();
+      // بعد 6 صفحات لو لقينا ماكينة نوقف، ولو لسه مفيش نكمّل لحد 25 صفحة
+      if (pi >= 6 && votes.isNotEmpty) break;
+      var got = false;
+      try {
+        final dpi = await _safeDpi(bytes, pi, 200);
+        await for (final page in Printing.raster(bytes, pages: [pi], dpi: dpi)) {
+          got = true;
+          final png = await page.toPng();
+          final tp = File('$mTmpDir/id_$pi.png');
+          _ensureMTmp();
+          await tp.writeAsBytes(png);
+          try {
+            final res = await _ocr(rec, tp.path);
+            sb.writeln(res.text);
+            _tidVotes(res.text).forEach((k, v) => votes[k] = (votes[k] ?? 0) + v);
+          } catch (_) {}
+          try {
+            tp.deleteSync();
+          } catch (_) {}
+        }
+      } catch (e) {
+        if (!_pageEnd(e) || pi == 0) rethrow; // آخر صفحة عدّت = مش خطأ
+      }
+      if (!got) break;
+      id = _identify(sb.toString());
+      final rk = _rankVotes(votes);
+      // وقف بدري لو الماكينة واضحة (Terminal ID مقروء بوضوح) واليوم معروف
+      if (id.day != null &&
+          rk.isNotEmpty &&
+          rk.first.value >= 3 &&
+          (rk.length < 2 || rk.first.value >= rk[1].value * 2)) {
+        break;
+      }
+    }
+    final rk = _rankVotes(votes);
+    r.altTids = rk.map((e) => e.key).toList();
+    r.votes = votes;
+    var tid = rk.isNotEmpty ? rk.first.key : id.tid;
+    var fromUnit = false;
+    if (tid == null) {
+      // مفيش Terminal ID مقروء: نحدد الوحدة من Merchant ID/اسم الوحدة جوه الـ PDF،
+      // ولو الوحدة فيها ماكينة واحدة بس نستخدمها (وتتعلّم للمراجعة)
+      final row = findUnitExtraIn([sb.toString()]);
+      if (row != null) {
+        final same = terminals.entries.where((e) => e.value.excelRow == row).toList();
+        if (same.length == 1) {
+          tid = same.first.key;
+          fromUnit = true;
+        }
+      }
+    }
+    try {
+      final all = sb.toString();
+      File('$baseDir/id_debug.txt').writeAsStringSync(
+          '##### ${r.pdfName}\ntid=$tid fromUnit=$fromUnit day=${id.day}.${id.month}\n'
+          'votes=${rk.map((e) => '${e.key}:${e.value}').join(' , ')}\n'
+          '${tid == null ? all.substring(0, all.length > 2500 ? 2500 : all.length) : ''}\n\n',
+          mode: FileMode.append);
+    } catch (_) {}
+    final top = rk.isNotEmpty ? rk.first.value : 0.0;
+    final weak = tid != null &&
+        ((!fromUnit && top < 2) || !_plausibleDay(id.day, id.month));
+    if (weak) {
+      // مش واضح إنه إيصال ماكينة (توكيل / ملف تاني): تحت المراجعة، من غير تسمية ولا عد
+      r.tidUsed = null;
+      r.newName = null;
+      if (id.day != null && id.month != null) {
+        r.dayUsed = id.day;
+        r.monthUsed = id.month;
+      }
+      r.idOk = false;
+      r.idNotes.add('الملف ده مش واضح إنه إيصال ماكينة (قراءة ضعيفة للـ Terminal ID)، راجعه');
+      r.count = 0;
+      r.cntOk = true;
+      r.seqBad = false;
+      r.detail = 'للمراجعة (مش معدود)';
+      return;
+    }
+    await _applyName(r, f, tid, id.day, id.month);
+    if (fromUnit && r.newName != null) {
+      r.idOk = false;
+      r.idNotes.add('Terminal ID مش واضح، الوحدة اتحددت من Merchant ID/الاسم جوه الـ PDF، راجع');
     }
   }
 
-  /// تعديل إيصال بعد التصوير (قص، تدوير، فلتر) من النسخة الأصلية، مع التنقل بين الصفحات
-  /// (أسهم / سويب)، والحذف، وإضافة صورة. بترجّع true لو الموظف داس "إعادة أخذ".
-  Future<bool> _edit(int i, {int tab = 0, bool fromCam = false}) async {
-    var idx = i;
-    while (mounted && imgs.isNotEmpty) {
-      idx = idx.clamp(0, imgs.length - 1);
-      final old = imgs[idx];
-      final out = await Navigator.push<String>(
-        context,
-        PageRouteBuilder<String>(
-          transitionDuration: const Duration(milliseconds: 160),
-          reverseTransitionDuration: const Duration(milliseconds: 120),
-          pageBuilder: (_, __, ___) => EditorPage(
-              path: old,
-              prefix: 'r_',
-              initialTab: tab,
-              canRetake: fromCam,
-              pageIndex: idx,
-              pageCount: imgs.length,
-              canDelete: true),
-          transitionsBuilder: (_, a, __, child) => FadeTransition(opacity: a, child: child),
-        ),
-      );
-      tab = 0; // الصفحات اللي بننتقل ليها بتفتح على القص
-      if (!mounted || out == null) return false;
-      if (out == kRetake || out == kDelete) {
-        await Store.unlistFromDraft(old);
-        await Store.del(old);
-        if (mounted) {
-          setState(() {
-            imgs.remove(old);
-            built = null;
-          });
+  // لو ملفين اتعرفوا على نفس الماكينة: الأقوى (أكتر أصوات) يفضل، والتاني ياخد مرشحه التاني لو قراءته واضحة
+  Future<void> _resolveDuplicates() async {
+    final groups = <String, List<MResult>>{};
+    for (final r in results) {
+      if (r.tidUsed != null && r.newName != null && !r.excluded) {
+        groups.putIfAbsent(r.tidUsed!, () => <MResult>[]).add(r);
+      }
+    }
+    for (final e in groups.entries) {
+      final g = e.value;
+      if (g.length < 2) continue;
+      g.sort((a, b) => (b.votes[e.key] ?? 0).compareTo(a.votes[e.key] ?? 0));
+      for (var i = 1; i < g.length; i++) {
+        final r = g[i];
+        if (!File(r.srcPath).existsSync()) continue;
+        final claimed = results.map((x) => x.tidUsed).whereType<String>().toSet();
+        String? alt;
+        for (final c in r.altTids) {
+          if (c == e.key || claimed.contains(c)) continue;
+          if ((r.votes[c] ?? 0) >= 1) {
+            alt = c;
+            break;
+          }
         }
-        if (out == kRetake) return true;
-        continue; // بعد الحذف: يفضل في التعديل على الصفحة اللي جنبها
+        if (alt == null) continue;
+        await _applyName(r, File(r.srcPath), alt, r.dayUsed, r.monthUsed);
+        if (r.newName != null) {
+          r.idOk = false;
+          r.idNotes.add('الـ PDF اتعرّف على نفس ماكينة ملف تاني، اتسمّى ماكينة ${terminals[alt]!.orderNum} (المرشح التاني من قراءة الـ PDF)، راجع');
+        }
       }
-      var path = out;
-      String? dir;
-      EditParams? allStyle;
-      if (out.startsWith('$kAllPrefix|')) {
-        final parts = out.split('|');
-        allStyle = EditParams.decode(parts[1]);
-        path = parts.sublist(2).join('|');
+    }
+  }
+
+  // بيعلّم الملفات اللي لسه واخدة نفس الماكينة (مفيش حل تلقائي)
+  void _flagDuplicates() {
+    const tag = 'نفس الماكينة';
+    for (final r in results) {
+      final had = r.idNotes.any((n) => n.startsWith(tag));
+      r.idNotes.removeWhere((n) => n.startsWith(tag));
+      if (had && r.idNotes.isEmpty && r.newName != null) r.idOk = true;
+    }
+    final groups = <String, List<MResult>>{};
+    for (final r in results) {
+      if (r.tidUsed != null && r.newName != null && !r.excluded) {
+        groups.putIfAbsent(r.tidUsed!, () => <MResult>[]).add(r);
       }
-      if (out.startsWith('$kNavPrefix|')) {
-        final parts = out.split('|');
-        dir = parts[1];
-        path = parts.sublist(2).join('|');
+    }
+    for (final e in groups.entries) {
+      if (e.value.length < 2) continue;
+      final info = terminals[e.key];
+      for (final r in e.value) {
+        final others = e.value.where((x) => !identical(x, r)).map((x) => x.pdfName).join(' ، ');
+        r.idOk = false;
+        r.idNotes.add('$tag (${info?.orderNum ?? ''} ${info?.unitName ?? ''}) اتعرفت كمان في: $others — راجع');
       }
-      if (path != old) {
+    }
+  }
+
+  Future<void> _applyName(MResult r, File f, String? tid, String? day, String? month) async {
+    r.idOk = true;
+    r.idNotes.clear();
+    // نسخة قديمة متسمية للملف ده: نمسحها قبل ما نسمّي من جديد
+    if (r.newName != null &&
+        r.openPath != null &&
+        r.openPath != r.srcPath &&
+        r.openPath != f.path &&
+        r.openPath!.startsWith(destDir)) {
+      try {
+        File(r.openPath!).deleteSync();
+      } catch (_) {}
+    }
+    r.newName = null;
+    r.tidUsed = tid;
+    if (tid == null || !terminals.containsKey(tid)) {
+      r.idOk = false;
+      r.idNotes.add('مش قادر أعرف الماكينة من الـ PDF');
+      return;
+    }
+    final info = terminals[tid]!;
+    r.orderNum = info.orderNum;
+    if (day == null || month == null) {
+      r.idOk = false;
+      r.idNotes.add('مش قادر أعرف التاريخ من الـ PDF');
+      return;
+    }
+    r.dayUsed = day;
+    r.monthUsed = month;
+    final name = machineNewName(info, day, month);
+    var final0 = name;
+    // "_2" بس لو فعلاً ملف تاني (من نفس الفحص) واخد نفس الاسم؛ أي ملف قديم في الفولدر بنكتب فوقه
+    var k = 2;
+    while (results.any((x) => x != r && !x.excluded && x.newName == final0)) {
+      final0 = '${name}_$k';
+      k++;
+    }
+    Directory(destDir).createSync(recursive: true);
+    final dst = File('$destDir/$final0.pdf');
+    if (dst.path != f.path) {
+      try {
+        if (dst.existsSync()) dst.deleteSync();
+      } catch (_) {}
+      await f.copy(dst.path);
+    }
+    r.newName = final0;
+    r.openPath = dst.path;
+  }
+
+  void _tick(int pg, [int? total]) {
+    if (!mounted || _curLabel.isEmpty) return;
+    setState(() => status = '$_curLabel • صفحة $pg${total != null ? ' / $total' : ''}');
+  }
+
+  Future<void> _countAll(TextRecognizer rec, {Set<MResult>? only}) async {
+    // ملف التطبيق اتقفل أثناء عدّه 3 مرات: نعدّيه بدل ما نلف في دايرة
+    for (final r in results) {
+      if (r.pending && r.tries >= 3) {
+        r.count = 0;
+        r.cntOk = false;
+        r.cntNotes.add('العد وقف أكتر من مرة (التطبيق اتقفل). من ⋮ اختار إعادة العد');
+      }
+    }
+    final todo = results.where((r) => r.pending && (only == null || only.contains(r))).toList();
+    for (var i = 0; i < todo.length; i++) {
+      if (stopReq) break;
+      final r = todo[i];
+      if (r.excluded) continue; // اتعلّم غلط وإحنا بنعد
+      r.tries++;
+      saveMState(results);
+      _curLabel = 'عدّ الإيصالات ${i + 1} / ${todo.length}: ${r.newName ?? r.pdfName}';
+      if (mounted) {
+        setState(() {
+          status = _curLabel;
+          progressValue = i / todo.length;
+        });
+      }
+      try {
+        await _countOne(r, rec);
+      } on ScanStopped {
+        // وقفنا في نص الملف: نسيبه "لسه ما اتعدّش" علشان يتكمل من أول مرة تانية
+        r.count = -1;
+        r.tries = 0;
+        r.cntNotes.clear();
+        saveMState(results);
+        break;
+      } catch (e, st) {
+        _dbg('COUNT_ERROR ${r.pdfName}: $e\n$st');
+        r.count = 0;
+        r.cntOk = false;
+        r.cntNotes.add('فشل العد: ${e.toString().split('\n').first}. من ⋮ اختار إعادة العد');
+      }
+      r.tries = 0;
+      saveMState(results);
+      if (only == null) {
+        logScan(
+            tab: 'mach',
+            title: '${r.cntOk ? '✅' : '⚠️'} ${r.newName ?? r.pdfName}: ${r.count} إيصال',
+            text: r.cntNotes.join('\n'),
+            bad: !r.cntOk,
+            kind: chainRunning ? 'chain' : 'manual',
+            openKey: r.key);
+      }
+      _dbg('COUNT ${i + 1}/${todo.length} ${r.newName ?? r.pdfName} = ${r.count}  RSS=${ProcessInfo.currentRss ~/ 1048576}MB');
+      if (!mounted) return;
+      setState(() => progressValue = (i + 1) / todo.length);
+    }
+    _curLabel = '';
+  }
+
+  // العد السريع: بيقرا صورة كل صفحة مرة واحدة من غير تحويل PNG ولا شرائح. بيرجّع false لو الملف مش ممسوح
+  Future<bool> _countOneFast(MResult r, TextRecognizer rec, Uint8List bytes, File src) async {
+    // البحث في الـ bytes بيشتغل في isolate علشان الواجهة ما تهنجش مع الملفات الكبيرة
+    final ranges = await _pdfJpegRangesAsync(bytes);
+    if (ranges.isEmpty) return false;
+    final col = MCollector()..trackDups = true;
+    final sw = Stopwatch()..start();
+    var total = 0, totalMx = 0, failed = 0, slips = 0, total3 = 0;
+    final diff = <String>[];
+    final empty = <int>[];
+    final pageSm = <int, int>{}; // رقم الصفحة -> عدد الإيصالات المعدودة فيها (الطريقة 1)
+    final pageSm2 = <int, int>{}; // نفس الشيء بالطريقة 2
+    final pageSm3 = <int, int>{}; // نفس الشيء بالطريقة 3 (الأساسية)
+    final pageVote = <int, int>{}; // رقم الصفحة -> العدد اللي 3 أنواع علامات أو أكتر متفقين عليه (0 = مفيش اتفاق)
+    var total2 = 0;
+    final pageAmt = <int, List<double>>{}; // رقم الصفحة -> المبالغ المقروءة
+    final pageAmtN = <int, int>{}; // رقم الصفحة -> عدد علامات AMOUNT
+    final par = parallelCount;
+    // ⚡ المتوازي (تجريبي): بنقرا صفحتين مع بعض، وبعدين بنعالج النتايج بترتيب الصفحات (نفس منطق العد العادي)
+    if (par) {
+      final extra = <TextRecognizer>[
+        for (var k = 1; k < _kParWorkers; k++) TextRecognizer(script: TextRecognitionScript.latin)
+      ];
+      final recs = <TextRecognizer>[rec, ...extra];
+      try {
+        for (var i0 = 0; i0 < ranges.length; i0 += recs.length) {
+          if (stopReq) throw const ScanStopped();
+          final idxs = <int>[for (var k = i0; k < i0 + recs.length && k < ranges.length; k++) k];
+          _ensureMTmp();
+          _tick(i0 + 1, ranges.length);
+          final outs = await Future.wait(<Future<Object>>[
+            for (var j = 0; j < idxs.length; j++)
+              (() async {
+                final i = idxs[j];
+                try {
+                  final path = '$mTmpDir/f_$i.jpg';
+                  await File(path).writeAsBytes(Uint8List.sublistView(bytes, ranges[i][0], ranges[i][1]));
+                  return await _ocr(recs[j], path);
+                } catch (e) {
+                  return e;
+                }
+              })()
+          ]);
+          for (var j = 0; j < idxs.length; j++) {
+            final i = idxs[j];
+            final out = outs[j];
+            try {
+              if (out is! RecognizedText) throw out;
+              final res = out;
+              if (_isIdSlip(res)) {
+                slips++;
+              } else {
+                final sp = _structCount(res);
+                _dbg('PAGE ${i + 1}: m1=${sp.sm} m2=${sp.sm2} m3=${sp.sm3} ${sp.types} AMT=${sp.dbgAmt}');
+                total += sp.sm;
+                total2 += sp.sm2;
+                total3 += sp.sm3;
+                totalMx += sp.mx;
+                if (sp.sm == 0) empty.add(i + 1);
+                if ((sp.sm - sp.mx).abs() >= 2) diff.add('${i + 1} (${sp.sm} أو ${sp.mx})');
+                col.pageH = sp.h;
+                col.pages.add(<Anchor>[]);
+                col.curPage = i + 1;
+                _collect(res, 0, 1, col);
+                pageSm[i + 1] = sp.sm;
+                pageSm2[i + 1] = sp.sm2;
+                pageSm3[i + 1] = sp.sm3;
+                pageVote[i + 1] = sp.voteN >= 3 ? sp.vote : 0;
+                pageAmt[i + 1] = sp.amts;
+                pageAmtN[i + 1] = sp.types['amount'] ?? 0;
+              }
+            } catch (e) {
+              failed++;
+              if (failed <= 3) _dbg('FAST_PAGE_FAIL ${r.pdfName} p${i + 1}: ${e.toString().split('\n').first}');
+            }
+            try {
+              File('$mTmpDir/f_$i.jpg').deleteSync();
+            } catch (_) {}
+          }
+          await Future.delayed(const Duration(milliseconds: 2));
+        }
+      } finally {
+        for (final e in extra) {
+          try {
+            await e.close();
+          } catch (_) {}
+        }
+      }
+    }
+    if (!par) for (var i = 0; i < ranges.length; i++) {
+      if (stopReq) throw const ScanStopped();
+      final fp = File('$mTmpDir/f_$i.jpg');
+      try {
+        _ensureMTmp();
+        await fp.writeAsBytes(Uint8List.sublistView(bytes, ranges[i][0], ranges[i][1]));
+        _tick(i + 1, ranges.length);
+        final res = await _ocr(rec, fp.path);
+        if (_isIdSlip(res)) {
+          slips++;
+          try {
+            fp.deleteSync();
+          } catch (_) {}
+          continue;
+        }
+        final sp = _structCount(res);
+        _dbg('PAGE ${i + 1}: m1=${sp.sm} m2=${sp.sm2} m3=${sp.sm3} ${sp.types} AMT=${sp.dbgAmt}');
+        total += sp.sm;
+        total2 += sp.sm2;
+        total3 += sp.sm3;
+        totalMx += sp.mx;
+        if (sp.sm == 0) empty.add(i + 1);
+        if ((sp.sm - sp.mx).abs() >= 2) diff.add('${i + 1} (${sp.sm} أو ${sp.mx})');
+        col.pageH = sp.h;
+        col.pages.add(<Anchor>[]);
+        col.curPage = i + 1;
+        _collect(res, 0, 1, col);
+        pageSm[i + 1] = sp.sm;
+        pageSm2[i + 1] = sp.sm2;
+        pageSm3[i + 1] = sp.sm3;
+        pageVote[i + 1] = sp.voteN >= 3 ? sp.vote : 0;
+        pageAmt[i + 1] = sp.amts;
+        pageAmtN[i + 1] = sp.types['amount'] ?? 0;
+      } catch (e) {
+        failed++;
+        if (failed <= 3) _dbg('FAST_PAGE_FAIL ${r.pdfName} p${i + 1}: ${e.toString().split('\n').first}');
+      }
+      try {
+        fp.deleteSync();
+      } catch (_) {}
+      await Future.delayed(const Duration(milliseconds: 2));
+    }
+    _dbg('FAST${par ? '-PAR' : ''} ${r.pdfName}: ${ranges.length} صفحة، ${sw.elapsedMilliseconds ~/ 1000}ث، عدد $total (بالطريقة التانية $totalMx)، فشل $failed');
+    if (total == 0 || failed == ranges.length) return false; // نرجع للطريقة القديمة
+    // ───── صفحات مشكوك فيها: قراءة تانية بعد إزالة الخط الأحمر + عدّ المستطيلات بالشكل ─────
+    // بنعيد بس الصفحات اللي طرق العد اختلفت فيها أو عددها مش زي باقي الصفحات (غير آخر صفحة).
+    // البديل بيتقبل بس لو القراءة المنضّفة متفقة مع نفسها (الطرق التلاتة نفس الرقم) وعددها مش أقل من الأصلي
+    // (إزالة الأحمر بتكشف إيصالات متغطية، ما بتخفيش إيصالات)، ولو المستطيلات خالفتها بنسيب الأصلي ونعلّم الصفحة.
+    final pageNote = <int, String>{};
+    final sus = <int>{};
+    final keysSorted = pageSm3.keys.toList()..sort();
+    for (final k in keysSorted) {
+      if (pageSm[k] != pageSm3[k] || pageSm2[k] != pageSm3[k]) sus.add(k);
+    }
+    if (keysSorted.length >= 4) {
+      final lastK0 = keysSorted.last;
+      final freq0 = <int, int>{};
+      for (final k in keysSorted.where((k) => k != lastK0)) {
+        freq0[pageSm3[k]!] = (freq0[pageSm3[k]!] ?? 0) + 1;
+      }
+      if (freq0.isNotEmpty) {
+        final top0 = freq0.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+        for (final k in keysSorted.where((k) => k != lastK0)) {
+          if (pageSm3[k] != top0) sus.add(k);
+        }
+      }
+    }
+    for (final k in (redFixCount ? (sus.toList()..sort()) : <int>[])) {
+      if (stopReq) throw const ScanStopped();
+      try {
+        _ensureMTmp();
+        final p1 = '$mTmpDir/rr_${k - 1}.jpg';
+        final p2 = '$mTmpDir/rr_${k - 1}_c.jpg';
+        await File(p1).writeAsBytes(Uint8List.sublistView(bytes, ranges[k - 1][0], ranges[k - 1][1]));
+        final rect = await rectCountAsync(p1);
+        await redRemoveAsync(p1, p2);
+        final res3 = await _ocr(rec, p2);
+        final cs = _structCount(res3);
         try {
-          await Store.replaceInDraft(old, path);
-          if (!mounted) return false;
-          setState(() {
-            imgs[idx] = path;
-            built = null;
-          });
-        } catch (e) {
-          if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
-          return false;
+          File(p1).deleteSync();
+        } catch (_) {}
+        try {
+          File(p2).deleteSync();
+        } catch (_) {}
+        final o = pageSm3[k]!;
+        final cOk = cs.sm == cs.sm2 && cs.sm2 == cs.sm3;
+        _dbg('REDFIX ${r.pdfName} p$k: أصلي=${pageSm[k]}/${pageSm2[k]}/$o منضّف=${cs.sm}/${cs.sm2}/${cs.sm3} مستطيلات=${rect ?? '-'}');
+        int? pick;
+        String? why;
+        if (cOk && cs.sm3 >= o && cs.sm3 != o) {
+          if (rect != null && rect != cs.sm3 && rect == o) {
+            why = 'القراءة بعد إزالة الأحمر ${cs.sm3} والمستطيلات $rect، فاتحفظ $o (راجع)';
+          } else {
+            pick = cs.sm3;
+            why = 'اتصحّحت من $o لـ ${cs.sm3} بعد إزالة الخط الأحمر';
+          }
+        } else if (!cOk && rect != null && rect != o && rect == cs.sm3 && rect >= o) {
+          pick = rect;
+          why = 'اتصحّحت من $o لـ $rect (القراءة المنضّفة والمستطيلات اتفقوا)';
+        } else if (rect != null && rect != o && !(cOk && cs.sm3 == o)) {
+          why = 'عدد المستطيلات $rect مختلف عن العدد $o (راجع)';
+        }
+        if (pick != null) {
+          pageSm[k] = pick;
+          pageSm2[k] = pick;
+          pageSm3[k] = pick;
+          pageVote.remove(k);
+          pageAmt[k] = cs.amts;
+          pageAmtN[k] = cs.types['amount'] ?? 0;
+        }
+        if (why != null) pageNote[k] = why;
+      } catch (e) {
+        _dbg('REDFIX_FAIL ${r.pdfName} p$k: ${e.toString().split('\n').first}');
+      }
+      await Future.delayed(const Duration(milliseconds: 2));
+    }
+    // حماية الزيادة: الورقة بتشيل عدد ثابت (مثلاً 15). صفحة كاملة (مش الأخيرة) عددها أكتر بواحد من الأغلبية
+    // وأغلب علامات الإيصال (3 أنواع أو أكتر) متفقة على عدد الأغلبية = الزيادة قراءة مكررة فنرجّعها للأغلبية.
+    if (consensusGuard && keysSorted.length >= 4) {
+      final lastG = keysSorted.last;
+      final bodyG = keysSorted.where((k) => k != lastG).toList();
+      final fq = <int, int>{};
+      for (final k in bodyG) {
+        fq[pageSm3[k]!] = (fq[pageSm3[k]!] ?? 0) + 1;
+      }
+      if (fq.isNotEmpty) {
+        final tp = fq.entries.reduce((a, b) => a.value >= b.value ? a : b);
+        if (tp.key > 0 && tp.value >= bodyG.length * 0.6) {
+          for (final k in bodyG) {
+            final cur = pageSm3[k]!;
+            if (cur == tp.key + 1 && pageVote[k] == tp.key) {
+              pageNote[k] = 'اتصحّحت من $cur لـ ${tp.key}: الصفحة الكاملة ${tp.key} إيصال والعلامات متفقة على ${tp.key} (راجع)';
+              _dbg('GUARD ${r.pdfName} p$k: $cur -> ${tp.key}');
+              pageSm[k] = tp.key;
+              pageSm2[k] = tp.key;
+              pageSm3[k] = tp.key;
+            }
+          }
         }
       }
-      if (allStyle != null) {
-        await _applyToAll(allStyle, path);
-        return false;
+    }
+    if (pageNote.isNotEmpty) {
+      total = pageSm.values.fold<int>(0, (a, b) => a + b);
+      total2 = pageSm2.values.fold<int>(0, (a, b) => a + b);
+      total3 = pageSm3.values.fold<int>(0, (a, b) => a + b);
+    }
+    final sc = col.finish();
+    final total1 = total; // الطريقة 1 (القديمة)
+    var dualInfo = '';
+    var dualNote = '';
+    // العدد الأساسي = الطريقة 3 (التسلسل الرأسي). الطريقتين التانيين (1 و2) للمقارنة والتحذير.
+    var chosenM = countMethod; // الطريقة اللي اتختار منها العدد (من قايمة طرق العد)
+    final pickedTotal = chosenM == 1 ? total1 : (chosenM == 2 ? total2 : total3);
+    if (pickedTotal <= 0) chosenM = total3 > 0 ? 3 : 1;
+    total = chosenM == 1 ? total1 : (chosenM == 2 ? total2 : total3);
+    // العدد بيتحدد من القراءة بس. الباتش والسيستم بيتقارنوا بيه في التقرير ومش بيأثروا عليه أبداً.
+    // ───── آخر صفحة: قراءة تانية بصورة محسّنة للمقارنة بس (من غير أي مرجع من الباتش أو السيستم) ─────
+    if (stopReq) throw const ScanStopped();
+    var lastInfo = '';
+    final lastKeys = pageSm3.keys.toList()..sort();
+    if (lastKeys.isNotEmpty) {
+      final lastK = lastKeys.last;
+      final lm1 = pageSm[lastK] ?? 0, lm2 = pageSm2[lastK] ?? 0, lm3 = pageSm3[lastK] ?? 0;
+      final curLast = chosenM == 1 ? lm1 : (chosenM == 2 ? lm2 : lm3);
+      final lastDisagree = lm1 != lm3 || lm2 != lm3;
+      final seqMiss = sc.rangeLen != null && sc.full >= total * 0.8 && total != sc.rangeLen;
+      lastInfo = ' • آخر صفحة ($lastK): $curLast إيصال';
+      if (dualCount || lastDisagree || seqMiss) {
+        try {
+          final i = lastK - 1;
+          _ensureMTmp();
+          final p1 = '$mTmpDir/last_$i.jpg';
+          final p2 = '$mTmpDir/last_${i}_e.jpg';
+          await File(p1).writeAsBytes(Uint8List.sublistView(bytes, ranges[i][0], ranges[i][1]));
+          await enhanceImageAsync(p1, p2);
+          final res2 = await _ocr(rec, p2);
+          final sp2 = _structCount(res2);
+          try {
+            File(p1).deleteSync();
+          } catch (_) {}
+          try {
+            File(p2).deleteSync();
+          } catch (_) {}
+          _dbg('LASTPAGE ${r.pdfName} p$lastK: أصلي=$lm1/$lm2/$lm3 محسّن=${sp2.sm}/${sp2.sm2}/${sp2.sm3}');
+          if (sp2.sm3 != lm3) {
+            r.cntOk = false;
+            r.cntNotes.add('آخر صفحة ($lastK) اتقرت مرتين بنتيجتين مختلفتين: $lm3 / ${sp2.sm3} (راجعها)');
+          } else {
+            lastInfo += ' ✓ اتأكدت بقراءة تانية';
+          }
+        } catch (e) {
+          _dbg('LASTPAGE_FAIL ${r.pdfName}: ${e.toString().split('\n').first}');
+        }
       }
-      if (dir == null) return false; // ✓ تم
-      if (dir == 'prev') {
-        idx -= 1;
+    }
+    if (total1 != total3 || total2 != total3) {
+      final pg = <String>[];
+      for (final k in pageSm.keys) {
+        if (pageSm[k] != pageSm3[k] || pageSm2[k] != pageSm3[k]) {
+          pg.add('$k (${pageSm[k]} / ${pageSm2[k]} / ${pageSm3[k]})');
+        }
+      }
+      final pgTxt = pg.isEmpty ? '' : ' • الصفحات: ${pg.join('، ')}';
+      // العدد الأساسي (طريقة 3) بيفضل دايماً، ونعلّم الملف للمراجعة
+      dualNote = 'طرق العد اختلفت: $total1 / $total2 / $total3 (المعروض $total)$pgTxt (راجع)';
+    }
+    r.count = total;
+    r.pageCounts = {
+      for (final k in (pageSm3.keys.toList()..sort())) k: chosenM == 1 ? (pageSm[k] ?? 0) : (chosenM == 2 ? (pageSm2[k] ?? 0) : (pageSm3[k] ?? 0))
+    };
+    r.pageWarn = {
+      for (final k in pageSm3.keys)
+        if (pageSm[k] != pageSm3[k] || pageSm2[k] != pageSm3[k]) k
+    };
+    r.pageNote = Map<int, String>.from(pageNote);
+    for (final k in pageNote.keys) {
+      r.pageWarn.add(k);
+    }
+    // أرقام إيصالات ناقصة في صفحة معينة (بس لو أغلب أرقام الـ RRN اتقرت، غير كده الأرقام الناقصة بتبقى مش اتقرت مش مفقودة)
+    if (sc.rangeLen != null && sc.full >= total * 0.8) {
+      sc.seqMissingByPage.forEach((pg, nums) {
+        final txt = 'أرقام إيصالات ناقصة بعد الصفحة دي: ${nums.take(5).map((n) => n.toString().padLeft(6, '0')).join(' - ')}';
+        r.pageNote[pg] = r.pageNote[pg] == null ? txt : '${r.pageNote[pg]} • $txt';
+        r.pageWarn.add(pg);
+      });
+    }
+    r.amtSum = 0;
+    r.amtRead = 0;
+    pageAmt.forEach((k, v) {
+      r.amtRead += v.length;
+      for (final x in v) {
+        r.amtSum += x;
+      }
+    });
+    r.detail = 'عدّ سريع${par ? ' متوازي' : ''} • ${ranges.length} صفحة • RRN مقروء ${sc.full}${sc.rangeText}'
+        '${slips > 0 ? ' • أوراق تعريف مُتجاهلة $slips' : ''}'
+        ' • ⏱ ${fmtElapsed(Duration(seconds: (sw.elapsedMilliseconds / 1000).round()))}';
+    if (dualInfo.isNotEmpty) r.detail += dualInfo;
+    if (lastInfo.isNotEmpty) r.detail += lastInfo;
+    if (dualNote.isNotEmpty) {
+      r.cntOk = false;
+      r.cntNotes.add(dualNote);
+    }
+    if (failed > 0) {
+      r.cntOk = false;
+      r.cntNotes.add('$failed صفحة فشلت قراءتها، العدد ممكن يكون ناقص');
+    }
+    if (empty.isNotEmpty) {
+      r.cntNotes.add('صفحات ما لقيتش فيها إيصالات: ${empty.join('، ')}');
+    }
+    if (diff.isNotEmpty) {
+      r.cntNotes.add('صفحات الطريقتين اختلفوا فيها: ${diff.join('، ')} (راجعها لو العدد مهم)');
+    }
+    // الصفحات الكاملة غالباً نفس العدد (10 أو 15 مثلاً) وآخر صفحة بس بتقل: نعلّم الصفحة الشاذة
+    if (pageSm3.length >= 4) {
+      final keys = pageSm3.keys.toList()..sort();
+      final lastK = keys.last;
+      final body = keys.where((k) => k != lastK).toList();
+      final freq = <int, int>{};
+      for (final k in body) {
+        freq[pageSm3[k]!] = (freq[pageSm3[k]!] ?? 0) + 1;
+      }
+      final top = freq.entries.reduce((a, b) => a.value >= b.value ? a : b);
+      if (top.key > 0 && top.value >= body.length * 0.6) {
+        final odd = <String>[];
+        for (final k in body) {
+          if (pageSm3[k] != top.key) odd.add('$k (${pageSm3[k]})');
+        }
+        if (pageSm3[lastK]! > top.key) odd.add('$lastK (${pageSm3[lastK]}) آخر صفحة أكتر من باقي الصفحات');
+        if (odd.isNotEmpty) {
+          r.cntNotes.add('أغلب الصفحات ${top.key} إيصال، والصفحات دي مختلفة: ${odd.join('، ')} (راجعها)');
+        }
+      }
+    }
+    // نقارن بتسلسل الـ RRN بس لو الأرقام اتقرت كفاية
+    if (sc.rangeLen != null && sc.full >= total * 0.8 && total != sc.rangeLen) {
+      // فرق أقل من kSoftGap إيصالات (ناقص أو زيادة): ملاحظة تحذير بس ومش مراجعة
+      if ((total - sc.rangeLen!).abs() >= kSoftGap) r.seqBad = true;
+      final miss = sc.seqMissing.take(10).map((n) => n.toString().padLeft(6, '0')).join(' - ');
+      r.cntNotes.add('العدد $total بس التسلسل ${sc.rangeLen}'
+          '${sc.seqMissing.isNotEmpty ? '\nأرقام مش لاقيها: [ $miss ]${sc.seqMissing.length > 10 ? ' ...' : ''}' : ''}');
+    }
+    if (sc.otherDay.length >= 3 && sc.otherDay.length >= total * 0.1) {
+      r.cntOk = false;
+      r.cntNotes.add('مش تبع نفس اليوم: ${sc.otherDay.take(5).join(' ، ')}');
+    }
+    if (sc.nonPayment) {
+      r.cntNotes.add('فيه إيصال إقفال/ملخص/إعادة طباعة (اتجاهل ومش معدود)');
+    }
+    if (sc.dups.isNotEmpty) {
+      // للمعرفة بس: مش بيتخصم من العدد ومش بيدخل الملف في المراجعة
+      final es = sc.dups.entries.toList();
+      for (final e in es.take(8)) {
+        final byPg = <int, int>{};
+        for (final p in e.value) {
+          byPg[p] = (byPg[p] ?? 0) + 1;
+        }
+        final pgs = byPg.keys.toList()..sort();
+        final where = pgs.map((p) => byPg[p]! > 1 ? 'صفحة $p (${byPg[p]} مرات)' : 'صفحة $p').join(' و ');
+        r.cntNotes.add('إيصال متكرر رقم ${e.key.substring(6)}: $where');
+      }
+      if (es.length > 8) r.cntNotes.add('إيصال متكرر: و ${es.length - 8} تانيين كمان');
+    }
+    if (r.newName == null && sc.tid != null) {
+      await _applyName(r, src, sc.tid, sc.day, sc.month);
+    } else if (sc.tid != null && terminals[sc.tid] != null && r.orderNum != null &&
+        terminals[sc.tid]!.orderNum != r.orderNum) {
+      r.cntOk = false;
+      r.cntNotes.add('العد لقى ماكينة ${terminals[sc.tid]!.orderNum} بس التسمية ماكينة ${r.orderNum}، راجع');
+    }
+    return true;
+  }
+
+  Future<void> _countOne(MResult r, TextRecognizer rec) async {
+    File? src;
+    if (File(r.srcPath).existsSync()) {
+      src = File(r.srcPath);
+    } else if (r.openPath != null && File(r.openPath!).existsSync()) {
+      src = File(r.openPath!);
+    }
+    r.cntNotes.clear();
+    r.cntOk = true;
+    r.seqBad = false;
+    if (src == null) {
+      r.count = 0;
+      r.cntOk = false;
+      r.cntNotes.add('الملف الأصلي مش موجود');
+      return;
+    }
+    final bytes = await src.readAsBytes();
+    if (fastCount) {
+      try {
+        if (await _countOneFast(r, rec, bytes, src)) return;
+      } on ScanStopped {
+        rethrow;
+      } catch (e) {
+        _dbg('FAST فشل وهنكمل بالطريقة الدقيقة: $e');
+      }
+      r.cntNotes.clear();
+      r.cntOk = true;
+      r.seqBad = false;
+    }
+    final col = MCollector();
+    _tmStrips = 0;
+    _tmOcr = 0;
+    var nPages = 0, tRaster = 0;
+    final swAll = Stopwatch()..start();
+    double? dpiCache; // مقاس الصفحات في الملف الممسوح واحد: نقيس مرة بس
+    // صفحة صفحة (مش الملف كله مرة واحدة) علشان الذاكرة ما تخلصش والتطبيق ما يقفلش
+    final failedPages = <int>[];
+    var consecFail = 0;
+    for (var pg = 1; pg <= 400; pg++) {
+      if (stopReq) throw const ScanStopped();
+      var got = false;
+      Object? lastErr;
+      for (var attempt = 0; attempt < 2 && !got; attempt++) {
+        try {
+          final t0 = swAll.elapsedMilliseconds;
+          final dpi = dpiCache ??= await _safeDpi(bytes, pg - 1, 220);
+          await for (final page in Printing.raster(bytes, pages: [pg - 1], dpi: dpi)) {
+            got = true;
+            nPages++;
+            _tick(pg);
+            final png = await page.toPng();
+            tRaster += swAll.elapsedMilliseconds - t0;
+            final tp = File('$mTmpDir/m_$pg.png');
+            _ensureMTmp();
+            await tp.writeAsBytes(png);
+            await ocrPageStrips(rec, tp.path, '$mTmpDir/m_${pg}_s', col);
+            try {
+              tp.deleteSync();
+            } catch (_) {}
+          }
+          lastErr = null;
+        } catch (e) {
+          lastErr = e;
+          if (got && !_pageEnd(e)) {
+            failedPages.add(pg); // الصفحة اتقرت جزئياً وفشلت: نسجّلها بدل ما تتبلع
+            _dbg('PAGE_FAIL ${r.pdfName} p$pg: ${e.toString().split('\n').first}');
+          }
+          if (_pageEnd(e) || got) break; // آخر صفحة عدّت، أو الصفحة اتقرت جزئياً: ما نعيدهاش
+        }
+      }
+      if (got) {
+        consecFail = 0;
+        await Future.delayed(const Duration(milliseconds: 5));
         continue;
       }
-      idx += 1;
-      if (idx >= imgs.length) {
-        // آخر صفحة + "التالي": إضافة صورة جديدة
-        if (fromCam) return false; // الكاميرا تحت: نرجعلها
-        if (mounted) await _add();
-        return false;
+      if (lastErr == null || _pageEnd(lastErr)) break; // نهاية الملف
+      // خطأ مش معروف: لو أول صفحة الملف كله فشل، غير كده نسجّل الصفحة ونكمّل (صفحتين ورا بعض = نهاية الملف)
+      if (nPages == 0) throw lastErr;
+      _dbg('PAGE_FAIL ${r.pdfName} p$pg: $lastErr');
+      failedPages.add(pg);
+      consecFail++;
+      if (consecFail >= 2) {
+        failedPages.removeRange(failedPages.length - consecFail, failedPages.length);
+        break;
       }
     }
-    return false;
+    _dbg('PAGES ${r.pdfName}: $nPages صفحة، المجموع ${swAll.elapsedMilliseconds ~/ 1000}ث '
+        '(raster+png ${tRaster ~/ 1000}ث، شرائح ${_tmStrips ~/ 1000}ث، OCR ${_tmOcr ~/ 1000}ث)');
+    final sc = col.finish();
+    r.count = sc.count;
+    if (failedPages.isNotEmpty) {
+      r.cntOk = false;
+      r.cntNotes.add('صفحات فشلت قراءتها: ${failedPages.join('، ')}، العدد ممكن يكون ناقص');
+    }
+    r.detail = 'RRN كامل ${sc.full} • ناقص القراءة ${sc.partial}${sc.rangeText}'
+        '${col.slips > 0 ? ' • أوراق تعريف مُتجاهلة ${col.slips}' : ''}'
+        ' • ⏱ ${fmtElapsed(Duration(seconds: (swAll.elapsedMilliseconds / 1000).round()))}';
+    if (!sc.agree) {
+      // فرق أقل من kSoftGap إيصالات (ناقص أو زيادة): ملاحظة تحذير بس ومش مراجعة
+      if ((sc.count - sc.rangeLen!).abs() >= kSoftGap) r.seqBad = true;
+      r.cntNotes.add(sc.seqNote);
+    }
+    if (sc.otherDay.isNotEmpty) {
+      r.cntOk = false;
+      r.cntNotes.add('مش تبع نفس اليوم: ${sc.otherDay.join(' ، ')}');
+    }
+    if (sc.nonPayment) {
+      r.cntNotes.add('فيه إيصال إقفال/ملخص/إعادة طباعة (اتجاهل ومش معدود)');
+    }
+    if (r.newName == null && sc.tid != null) {
+      // التعريف السريع فشل: نسمّي من نتيجة العد الكاملة
+      await _applyName(r, src, sc.tid, sc.day, sc.month);
+    } else if (sc.tid != null && terminals[sc.tid] != null && r.orderNum != null &&
+        terminals[sc.tid]!.orderNum != r.orderNum) {
+      r.cntOk = false;
+      r.cntNotes.add('العد لقى ماكينة ${terminals[sc.tid]!.orderNum} بس التسمية ماكينة ${r.orderNum}، راجع');
+    }
   }
 
-  Widget _item(int i) {
-    final path = imgs[i];
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      shape: kCardShape,
-      key: ValueKey(path),
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: () => Navigator.push(
-            context,
-            MaterialPageRoute(
-                builder: (_) => ZoomPage(
-                    child: ReceiptPreview(
-                        path: path, tag: tag!, showTag: !noTags.contains(path))))),
-        child: Padding(
-          padding: const EdgeInsets.all(8),
-          child: Row(children: [
-            CircleAvatar(
-                radius: 14,
-                backgroundColor: cs.primary,
-                child: Text('${i + 1}', style: TextStyle(color: cs.onPrimary, fontSize: 13))),
-            const SizedBox(width: 10),
-            // المصغّرة = الناتج النهائي: شريط أبيض بعرض الصورة والورقة في منتصفه فوق الإيصال
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                width: 96,
-                height: 128,
-                decoration: BoxDecoration(border: Border.all(color: Colors.black12)),
-                child: FittedBox(
-                  fit: BoxFit.cover,
-                  alignment: Alignment.topCenter,
-                  clipBehavior: Clip.hardEdge,
-                  child: SizedBox(
-                      width: 300,
-                      child: ReceiptPreview(
-                          path: path,
-                          tag: tag!,
-                          cacheWidth: 300,
-                          showTag: !noTags.contains(path))),
-                ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(child: Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey))),
-            IconButton(
-                tooltip: noTags.contains(path) ? 'إظهار الورقة' : 'إخفاء الورقة',
-                icon: Icon(noTags.contains(path) ? Icons.label_off_rounded : Icons.label_outline_rounded),
-                onPressed: busy ? null : () => _toggleTag(path)),
-            IconButton(
-                tooltip: 'تعديل',
-                icon: const Icon(Icons.tune_rounded),
-                onPressed: busy ? null : () => _edit(i)),
-            IconButton(
-                tooltip: 'مسح',
-                icon: const Icon(Icons.delete_outline_rounded, color: Colors.red),
-                onPressed: busy ? null : () => _remove(i)),
-            ReorderableDragStartListener(
-                index: i,
-                child:
-                    const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle_rounded))),
-          ]),
+  Future<void> recount(MResult r) async {
+    r.count = -1;
+    r.tries = 0;
+    saveMState(results);
+    if (mounted) setState(() => status = 'اتعلّم للعد. اضغط \"فحص إيصالات الدفع\".');
+  }
+
+  List<String> missingMachines() {
+    final got = results.where((r) => !r.excluded).map((r) => r.orderNum).whereType<int>().toSet();
+    final out = <String>[];
+    for (var n = 1; n <= kMainMachines; n++) {
+      if (!got.contains(n)) out.add('$n ${terminals[numToTid[n]]!.unitName}');
+    }
+    return out;
+  }
+
+  Future<void> openReport(MResult r) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ReceiptReportPage(
+          r: r,
+          canEdit: !busy,
+          onChanged: () {
+            saveMState(results);
+            if (mounted) setState(() {});
+          },
+          onOpenPdf: () => openPdf(r.openPath),
+          onRecount: () => recount(r),
+          onVerdict: (v) => setVerdict(r, v, toggle: false),
         ),
       ),
     );
+    if (mounted) setState(() {});
+  }
+
+  Future<void> openOverview() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MachinesReportPage(
+          results: results,
+          missing: missingMachines(),
+          openReport: openReport,
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
+    return PopScope(
+      canPop: !busy,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (!didPop && busy) {
+          // الفحص شغال: ما نقفلش الشاشة، نرجّع التطبيق للخلفية بس علشان الفحص يكمّل
+          _dbg('BACK while busy -> moveToBack');
+          try {
+            await _chan.invokeMethod('moveToBack');
+          } catch (_) {}
+        }
+      },
+      child: _buildScaffold(context),
+    );
+  }
+
+  Widget _buildScaffold(BuildContext context) {
+    AppSettings.of(context);
+    final missing = results.isEmpty ? <String>[] : missingMachines();
+    final reviewN = results.where((r) => !r.ok).length;
+    final pendCount = results.where((r) => r.pending).length;
+    final named = results.where((r) => r.newName != null && !r.excluded).length;
+    final totalRc = results.fold<int>(0, (a, r) => a + (r.count > 0 && !r.excluded ? r.count : 0));
+    final visRes = _visibleResults();
+    _syncBadge(machBadge, reviewN);
+    machBusyG = busy;
     return Scaffold(
-      appBar: AppBar(title: Text('إيصالات الدفع (${imgs.length})')),
-      body: Column(children: [
-        Expanded(
-          child: !loaded
-              ? const Center(child: CircularProgressIndicator())
-              : imgs.isEmpty
-                  ? Center(
-                      child: busy
-                          ? const CircularProgressIndicator()
-                          : const Text('لسه مفيش صور', style: TextStyle(fontSize: 16)))
-                  : ReorderableListView.builder(
-                      padding: const EdgeInsets.all(12),
-                      buildDefaultDragHandles: false,
-                      itemCount: imgs.length,
-                      onReorder: _reorder,
-                      itemBuilder: (_, i) => _item(i),
-                    ),
-        ),
-        SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              SizedBox(
-                width: double.infinity,
-                child: FilterBar(
-                  selected: filter,
-                  onChanged: busy
-                      ? null
-                      : (f) {
-                          setState(() => filter = f);
-                          Store.setFilter(f);
-                        },
+      appBar: AppBar(
+        toolbarHeight: 54,
+        titleSpacing: 12,
+        title: const AppTitle(),
+        actions: [
+          const HeaderButtons(),
+          _moreMenu(context, busy: busy),
+        ],
+      ),
+      bottomNavigationBar: _scanBar(
+        busy: busy,
+        stopReq: stopReq,
+        onStop: () => setState(() {
+          chainAbort = true;
+          stopReq = true;
+        }),
+        thisLabel: 'فحص إيصالات الدفع',
+        onScanThis: () => _startCountAll(),
+        progress: progressValue,
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+        children: [
+          _settingsCollapsed(
+              context,
+              '${pdfDir != null ? baseName(pdfDir!) : _l(context, 'واتساب', 'WhatsApp')} • ${_periodLabelOf(days)}'
+              ' • ${_l(context, 'المخرجات', 'Output')}: ${destDir == defaultMDest ? _l(context, 'الافتراضي', 'Default') : baseName(destDir)}'
+              '${autoScan ? ' • ${_l(context, 'فحص تلقائي ✓', 'Auto-scan ✓')}' : ''}',
+              [
+            _switchRow('فحص تلقائي خفيف (يعدّ الملف الجديد لوحده ويبعتلك إشعار بالنتيجة)', autoScan, (v) => _setAuto(v)),
+            _countMethodsPanel(busy: busy, onChanged: () => setState(() {})),
+            const Divider(height: 4),
+            _sourceChips(context,
+                busy: busy,
+                days: days,
+                onDays: (d) {
+                  setState(() => days = d);
+                  sharedDays.value = d;
+                },
+                periodLabel: _periodLabelOf(days),
+                sourcePath: pdfDir,
+                onPickSource: pickDir,
+                onUseWhatsApp: () {
+                  savePdfDir(null);
+                  setState(() => pdfDir = null);
+                },
                 ),
-              ),
-              Row(children: [
-                const SizedBox(width: 4),
-                const Expanded(
-                    child: Text('تصوير متتالي (يفتح الكاميرا تاني بعد كل إيصال)',
-                        style: TextStyle(fontSize: 12))),
-                Switch(
-                    value: continuous,
-                    onChanged: (v) {
-                      setState(() => continuous = v);
-                      Store.setContinuous(v);
-                    }),
-              ]),
-              Row(children: [
-                Expanded(
-                  child: FilledButton.tonalIcon(
-                    onPressed: busy ? null : _add,
-                    icon: const Icon(Icons.add_a_photo_rounded),
-                    label: const Text('تصوير'),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: busy ? null : _addGallery,
-                    icon: const Icon(Icons.photo_library_rounded),
-                    label: const Text('من المعرض'),
-                  ),
-                ),
-              ]),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                height: 50,
-                child: FilledButton.icon(
-                  onPressed: (busy || imgs.isEmpty) ? null : (built == null ? _createAndSend : _send),
-                  icon: busy
-                      ? const SizedBox(
-                          width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                      : Icon(built == null ? Icons.picture_as_pdf_rounded : Icons.visibility_rounded),
-                  label: Text(progress != null
-                      ? 'جارى التجهيز $progress'
-                      : (built == null ? 'إنشاء ومعاينة PDF' : 'معاينة ومشاركة')),
-                ),
-              ),
-            ]),
+            _outputCard(context,
+                busy: busy,
+                outPath: destDir,
+                outIsDefault: destDir == defaultMDest,
+                onPickOut: pickOut,
+                onUseDefaultOut: useDefaultOut,
+                onOpenOut: openDest),
+          ]),
+          _runAllCard(),
+          _statusBox(status),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              _statCard(Icons.description, 'ملفات', '${results.length}', Colors.blueGrey, compact: true),
+              _statCard(Icons.drive_file_rename_outline, 'اتسمّى', '$named', Colors.blueGrey, compact: true),
+              _statCard(Icons.receipt_long, 'إيصالات', '$totalRc', Colors.blueGrey, compact: true),
+              _statCard(Icons.hourglass_bottom, 'لسه', '$pendCount', Colors.amber, compact: true),
+              _statCard(Icons.fact_check, 'مراجعة', '$reviewN', kReviewTone, compact: true),
+            ],
           ),
-        ),
-      ]),
+          const SizedBox(height: 6),
+          _actionRow([
+            _quickBtnG(context, Icons.insights, _l(context, 'التقرير', 'Report'),
+                results.isEmpty ? null : openOverview),
+            _quickBtnG(context, Icons.chat, 'إرسال الكل ($named)',
+                (busy && !namingDone) || named == 0 ? null : shareAll),
+            _quickBtnG(context, Icons.drive_file_move, _l(context, 'نقل', 'Move'),
+                (busy && !namingDone) || results.every((r) => r.excluded) ? null : transferGood),
+            _quickBtnG(context, Icons.note_add, 'يدوي', busy ? null : pickManualPdfs),
+          ]),
+          const SizedBox(height: 4),
+          _filterRowCompact(reviewOnly, results.length, reviewN, (v) => setState(() => reviewOnly = v)),
+          _reviewTools(context,
+              hint: _l(context, 'اسحب أي ملف لتعليمه: صح ✓ أو غلط ✗',
+                  'Swipe any file to mark it: OK ✓ or wrong ✗'),
+              count: reviewN,
+              reviewOnly: reviewOnly,
+              busy: busy,
+              onRestOk: markRestOk),
+          if (results.isNotEmpty)
+            _listTools(context,
+                remaining: reviewN,
+                total: results.length,
+                controller: _searchCtl,
+                onQuery: (v) => setState(() => _q = v),
+                sort: _sort,
+                sortLabels: [
+                  _l(context, 'الترتيب الأصلي', 'Original order'),
+                  _l(context, 'رقم الماكينة', 'Machine number'),
+                  _l(context, 'الأكبر فرقاً', 'Largest gap'),
+                  _l(context, 'الأكثر إيصالات', 'Most receipts'),
+                ],
+                onSort: (v) => setState(() => _sort = v)),
+          if (missing.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: _tintBg(context, Colors.amber),
+                border: Border.all(color: _tintBorder(context, Colors.amber)),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text('⚠️ ماكينات ما وصلش ملفها (${missing.length}): ${missing.join(' ، ')}',
+                  style: const TextStyle(fontSize: 13)),
+            ),
+          ],
+          const SizedBox(height: 10),
+          if (results.isEmpty && busy) const _SkeletonList(),
+          if (results.isEmpty && !busy)
+            _emptyState(context, Icons.folder_copy, _l(context, 'مفيش ملفات لسه', 'No files yet'),
+                _l(context, 'اضغط "فحص إيصالات الدفع" علشان نقرا ملفات الـ PDF ونسمّيها.',
+                    'Tap "Scan payment receipts" to read and rename the PDF files.'),
+                actionLabel: _l(context, 'فحص إيصالات الدفع', 'Scan payment receipts'),
+                onAction: () => _startCountAll()),
+          if (results.isNotEmpty && visRes.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(24),
+              child: Center(child: w.Text(_l(context, 'مفيش نتايج.', 'No results.'))),
+            ),
+          for (final r in visRes)
+            Builder(builder: (context) {
+              final match = _batchMatch(r);
+              final soft = _batchSoft(r);
+              final stripColor = _mStripColor(r);
+              final Color? cardTint = r.excluded
+                  ? _tintBg(context, Colors.grey, strong: true)
+                  : (match == null
+                      ? null
+                      : (match ? _tintBg(context, Colors.green) : (soft ? _tintBg(context, Colors.amber) : _tintBg(context, Colors.red))));
+              return Dismissible(
+                key: ObjectKey(r),
+                confirmDismiss: (dir) async {
+                  HapticFeedback.lightImpact();
+                  setVerdict(r, dir == DismissDirection.startToEnd ? 1 : -1, toggle: false);
+                  return false;
+                },
+                background: Container(
+                  color: _tintBg(context, Colors.green, strong: true),
+                  alignment: AlignmentDirectional.centerStart,
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: const Text('صح ✓', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                secondaryBackground: Container(
+                  color: _tintBg(context, Colors.red, strong: true),
+                  alignment: AlignmentDirectional.centerEnd,
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: const Text('غلط ✗', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                child: TweenAnimationBuilder<Color?>(
+                  tween: ColorTween(end: cardTint ?? Theme.of(context).colorScheme.surfaceContainerLow),
+                  duration: const Duration(milliseconds: 350),
+                  builder: (context, cardCol, _) => Card(
+                  margin: const EdgeInsets.symmetric(vertical: 2),
+                  clipBehavior: Clip.antiAlias,
+                  color: cardCol,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 350),
+                    decoration: BoxDecoration(
+                      border: BorderDirectional(start: BorderSide(color: stripColor, width: 4)),
+                    ),
+                    child: InkWell(
+                    onTap: () => openReport(r),
+                    child: Padding(
+                    padding: const EdgeInsetsDirectional.fromSTEB(12, 5, 4, 5),
+                    child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                    Expanded(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _mTitle(context, r),
+                          const SizedBox(height: 2),
+                          _mSubtitle(context, r, busy),
+                        ],
+                      ),
+                    ),
+                    SizedBox(
+                      width: 52,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          PopupMenuButton<String>(
+                            tooltip: tr('المزيد'),
+                            padding: EdgeInsets.zero,
+                            onSelected: (v) {
+                              if (v == 'report') {
+                                openReport(r);
+                              } else if (v == 'open') {
+                                openPdf(r.openPath);
+                              } else if (v == 'share') {
+                                shareOne(r);
+                              } else if (v == 'recount') {
+                                recount(r);
+                              } else if (v == 'assign') {
+                                assignMachine(r);
+                              } else if (v == 'clear') {
+                                setVerdict(r, 0, toggle: false);
+                              }
+                            },
+                            itemBuilder: (_) => [
+                              PopupMenuItem(
+                                  value: 'report',
+                                  child: w.Text(_l(context, 'تقرير الإيصال', 'Receipt report'))),
+                              PopupMenuItem(
+                                  value: 'open',
+                                  child: w.Text(_l(context, 'فتح الملف', 'Open file'))),
+                              PopupMenuItem(
+                                  value: 'share',
+                                  enabled: r.newName != null && !r.excluded,
+                                  child: const Text('إرسال الملف')),
+                              PopupMenuItem(
+                                  value: 'assign', enabled: !busy, child: const Text('تحديد الماكينة')),
+                              PopupMenuItem(
+                                  value: 'recount', enabled: !busy, child: const Text('إعادة العد')),
+                              if (r.verdict != 0)
+                                const PopupMenuItem(value: 'clear', child: Text('إلغاء علامة صح/غلط')),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    ],
+                    ),
+                    ),
+                    ),
+                  ),
+                  ),
+                ),
+              );
+            }),
+        ],
+      ),
     );
   }
 }
