@@ -3501,6 +3501,20 @@ class _EditorPageState extends State<EditorPage> {
   double brightness = 0;
   late int tab = widget.initialTab; // 0 قص، 1 تدوير، 2 ألوان
   int drag = -1; // 0..3 زوايا، 4..7 حواف، 8 تحريك الكل
+  // تكبير/تصغير منطقة القص: قرصة بإصبعين، أو نقرتين، وسحب بإصبع واحد لتحريك الصورة وهي مكبّرة
+  double _zm = 1;
+  Offset _pan = Offset.zero;
+  final Map<int, Offset> _ptrs = {};
+  double _pinchD0 = 0, _pinchZ0 = 1;
+  Offset _pinchFocalImg = Offset.zero;
+  Offset _lastPtr = Offset.zero;
+  Offset _downPos = Offset.zero;
+  bool _movedFar = false;
+  bool _pinched = false;
+  DateTime _downAt = DateTime(2000);
+  DateTime _lastTapAt = DateTime(2000);
+  Offset _lastTapPos = Offset.zero;
+  static const _maxZoom = 6.0;
   bool busy = false;
   bool _quadTouched = false; // الموظف حدد الإطار بنفسه: القص التلقائي المتأخر ميلمسوش
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
@@ -3605,8 +3619,17 @@ class _EditorPageState extends State<EditorPage> {
 
   // ---------- اللمس ----------
 
+  Offset _clampPan(Offset p, Size s) => Offset(
+        p.dx.clamp(s.width - s.width * _zm, 0.0).toDouble(),
+        p.dy.clamp(s.height - s.height * _zm, 0.0).toDouble(),
+      );
+
+  /// p: إحداثيات على الشاشة (جوه منطقة العرض).
   void _down(Offset p, Size s) {
-    final pts = [for (final q in quad) Offset(q.dx * s.width, q.dy * s.height)];
+    final pan = _clampPan(_pan, s);
+    final pts = [
+      for (final q in quad) Offset(q.dx * s.width * _zm + pan.dx, q.dy * s.height * _zm + pan.dy)
+    ];
     var best = -1;
     var bd = 44.0;
     for (var i = 0; i < 4; i++) {
@@ -3661,6 +3684,95 @@ class _EditorPageState extends State<EditorPage> {
     setState(() => quad = q);
   }
 
+  void _ptrDown(PointerDownEvent e, Offset origin, Size s) {
+    final p = e.localPosition - origin;
+    _ptrs[e.pointer] = p;
+    if (_ptrs.length == 1) {
+      _pinched = false;
+      _movedFar = false;
+      _downPos = p;
+      _lastPtr = p;
+      _downAt = DateTime.now();
+      _down(p, s);
+    } else if (_ptrs.length == 2) {
+      // إصبعين: تكبير/تصغير (وبنوقف سحب الزوايا)
+      if (drag != -1) setState(() => drag = -1);
+      _pinched = true;
+      final v = _ptrs.values.toList();
+      _pinchD0 = math.max((v[0] - v[1]).distance, 1);
+      _pinchZ0 = _zm;
+      final mid = (v[0] + v[1]) / 2;
+      final pan = _clampPan(_pan, s);
+      _pinchFocalImg = Offset((mid.dx - pan.dx) / _zm, (mid.dy - pan.dy) / _zm);
+    }
+  }
+
+  void _ptrMove(PointerMoveEvent e, Offset origin, Size s) {
+    if (!_ptrs.containsKey(e.pointer)) return;
+    final p = e.localPosition - origin;
+    _ptrs[e.pointer] = p;
+    if (_ptrs.length >= 2) {
+      final v = _ptrs.values.toList();
+      final mid = (v[0] + v[1]) / 2;
+      final z = (_pinchZ0 * (v[0] - v[1]).distance / _pinchD0).clamp(1.0, _maxZoom).toDouble();
+      setState(() {
+        _zm = z;
+        _pan = _clampPan(Offset(mid.dx - _pinchFocalImg.dx * z, mid.dy - _pinchFocalImg.dy * z), s);
+      });
+      return;
+    }
+    final delta = p - _lastPtr;
+    _lastPtr = p;
+    if ((p - _downPos).distance > 12) _movedFar = true;
+    if (_pinched) {
+      // آخر إصبع بعد القرصة: بيحرك الصورة بس
+      if (_zm > 1.001) setState(() => _pan = _clampPan(_pan + delta, s));
+      return;
+    }
+    if (drag >= 0 && drag < 8) {
+      _move(delta / _zm, s);
+    } else if (_zm > 1.001) {
+      setState(() => _pan = _clampPan(_pan + delta, s)); // سحب الصورة وهي مكبّرة
+    } else if (drag == 8) {
+      _move(delta / _zm, s);
+    }
+  }
+
+  void _ptrUp(PointerEvent e, Size s, {bool cancel = false}) {
+    final had = _ptrs.remove(e.pointer) != null;
+    if (!had) return;
+    if (_ptrs.isNotEmpty) {
+      _lastPtr = _ptrs.values.first;
+      return;
+    }
+    final wasDrag = drag;
+    if (drag != -1) setState(() => drag = -1);
+    if (cancel || _pinched || _movedFar) return;
+    // نقرة سريعة: نقرتين ورا بعض = تكبير/رجوع
+    final now = DateTime.now();
+    if (now.difference(_downAt).inMilliseconds > 300) return;
+    final onHandle = wasDrag >= 0 && wasDrag < 8;
+    if (onHandle) return;
+    final pos = _downPos;
+    if (now.difference(_lastTapAt).inMilliseconds < 350 && (pos - _lastTapPos).distance < 40) {
+      _lastTapAt = DateTime(2000);
+      setState(() {
+        if (_zm > 1.05) {
+          _zm = 1;
+          _pan = Offset.zero;
+        } else {
+          final pan = _clampPan(_pan, s);
+          final fi = Offset((pos.dx - pan.dx) / _zm, (pos.dy - pan.dy) / _zm);
+          _zm = 2.5;
+          _pan = _clampPan(Offset(pos.dx - fi.dx * _zm, pos.dy - fi.dy * _zm), s);
+        }
+      });
+    } else {
+      _lastTapAt = now;
+      _lastTapPos = pos;
+    }
+  }
+
   Offset? _focus(Size s) {
     if (drag < 0 || drag > 7) return null;
     final n = drag < 4 ? quad[drag] : (quad[drag - 4] + quad[(drag - 3) % 4]) / 2;
@@ -3680,7 +3792,8 @@ class _EditorPageState extends State<EditorPage> {
   /// عدسة مكبّرة بتظهر فوق الإصبع وقت سحب الزاوية.
   Widget _loupe(Offset f, Size s) {
     const d = 112.0, z = 2.6;
-    final left = f.dx < s.width / 2 ? s.width - d - 6 : 6.0;
+    final fx = f.dx * _zm + _clampPan(_pan, s).dx;
+    final left = fx < s.width / 2 ? s.width - d - 6 : 6.0;
     return Positioned(
       left: left,
       top: 6,
@@ -4008,22 +4121,51 @@ class _EditorPageState extends State<EditorPage> {
                     }
                     final size = Size(w, h);
                     final focus = _focus(size);
+                    final pan = _clampPan(_pan, size);
+                    final zoomed = _zm > 1.001;
+                    const origin = Offset(pad, pad);
                     return Center(
                       child: SizedBox(
                         width: w + 2 * pad,
                         height: h + 2 * pad,
-                        child: GestureDetector(
+                        child: Listener(
                           behavior: HitTestBehavior.opaque,
-                          onPanDown: (d) => _down(d.localPosition - const Offset(pad, pad), size),
-                          onPanUpdate: (d) => _move(d.delta, size),
-                          onPanEnd: (_) => setState(() => drag = -1),
-                          onPanCancel: () => setState(() => drag = -1),
+                          onPointerDown: (e) => _ptrDown(e, origin, size),
+                          onPointerMove: (e) => _ptrMove(e, origin, size),
+                          onPointerUp: (e) => _ptrUp(e, size),
+                          onPointerCancel: (e) => _ptrUp(e, size, cancel: true),
                           child: Padding(
                             padding: const EdgeInsets.all(pad),
-                            child: Stack(clipBehavior: Clip.none, children: [
-                              _img(w, h),
-                              Positioned.fill(child: CustomPaint(painter: _QuadPainter(quad))),
+                            child: Stack(clipBehavior: zoomed ? Clip.hardEdge : Clip.none, children: [
+                              Transform(
+                                transform: Matrix4.translationValues(pan.dx, pan.dy, 0) *
+                                    Matrix4.diagonal3Values(_zm, _zm, 1),
+                                child: _img(w, h),
+                              ),
+                              Positioned.fill(child: CustomPaint(painter: _QuadPainter(quad, _zm, pan))),
                               if (focus != null) _loupe(focus, size),
+                              if (zoomed)
+                                Positioned(
+                                  left: 6,
+                                  bottom: 6,
+                                  child: GestureDetector(
+                                    onTap: () => setState(() {
+                                      _zm = 1;
+                                      _pan = Offset.zero;
+                                    }),
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                      decoration: BoxDecoration(
+                                          color: Colors.black54, borderRadius: BorderRadius.circular(16)),
+                                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                        const Icon(Icons.zoom_out_map, size: 16, color: Colors.white),
+                                        const SizedBox(width: 4),
+                                        Text('×${_zm.toStringAsFixed(1)}',
+                                            style: const TextStyle(color: Colors.white, fontSize: 12)),
+                                      ]),
+                                    ),
+                                  ),
+                                ),
                             ]),
                           ),
                         ),
@@ -4122,11 +4264,13 @@ class _ViewPainter extends CustomPainter {
 
 class _QuadPainter extends CustomPainter {
   final List<Offset> q;
-  _QuadPainter(this.q);
+  final double zm;
+  final Offset pan;
+  _QuadPainter(this.q, [this.zm = 1, this.pan = Offset.zero]);
 
   @override
   void paint(Canvas canvas, Size s) {
-    final pts = [for (final p in q) Offset(p.dx * s.width, p.dy * s.height)];
+    final pts = [for (final p in q) Offset(p.dx * s.width * zm + pan.dx, p.dy * s.height * zm + pan.dy)];
     final poly = Path()..addPolygon(pts, true);
     canvas.drawPath(
         Path.combine(PathOperation.difference, Path()..addRect(Offset.zero & s), poly),
@@ -4154,7 +4298,7 @@ class _QuadPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_QuadPainter o) => o.q != q;
+  bool shouldRepaint(_QuadPainter o) => o.q != q || o.zm != zm || o.pan != pan;
 }
 
 // =====================================================================
