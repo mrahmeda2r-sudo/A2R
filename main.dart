@@ -3797,10 +3797,11 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
     final n = w * h;
     final feat = Uint8List(n);
     for (var i = 0; i < n; i++) {
-      final r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
-      final y = (r * 54 + g * 183 + b * 19) >> 8;
-      final chroma = math.max(r, math.max(g, b)) - math.min(r, math.min(g, b));
-      final v = y - 2 * chroma; // الخشب ملوّن فبيبقى أغمق، والورقة رمادية فبتفضل فاتحة
+      final int r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+      final int y = (r * 54 + g * 183 + b * 19) >> 8;
+      final int hi = r > g ? (r > b ? r : b) : (g > b ? g : b);
+      final int lo = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      final int v = y - 2 * (hi - lo); // الخشب ملوّن فبيبقى أغمق، والورقة رمادية فبتفضل فاتحة
       feat[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
     return _quadFromFeature(feat, w, h);
@@ -3940,9 +3941,9 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
   final ub = up.bytesPerPixel ?? 1, vb = vp.bytesPerPixel ?? 1;
   final feat = Uint8List(gw * gh);
   for (var gy = 0; gy < gh; gy++) {
-    final yu = (((gy + 0.5) * upH / gh).floor()).clamp(0, upH - 1);
+    final int yu = math.min(upH - 1, math.max(0, ((gy + 0.5) * upH / gh).floor()));
     for (var gx = 0; gx < gw; gx++) {
-      final xu = (((gx + 0.5) * upW / gw).floor()).clamp(0, upW - 1);
+      final int xu = math.min(upW - 1, math.max(0, ((gx + 0.5) * upW / gw).floor()));
       int sx, sy;
       switch (rot) {
         case 90:
@@ -3969,7 +3970,7 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
       if (ci < up.bytes.length && vi < vp.bytes.length) {
         chroma = (up.bytes[ci] - 128).abs() + (vp.bytes[vi] - 128).abs();
       }
-      final v = y - (chroma * 1.5).round();
+      final int v = y - (chroma * 1.5).round();
       feat[gy * gw + gx] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
   }
@@ -3986,7 +3987,7 @@ class _LiveQuadPainter extends CustomPainter {
     final pts = [for (final o in q) Offset(o.dx * size.width, o.dy * size.height)];
     final path = Path()..addPolygon(pts, true);
     const col = Color(0xFF1EC8A5);
-    canvas.drawPath(path, Paint()..color = col.withOpacity(0.18));
+    canvas.drawPath(path, Paint()..color = col.withValues(alpha: 0.18));
     canvas.drawPath(
         path,
         Paint()
