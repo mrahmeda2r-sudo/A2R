@@ -6,7 +6,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:camera/camera.dart' as cam;
 import 'package:document_scan/document_scan.dart' as ds;
-import 'package:flutter/foundation.dart' show compute;
+import 'package:flutter/foundation.dart' show compute, listEquals;
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1455,6 +1455,15 @@ class Store {
 
   static Future<void> setFilter(ScanFilter f) async => (await _p).setInt('filter', f.index);
 
+  /// المظهر: 0 داكن (الافتراضي)، 1 زي النظام، 2 فاتح
+  static Future<int> themeSetting() async => ((await _p).getInt('themeMode') ?? 0).clamp(0, 2).toInt();
+  static Future<void> setThemeSetting(int v) async => (await _p).setInt('themeMode', v);
+
+  /// اللون: 0 ذهبي (الافتراضي)، 1 فضي، 2 أزرق
+  static Future<int> paletteSetting() async =>
+      ((await _p).getInt('palette') ?? 0).clamp(0, AppPalette.values.length - 1).toInt();
+  static Future<void> setPaletteSetting(int v) async => (await _p).setInt('palette', v);
+
   static Future<bool> continuous() async => (await _p).getBool('continuous') ?? true;
   static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
 
@@ -1756,11 +1765,11 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
     builder: (c) => SafeArea(
       child: Wrap(children: [
         ListTile(
-            leading: const Icon(Icons.photo_camera),
+            leading: const Icon(Icons.photo_camera_rounded),
             title: const Text('الكاميرا'),
             onTap: () => Navigator.pop(c, ImageSource.camera)),
         ListTile(
-            leading: const Icon(Icons.photo_library),
+            leading: const Icon(Icons.photo_library_rounded),
             title: const Text('المعرض'),
             onTap: () => Navigator.pop(c, ImageSource.gallery)),
       ]),
@@ -2053,7 +2062,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
               ? () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length)
               : null,
           keyboardType: TextInputType.numberWithOptions(decimal: dec),
-          decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
+          decoration: InputDecoration(labelText: label, border: kFieldBorder),
         ),
       );
 
@@ -2321,7 +2330,32 @@ class ReceiptPreview extends StatelessWidget {
 void snack(BuildContext context, String m) =>
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
-const kBrandDark = Color(0xFF0E131A); // نفس خلفية الأيقونة. الشعار أبيض فمحتاج خلفية غامقة.
+/// الألوان المتاحة. الشعار أبيض فمحتاج خلفية غامقة (dark) في كل لون.
+enum AppPalette { gold, silver, blue }
+
+class Pal {
+  final String name;
+  final Color seed, accent, dark, mid, bg, onAccent;
+  const Pal(this.name, this.seed, this.accent, this.dark, this.mid, this.bg, this.onAccent);
+}
+
+const kPalettes = <AppPalette, Pal>{
+  AppPalette.gold: Pal('ذهبي', Color(0xFFC9A227), Color(0xFFE3B94A), Color(0xFF15120B),
+      Color(0xFF4A3A12), Color(0xFF0D0C09), Color(0xFF15120B)),
+  AppPalette.silver: Pal('فضي', Color(0xFF8E9AA8), Color(0xFFD3DAE3), Color(0xFF14171C),
+      Color(0xFF3C444F), Color(0xFF0C0D10), Color(0xFF14171C)),
+  AppPalette.blue: Pal('أزرق', Color(0xFF0B5FA5), Color(0xFF1EC8A5), Color(0xFF0E131A),
+      Color(0xFF0B5FA5), Color(0xFF0A0E13), Colors.white),
+};
+
+/// اللون الحالي (الافتراضي ذهبي).
+final ValueNotifier<AppPalette> appPalette = ValueNotifier(AppPalette.gold);
+Pal get pal => kPalettes[appPalette.value]!;
+Color get kAccent => pal.accent;
+Color get kBrandDark => pal.dark;
+
+const kFieldBorder = OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(14)));
+const kCardShape = RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(18)));
 
 Widget appLogo({double height = 36}) => Image.asset(
       'assets/logo.png',
@@ -2352,6 +2386,10 @@ Future<void> main() async {
   };
   await AppData.load();
   try {
+    appThemeMode.value = _themeOf(await Store.themeSetting());
+    appPalette.value = AppPalette.values[await Store.paletteSetting()];
+  } catch (_) {}
+  try {
     final sp = await SharedPreferences.getInstance();
     if (sp.getBool('apply_guard') == true) {
       await sp.setBool('apply_safe', true);
@@ -2380,33 +2418,76 @@ Future<void> main() async {
   runApp(A2RApp(resumeTarget: resume));
 }
 
-ThemeData _theme(Brightness b) => ThemeData(
-      colorSchemeSeed: const Color(0xFF0B5FA5),
-      brightness: b,
-      useMaterial3: true,
-      appBarTheme: const AppBarTheme(
-        backgroundColor: kBrandDark,
-        foregroundColor: Colors.white,
-        surfaceTintColor: Colors.transparent,
-        systemOverlayStyle: SystemUiOverlayStyle.light,
+ThemeData _theme(Brightness b) {
+  final p = pal;
+  final dark = b == Brightness.dark;
+  final cs = ColorScheme.fromSeed(seedColor: p.seed, brightness: b);
+  RoundedRectangleBorder rr(double r) =>
+      RoundedRectangleBorder(borderRadius: BorderRadius.circular(r));
+  return ThemeData(
+    useMaterial3: true,
+    colorScheme: cs,
+    scaffoldBackgroundColor: dark ? p.bg : null,
+    appBarTheme: AppBarTheme(
+      backgroundColor: p.dark,
+      foregroundColor: Colors.white,
+      surfaceTintColor: Colors.transparent,
+      centerTitle: true,
+      elevation: 0,
+      iconTheme: IconThemeData(color: p.accent),
+      actionsIconTheme: IconThemeData(color: p.accent),
+      titleTextStyle:
+          const TextStyle(color: Colors.white, fontSize: 19, fontWeight: FontWeight.bold),
+      systemOverlayStyle: SystemUiOverlayStyle.light,
+    ),
+    filledButtonTheme: FilledButtonThemeData(
+      style: FilledButton.styleFrom(
+        minimumSize: const Size(0, 48),
+        shape: rr(14),
+        textStyle: const TextStyle(fontWeight: FontWeight.bold),
       ),
-    );
+    ),
+    outlinedButtonTheme: OutlinedButtonThemeData(
+      style: OutlinedButton.styleFrom(
+        minimumSize: const Size(0, 46),
+        shape: rr(14),
+        side: BorderSide(color: dark ? p.accent.withAlpha(120) : cs.outline),
+      ),
+    ),
+    chipTheme: const ChipThemeData(shape: StadiumBorder()),
+    snackBarTheme: SnackBarThemeData(behavior: SnackBarBehavior.floating, shape: rr(14)),
+    bottomSheetTheme: const BottomSheetThemeData(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+    ),
+    dividerTheme: DividerThemeData(color: cs.outlineVariant),
+  );
+}
+
+/// المظهر: الافتراضي داكن. الإعدادات: 0 داكن، 1 زي النظام، 2 فاتح.
+final ValueNotifier<ThemeMode> appThemeMode = ValueNotifier(ThemeMode.dark);
+
+ThemeMode _themeOf(int i) =>
+    i == 1 ? ThemeMode.system : (i == 2 ? ThemeMode.light : ThemeMode.dark);
 
 class A2RApp extends StatelessWidget {
   final String? resumeTarget;
   const A2RApp({super.key, this.resumeTarget});
   @override
-  Widget build(BuildContext context) => MaterialApp(
-        title: 'A2R',
-        debugShowCheckedModeBanner: false,
-        theme: _theme(Brightness.light),
-        darkTheme: _theme(Brightness.dark),
-        themeMode: ThemeMode.system,
-        locale: const Locale('ar'),
-        supportedLocales: const [Locale('ar'), Locale('en')],
-        localizationsDelegates: GlobalMaterialLocalizations.delegates,
-        builder: (c, w) => Directionality(textDirection: TextDirection.rtl, child: w!),
-        home: LoginScreen(resumeTarget: resumeTarget),
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: Listenable.merge([appThemeMode, appPalette]),
+        builder: (_, __) => MaterialApp(
+          title: 'A2R',
+          debugShowCheckedModeBanner: false,
+          theme: _theme(Brightness.light),
+          darkTheme: _theme(Brightness.dark),
+          themeMode: appThemeMode.value,
+          // اللغة حسب لغة التليفون: عربي لو التليفون عربي، وغير كده إنجليزي (واتجاه الشاشة بيتبع اللغة)
+          supportedLocales: const [Locale('ar'), Locale('en')],
+          localeResolutionCallback: (l, supported) =>
+              (l != null && l.languageCode == 'ar') ? const Locale('ar') : const Locale('en'),
+          localizationsDelegates: GlobalMaterialLocalizations.delegates,
+          home: LoginScreen(resumeTarget: resumeTarget),
+        ),
       );
 }
 
@@ -2516,6 +2597,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     padding: const EdgeInsets.symmetric(vertical: 24),
                     decoration: BoxDecoration(
                       color: kBrandDark,
+                      border: Border.all(color: kAccent.withAlpha(120), width: 1.5),
                       borderRadius: BorderRadius.circular(28),
                     ),
                     child: appLogo(height: 120),
@@ -2526,8 +2608,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     isExpanded: true,
                     decoration: const InputDecoration(
                         labelText: 'الاسم',
-                        prefixIcon: Icon(Icons.person_outline),
-                        border: OutlineInputBorder()),
+                        prefixIcon: Icon(Icons.person_rounded), border: kFieldBorder),
                     items: AppData.names
                         .map((n) => DropdownMenuItem(value: n, child: Text(n)))
                         .toList(),
@@ -2539,8 +2620,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     isExpanded: true,
                     decoration: const InputDecoration(
                         labelText: 'الوحدة',
-                        prefixIcon: Icon(Icons.location_on_outlined),
-                        border: OutlineInputBorder()),
+                        prefixIcon: Icon(Icons.location_on_rounded), border: kFieldBorder),
                     items: AppData.units
                         .map((x) => DropdownMenuItem(value: x.name, child: Text(x.name)))
                         .toList(),
@@ -2557,8 +2637,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       isExpanded: true,
                       decoration: const InputDecoration(
                           labelText: 'المبنى',
-                          prefixIcon: Icon(Icons.apartment),
-                          border: OutlineInputBorder()),
+                          prefixIcon: Icon(Icons.apartment_rounded), border: kFieldBorder),
                       items: u.buildings
                           .map((b) => DropdownMenuItem(value: b, child: Text(b)))
                           .toList(),
@@ -2666,6 +2745,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     var autoEdit = await Store.autoEdit();
     var trim = await Store.trimMargins();
     var pdfSz = await Store.pdfSize();
+    var theme = await Store.themeSetting();
+    var palSel = AppPalette.values[await Store.paletteSetting()];
     if (!mounted) return;
     await showDialog(
       context: context,
@@ -2678,6 +2759,46 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    child: Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: Text('المظهر', style: TextStyle(fontWeight: FontWeight.bold))),
+                  ),
+                  for (final o in const <(int, String)>[(0, 'داكن (الافتراضي)'), (1, 'زي النظام'), (2, 'فاتح')])
+                    RadioListTile<int>(
+                      dense: true,
+                      title: Text(o.$2),
+                      value: o.$1,
+                      groupValue: theme,
+                      onChanged: (v) {
+                        setS(() => theme = v!);
+                        Store.setThemeSetting(v!);
+                        appThemeMode.value = _themeOf(v);
+                      },
+                    ),
+                  const Divider(),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    child: Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: Text('اللون', style: TextStyle(fontWeight: FontWeight.bold))),
+                  ),
+                  for (final pp in AppPalette.values)
+                    RadioListTile<AppPalette>(
+                      dense: true,
+                      title: Text(kPalettes[pp]!.name),
+                      secondary: CircleAvatar(radius: 11, backgroundColor: kPalettes[pp]!.accent),
+                      value: pp,
+                      groupValue: palSel,
+                      onChanged: (v) {
+                        setS(() => palSel = v!);
+                        Store.setPaletteSetting(v!.index);
+                        appPalette.value = v;
+                        setState(() {});
+                      },
+                    ),
+                  const Divider(),
                   RadioListTile<PerfMode>(
                     title: const Text('الوضع الاقتصادي (Lite)'),
                     subtitle: const Text('أسرع أداء للأجهزة القديمة، يستهلك رامات أقل ويعطل المؤثرات الثقيلة.'),
@@ -2927,7 +3048,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           border: Border.all(color: color.withAlpha(120)),
         ),
         child: Row(children: [
-          Icon(done ? Icons.check_circle : Icons.pending_outlined, color: color, size: 22),
+          Icon(done ? Icons.check_circle_rounded : Icons.pending_rounded, color: color, size: 22),
           const SizedBox(width: 8),
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2941,22 +3062,39 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _big(IconData icon, String label, VoidCallback onTap) => SizedBox(
-        height: 140,
-        child: FilledButton.tonal(
-          style: FilledButton.styleFrom(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-              padding: const EdgeInsets.all(8)),
-          onPressed: onTap,
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Icon(icon, size: 44),
-            const SizedBox(height: 8),
+  Widget _big(IconData icon, String label, VoidCallback onTap) {
+    final cs = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: 140,
+      child: Material(
+        color: cs.surfaceContainerHigh,
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+          side: BorderSide(color: kAccent.withAlpha(110), width: 1.2),
+        ),
+        child: InkWell(
+          onTap: onTap,
+          child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Container(
+              width: 58,
+              height: 58,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: kAccent.withAlpha(32),
+                border: Border.all(color: kAccent.withAlpha(140)),
+              ),
+              child: Icon(icon, size: 30, color: kAccent),
+            ),
+            const SizedBox(height: 10),
             Text(label,
                 textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           ]),
         ),
-      );
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2972,11 +3110,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         actions: [
           IconButton(
               tooltip: 'إعدادات الأداء',
-              icon: const Icon(Icons.settings),
+              icon: const Icon(Icons.settings_rounded),
               onPressed: _showSettings),
           IconButton(
               tooltip: 'تغيير الحساب',
-              icon: const Icon(Icons.switch_account),
+              icon: const Icon(Icons.switch_account_rounded),
               onPressed: () => Navigator.pop(context)),
         ],
       ),
@@ -2989,14 +3127,15 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             gradient: LinearGradient(
               begin: Alignment.topRight,
               end: Alignment.bottomLeft,
-              colors: [kBrandDark, cs.primary],
+              colors: [kBrandDark, pal.mid],
             ),
+            border: Border.all(color: kAccent.withAlpha(110), width: 1.2),
           ),
           child: DefaultTextStyle(
             style: const TextStyle(color: Colors.white, fontSize: 16),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
-                const Icon(Icons.person, color: Colors.white),
+                Icon(Icons.person_rounded, color: kAccent),
                 const SizedBox(width: 8),
                 Expanded(
                     child: Text(s.name,
@@ -3004,13 +3143,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               ]),
               const SizedBox(height: 8),
               Row(children: [
-                const Icon(Icons.location_on_outlined, color: Colors.white),
+                Icon(Icons.location_on_rounded, color: kAccent),
                 const SizedBox(width: 8),
                 Expanded(child: Text(unitLine)),
               ]),
               const SizedBox(height: 8),
               Row(children: [
-                const Icon(Icons.calendar_today, color: Colors.white, size: 20),
+                Icon(Icons.calendar_today_rounded, color: kAccent, size: 20),
                 const SizedBox(width: 8),
                 Text(s.date,
                     textDirection: TextDirection.ltr,
@@ -3025,20 +3164,20 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         ),
         const SizedBox(height: 14),
         Row(children: [
-          _statusChip(Icons.receipt_long, 'الباتش', batchSent, 'اتبعت', 'لسه'),
+          _statusChip(Icons.receipt_long_rounded, 'الباتش', batchSent, 'اتبعت', 'لسه'),
           const SizedBox(width: 10),
-          _statusChip(Icons.payments, 'الإيصالات', receiptsSent, 'اتبعت',
+          _statusChip(Icons.payments_rounded, 'الإيصالات', receiptsSent, 'اتبعت',
               draft.isEmpty ? 'لسه' : '${draft.length} صورة جاهزة'),
         ]),
         const SizedBox(height: 14),
         Row(children: [
           Expanded(
-              child: _big(Icons.receipt_long, 'الباتش',
+              child: _big(Icons.receipt_long_rounded, 'الباتش',
                   () => _open(BatchScreen(session: s, fresh: true)))),
           const SizedBox(width: 12),
           Expanded(
               child: _big(
-                  Icons.payments, 'إيصالات الدفع', () => _open(ReceiptsScreen(session: s)))),
+                  Icons.payments_rounded, 'إيصالات الدفع', () => _open(ReceiptsScreen(session: s)))),
         ]),
         if (draft.isNotEmpty || pf != null || bi != null) ...[
           const SizedBox(height: 24),
@@ -3047,6 +3186,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           const SizedBox(height: 8),
           if (bi != null)
             Card(
+      shape: kCardShape,
               child: ListTile(
                 leading: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
@@ -3059,17 +3199,18 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
                       tooltip: 'إرسال',
-                      icon: const Icon(Icons.send),
+                      icon: const Icon(Icons.send_rounded),
                       onPressed: busy ? null : _sendBatch),
                   IconButton(
                       tooltip: 'مسح',
-                      icon: const Icon(Icons.delete, color: Colors.red),
+                      icon: const Icon(Icons.delete_rounded, color: Colors.red),
                       onPressed: busy ? null : _trashBatch),
                 ]),
               ),
             ),
           if (draft.isNotEmpty)
             Card(
+      shape: kCardShape,
               child: ListTile(
                 leading: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
@@ -3081,14 +3222,15 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 onTap: () => _open(ReceiptsScreen(session: s)),
                 trailing: IconButton(
                     tooltip: 'مسح',
-                    icon: const Icon(Icons.delete, color: Colors.red),
+                    icon: const Icon(Icons.delete_rounded, color: Colors.red),
                     onPressed: _trashDraft),
               ),
             ),
           if (pf != null)
             Card(
+      shape: kCardShape,
               child: ListTile(
-                leading: const Icon(Icons.picture_as_pdf, size: 36, color: Colors.red),
+                leading: const Icon(Icons.picture_as_pdf_rounded, size: 36, color: Colors.red),
                 title: Text(pf.file.path.split('/').last,
                     maxLines: 2, overflow: TextOverflow.ellipsis),
                 subtitle: Text(
@@ -3096,10 +3238,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 onTap: _openPdf,
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
-                      tooltip: 'إرسال', icon: const Icon(Icons.send), onPressed: _sendPdf),
+                      tooltip: 'إرسال', icon: const Icon(Icons.send_rounded), onPressed: _sendPdf),
                   IconButton(
                       tooltip: 'مسح',
-                      icon: const Icon(Icons.delete, color: Colors.red),
+                      icon: const Icon(Icons.delete_rounded, color: Colors.red),
                       onPressed: _trashPdf),
                 ]),
               ),
@@ -3484,7 +3626,7 @@ class _BatchScreenState extends State<BatchScreen> {
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   child: Row(children: [
-                    const Icon(Icons.format_size),
+                    const Icon(Icons.format_size_rounded),
                     Expanded(
                       child: Slider(
                         value: bandScale.clamp(0.3, kBandMaxScale).toDouble(),
@@ -3500,7 +3642,7 @@ class _BatchScreenState extends State<BatchScreen> {
                             style: const TextStyle(fontSize: 12, color: Colors.grey))),
                     IconButton(
                       tooltip: 'الحجم الأصلي',
-                      icon: const Icon(Icons.restart_alt),
+                      icon: const Icon(Icons.restart_alt_rounded),
                       onPressed: noTag ? null : () => _setBand(kBatchTagW),
                     ),
                   ]),
@@ -3512,7 +3654,7 @@ class _BatchScreenState extends State<BatchScreen> {
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   child: Row(children: [
-                    const Icon(Icons.format_size),
+                    const Icon(Icons.format_size_rounded),
                     Expanded(
                       child: Slider(
                         value: pos!.s.clamp(0.1, 0.98).toDouble(),
@@ -3523,7 +3665,7 @@ class _BatchScreenState extends State<BatchScreen> {
                     ),
                     IconButton(
                       tooltip: 'المكان الأصلي',
-                      icon: const Icon(Icons.restart_alt),
+                      icon: const Icon(Icons.restart_alt_rounded),
                       onPressed: noTag ? null : () => _set(TagPos.initial(tag!)),
                     ),
                   ]),
@@ -3537,7 +3679,7 @@ class _BatchScreenState extends State<BatchScreen> {
                       Expanded(
                         child: OutlinedButton.icon(
                           onPressed: busy ? null : _capture,
-                          icon: const Icon(Icons.add_a_photo),
+                          icon: const Icon(Icons.add_a_photo_rounded),
                           label: const Text('تصوير'),
                         ),
                       ),
@@ -3545,7 +3687,7 @@ class _BatchScreenState extends State<BatchScreen> {
                       Expanded(
                         child: OutlinedButton.icon(
                           onPressed: busy ? null : _gallery,
-                          icon: const Icon(Icons.photo_library),
+                          icon: const Icon(Icons.photo_library_rounded),
                           label: const Text('معرض'),
                         ),
                       ),
@@ -3553,7 +3695,7 @@ class _BatchScreenState extends State<BatchScreen> {
                       Expanded(
                         child: OutlinedButton.icon(
                           onPressed: busy ? null : _edit,
-                          icon: const Icon(Icons.crop),
+                          icon: const Icon(Icons.crop_rounded),
                           label: const Text('تعديل'),
                         ),
                       ),
@@ -3569,7 +3711,7 @@ class _BatchScreenState extends State<BatchScreen> {
                                 width: 18,
                                 height: 18,
                                 child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.send),
+                            : const Icon(Icons.send_rounded),
                         label: const Text('إرسال'),
                       ),
                     ),
@@ -3764,7 +3906,8 @@ Uint8List _warpJob(Map<String, dynamic> a) {
 Future<List<Offset>?> detectDocQuad(String path) async {
   final swDet = Stopwatch()..start();
   try {
-    return await _detectDocQuadImpl(path);
+    final q = await _detectDocQuadImpl(path);
+    return q == null ? null : _rectOf(q);
   } finally {
     AppLog.i('t detect ${swDet.elapsedMilliseconds}ms');
   }
@@ -3824,6 +3967,19 @@ double _quadArea(List<Offset> q) {
     a += p.dx * n.dy - n.dx * p.dy;
   }
   return a.abs() / 2;
+}
+
+/// أصغر مستطيل مستقيم (من غير ميلان) بيحتوي الرباعي: ده شكل القص التلقائي.
+/// بيرجّع TL,TR,BR,BL كنسب.
+List<Offset> _rectOf(List<Offset> q) {
+  var l = 1.0, t = 1.0, r = 0.0, b = 0.0;
+  for (final p in q) {
+    l = math.min(l, p.dx);
+    t = math.min(t, p.dy);
+    r = math.max(r, p.dx);
+    b = math.max(b, p.dy);
+  }
+  return [Offset(l, t), Offset(r, t), Offset(r, b), Offset(l, b)];
 }
 
 Future<bool> _nativeDetectorAllowed() async {
@@ -4036,7 +4192,7 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
   }
   final q = _quadFromFeature(feat, gw, gh);
   if (q == null || _quadArea(q) > 0.97) return null;
-  return q;
+  return _rectOf(q);
 }
 
 class _LiveQuadPainter extends CustomPainter {
@@ -4046,7 +4202,7 @@ class _LiveQuadPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final pts = [for (final o in q) Offset(o.dx * size.width, o.dy * size.height)];
     final path = Path()..addPolygon(pts, true);
-    const col = Color(0xFF1EC8A5);
+    final col = kAccent;
     canvas.drawPath(path, Paint()..color = col.withValues(alpha: 0.18));
     canvas.drawPath(
         path,
@@ -4389,7 +4545,7 @@ class _EditorPageState extends State<EditorPage> {
     return IconButton(
       visualDensity: VisualDensity.compact,
       tooltip: isFav ? 'مسح الإعداد المفضل' : 'حفظ السطوع والتباين والحدة كإعداد مفضل للفلتر ده',
-      icon: Icon(isFav ? Icons.star : Icons.star_border, size: 22),
+      icon: Icon(isFav ? Icons.star_rounded : Icons.star_border_rounded, size: 22),
       onPressed: busy ? null : () => _toggleFav(isFav),
     );
   }
@@ -4406,7 +4562,7 @@ class _EditorPageState extends State<EditorPage> {
           message: 'اضغط مطوّلاً لرؤية الأصل',
           child: Padding(
             padding: const EdgeInsets.all(10),
-            child: Icon(Icons.compare, color: _peek ? const Color(0xFF1EC8A5) : null),
+            child: Icon(Icons.compare_rounded, color: _peek ? kAccent : null),
           ),
         ),
       );
@@ -4872,7 +5028,7 @@ class _EditorPageState extends State<EditorPage> {
                       _matrixNow(),
                       focus: f, zoom: z),
                 ),
-              const Center(child: Icon(Icons.add, size: 22, color: Colors.redAccent)),
+              const Center(child: Icon(Icons.add_rounded, size: 22, color: Colors.redAccent)),
             ]),
           ),
         ),
@@ -4984,7 +5140,7 @@ class _EditorPageState extends State<EditorPage> {
             Expanded(
               child: OutlinedButton.icon(
                 onPressed: busy ? null : _auto,
-                icon: const Icon(Icons.auto_fix_high),
+                icon: const Icon(Icons.auto_fix_high_rounded),
                 label: const Text('تلقائي'),
               ),
             ),
@@ -5002,7 +5158,7 @@ class _EditorPageState extends State<EditorPage> {
                         });
                         _mark();
                       },
-                icon: const Icon(Icons.crop_free),
+                icon: const Icon(Icons.crop_free_rounded),
                 label: const Text('الصورة كلها'),
               ),
             ),
@@ -5013,7 +5169,7 @@ class _EditorPageState extends State<EditorPage> {
           Row(mainAxisAlignment: MainAxisAlignment.center, children: [
             IconButton.filledTonal(
               tooltip: 'لفّ يسار',
-              icon: const Icon(Icons.rotate_left),
+              icon: const Icon(Icons.rotate_left_rounded),
               onPressed: busy
                   ? null
                   : () => setState(() {
@@ -5025,7 +5181,7 @@ class _EditorPageState extends State<EditorPage> {
             const SizedBox(width: 16),
             IconButton.filledTonal(
               tooltip: 'لفّ يمين',
-              icon: const Icon(Icons.rotate_right),
+              icon: const Icon(Icons.rotate_right_rounded),
               onPressed: busy
                   ? null
                   : () => setState(() {
@@ -5036,7 +5192,7 @@ class _EditorPageState extends State<EditorPage> {
             ),
           ]),
           Row(children: [
-            const Icon(Icons.straighten),
+            const Icon(Icons.straighten_rounded),
             Expanded(
               child: Slider(
                 value: angle,
@@ -5066,7 +5222,7 @@ class _EditorPageState extends State<EditorPage> {
             Expanded(child: FilterBar(selected: filter, onChanged: busy ? null : _onFilter)),
           ]),
           Row(children: [
-            const Icon(Icons.brightness_6, size: 20),
+            const Icon(Icons.brightness_6_rounded, size: 20),
             Expanded(
               child: Slider(
                 value: brightness,
@@ -5076,7 +5232,7 @@ class _EditorPageState extends State<EditorPage> {
                 onChangeEnd: busy ? null : (_) => _mark(),
               ),
             ),
-            const Icon(Icons.contrast, size: 20),
+            const Icon(Icons.contrast_rounded, size: 20),
             Expanded(
               child: Slider(
                 value: contrast,
@@ -5088,7 +5244,7 @@ class _EditorPageState extends State<EditorPage> {
             ),
             IconButton(
               tooltip: 'إعادة ضبط',
-              icon: const Icon(Icons.restart_alt),
+              icon: const Icon(Icons.restart_alt_rounded),
               onPressed: busy
                   ? null
                   : () {
@@ -5103,7 +5259,7 @@ class _EditorPageState extends State<EditorPage> {
             ),
           ]),
           Row(children: [
-            const Icon(Icons.deblur, size: 20),
+            const Icon(Icons.deblur_rounded, size: 20),
             Expanded(
               child: Slider(
                 value: sharp,
@@ -5126,7 +5282,7 @@ class _EditorPageState extends State<EditorPage> {
   }
 
   Widget _barBtn(IconData i, String label, bool on, VoidCallback? onTap) {
-    final col = on ? const Color(0xFF1EC8A5) : Theme.of(context).colorScheme.onSurface;
+    final col = on ? kAccent : Theme.of(context).colorScheme.onSurface;
     return InkResponse(
       onTap: onTap,
       radius: 36,
@@ -5165,13 +5321,13 @@ class _EditorPageState extends State<EditorPage> {
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),
         child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          _pagerBtn(Icons.chevron_left, (busy || widget.pageIndex <= 0) ? null : () => _nav('prev')),
+          _pagerBtn(Icons.chevron_left_rounded, (busy || widget.pageIndex <= 0) ? null : () => _nav('prev')),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 18),
             child: Text('${widget.pageIndex + 1}/${widget.pageCount}',
                 style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
           ),
-          _pagerBtn(last ? Icons.add_a_photo_outlined : Icons.chevron_right, busy ? null : () => _nav('next')),
+          _pagerBtn(last ? Icons.add_a_photo_rounded : Icons.chevron_right_rounded, busy ? null : () => _nav('next')),
         ]),
       ),
     );
@@ -5185,12 +5341,12 @@ class _EditorPageState extends State<EditorPage> {
         actions: [
           IconButton(
             tooltip: 'تراجع',
-            icon: const Icon(Icons.undo),
+            icon: const Icon(Icons.undo_rounded),
             onPressed: (busy || !_canUndo) ? null : _undo,
           ),
           IconButton(
             tooltip: 'إعادة',
-            icon: const Icon(Icons.redo),
+            icon: const Icon(Icons.redo_rounded),
             onPressed: (busy || !_canRedo) ? null : _redo,
           ),
           if (widget.pageCount > 1)
@@ -5205,7 +5361,7 @@ class _EditorPageState extends State<EditorPage> {
           if (widget.canDelete)
             IconButton(
               tooltip: 'حذف الصفحة',
-              icon: const Icon(Icons.delete_outline),
+              icon: const Icon(Icons.delete_outline_rounded),
               onPressed: busy ? null : _confirmDelete,
             ),
         ],
@@ -5246,7 +5402,7 @@ class _EditorPageState extends State<EditorPage> {
                               Transform(
                                 transform: Matrix4.translationValues(pan.dx, pan.dy, 0) *
                                     Matrix4.diagonal3Values(_zm, _zm, 1),
-                                child: _img(w, h),
+                                child: RepaintBoundary(child: _img(w, h)),
                               ),
                               Positioned.fill(child: CustomPaint(painter: _QuadPainter(quad, _zm, pan))),
                               if (focus != null) _loupe(focus, size),
@@ -5264,7 +5420,7 @@ class _EditorPageState extends State<EditorPage> {
                                       decoration: BoxDecoration(
                                           color: Colors.black54, borderRadius: BorderRadius.circular(16)),
                                       child: Row(mainAxisSize: MainAxisSize.min, children: [
-                                        const Icon(Icons.zoom_out_map, size: 16, color: Colors.white),
+                                        const Icon(Icons.zoom_out_map_rounded, size: 16, color: Colors.white),
                                         const SizedBox(width: 4),
                                         Text('×${_zm.toStringAsFixed(1)}',
                                             style: const TextStyle(color: Colors.white, fontSize: 12)),
@@ -5295,9 +5451,9 @@ class _EditorPageState extends State<EditorPage> {
                   padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
                   child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
                     if (widget.canRetake)
-                      _barBtn(Icons.cameraswitch_outlined, 'إعادة أخذ', false,
+                      _barBtn(Icons.cameraswitch_rounded, 'إعادة أخذ', false,
                           busy ? null : () => Navigator.pop(context, kRetake)),
-                    _barBtn(Icons.rotate_left, 'يسار', tab == 1, busy
+                    _barBtn(Icons.rotate_left_rounded, 'يسار', tab == 1, busy
                         ? null
                         : () => setState(() {
                               tab = 1;
@@ -5305,8 +5461,8 @@ class _EditorPageState extends State<EditorPage> {
                               quad = _turnCcw(quad);
                               _loadView();
                             })),
-                    _barBtn(Icons.auto_awesome, 'فلتر', tab == 2, () => setState(() => tab = 2)),
-                    _barBtn(Icons.crop, 'قص', tab == 0, () => setState(() => tab = 0)),
+                    _barBtn(Icons.auto_awesome_rounded, 'فلتر', tab == 2, () => setState(() => tab = 2)),
+                    _barBtn(Icons.crop_rounded, 'قص', tab == 0, () => setState(() => tab = 0)),
                     InkResponse(
                       onTap: (busy || aspect == null) ? null : _apply,
                       radius: 40,
@@ -5314,16 +5470,16 @@ class _EditorPageState extends State<EditorPage> {
                         width: 78,
                         height: 46,
                         decoration: BoxDecoration(
-                          color: const Color(0xFF1EC8A5),
+                          color: kAccent,
                           borderRadius: BorderRadius.circular(8),
                         ),
                         child: busy
-                            ? const Center(
+                            ? Center(
                                 child: SizedBox(
                                     width: 22,
                                     height: 22,
-                                    child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white)))
-                            : const Icon(Icons.check, color: Colors.white, size: 30),
+                                    child: CircularProgressIndicator(strokeWidth: 2.5, color: pal.onAccent)))
+                            : Icon(Icons.check_rounded, color: pal.onAccent, size: 30),
                       ),
                     ),
                   ]),
@@ -5373,7 +5529,13 @@ class _ViewPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_ViewPainter o) => true;
+  bool shouldRepaint(_ViewPainter o) =>
+      !identical(o.img, img) ||
+      o.box != box ||
+      o.angle != angle ||
+      o.focus != focus ||
+      o.zoom != zoom ||
+      !listEquals(o.m, m);
 }
 
 class _QuadPainter extends CustomPainter {
@@ -5399,7 +5561,7 @@ class _QuadPainter extends CustomPainter {
     final ring = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2
-      ..color = const Color(0xFF0B5FA5);
+      ..color = pal.mid;
     for (var i = 0; i < 4; i++) {
       final m = (pts[i] + pts[(i + 1) % 4]) / 2;
       canvas.drawCircle(m, 7, fill);
@@ -5553,7 +5715,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
           if (shared)
             TextButton.icon(
               onPressed: busy ? null : _done,
-              icon: const Icon(Icons.check),
+              icon: const Icon(Icons.check_rounded),
               label: const Text('تم'),
             ),
         ],
@@ -5575,7 +5737,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
               Expanded(
                 child: FilledButton.icon(
                   onPressed: busy ? null : _sharePdf,
-                  icon: const Icon(Icons.picture_as_pdf),
+                  icon: const Icon(Icons.picture_as_pdf_rounded),
                   label: const Text('مشاركة PDF'),
                 ),
               ),
@@ -5586,7 +5748,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
                   icon: busy
                       ? const SizedBox(
                           width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Icon(Icons.image),
+                      : const Icon(Icons.image_rounded),
                   label: Text(progress != null ? 'تجهيز $progress' : 'مشاركة صور'),
                 ),
               ),
@@ -5651,7 +5813,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   bool _live = false, _liveBusy = false;
   int _lastLive = 0, _liveMiss = 0;
 
-  static const _flashIcons = [Icons.flash_off, Icons.flash_auto, Icons.flash_on, Icons.highlight];
+  static const _flashIcons = [Icons.flash_off_rounded, Icons.flash_auto_rounded, Icons.flash_on_rounded, Icons.highlight_rounded];
   static const _flashNames = ['الفلاش مقفول', 'فلاش تلقائي', 'فلاش', 'كشاف'];
 
   @override
@@ -5939,7 +6101,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   }
 
   Widget _icon(IconData i, String label, VoidCallback? onTap, {bool on = false}) {
-    final col = on ? const Color(0xFF1EC8A5) : Colors.white;
+    final col = on ? kAccent : Colors.white;
     return InkResponse(
       onTap: onTap,
       radius: 32,
@@ -5972,7 +6134,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
               clipBehavior: Clip.antiAlias,
               child: t != null
                   ? Image.file(File(t), fit: BoxFit.cover, cacheWidth: 160, errorBuilder: (_, __, ___) => const SizedBox())
-                  : const Icon(Icons.photo_library_outlined, color: Colors.white38),
+                  : const Icon(Icons.photo_library_rounded, color: Colors.white38),
             ),
           ),
           if (_count > 0)
@@ -6003,7 +6165,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
-            const Icon(Icons.no_photography, color: Colors.white54, size: 48),
+            const Icon(Icons.no_photography_rounded, color: Colors.white54, size: 48),
             const SizedBox(height: 12),
             Text('كاميرا التطبيق مش شغالة على الموبايل ده\n$_err',
                 textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)),
@@ -6062,7 +6224,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                   width: 60,
                   height: 60,
                   decoration: BoxDecoration(
-                    border: Border.all(color: const Color(0xFF1EC8A5), width: 2),
+                    border: Border.all(color: kAccent, width: 2),
                     borderRadius: BorderRadius.circular(8),
                   ),
                 ),
@@ -6085,17 +6247,17 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
             Padding(
               padding: const EdgeInsets.only(top: 6),
               child: Text(widget.title,
-                  style: const TextStyle(color: Color(0xFF1EC8A5), fontSize: 15, fontWeight: FontWeight.w600)),
+                  style: TextStyle(color: kAccent, fontSize: 15, fontWeight: FontWeight.w600)),
             ),
             // صف الأيقونات: إغلاق، فلاش، جودة، معرض
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
               child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                _icon(Icons.close, 'إغلاق', () => Navigator.pop(context)),
+                _icon(Icons.close_rounded, 'إغلاق', () => Navigator.pop(context)),
                 _icon(_flashIcons[_flash], 'فلاش', _cycleFlash, on: _flash != 0),
-                _icon(Icons.hd, _hd ? 'جودة عالية' : 'جودة عادية', _toggleHd, on: _hd),
-                _icon(Icons.grid_3x3, 'شبكة', _toggleGrid, on: _grid),
-                if (widget.onGallery != null) _icon(Icons.photo_library_outlined, 'معرض', _gallery),
+                _icon(Icons.hd_rounded, _hd ? 'جودة عالية' : 'جودة عادية', _toggleHd, on: _hd),
+                _icon(Icons.grid_3x3_rounded, 'شبكة', _toggleGrid, on: _grid),
+                if (widget.onGallery != null) _icon(Icons.photo_library_rounded, 'معرض', _gallery),
               ]),
             ),
             // صف التصوير: المصغّرة بالعداد، الزر، تم
@@ -6111,7 +6273,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                     padding: const EdgeInsets.all(5),
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      border: Border.all(color: const Color(0xFF1EC8A5), width: 4),
+                      border: Border.all(color: kAccent, width: 4),
                     ),
                     child: Container(
                       decoration: BoxDecoration(
@@ -6130,8 +6292,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                           child: Container(
                             height: 48,
                             decoration: BoxDecoration(
-                                color: const Color(0xFF1EC8A5), borderRadius: BorderRadius.circular(10)),
-                            child: const Icon(Icons.check, color: Colors.white, size: 30),
+                                color: kAccent, borderRadius: BorderRadius.circular(10)),
+                            child: Icon(Icons.check_rounded, color: pal.onAccent, size: 30),
                           ),
                         )
                       : const SizedBox(),
@@ -6233,12 +6395,12 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       builder: (ctx) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           ListTile(
-            leading: const Icon(Icons.add_a_photo),
+            leading: const Icon(Icons.add_a_photo_rounded),
             title: const Text('كاميرا'),
             onTap: () => Navigator.pop(ctx, 'camera'),
           ),
           ListTile(
-            leading: const Icon(Icons.photo_library),
+            leading: const Icon(Icons.photo_library_rounded),
             title: const Text('معرض'),
             onTap: () => Navigator.pop(ctx, 'gallery'),
           ),
@@ -6560,6 +6722,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final path = imgs[i];
     final cs = Theme.of(context).colorScheme;
     return Card(
+      shape: kCardShape,
       key: ValueKey(path),
       margin: const EdgeInsets.symmetric(vertical: 4),
       child: InkWell(
@@ -6603,20 +6766,20 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             const Expanded(child: Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey))),
             IconButton(
                 tooltip: noTags.contains(path) ? 'إظهار الورقة' : 'إخفاء الورقة',
-                icon: Icon(noTags.contains(path) ? Icons.label_off_outlined : Icons.label_outline),
+                icon: Icon(noTags.contains(path) ? Icons.label_off_rounded : Icons.label_outline_rounded),
                 onPressed: busy ? null : () => _toggleTag(path)),
             IconButton(
                 tooltip: 'تعديل',
-                icon: const Icon(Icons.tune),
+                icon: const Icon(Icons.tune_rounded),
                 onPressed: busy ? null : () => _edit(i)),
             IconButton(
                 tooltip: 'مسح',
-                icon: const Icon(Icons.delete_outline, color: Colors.red),
+                icon: const Icon(Icons.delete_outline_rounded, color: Colors.red),
                 onPressed: busy ? null : () => _remove(i)),
             ReorderableDragStartListener(
                 index: i,
                 child:
-                    const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle))),
+                    const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle_rounded))),
           ]),
         ),
       ),
@@ -6676,7 +6839,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                 Expanded(
                   child: FilledButton.tonalIcon(
                     onPressed: busy ? null : _add,
-                    icon: const Icon(Icons.add_a_photo),
+                    icon: const Icon(Icons.add_a_photo_rounded),
                     label: const Text('تصوير'),
                   ),
                 ),
@@ -6684,7 +6847,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                 Expanded(
                   child: OutlinedButton.icon(
                     onPressed: busy ? null : _addGallery,
-                    icon: const Icon(Icons.photo_library),
+                    icon: const Icon(Icons.photo_library_rounded),
                     label: const Text('من المعرض'),
                   ),
                 ),
@@ -6698,7 +6861,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                   icon: busy
                       ? const SizedBox(
                           width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                      : Icon(built == null ? Icons.picture_as_pdf : Icons.visibility),
+                      : Icon(built == null ? Icons.picture_as_pdf_rounded : Icons.visibility_rounded),
                   label: Text(progress != null
                       ? 'جارى التجهيز $progress'
                       : (built == null ? 'إنشاء ومعاينة PDF' : 'معاينة ومشاركة')),
