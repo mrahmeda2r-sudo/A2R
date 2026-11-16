@@ -1471,6 +1471,11 @@ class Store {
       ((await _p).getInt('palette') ?? 0).clamp(0, AppPalette.values.length - 1).toInt();
   static Future<void> setPaletteSetting(int v) async => (await _p).setInt('palette', v);
 
+  /// القص التلقائي: 0 ذكي (الافتراضي)، 1 مستطيل دايماً، 2 منظور دايماً
+  static Future<int> autoCropSetting() async =>
+      ((await _p).getInt('autoCrop') ?? 0).clamp(0, 2).toInt();
+  static Future<void> setAutoCropSetting(int v) async => (await _p).setInt('autoCrop', v);
+
   static Future<bool> continuous() async => (await _p).getBool('continuous') ?? true;
   static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
 
@@ -2395,6 +2400,7 @@ Future<void> main() async {
   try {
     appThemeMode.value = _themeOf(await Store.themeSetting());
     appPalette.value = AppPalette.values[await Store.paletteSetting()];
+    autoCropMode = await Store.autoCropSetting();
   } catch (_) {}
   try {
     final sp = await SharedPreferences.getInstance();
@@ -2694,7 +2700,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   PerfMode mode = PerfMode.balanced;
-  int scan = 0, qual = 1, pdfSz = 0, theme = 0;
+  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0;
   bool autoEdit = false, trim = false, slow = false;
   AppPalette palSel = AppPalette.gold;
   bool loaded = false;
@@ -2727,6 +2733,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final pz = await Store.pdfSize();
     final th = await Store.themeSetting();
     final pl = await Store.paletteSetting();
+    final cr = await Store.autoCropSetting();
     var sl = false;
     try {
       sl = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
@@ -2741,6 +2748,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       pdfSz = pz;
       theme = th;
       palSel = AppPalette.values[pl];
+      crop = cr;
       slow = sl;
       loaded = true;
     });
@@ -2807,6 +2815,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     appThemeMode.value = _themeOf(v);
   }
 
+  Future<void> _setCrop(int v) async {
+    setState(() => crop = v);
+    autoCropMode = v;
+    await Store.setAutoCropSetting(v);
+  }
+
   Future<void> _setPalette(AppPalette v) async {
     setState(() => palSel = v);
     await Store.setPaletteSetting(v.index);
@@ -2827,6 +2841,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await Store.setTrimMargins(false);
     await _setTheme(0);
     await _setPalette(AppPalette.gold);
+    await _setCrop(0);
     if (mounted) snack(context, 'اتعمل إعادة ضبط');
   }
 
@@ -3013,6 +3028,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Card(
                   shape: kCardShape,
                   child: Column(children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        const Text('القص التلقائي', style: TextStyle(fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 2),
+                        Text(
+                            crop == 0
+                                ? 'ذكي: يعدّل الورقة لو شكلها مستطيل، ولو الكشف مش مظبوط يرجع لمستطيل مستقيم'
+                                : (crop == 1
+                                    ? 'مستطيل مستقيم دايماً، من غير ميلان'
+                                    : 'أربع أركان حرة مع تصحيح المنظور'),
+                            style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: double.infinity,
+                          child: SegmentedButton<int>(
+                            showSelectedIcon: false,
+                            segments: const [
+                              ButtonSegment(value: 0, label: Text('ذكي')),
+                              ButtonSegment(value: 1, label: Text('مستطيل')),
+                              ButtonSegment(value: 2, label: Text('منظور')),
+                            ],
+                            selected: {crop},
+                            onSelectionChanged: (v) => _setCrop(v.first),
+                          ),
+                        ),
+                      ]),
+                    ),
                     SwitchListTile(
                       title: const Text('أوضاع الفلتر بعد كل صورة'),
                       subtitle: const Text('تظهر شاشة الفلاتر والقص بعد كل صورة'),
@@ -4117,9 +4160,9 @@ Uint8List _warpJob(Map<String, dynamic> a) {
 Future<List<Offset>?> detectDocQuad(String path) async {
   final swDet = Stopwatch()..start();
   try {
-    // احتفظ بالأركان الأربعة المكتشفة لتصحيح المنظور الحقيقي بدلاً من
-    // تحويلها إلى مستطيل مستقيم قد يقتطع أطراف الإيصال المائل.
-    return await _detectDocQuadImpl(path);
+    final q = await _detectDocQuadImpl(path);
+    if (q == null) return null;
+    return _shapeQuad(q, await imageAspect(path));
   } finally {
     AppLog.i('t detect ${swDet.elapsedMilliseconds}ms');
   }
@@ -4192,6 +4235,35 @@ List<Offset> _rectOf(List<Offset> q) {
     b = math.max(b, p.dy);
   }
   return [Offset(l, t), Offset(r, t), Offset(r, b), Offset(l, b)];
+}
+
+/// شكل القص التلقائي: 0 ذكي (الافتراضي)، 1 مستطيل دايماً، 2 منظور (4 أركان) دايماً.
+int autoCropMode = 0;
+
+/// الفرق بين اتجاهين (بالدرجات) كخطوط، من 0 لـ 90.
+double _angDiff(double a, double b) {
+  final d = (a - b).abs() % 180;
+  return d > 90 ? 180 - d : d;
+}
+
+/// بيقرر شكل الإطار التلقائي. aspect = ارتفاع/عرض الصورة.
+/// الذكي: لو الأركان الأربعة شكلها مستطيل فعلاً (حتى لو ملفوف) بنحتفظ بيها عشان تتعدّل الورقة،
+/// ولو الشكل مائل أو مشوّه (غالباً الكشف غلط أو منظور قوي) بنرجع لمستطيل مستقيم.
+List<Offset> _shapeQuad(List<Offset> q, double aspect) {
+  if (autoCropMode == 2) return q;
+  if (autoCropMode == 1) return _rectOf(q);
+  final p = [for (final o in q) Offset(o.dx, o.dy * aspect)];
+  double dir(Offset a, Offset b) => math.atan2(b.dy - a.dy, b.dx - a.dx) * 180 / math.pi;
+  final top = dir(p[0], p[1]), right = dir(p[3], p[2]);
+  final left = dir(p[0], p[3]), rightSide = dir(p[1], p[2]);
+  final par = math.max(_angDiff(top, right), _angDiff(left, rightSide));
+  var dev = 0.0;
+  for (final a in [top, right]) {
+    for (final b in [left, rightSide]) {
+      dev = math.max(dev, 90 - _angDiff(a, b));
+    }
+  }
+  return (par <= 6 && dev <= 8) ? q : _rectOf(q);
 }
 
 Future<bool> _nativeDetectorAllowed() async {
@@ -4404,7 +4476,7 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
   }
   final q = _quadFromFeature(feat, gw, gh);
   if (q == null || _quadArea(q) > 0.97) return null;
-  return _rectOf(q);
+  return _shapeQuad(q, gh / gw);
 }
 
 class _LiveQuadPainter extends CustomPainter {
