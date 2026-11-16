@@ -914,6 +914,7 @@ Future<bool> _decodesOk(Uint8List b) async {
 /// وبعدها بيتطبق الفلتر لو الموظف اختاره.
 Future<String> persistImage(String src, String name,
     {ScanFilter filter = ScanFilter.original}) async {
+  final swPersist = Stopwatch()..start();
   final mode = await Store.perfMode();
   final maxSide = getMaxSide(mode);
   Uint8List? bytes;
@@ -929,6 +930,7 @@ Future<String> persistImage(String src, String name,
   } catch (e, st) {
     AppLog.e('persistImage', e, st);
   }
+  AppLog.i('t persist.compress ${swPersist.elapsedMilliseconds}ms');
   if (bytes != null && !await _decodesOk(bytes)) bytes = null;
   if (bytes == null) {
     try {
@@ -957,8 +959,10 @@ Future<String> persistImage(String src, String name,
     await File(Store.baseOf(f.path)).writeAsBytes(bytes, flush: true);
     await Store.setEdit(f.path, EditParams(filter: filter));
   }
+  final tFilter = swPersist.elapsedMilliseconds;
   bytes = await applyFilter(bytes, filter);
   await f.writeAsBytes(bytes, flush: true);
+  AppLog.i('t persist.filter ${swPersist.elapsedMilliseconds - tFilter}ms total ${swPersist.elapsedMilliseconds}ms');
   return f.path;
 }
 
@@ -1809,6 +1813,7 @@ Future<String?> takeLostPick(String target) async {
 
 /// كل التصوير (كاميرا أو معرض) بيعدي على ماسح المستندات (قص).
 /// لو الماسح مش شغال على الموبايل بيتحول للكاميرا العادية تلقائياً.
+List<Offset>? _shotQuad; // آخر تحديد حي وقت الضغط على زر التصوير (اقتراح فوري لشاشة التعديل، بيتستخدم مرة واحدة)
 bool _lastScanManual = false; // آخر تصوير اتعمل بالكاميرا العادية (من غير ماسح ML Kit) فمحتاج شاشة القص
 bool _scannerFailed = false; // فشل الماسح في الجلسة دي (بيتصفّر لما التطبيق يتقفل)
 
@@ -3218,8 +3223,9 @@ class _BatchScreenState extends State<BatchScreen> {
           filter: ScanFilter.receipt);
       await Store.setBatchImg(path);
       await _show(path);
-      final warn = await qualityWarning(path);
-      if (warn != null && mounted) snack(context, warn);
+      unawaited(qualityWarning(path).then((warn) {
+        if (warn != null && mounted) snack(context, warn);
+      }));
       return true;
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
@@ -3711,6 +3717,15 @@ Uint8List _warpJob(Map<String, dynamic> a) {
 /// كشف حدود الورقة: أول حاجة المحرك الأصلي (OpenCV) من حزمة document_scan، أوفلاين ومن غير Play Services،
 /// ولو فشل أو رجّع null بنرجع للكشف البسيط تحت. بيرجّع TL,TR,BR,BL كنسب، أو null.
 Future<List<Offset>?> detectDocQuad(String path) async {
+  final swDet = Stopwatch()..start();
+  try {
+    return await _detectDocQuadImpl(path);
+  } finally {
+    AppLog.i('t detect ${swDet.elapsedMilliseconds}ms');
+  }
+}
+
+Future<List<Offset>?> _detectDocQuadImpl(String path) async {
   final mode = await Store.perfMode();
   List<Offset>? native;
   if (mode != PerfMode.lite && await _nativeDetectorAllowed()) {
@@ -4546,7 +4561,17 @@ class _EditorPageState extends State<EditorPage> {
       _sig0 = _sig();
       AppLog.i('editor view loaded');
       WidgetsBinding.instance.addPostFrameCallback((_) => AppLog.i('editor first frame'));
-      if (mounted && (e == null || e.quad == null) && _lastScanManual) await _auto(silent: true);
+      if (mounted && (e == null || e.quad == null) && _lastScanManual) {
+        final live = widget.canRetake ? _shotQuad : null;
+        _shotQuad = null;
+        if (live != null && live.length == 4 && _quadConvex(live) && turns == 0) {
+          setState(() => quad = List.of(live)); // اقتراح فوري من المعاينة الحية
+          _mark();
+          unawaited(_refineQuad()); // الكشف الدقيق بيشتغل في الخلفية ويحدّث الإطار بهدوء
+        } else {
+          await _auto(silent: true);
+        }
+      }
     } catch (e, st) {
       AppLog.e('_init', e, st);
       if (mounted) {
@@ -4808,6 +4833,22 @@ class _EditorPageState extends State<EditorPage> {
         ),
       ),
     );
+  }
+
+  /// تحسين هادي للإطار بعد ما الاقتراح الفوري ظهر: من غير مؤشر انتظار، ومبيلمسش لو الموظف عدّل بإيده.
+  Future<void> _refineQuad() async {
+    try {
+      final q = await detectDocQuad(src!);
+      if (!mounted || _quadTouched || q == null) return;
+      var r = q;
+      for (var i = 0; i < turns; i++) {
+        r = _turnCw(r);
+      }
+      setState(() => quad = r);
+      _mark();
+    } catch (e, st) {
+      AppLog.e('_refineQuad', e, st);
+    }
   }
 
   Future<void> _auto({bool silent = false}) async {
@@ -5623,9 +5664,17 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final back = cams.firstWhere((x) => x.lensDirection == cam.CameraLensDirection.back,
           orElse: () => cams.first);
       final perf = await Store.perfMode();
-      final preset = _hd && perf != PerfMode.lite
-          ? cam.ResolutionPreset.ultraHigh
-          : cam.ResolutionPreset.veryHigh;
+      final slow = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
+      // الصورة بتتحفظ بحد أقصى 800/1400/2400، فمفيش داعي لـ 4K غير في الوضع "برو".
+      // الجهاز اللي التصوير فيه بطيء بيتنزّل له درجة تلقائياً.
+      late final cam.ResolutionPreset preset;
+      if (perf == PerfMode.pro) {
+        preset = _hd && !slow ? cam.ResolutionPreset.ultraHigh : cam.ResolutionPreset.veryHigh;
+      } else if (perf == PerfMode.balanced) {
+        preset = _hd && !slow ? cam.ResolutionPreset.veryHigh : cam.ResolutionPreset.high;
+      } else {
+        preset = cam.ResolutionPreset.high;
+      }
       // YUV420 عشان نقدر نحلل الإطارات للتحديد الحي (التصوير نفسه لسه JPEG)
       final c = cam.CameraController(back, preset,
           enableAudio: false,
@@ -5741,7 +5790,9 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     HapticFeedback.selectionClick();
     setState(() => _hd = !_hd);
     try {
-      (await SharedPreferences.getInstance()).setBool('camHd', _hd);
+      final sp = await SharedPreferences.getInstance();
+      await sp.setBool('camHd', _hd);
+      await sp.remove('camSlow'); // اختيار الموظف بيلغي التنزيل التلقائي
     } catch (_) {}
     await _start();
   }
@@ -5764,12 +5815,23 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     setState(() => _shooting = true);
     try {
       HapticFeedback.mediumImpact();
+      final lq = _liveQuad;
+      _shotQuad = lq == null ? null : List<Offset>.of(lq);
+      final swShot = Stopwatch()..start();
       await _stopLive();
       final x = await c.takePicture();
+      final shotMs = swShot.elapsedMilliseconds;
+      AppLog.i('t takePicture ${shotMs}ms');
+      if (shotMs > 2500) {
+        try {
+          (await SharedPreferences.getInstance()).setBool('camSlow', true);
+        } catch (_) {}
+      }
       try {
         await c.pausePreview();
       } catch (_) {}
       final s = await widget.onShot(x.path);
+      AppLog.i('t shot+edit total ${swShot.elapsedMilliseconds}ms');
       if (!mounted) return;
       try {
         await c.resumePreview();
@@ -6218,8 +6280,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       built = null;
       HapticFeedback.lightImpact();
       if (imgs.isNotEmpty) {
-        final warn = await qualityWarning(imgs.last);
-        if (warn != null && mounted) snack(context, warn);
+        unawaited(qualityWarning(imgs.last).then((warn) {
+          if (warn != null && mounted) snack(context, warn);
+        }));
       }
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
