@@ -433,6 +433,50 @@ Future<List<double>?> autoLevelsOf(Uint8List bytes) async {
   }
 }
 
+/// قص الهوامش البيضاء الفاضية (بعد تنضيف الإيصال). بيرجّع {out, w, h}، أو {w: 0} لو مفيش داعي للقص.
+Map<String, dynamic> _trimJob(Map<String, dynamic> a) {
+  final src = a['src'] as Uint8List;
+  final w = a['w'] as int, h = a['h'] as int;
+  final rows = List<int>.filled(h, 0), cols = List<int>.filled(w, 0);
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      final i = (y * w + x) * 4;
+      if (src[i] + src[i + 1] + src[i + 2] < 3 * 235) {
+        rows[y]++;
+        cols[x]++;
+      }
+    }
+  }
+  var y0 = 0, y1 = h - 1, x0 = 0, x1 = w - 1;
+  while (y0 < h && rows[y0] < 2) {
+    y0++;
+  }
+  while (y1 > y0 && rows[y1] < 2) {
+    y1--;
+  }
+  while (x0 < w && cols[x0] < 2) {
+    x0++;
+  }
+  while (x1 > x0 && cols[x1] < 2) {
+    x1--;
+  }
+  if (y0 >= y1 || x0 >= x1) return <String, dynamic>{'w': 0};
+  final px = math.max(6, (w * 0.03).round()), py = math.max(6, (h * 0.02).round());
+  x0 = math.max(0, x0 - px);
+  x1 = math.min(w - 1, x1 + px);
+  y0 = math.max(0, y0 - py);
+  y1 = math.min(h - 1, y1 + py);
+  final nw = x1 - x0 + 1, nh = y1 - y0 + 1;
+  // لو الناتج صغير جداً (الصورة فاضية تقريباً) أو مفيش هوامش تستاهل: منقصش
+  if (nw < w * 0.2 || nh < h * 0.1 || nw * nh > w * h * 0.97) return <String, dynamic>{'w': 0};
+  final out = Uint8List(nw * nh * 4);
+  for (var y = 0; y < nh; y++) {
+    final s = ((y + y0) * w + x0) * 4;
+    out.setRange(y * nw * 4, (y + 1) * nw * 4, src, s);
+  }
+  return <String, dynamic>{'out': out, 'w': nw, 'h': nh};
+}
+
 Uint8List _rotateJob(Map<String, dynamic> a) {
   final src = a['src'] as Uint8List;
   final w = a['w'] as int, h = a['h'] as int, t = a['t'] as int;
@@ -1266,9 +1310,20 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     final th = pageW * tag.h / 1000;
     final pad = pageW * kBandPad;
     final bandH = th + pad * 2;
+    final compact = (await Store.pdfSize()) == 1;
     for (var i = 0; i < receipts.length; i++) {
       onProgress?.call(i, receipts.length);
-      final bytes = await File(receipts[i]).readAsBytes();
+      var bytes = await File(receipts[i]).readAsBytes();
+      if (compact) {
+        // PDF مضغوط: نسخة أصغر (عرض ~720 وجودة 70) لو طلعت أخف وسليمة، وإلا بنستخدم الأصلية
+        try {
+          final c = await FlutterImageCompress.compressWithList(bytes,
+              minWidth: 720, minHeight: 720, quality: 70, format: CompressFormat.jpeg);
+          if (c.isNotEmpty && c.length < bytes.length && await _decodesOk(c)) bytes = c;
+        } catch (e, st) {
+          AppLog.e('pdf.compact', e, st);
+        }
+      }
       final sz = await imageSize(bytes);
       final imgH = pageW * sz.h / sz.w;
       final hide = await Store.noTag(receipts[i]);
@@ -1389,6 +1444,35 @@ class Store {
   static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
 
   /// فتح شاشة الفلاتر والقص بعد كل صورة (تصوير أو معرض)
+  /// قص الهوامش البيضاء الفاضية بعد تعديل الإيصال (مقفول افتراضياً)
+  static Future<bool> trimMargins() async => (await _p).getBool('trim') ?? false;
+  static Future<void> setTrimMargins(bool v) async => (await _p).setBool('trim', v);
+
+  /// حجم الـ PDF: 0 كما هو، 1 مضغوط
+  static Future<int> pdfSize() async => ((await _p).getInt('pdfSize') ?? 0).clamp(0, 1).toInt();
+  static Future<void> setPdfSize(int v) async => (await _p).setInt('pdfSize', v);
+
+  /// إعداد مفضل لكل فلتر: [تباين، سطوع، حدة]
+  static Future<List<double>?> favOf(ScanFilter f) async {
+    try {
+      final s = (await _p).getString('fav:${f.name}');
+      if (s == null) return null;
+      final l = [for (final e in (jsonDecode(s) as List)) (e as num).toDouble()];
+      return l.length == 3 ? l : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> setFav(ScanFilter f, List<double>? v) async {
+    final p = await _p;
+    if (v == null) {
+      await p.remove('fav:${f.name}');
+    } else {
+      await p.setString('fav:${f.name}', jsonEncode(v));
+    }
+  }
+
   static Future<bool> autoEdit() async => (await _p).getBool('autoEdit') ?? false;
   static Future<void> setAutoEdit(bool v) async => (await _p).setBool('autoEdit', v);
 
@@ -2536,6 +2620,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     var scan = await Store.scanSetting();
     var qual = await Store.qualitySetting();
     var autoEdit = await Store.autoEdit();
+    var trim = await Store.trimMargins();
+    var pdfSz = await Store.pdfSize();
     if (!mounted) return;
     await showDialog(
       context: context,
@@ -2626,6 +2712,48 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                     onChanged: (v) {
                       setS(() => autoEdit = v);
                       Store.setAutoEdit(v);
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    title: const Text('قص الهوامش البيضاء تلقائياً'),
+                    subtitle: const Text(
+                        'في فلاتر الإيصال: بيشيل البياض الفاضي حوالين الإيصال لما تضغط ✓ في التعديل'),
+                    value: trim,
+                    onChanged: (v) {
+                      setS(() => trim = v);
+                      Store.setTrimMargins(v);
+                    },
+                  ),
+                  const Divider(),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    child: Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: Text('حجم ملف الـ PDF', style: TextStyle(fontWeight: FontWeight.bold))),
+                  ),
+                  RadioListTile<int>(
+                    dense: true,
+                    title: const Text('كما هو (أعلى جودة)'),
+                    subtitle: const Text('الصور بتتحط في الـ PDF من غير أي ضغط إضافي'),
+                    value: 0,
+                    groupValue: pdfSz,
+                    onChanged: (v) {
+                      setS(() => pdfSz = v!);
+                      Store.setPdfSize(v!);
+                      Store.clearPdf();
+                    },
+                  ),
+                  RadioListTile<int>(
+                    dense: true,
+                    title: const Text('مضغوط (حجم أصغر)'),
+                    subtitle: const Text('أنسب للإرسال بالنت الضعيف، والكتابة الصغيرة ممكن تقل وضوحها شوية'),
+                    value: 1,
+                    groupValue: pdfSz,
+                    onChanged: (v) {
+                      setS(() => pdfSz = v!);
+                      Store.setPdfSize(v!);
+                      Store.clearPdf();
                     },
                   ),
                 ],
@@ -3723,7 +3851,169 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
 /// التعديل دايماً بيبدأ من النسخة الأصلية، فتقدر تكبّر القص أو ترجّع الفلتر في أي وقت.
 const kRetake = '__retake__'; // EditorPage بترجّعه لما الموظف يدوس "إعادة أخذ"
 const kDelete = '__delete__'; // حذف الصفحة الحالية
+const kAllPrefix = '__all__'; // __all__|<EditParams json>|<path>: حفظ الصفحة الحالية وتطبيق الفلتر على كل الصفحات
 const kNavPrefix = '__nav__'; // __nav__|next|<path> أو __nav__|prev|<path>: انتقال لصفحة تانية بعد حفظ التعديل
+
+/// بيرسم صفحة بعد التعديل (قص + تدوير + فلتر) من نسختها الأصلية وبيرجّع مسار الصورة الجديدة.
+/// بيستخدمه المحرر (زر ✓) و"طبّق على كل الصفحات".
+Future<String> renderEditedPage(String path, String prefix, EditParams e) async {
+  final sp = await SharedPreferences.getInstance();
+  Store.working++;
+  try {
+    // علامة: لو التطبيق اتقفل جوه "تم"، في التشغيل الجاي بنشغّل وضع آمن بدقة أقل
+    await sp.setBool('apply_guard', true);
+    final baseF = File(Store.baseOf(path));
+    final src = await baseF.exists() ? baseF.path : path;
+    final turns = e.turns, angle = e.angle, filter = e.filter;
+    final contrast = e.contrast, brightness = e.brightness, sharp = e.sharp;
+    var levels = e.levels;
+    final quad = (e.quad != null && _quadConvex(e.quad!))
+        ? e.quad!
+        : const [Offset(0, 0), Offset(1, 0), Offset(1, 1), Offset(0, 1)];
+    AppLog.i('apply start turns=$turns angle=${angle.toStringAsFixed(1)} filter=${filter.name}');
+    if (filter == ScanFilter.auto && levels == null) {
+      levels = await autoLevelsOf(await File(src).readAsBytes());
+    }
+    final r = await _rotatedImage(src, turns);
+    final rw = r.width, rh = r.height;
+    AppLog.i('apply decoded ${rw}x$rh');
+    final bd = await r.toByteData(format: ui.ImageByteFormat.rawRgba);
+    r.dispose();
+    if (bd == null) throw Exception('تعذر قراءة الصورة');
+    final pts = [for (final q in quad) Offset(q.dx * rw, q.dy * rh)];
+    final topW = (pts[1] - pts[0]).distance, botW = (pts[2] - pts[3]).distance;
+    final leftH = (pts[3] - pts[0]).distance, rightH = (pts[2] - pts[1]).distance;
+    var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
+    final mode = await Store.perfMode();
+    final safe = sp.getBool('apply_safe') ?? false;
+    final maxSide = safe ? math.min(900, getMaxSide(mode)) : getMaxSide(mode);
+    final k = math.min(1.0, maxSide / math.max(ow, oh));
+    ow *= k;
+    oh *= k;
+    final w = math.max(8, ow.round()), h = math.max(8, oh.round());
+    AppLog.i('apply warp ${w}x$h safe=$safe');
+    var rgba = await compute(_warpJob, <String, dynamic>{
+      'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+      'sw': rw,
+      'sh': rh,
+      'ow': w,
+      'oh': h,
+      'theta': angle * math.pi / 180,
+      'h': _homography(pts),
+      // فلاتر الإيصال: التباين والسطوع بيتطبقوا بعد التنضيف (زي المعاينة بالظبط)
+      'm': isCleanFilter(filter)
+          ? editMatrix(ScanFilter.original, 0, 0)
+          : editMatrix(filter, contrast, brightness, levels),
+    });
+    AppLog.i('apply warp done');
+    if (isCleanFilter(filter)) {
+      rgba = await compute(_cleanJob, <String, dynamic>{
+        'src': rgba,
+        'w': w,
+        'h': h,
+        'gray': false,
+        'th': usesThermalClean(filter),
+      });
+      AppLog.i('apply clean done');
+      if (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw) {
+        rgba = await compute(_matrixJob, <String, dynamic>{
+          'src': rgba,
+          'm': editMatrix(filter, contrast, brightness),
+        });
+      }
+    }
+    final sk = effSharpness(filter, sharp);
+    if (sk > 0) {
+      rgba = await compute(_sharpenJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': sk});
+      AppLog.i('apply sharpen done');
+    }
+    var fw = w, fh = h;
+    if (isCleanFilter(filter) && await Store.trimMargins()) {
+      final tr = await compute(_trimJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h});
+      final tw = tr['w'] as int;
+      if (tw > 0) {
+        rgba = tr['out'] as Uint8List;
+        fw = tw;
+        fh = tr['h'] as int;
+        AppLog.i('apply trim ${w}x$h -> ${fw}x$fh');
+      }
+    }
+    final comp = Completer<ui.Image>();
+    ui.decodeImageFromPixels(rgba, fw, fh, ui.PixelFormat.rgba8888, comp.complete);
+    final outImg = await comp.future;
+    final png = await outImg.toByteData(format: ui.ImageByteFormat.png);
+    outImg.dispose();
+    if (png == null) throw Exception('تعذر حفظ الصورة');
+    AppLog.i('apply png ${png.lengthInBytes ~/ 1024}KB');
+    final jpg = await FlutterImageCompress.compressWithList(
+      png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
+      minWidth: fw,
+      minHeight: fh,
+      quality: await Store.jpegQuality(),
+      format: CompressFormat.jpeg,
+    );
+    final dir = (await Store.dir()).path;
+    final nf = File('$dir/$prefix${DateTime.now().microsecondsSinceEpoch}.jpg');
+    await nf.writeAsBytes(jpg, flush: true);
+    AppLog.i('apply jpg ${jpg.length ~/ 1024}KB saved');
+    // النسخة الأصلية بتنتقل للصورة الجديدة (أو بتتعمل أول مرة من الصورة الحالية)
+    final oldBase = File(Store.baseOf(path));
+    final newBase = Store.baseOf(nf.path);
+    if (await oldBase.exists()) {
+      await oldBase.rename(newBase);
+    } else {
+      await File(path).copy(newBase);
+    }
+    await Store.setEdit(
+        nf.path,
+        EditParams(
+            quad: quad,
+            turns: turns,
+            angle: angle,
+            filter: filter,
+            contrast: contrast,
+            brightness: brightness,
+            sharp: sharp,
+            levels: levels));
+    AppLog.i('apply done');
+    return nf.path;
+  } finally {
+    try {
+      await sp.setBool('apply_guard', false);
+    } catch (_) {}
+    Store.working--;
+  }
+}
+
+/// لقطة من إعدادات المحرر (للتراجع والإعادة).
+class _EditSnap {
+  final List<Offset> quad;
+  final int turns;
+  final double angle;
+  final ScanFilter filter;
+  final double contrast, brightness, sharp;
+  final String sig;
+  _EditSnap(this.quad, this.turns, this.angle, this.filter, this.contrast, this.brightness,
+      this.sharp, this.sig);
+}
+
+class _GridPainter extends CustomPainter {
+  const _GridPainter();
+  @override
+  void paint(Canvas canvas, Size size) {
+    final p = Paint()
+      ..color = Colors.white54
+      ..strokeWidth = 1;
+    for (var i = 1; i < 3; i++) {
+      final x = size.width * i / 3, y = size.height * i / 3;
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), p);
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), p);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_GridPainter o) => false;
+}
 
 class EditorPage extends StatefulWidget {
   final bool canRetake; // بيظهر زر إعادة الأخذ لما الشاشة تتفتح من الكاميرا
@@ -3793,9 +4083,115 @@ class _EditorPageState extends State<EditorPage> {
   ui.Image? _sharpBase; // الصورة اللي اتحسبت منها sharpImg
   int _sharpGen = 0;
 
+  // تراجع/إعادة
+  final List<_EditSnap> _hist = [];
+  int _hi = -1;
+  bool get _canUndo => _hi > 0;
+  bool get _canRedo => _hi >= 0 && _hi < _hist.length - 1;
+  bool _peek = false; // ضغط مطوّل على زر المقارنة = عرض الصورة الأصلية
+  final Map<ScanFilter, List<double>> _favs = {};
+
+  void _mark() {
+    final sg = _sig();
+    if (_hi >= 0 && _hist[_hi].sig == sg) return;
+    _hist.removeRange(_hi + 1, _hist.length);
+    _hist.add(_EditSnap(List.of(quad), turns, angle, filter, contrast, brightness, sharp, sg));
+    if (_hist.length > 40) _hist.removeAt(0);
+    _hi = _hist.length - 1;
+    if (mounted) setState(() {});
+  }
+
+  void _restore(_EditSnap s) {
+    final turnsChanged = s.turns != turns;
+    final filterChanged = s.filter != filter;
+    setState(() {
+      quad = List.of(s.quad);
+      turns = s.turns;
+      angle = s.angle;
+      filter = s.filter;
+      contrast = s.contrast;
+      brightness = s.brightness;
+      sharp = s.sharp;
+    });
+    if (turnsChanged) {
+      _loadView();
+    } else if (filterChanged) {
+      _afterFilter(s.filter);
+    } else {
+      _resharp();
+    }
+  }
+
+  void _undo() {
+    if (!_canUndo) return;
+    _hi--;
+    _restore(_hist[_hi]);
+  }
+
+  void _redo() {
+    if (!_canRedo) return;
+    _hi++;
+    _restore(_hist[_hi]);
+  }
+
+  Future<void> _loadFavs() async {
+    for (final f in ScanFilter.values) {
+      final v = await Store.favOf(f);
+      if (v != null) _favs[f] = v;
+    }
+  }
+
+  Future<void> _toggleFav(bool isFav) async {
+    final f = filter;
+    if (isFav) {
+      await Store.setFav(f, null);
+      _favs.remove(f);
+    } else {
+      final v = [contrast, brightness, sharp];
+      await Store.setFav(f, v);
+      _favs[f] = v;
+    }
+    if (!mounted) return;
+    setState(() {});
+    snack(context, isFav ? 'اتمسح الإعداد المفضل' : 'اتحفظ الإعداد المفضل لفلتر ${kFilterLabels[f]}');
+  }
+
+  Widget _favBtn() {
+    final fv = _favs[filter];
+    final isFav = fv != null &&
+        (fv[0] - contrast).abs() < 0.001 &&
+        (fv[1] - brightness).abs() < 0.001 &&
+        (fv[2] - sharp).abs() < 0.001;
+    return IconButton(
+      visualDensity: VisualDensity.compact,
+      tooltip: isFav ? 'مسح الإعداد المفضل' : 'حفظ السطوع والتباين والحدة كإعداد مفضل للفلتر ده',
+      icon: Icon(isFav ? Icons.star : Icons.star_border, size: 22),
+      onPressed: busy ? null : () => _toggleFav(isFav),
+    );
+  }
+
+  Widget _peekBtn() => Listener(
+        onPointerDown: busy ? null : (_) => setState(() => _peek = true),
+        onPointerUp: (_) {
+          if (_peek) setState(() => _peek = false);
+        },
+        onPointerCancel: (_) {
+          if (_peek) setState(() => _peek = false);
+        },
+        child: Tooltip(
+          message: 'اضغط مطوّلاً لرؤية الأصل',
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Icon(Icons.compare, color: _peek ? const Color(0xFF1EC8A5) : null),
+          ),
+        ),
+      );
+
   bool get _cleanReady =>
       isCleanFilter(filter) && cleaned != null && _cleanedThermal == usesThermalClean(filter);
   ui.Image get _base => _cleanReady ? cleaned! : view!;
+  ui.Image get _shownNow => _peek ? view! : _shown;
+
   ui.Image get _shown {
     final b = _base;
     return (effSharpness(filter, sharp) > 0 && sharpImg != null && identical(_sharpBase, b))
@@ -3880,7 +4276,7 @@ class _EditorPageState extends State<EditorPage> {
   }
 
   /// مصفوفة المعاينة: لحد ما النسخة المنضّفة تجهز بنعرض الصورة من غير فلتر الإيصال (عشان مايظهرش أسود فجأة).
-  List<double> _matrixNow() => (isCleanFilter(filter) && !_cleanReady)
+  List<double> _matrixNow() => (_peek || (isCleanFilter(filter) && !_cleanReady))
       ? editMatrix(ScanFilter.original, 0, 0)
       : editMatrix(filter, contrast, brightness, levels);
 
@@ -3899,8 +4295,19 @@ class _EditorPageState extends State<EditorPage> {
   void _onFilter(ScanFilter f) {
     setState(() {
       filter = f;
+      final fv = _favs[f]; // الإعداد المفضل للفلتر (لو محفوظ)
+      if (fv != null) {
+        contrast = fv[0];
+        brightness = fv[1];
+        sharp = fv[2];
+      }
       if (f == ScanFilter.sharpen && sharp < 0.7) sharp = 0.7;
     });
+    _afterFilter(f);
+    _mark();
+  }
+
+  void _afterFilter(ScanFilter f) {
     if (isCleanFilter(f)) {
       if (cleaned == null || _cleanedThermal != usesThermalClean(f)) {
         _makeClean();
@@ -3938,6 +4345,7 @@ class _EditorPageState extends State<EditorPage> {
         _resharp();
       }
       if (filter == ScanFilter.auto && levels == null) _makeLevels();
+      _mark();
     } catch (e, st) {
       AppLog.e('_loadView', e, st);
       if (mounted) {
@@ -3950,6 +4358,7 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _init() async {
     try {
       AppLog.i('editor open');
+      await _loadFavs();
       final base = File(Store.baseOf(widget.path));
       final s = await base.exists() ? base.path : widget.path;
       final a = await imageAspect(s);
@@ -4149,6 +4558,7 @@ class _EditorPageState extends State<EditorPage> {
     }
     final wasDrag = drag;
     if (drag != -1) setState(() => drag = -1);
+    if (wasDrag != -1 && !cancel) _mark();
     if (cancel || _pinched) return;
     if (_swipeOk) {
       // سويب أفقي: يمين = الصفحة اللي بعدها (أو إضافة صورة)، شمال = اللي قبلها
@@ -4198,7 +4608,7 @@ class _EditorPageState extends State<EditorPage> {
       ? SizedBox(width: w, height: h)
       : CustomPaint(
           size: Size(w, h),
-          painter: _ViewPainter(_shown, Size(w, h), angle * math.pi / 180,
+          painter: _ViewPainter(_shownNow, Size(w, h), angle * math.pi / 180,
               _matrixNow()),
         );
 
@@ -4224,7 +4634,7 @@ class _EditorPageState extends State<EditorPage> {
               if (view != null)
                 CustomPaint(
                   size: const Size(d, d),
-                  painter: _ViewPainter(_shown, s, angle * math.pi / 180,
+                  painter: _ViewPainter(_shownNow, s, angle * math.pi / 180,
                       _matrixNow(),
                       focus: f, zoom: z),
                 ),
@@ -4254,129 +4664,61 @@ class _EditorPageState extends State<EditorPage> {
           quad = r;
           angle = 0;
         });
+        _mark();
       }
     } finally {
       if (mounted) setState(() => busy = false);
     }
   }
 
-  Future<void> _apply({String? nav}) async {
+  Future<void> _apply({String? nav, bool all = false}) async {
     if (!_quadConvex(quad)) {
       snack(context, 'حدود القص متداخلة، عدّل الزوايا');
       return;
     }
     setState(() => busy = true);
-    Store.working++;
-    final sp = await SharedPreferences.getInstance();
     try {
-      // علامة: لو التطبيق اتقفل جوه "تم"، في التشغيل الجاي بنشغّل وضع آمن بدقة أقل
-      await sp.setBool('apply_guard', true);
-      AppLog.i('apply start turns=$turns angle=${angle.toStringAsFixed(1)} filter=${filter.name}');
-      if (filter == ScanFilter.auto && levels == null) {
-        levels = await autoLevelsOf(await File(src!).readAsBytes());
+      final ep = EditParams(
+          quad: quad,
+          turns: turns,
+          angle: angle,
+          filter: filter,
+          contrast: contrast,
+          brightness: brightness,
+          sharp: sharp,
+          levels: levels);
+      final np = await renderEditedPage(widget.path, widget.prefix, ep);
+      if (mounted) {
+        final style =
+            EditParams(filter: filter, contrast: contrast, brightness: brightness, sharp: sharp);
+        Navigator.pop(
+            context,
+            all
+                ? '$kAllPrefix|${style.encode()}|$np'
+                : (nav == null ? np : '$kNavPrefix|$nav|$np'));
       }
-      final r = await _rotatedImage(src!, turns);
-      final rw = r.width, rh = r.height;
-      AppLog.i('apply decoded ${rw}x$rh');
-      final bd = await r.toByteData(format: ui.ImageByteFormat.rawRgba);
-      r.dispose();
-      if (bd == null) throw Exception('تعذر قراءة الصورة');
-      final pts = [for (final q in quad) Offset(q.dx * rw, q.dy * rh)];
-      final topW = (pts[1] - pts[0]).distance, botW = (pts[2] - pts[3]).distance;
-      final leftH = (pts[3] - pts[0]).distance, rightH = (pts[2] - pts[1]).distance;
-      var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
-      final mode = await Store.perfMode();
-      final safe = sp.getBool('apply_safe') ?? false;
-      final maxSide = safe ? math.min(900, getMaxSide(mode)) : getMaxSide(mode);
-      final k = math.min(1.0, maxSide / math.max(ow, oh));
-      ow *= k;
-      oh *= k;
-      final w = math.max(8, ow.round()), h = math.max(8, oh.round());
-      AppLog.i('apply warp ${w}x$h safe=$safe');
-      var rgba = await compute(_warpJob, <String, dynamic>{
-        'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
-        'sw': rw,
-        'sh': rh,
-        'ow': w,
-        'oh': h,
-        'theta': angle * math.pi / 180,
-        'h': _homography(pts),
-        // فلاتر الإيصال: التباين والسطوع بيتطبقوا بعد التنضيف (زي المعاينة بالظبط)
-        'm': isCleanFilter(filter)
-            ? editMatrix(ScanFilter.original, 0, 0)
-            : editMatrix(filter, contrast, brightness, levels),
-      });
-      AppLog.i('apply warp done');
-      if (isCleanFilter(filter)) {
-        rgba = await compute(_cleanJob, <String, dynamic>{
-          'src': rgba,
-          'w': w,
-          'h': h,
-          'gray': false,
-          'th': usesThermalClean(filter),
-        });
-        AppLog.i('apply clean done');
-        if (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw) {
-          rgba = await compute(_matrixJob, <String, dynamic>{
-            'src': rgba,
-            'm': editMatrix(filter, contrast, brightness),
-          });
-        }
-      }
-      final sk = effSharpness(filter, sharp);
-      if (sk > 0) {
-        rgba = await compute(_sharpenJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': sk});
-        AppLog.i('apply sharpen done');
-      }
-      final comp = Completer<ui.Image>();
-      ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
-      final outImg = await comp.future;
-      final png = await outImg.toByteData(format: ui.ImageByteFormat.png);
-      outImg.dispose();
-      if (png == null) throw Exception('تعذر حفظ الصورة');
-      AppLog.i('apply png ${png.lengthInBytes ~/ 1024}KB');
-      final jpg = await FlutterImageCompress.compressWithList(
-        png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
-        minWidth: w,
-        minHeight: h,
-        quality: await Store.jpegQuality(),
-        format: CompressFormat.jpeg,
-      );
-      final dir = (await Store.dir()).path;
-      final nf = File('$dir/${widget.prefix}${DateTime.now().microsecondsSinceEpoch}.jpg');
-      await nf.writeAsBytes(jpg, flush: true);
-      AppLog.i('apply jpg ${jpg.length ~/ 1024}KB saved');
-      // النسخة الأصلية بتنتقل للصورة الجديدة (أو بتتعمل أول مرة من الصورة الحالية)
-      final oldBase = File(Store.baseOf(widget.path));
-      final newBase = Store.baseOf(nf.path);
-      if (await oldBase.exists()) {
-        await oldBase.rename(newBase);
-      } else {
-        await File(widget.path).copy(newBase);
-      }
-      await Store.setEdit(
-          nf.path,
-          EditParams(
-              quad: quad,
-              turns: turns,
-              angle: angle,
-              filter: filter,
-              contrast: contrast,
-              brightness: brightness,
-              sharp: sharp,
-              levels: levels));
-      AppLog.i('apply done');
-      if (mounted) Navigator.pop(context, nav == null ? nf.path : '$kNavPrefix|$nav|${nf.path}');
     } catch (e, st) {
       AppLog.e('editor._apply', e, st);
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
-      try {
-        await sp.setBool('apply_guard', false);
-      } catch (_) {}
-      Store.working--;
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  Future<void> _confirmApplyAll() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('تطبيق على كل الصفحات'),
+        content: const Text(
+            'هيتطبق الفلتر والسطوع والتباين والحدة على كل الصفحات. القص والتدوير بتاع كل صفحة هيفضلوا زي ما هما.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('طبّق')),
+        ],
+      ),
+    );
+    if (ok == true && mounted) await _apply(all: true);
   }
 
   // ---------- لوحات التحكم ----------
@@ -4408,6 +4750,7 @@ class _EditorPageState extends State<EditorPage> {
                           angle = 0;
                           quad = List.of(_full);
                         });
+                        _mark();
                       },
                 icon: const Icon(Icons.crop_free),
                 label: const Text('الصورة كلها'),
@@ -4452,17 +4795,26 @@ class _EditorPageState extends State<EditorPage> {
                 divisions: 80,
                 label: '${angle.toStringAsFixed(1)}°',
                 onChanged: busy ? null : (v) => setState(() => angle = v),
+                onChangeEnd: busy ? null : (_) => _mark(),
               ),
             ),
             TextButton(
-              onPressed: (busy || angle == 0) ? null : () => setState(() => angle = 0),
+              onPressed: (busy || angle == 0)
+                  ? null
+                  : () {
+                      setState(() => angle = 0);
+                      _mark();
+                    },
               child: const Text('0°'),
             ),
           ]),
         ]);
       default:
         return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          FilterBar(selected: filter, onChanged: busy ? null : _onFilter),
+          Row(children: [
+            _peekBtn(),
+            Expanded(child: FilterBar(selected: filter, onChanged: busy ? null : _onFilter)),
+          ]),
           Row(children: [
             const Icon(Icons.brightness_6, size: 20),
             Expanded(
@@ -4471,6 +4823,7 @@ class _EditorPageState extends State<EditorPage> {
                 min: -1,
                 max: 1,
                 onChanged: busy ? null : (v) => setState(() => brightness = v),
+                onChangeEnd: busy ? null : (_) => _mark(),
               ),
             ),
             const Icon(Icons.contrast, size: 20),
@@ -4480,6 +4833,7 @@ class _EditorPageState extends State<EditorPage> {
                 min: -0.5,
                 max: 1,
                 onChanged: busy ? null : (v) => setState(() => contrast = v),
+                onChangeEnd: busy ? null : (_) => _mark(),
               ),
             ),
             IconButton(
@@ -4487,12 +4841,15 @@ class _EditorPageState extends State<EditorPage> {
               icon: const Icon(Icons.restart_alt),
               onPressed: busy
                   ? null
-                  : () => setState(() {
+                  : () {
+                      setState(() {
                         brightness = 0;
                         contrast = 0;
                         sharp = 0;
-                        _resharp();
-                      }),
+                      });
+                      _resharp();
+                      _mark();
+                    },
             ),
           ]),
           Row(children: [
@@ -4503,12 +4860,16 @@ class _EditorPageState extends State<EditorPage> {
                 min: 0,
                 max: 1,
                 onChanged: busy ? null : (v) => setState(() => sharp = v),
-                onChangeEnd: busy ? null : (_) => _resharp(),
+                onChangeEnd: busy
+                    ? null
+                    : (_) {
+                        _resharp();
+                        _mark();
+                      },
               ),
             ),
-            const SizedBox(width: 6),
             const Text('حدة', style: TextStyle(fontSize: 12, color: Colors.grey)),
-            const SizedBox(width: 6),
+            _favBtn(),
           ]),
         ]);
     }
@@ -4572,6 +4933,25 @@ class _EditorPageState extends State<EditorPage> {
       appBar: AppBar(
         title: const Text('تعديل الصورة'),
         actions: [
+          IconButton(
+            tooltip: 'تراجع',
+            icon: const Icon(Icons.undo),
+            onPressed: (busy || !_canUndo) ? null : _undo,
+          ),
+          IconButton(
+            tooltip: 'إعادة',
+            icon: const Icon(Icons.redo),
+            onPressed: (busy || !_canRedo) ? null : _redo,
+          ),
+          if (widget.pageCount > 1)
+            PopupMenuButton<String>(
+              tooltip: 'المزيد',
+              enabled: !busy,
+              onSelected: (_) => _confirmApplyAll(),
+              itemBuilder: (_) => const [
+                PopupMenuItem<String>(value: 'all', child: Text('طبّق الفلتر على كل الصفحات')),
+              ],
+            ),
           if (widget.canDelete)
             IconButton(
               tooltip: 'حذف الصفحة',
@@ -5012,6 +5392,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   bool _shooting = false;
   bool _hd = true;
   int _flash = 0; // 0 مقفول، 1 تلقائي، 2 فلاش، 3 كشاف
+  bool _grid = false; // شبكة الأثلاث للمحاذاة
   late int _count = widget.count;
   String? _thumb;
   double _minZoom = 1, _maxZoom = 1, _zoom = 1, _zoom0 = 1;
@@ -5028,6 +5409,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     SharedPreferences.getInstance().then((p) {
       _hd = p.getBool('camHd') ?? true;
       _flash = p.getInt('camFlash') ?? 0;
+      _grid = p.getBool('camGrid') ?? false;
       _start();
     }).catchError((Object e, StackTrace st) {
       AppLog.e('cam.prefs', e, st);
@@ -5111,6 +5493,14 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         cam.FlashMode.always,
         cam.FlashMode.torch,
       ][_flash]);
+    } catch (_) {}
+  }
+
+  Future<void> _toggleGrid() async {
+    HapticFeedback.selectionClick();
+    setState(() => _grid = !_grid);
+    try {
+      (await SharedPreferences.getInstance()).setBool('camGrid', _grid);
     } catch (_) {}
   }
 
@@ -5315,6 +5705,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
               child: SizedBox(width: ar * 1000, height: 1000, child: cam.CameraPreview(c)),
             ),
           ),
+          if (_grid) const Positioned.fill(child: IgnorePointer(child: CustomPaint(painter: _GridPainter()))),
           if (_focusAt != null)
             Positioned(
               left: _focusAt!.dx - 30,
@@ -5356,6 +5747,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                 _icon(Icons.close, 'إغلاق', () => Navigator.pop(context)),
                 _icon(_flashIcons[_flash], 'فلاش', _cycleFlash, on: _flash != 0),
                 _icon(Icons.hd, _hd ? 'جودة عالية' : 'جودة عادية', _toggleHd, on: _hd),
+                _icon(Icons.grid_3x3, 'شبكة', _toggleGrid, on: _grid),
                 if (widget.onGallery != null) _icon(Icons.photo_library_outlined, 'معرض', _gallery),
               ]),
             ),
@@ -5683,6 +6075,56 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (done == true && mounted) Navigator.pop(context);
   }
 
+  /// تطبيق الفلتر والسطوع والتباين والحدة على كل الصفحات (القص والتدوير بتاع كل صفحة زي ما هما).
+  Future<void> _applyToAll(EditParams style, String exceptPath) async {
+    if (!mounted) return;
+    setState(() {
+      busy = true;
+      progress = '0/${imgs.length}';
+    });
+    var failed = 0;
+    try {
+      for (var i = 0; i < imgs.length; i++) {
+        final p = imgs[i];
+        if (p == exceptPath) continue;
+        if (mounted) setState(() => progress = '${i + 1}/${imgs.length}');
+        try {
+          final old = await Store.editOf(p);
+          final ep = EditParams(
+            quad: old?.quad,
+            turns: old?.turns ?? 0,
+            angle: old?.angle ?? 0,
+            filter: style.filter,
+            contrast: style.contrast,
+            brightness: style.brightness,
+            sharp: style.sharp,
+          );
+          final np = await renderEditedPage(p, 'r_', ep);
+          await Store.replaceInDraft(p, np);
+          if (mounted) {
+            setState(() {
+              imgs[i] = np;
+              built = null;
+            });
+          }
+        } catch (e, st) {
+          failed++;
+          AppLog.e('applyToAll', e, st);
+        }
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          progress = null;
+        });
+      }
+    }
+    if (mounted) {
+      snack(context, failed == 0 ? 'اتطبق على كل الصفحات' : 'اتطبق، و$failed صفحة فشلت');
+    }
+  }
+
   /// تعديل إيصال بعد التصوير (قص، تدوير، فلتر) من النسخة الأصلية، مع التنقل بين الصفحات
   /// (أسهم / سويب)، والحذف، وإضافة صورة. بترجّع true لو الموظف داس "إعادة أخذ".
   Future<bool> _edit(int i, {int tab = 0, bool fromCam = false}) async {
@@ -5722,6 +6164,12 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       }
       var path = out;
       String? dir;
+      EditParams? allStyle;
+      if (out.startsWith('$kAllPrefix|')) {
+        final parts = out.split('|');
+        allStyle = EditParams.decode(parts[1]);
+        path = parts.sublist(2).join('|');
+      }
       if (out.startsWith('$kNavPrefix|')) {
         final parts = out.split('|');
         dir = parts[1];
@@ -5739,6 +6187,10 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
           if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
           return false;
         }
+      }
+      if (allStyle != null) {
+        await _applyToAll(allStyle, path);
+        return false;
       }
       if (dir == null) return false; // ✓ تم
       if (dir == 'prev') {
