@@ -33,6 +33,8 @@ const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصور
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
 const kBatchTagW = 0.8; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
+const kBandGapNear = 0.004; // المسافة بين الورقة وصورة الباتش (الورقة لازقة في الصورة)
+const kBandMaxScale = 1.3; // أقصى حجم للورقة في الشريط (أكتر من 1.0 = أعرض من الصورة وبتزيد هوامش بيضا على الجنب)
 enum PerfMode { lite, balanced, pro }
 
 /// الدقة الافتراضية لمعاينة الإيصال (نفس وضع balanced).
@@ -1176,8 +1178,9 @@ Future<Uint8List> composeBatch(String path, Session s) async {
   final w = iw.toDouble(), h = ih.toDouble();
   final Tag tag;
   final Offset tagAt;
-  int imgY = 0;
+  int imgY = 0, imgX = 0;
   final int oh;
+  int ow = iw;
   if (layout == 2) {
     final ref = await receiptTag(1000, s, batch: true);
     final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref), ref, h / w);
@@ -1186,9 +1189,12 @@ Future<Uint8List> composeBatch(String path, Session s) async {
     oh = ih;
   } else {
     tag = await batchBandTag(s, w);
-    final pad = w * kBandPad;
-    final band = tag.h + pad * 2;
-    tagAt = Offset((w - tag.w) / 2, layout == 0 ? pad : h + pad);
+    final pad = w * kBandPad; // الهامش الخارجي
+    final gap = w * kBandGapNear; // الهامش اللي بين الورقة والصورة (صغير)
+    final band = tag.h + pad + gap;
+    ow = math.max(iw, tag.w.ceil());
+    imgX = ((ow - iw) / 2).round();
+    tagAt = Offset((ow - tag.w) / 2, layout == 0 ? pad : h + gap);
     imgY = layout == 0 ? band.ceil() : 0;
     oh = ih + band.ceil();
   }
@@ -1206,33 +1212,33 @@ Future<Uint8List> composeBatch(String path, Session s) async {
     'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
     'tw': tw,
     'th': th,
-    'ow': iw,
+    'ow': ow,
     'oh': oh,
-    'ix': 0,
+    'ix': imgX,
     'iy': imgY,
     'tx': tagAt.dx.round(),
     'ty': tagAt.dy.round(),
   });
   final comp = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, iw, oh, ui.PixelFormat.rgba8888, comp.complete);
+  ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
   final outImg = await comp.future;
   final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
   outImg.dispose();
   if (pngBd == null) throw Exception('تعذر حفظ الصورة');
   final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
   final q = await Store.jpegQuality();
-  final want = _meanLum(rgba, iw, oh);
+  final want = _meanLum(rgba, ow, oh);
   // أول محاولة بالأبعاد الكاملة، ولو الناتج مشوّه نجرّب أبعاد أصغر، ولو برضه مشوّه منبعتش صورة بايظة
   for (final k in const [1.0, 0.75]) {
     final jpg = await FlutterImageCompress.compressWithList(
       png,
-      minWidth: (iw * k).round(),
+      minWidth: (ow * k).round(),
       minHeight: (oh * k).round(),
       quality: q,
       format: CompressFormat.jpeg,
     );
     final got = await _jpegMeanLum(jpg);
-    AppLog.i('compose ${iw}x$oh k=$k ${jpg.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} '
+    AppLog.i('compose ${ow}x$oh k=$k ${jpg.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} '
         'got=${got?.toStringAsFixed(0)}');
     if (got != null && (got - want).abs() < 25) return jpg;
   }
@@ -1482,7 +1488,7 @@ class Store {
 
   /// حجم الورقة في وضع الشريط (نسبة من عرض الصورة)
   static Future<double> bandScale() async =>
-      ((await _p).getDouble('bandScale') ?? kBatchTagW).clamp(0.3, 1.0).toDouble();
+      ((await _p).getDouble('bandScale') ?? kBatchTagW).clamp(0.3, kBandMaxScale).toDouble();
   static Future<void> setBandScale(double v) async => (await _p).setDouble('bandScale', v);
 
   // --- مكان وحجم الورقة ---
@@ -2244,33 +2250,58 @@ class ReceiptPreview extends StatelessWidget {
   final int cacheWidth;
   final bool showTag;
   final bool bottom; // الشريط تحت الصورة بدل فوقها
+  /// لو متحدد: الورقة بنسبة من عرض الصورة (زي ما بتتركب في الباتش) وملزوقة في الصورة،
+  /// والـ tag بيكون نسخة مرجعية بتتكبّر وتتصغّر فوراً من غير إعادة رسم.
+  final double? bandScale;
   const ReceiptPreview(
       {super.key,
       required this.path,
       required this.tag,
       this.cacheWidth = kMaxSide,
       this.showTag = true,
-      this.bottom = false});
+      this.bottom = false,
+      this.bandScale});
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
-        final cw = cons.maxWidth;
+        final k = bandScale;
+        final full = cons.maxWidth;
+        // عرض الصورة نفسها: لو الورقة أعرض من الصورة (k > 1) الصورة بتتوسّط بهوامش بيضا
+        final cw = k == null ? full : full / math.max(1.0, k);
+        Widget errW(BuildContext _, Object __, StackTrace? ___) =>
+            const SizedBox(height: 120, child: Center(child: Text('تعذر عرض الصورة')));
+        final pic = Image.file(File(path),
+            width: cw, fit: BoxFit.fitWidth, cacheWidth: cacheWidth, errorBuilder: errW);
+        if (k == null) {
+          final band = Container(
+            width: cw,
+            color: Colors.white,
+            padding: EdgeInsets.symmetric(vertical: cw * kBandPad),
+            alignment: Alignment.center,
+            child: Image.memory(tag.png,
+                width: cw * tag.w / 1000, height: cw * tag.h / 1000, fit: BoxFit.fill),
+          );
+          return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: bottom ? [pic, if (showTag) band] : [if (showTag) band, pic]);
+        }
+        final tw = cw * k;
+        final th = tw * tag.h / tag.w;
+        final pad = cw * kBandPad, gap = cw * kBandGapNear;
         final band = Container(
-          width: cw,
+          width: full,
           color: Colors.white,
-          padding: EdgeInsets.symmetric(vertical: cw * kBandPad),
+          padding: EdgeInsets.only(top: bottom ? gap : pad, bottom: bottom ? pad : gap),
           alignment: Alignment.center,
           child: Image.memory(tag.png,
-              width: cw * tag.w / 1000, height: cw * tag.h / 1000, fit: BoxFit.fill),
+              width: tw, height: th, fit: BoxFit.fill, gaplessPlayback: true),
         );
-        final pic = Image.file(File(path),
-            width: cw,
-            fit: BoxFit.fitWidth,
-            cacheWidth: cacheWidth,
-            errorBuilder: (_, __, ___) =>
-                const SizedBox(height: 120, child: Center(child: Text('تعذر عرض الصورة'))));
+        final picBox = Container(
+            width: full, color: Colors.white, alignment: Alignment.center, child: pic);
         return Column(
             mainAxisSize: MainAxisSize.min,
-            children: bottom ? [pic, if (showTag) band] : [if (showTag) band, pic]);
+            children: bottom
+                ? [picBox, if (showTag) band]
+                : [if (showTag) band, picBox]);
       });
 }
 
@@ -3088,7 +3119,7 @@ class _BatchScreenState extends State<BatchScreen> {
   Tag? bandTag;
   int layout = 0; // 0 شريط فوق، 1 شريط تحت، 2 فوق الصورة
   double bandScale = kBatchTagW; // حجم الورقة في وضع الشريط
-  int _bandGen = 0;
+  Timer? _bandT;
   TagPos? pos;
   double? aspect;
   bool busy = false;
@@ -3107,13 +3138,15 @@ class _BatchScreenState extends State<BatchScreen> {
     await Store.setNoTag(path, hide);
   }
 
-  Future<void> _setBand(double v) async {
+  /// تكبير/تصغير الورقة لحظي أثناء السحب (من غير إعادة رسم)، والحفظ بيتأجل لحد ما الإيد تقف.
+  void _setBand(double v) {
     setState(() => bandScale = v);
-    final gen = ++_bandGen;
-    await Store.setBandScale(v);
-    final bt = await batchBandTag(widget.session, 1000);
-    if (!mounted || gen != _bandGen) return;
-    setState(() => bandTag = bt);
+    _bandT?.cancel();
+    _bandT = Timer(const Duration(milliseconds: 300), () {
+      Store.setBandScale(v).catchError((Object e, StackTrace st) {
+        AppLog.e('setBandScale', e, st);
+      });
+    });
   }
 
   Future<void> _setLayout(int v) async {
@@ -3155,7 +3188,7 @@ class _BatchScreenState extends State<BatchScreen> {
       if (p.cx != p0.cx || p.cy != p0.cy) await Store.savePos(path, p, true);
       final nt = await Store.noTag(path);
       final lay = await Store.batchLayout();
-      final bt = await batchBandTag(widget.session, 1000);
+      final bt = await receiptTag(2000, widget.session, batch: true); // نسخة مرجعية عالية الدقة للمعاينة
       final bsc = await Store.bandScale();
       if (!mounted) return;
       setState(() {
@@ -3256,6 +3289,10 @@ class _BatchScreenState extends State<BatchScreen> {
 
   @override
   void dispose() {
+    if (_bandT?.isActive ?? false) {
+      _bandT!.cancel();
+      Store.setBandScale(bandScale);
+    }
     final t = _saveT;
     if (t != null && t.isActive) {
       t.cancel();
@@ -3321,6 +3358,8 @@ class _BatchScreenState extends State<BatchScreen> {
     setState(() => busy = true);
     try {
       await _flushPos();
+      _bandT?.cancel();
+      await Store.setBandScale(bandScale);
       final ok = await sendBatchFile(context, widget.session, img!);
       if (ok) HapticFeedback.mediumImpact();
       if (ok && mounted) Navigator.pop(context);
@@ -3354,10 +3393,11 @@ class _BatchScreenState extends State<BatchScreen> {
                           child: FittedBox(
                             fit: BoxFit.contain,
                             child: SizedBox(
-                              width: 1000,
+                              width: 1000 * math.max(1.0, bandScale),
                               child: ReceiptPreview(
                                   path: img!,
                                   tag: bandTag!,
+                                  bandScale: bandScale,
                                   bottom: layout == 1,
                                   showTag: !noTag),
                             ),
@@ -3396,12 +3436,17 @@ class _BatchScreenState extends State<BatchScreen> {
                     const Icon(Icons.format_size),
                     Expanded(
                       child: Slider(
-                        value: bandScale.clamp(0.3, 1.0).toDouble(),
+                        value: bandScale.clamp(0.3, kBandMaxScale).toDouble(),
                         min: 0.3,
-                        max: 1.0,
+                        max: kBandMaxScale,
                         onChanged: noTag ? null : _setBand,
                       ),
                     ),
+                    SizedBox(
+                        width: 44,
+                        child: Text('${(bandScale * 100).round()}%',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(fontSize: 12, color: Colors.grey))),
                     IconButton(
                       tooltip: 'الحجم الأصلي',
                       icon: const Icon(Icons.restart_alt),
