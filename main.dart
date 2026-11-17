@@ -1405,6 +1405,10 @@ class Store {
   static Future<int> scanSetting() async => ((await _p).getInt('scanMode') ?? 0).clamp(0, 3);
   static Future<void> setScanSetting(int v) async => (await _p).setInt('scanMode', v);
 
+  /// محرك التصوير: 0 كاميرا A2R المخصصة، 1 ماسح جوجل (ML Kit) — الافتراضي ماسح جوجل
+  static Future<int> scanEngine() async => ((await _p).getInt('scanEngine') ?? 1).clamp(0, 1);
+  static Future<void> setScanEngine(int v) async => (await _p).setInt('scanEngine', v);
+
   /// جودة الصورة: 0 صغيرة، 1 عادية، 2 عالية
   static Future<int> qualitySetting() async => ((await _p).getInt('jpegQ') ?? 1).clamp(0, 2);
   static Future<void> setQualitySetting(int v) async => (await _p).setInt('jpegQ', v);
@@ -1852,6 +1856,11 @@ const _scanOpts = <(int, String, String)>[
   (3, 'كامل', 'قص وتنضيف الصورة وإزالة الصوابع'),
 ];
 
+const _engineOpts = <(int, String, String)>[
+  (1, 'ماسح جوجل', 'قص ذكي بالذكاء الاصطناعي زي CamScanner (الافتراضي)'),
+  (0, 'كاميرا A2R', 'كاميرا التطبيق المخصصة مع القص اليدوي/التلقائي'),
+];
+
 const _qualOpts = <(int, String, String)>[
   (0, 'صغيرة', 'ملف أخف وأسرع في الإرسال'),
   (1, 'عادية', 'متوازنة (الافتراضي)'),
@@ -1861,18 +1870,18 @@ const _qualOpts = <(int, String, String)>[
 bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
 
 Future<List<String>> scanImages(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full}) async {
+    {ScannerMode mode = ScannerMode.full, bool camFallback = false}) async {
   if (_scanBusy) return [];
   _scanBusy = true;
   try {
-    return await _scanImagesImpl(context, limit, mode: mode);
+    return await _scanImagesImpl(context, limit, mode: mode, camFallback: camFallback);
   } finally {
     _scanBusy = false;
   }
 }
 
 Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full}) async {
+    {ScannerMode mode = ScannerMode.full, bool camFallback = false}) async {
   _lastScanManual = false;
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
@@ -1897,6 +1906,12 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
       AppLog.e('scanImages.prefs', e, st);
     }
     if (!context.mounted) return [];
+    if (camFallback) {
+      // الطالب بيحول لكاميرا A2R بنفسه: نرجّع فاضي من غير ما نفتح المعرض
+      AppLog.e('scanImages.unavailable', e, StackTrace.current);
+      snack(context, 'ماسح جوجل مش متاح على الموبايل ده، هنستخدم كاميرا A2R');
+      return [];
+    }
     await showDialog<void>(
       context: context,
       builder: (c) => Directionality(
@@ -2962,7 +2977,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   PerfMode mode = PerfMode.balanced;
-  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0;
+  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0, engine = 1;
   bool autoEdit = false, trim = false, slow = false;
   AppPalette palSel = AppPalette.gold;
   bool loaded = false;
@@ -2989,6 +3004,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _load() async {
     final m = await Store.perfMode();
     final sc = await Store.scanSetting();
+    final en = await Store.scanEngine();
     final q = await Store.qualitySetting();
     final ae = await Store.autoEdit();
     final tr = await Store.trimMargins();
@@ -3004,6 +3020,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() {
       mode = m;
       scan = sc;
+      engine = en;
       qual = q;
       autoEdit = ae;
       trim = tr;
@@ -3053,6 +3070,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _setMode(PerfMode v) async {
     setState(() => mode = v);
     await Store.setPerfMode(v);
+  }
+
+  Future<void> _setEngine(int v) async {
+    setState(() => engine = v);
+    await Store.setScanEngine(v);
   }
 
   Future<void> _setScan(int v) async {
@@ -3352,7 +3374,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _sub('الأداء'),
                       _radioGroup<PerfMode>(_perfOpts, mode, _setMode),
                       const Divider(),
-                      _sub('وضع الماسح'),
+                      _sub('الكاميرا / الماسح'),
+                      _radioGroup<int>(_engineOpts, engine, _setEngine),
+                      const Divider(),
+                      _sub('وضع ماسح جوجل'),
                       _radioGroup<int>(_scanOpts, scan, _setScan),
                       const Divider(),
                       _sub('جودة الصورة'),
@@ -3902,6 +3927,53 @@ class _BatchScreenState extends State<BatchScreen> {
 
   /// كاميرا التطبيق: صورة واحدة بس، بعدها شاشة التعديل علطول (من غير عداد).
   Future<void> _capture() async {
+    final engine = await Store.scanEngine();
+    final perf = await Store.perfMode();
+    if (!mounted) return;
+    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
+      await _captureGoogle();
+      // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
+      if (_scannerFailed && mounted) await _captureA2R();
+    } else {
+      await _captureA2R();
+    }
+  }
+
+  /// ماسح جوجل الذكي: صورة واحدة مقصوصة، وبعدها شاشة التعديل على الفلاتر.
+  Future<void> _captureGoogle() async {
+    final paths = await scanImages(context, 1, camFallback: true);
+    if (paths.isEmpty || !mounted) {
+      if (_scannerFailed) return; // الدالة اللي فوق هتفتح كاميرا A2R
+      if (mounted && img == null) Navigator.pop(context);
+      return;
+    }
+    final manual = _lastScanManual; // true لو الماسح فشل واتحوّلنا للمعرض
+    final saved = await _ingestQuick(paths.first);
+    if (saved == null) {
+      if (mounted && img == null) Navigator.pop(context);
+      return;
+    }
+    _lastScanManual = manual;
+    if (mounted && await _edit(tab: manual ? 0 : 2, fromCam: true, path: saved)) {
+      await Store.clearBatchImg();
+      if (mounted) setState(() => img = null);
+      await _captureGoogle(); // إعادة أخذ
+      return;
+    }
+    if (mounted && img == null) {
+      final cur = await Store.batchImg();
+      if (cur != null) await _show(cur);
+    }
+    final shown = img;
+    if (shown != null) {
+      unawaited(qualityWarning(shown).then((warn) {
+        if (warn != null && mounted) snack(context, warn);
+      }));
+    }
+    if (mounted && img == null) Navigator.pop(context);
+  }
+
+  Future<void> _captureA2R() async {
     if (!await ensureCamera(context)) {
       if (mounted && img == null) Navigator.pop(context);
       return;
@@ -6898,6 +6970,38 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   /// كاميرا التطبيق (شكل كام اسكنر): كل صورة بتتحفظ وتتفتح للتعديل، والكاميرا تفضل مفتوحة والعداد بيزيد.
   Future<void> _add() async {
+    final engine = await Store.scanEngine();
+    final perf = await Store.perfMode();
+    if (!mounted) return;
+    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
+      await _addGoogle();
+      // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
+      if (_scannerFailed && mounted) await _addA2R();
+    } else {
+      await _addA2R();
+    }
+  }
+
+  /// ماسح جوجل الذكي: بيرجّع الصور مقصوصة جاهزة، فبنفتح التعديل على تبويب الفلاتر.
+  Future<void> _addGoogle() async {
+    final paths = await scanImages(context, continuous ? 20 : 1, camFallback: true);
+    if (paths.isEmpty || !mounted) return;
+    // false = جاية مقصوصة من ماسح جوجل، true = الماسح فشل واتحوّلنا للمعرض (يحتاج قص)
+    final manual = _lastScanManual;
+    final start = imgs.length;
+    await _saveAll(paths);
+    _lastScanManual = manual;
+    for (var i = start; i < imgs.length; i++) {
+      if (!mounted) break;
+      final retake = await _edit(i, tab: manual ? 0 : 2, fromCam: true);
+      if (retake && mounted) {
+        await _addGoogle(); // إعادة أخذ: نفتح الماسح تاني
+        break;
+      }
+    }
+  }
+
+  Future<void> _addA2R() async {
     if (!await ensureCamera(context)) return;
     if (!mounted) return;
     await Navigator.push<void>(
