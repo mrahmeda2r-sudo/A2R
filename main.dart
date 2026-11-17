@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:google_mlkit_document_scanner/google_mlkit_document_scanner.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart' as mlt;
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
@@ -1990,6 +1991,187 @@ String _digits(String s) {
   return t;
 }
 
+/// نتيجة قراءة ورقة إغلاق الباتش من الصورة (أي قيمة ممكن تكون null لو متقرتش)
+class BatchOcr {
+  final String? count, total;
+  const BatchOcr(this.count, this.total);
+}
+
+final RegExp _ocrDec = RegExp(r'(?<![\d.,])\d[\d,]*[.,]\d{2}(?![\d.,])');
+final RegExp _ocrCountKw =
+    RegExp(r'count|cnt|txn|trans|no\.?\s*of|number|qty|عدد', caseSensitive: false);
+final RegExp _ocrTotalKw =
+    RegExp(r'total|amount|amt|sum|sales?|net|egp|اجمالي|إجمالي|مبلغ', caseSensitive: false);
+final RegExp _ocrInt = RegExp(r'(?<![\d.,:/\-])\d{1,6}(?![\d.,:/\-])');
+
+double? _ocrNum(String raw) {
+  var t = raw;
+  final m = RegExp(r'[.,](\d{2})$').firstMatch(t);
+  if (m == null) return null;
+  final intPart = t.substring(0, m.start).replaceAll(RegExp(r'[.,]'), '');
+  return double.tryParse('$intPart.${m.group(1)}');
+}
+
+/// بيحلل أسطر النص (كل سطر = صف واحد من الورقة) ويطلع عدد المعاملات والإجمالي
+BatchOcr _parseGeneric(List<String> rowsRaw) {
+  final rows = rowsRaw;
+  // أرقام عربية ← إنجليزي من غير ما نمس الفواصل
+  String norm(String r) {
+    const ar = '٠١٢٣٤٥٦٧٨٩', fa = '۰۱۲۳۴۵۶۷۸۹';
+    final b = StringBuffer();
+    for (final ch in r.split('')) {
+      final i = ar.indexOf(ch), j = fa.indexOf(ch);
+      b.write(i >= 0 ? i : (j >= 0 ? j : (ch == '٫' ? '.' : ch)));
+    }
+    return b.toString();
+  }
+
+  final rs = rows.map(norm).toList();
+
+  // --- الإجمالي: أكبر رقم بكسور في الصفوف اللي فيها كلمة total/amount، وإلا أكبر رقم بكسور في الورقة
+  double? best;
+  int? bestRow;
+  void scan(bool onlyKw) {
+    for (var i = 0; i < rs.length; i++) {
+      if (onlyKw && !_ocrTotalKw.hasMatch(rs[i])) continue;
+      for (final m in _ocrDec.allMatches(rs[i])) {
+        final v = _ocrNum(m.group(0)!);
+        if (v != null && (best == null || v > best!)) {
+          best = v;
+          bestRow = i;
+        }
+      }
+    }
+  }
+
+  scan(true);
+  if (best == null) scan(false);
+
+  // --- العدد
+  String? count;
+  String? firstInt(String r) {
+    final cleaned = r.replaceAll(_ocrDec, ' ');
+    final m = _ocrInt.firstMatch(cleaned);
+    return m?.group(0);
+  }
+
+  for (var i = 0; i < rs.length && count == null; i++) {
+    if (!_ocrCountKw.hasMatch(rs[i])) continue;
+    count = firstInt(rs[i]);
+    // القيمة ممكن تكون في السطر اللي بعده
+    if (count == null && i + 1 < rs.length) {
+      final nx = rs[i + 1];
+      if (!_ocrCountKw.hasMatch(nx) && !_ocrTotalKw.hasMatch(nx)) count = firstInt(nx);
+    }
+  }
+  // لو مفيش كلمة عدد: رقم صحيح قبل الإجمالي في نفس الصف
+  if (count == null && bestRow != null) {
+    final r = rs[bestRow!];
+    final dm = _ocrDec.firstMatch(r);
+    if (dm != null) {
+      final ints = _ocrInt.allMatches(r.substring(0, dm.start)).toList();
+      if (ints.isNotEmpty) count = ints.last.group(0);
+    }
+  }
+
+  return BatchOcr(
+    count == null ? null : '${int.parse(count)}',
+    best == null ? null : best!.toStringAsFixed(2),
+  );
+}
+
+final RegExp _ocrParen = RegExp(r'[(\[{]\s*([0-9OoIl]{1,6})\s*[)\]}]?');
+
+/// ورقة NBE: تحت GRAND TOTALS في سطر Sale العدد بين أقواس (015) والمبلغ جنبه
+BatchOcr parseBatchRows(List<String> rows) {
+  final gi = rows.lastIndexWhere((r) => RegExp(r'grand', caseSensitive: false).hasMatch(r));
+  String? count, total;
+  if (gi >= 0) {
+    double? best;
+    for (var i = gi; i < rows.length; i++) {
+      final r = rows[i];
+      if (count == null) {
+        final m = _ocrParen.firstMatch(r);
+        if (m != null) {
+          final d = m.group(1)!.replaceAll(RegExp(r'[Oo]'), '0').replaceAll(RegExp(r'[Il]'), '1');
+          count = '${int.parse(d)}';
+        }
+      }
+      if (RegExp(r'thank|hotline|nbe', caseSensitive: false).hasMatch(r)) break;
+      for (final m in _ocrDec.allMatches(r)) {
+        final v = _ocrNum(m.group(0)!);
+        if (v != null && (best == null || v > best)) best = v;
+      }
+    }
+    if (best != null) total = best.toStringAsFixed(2);
+  }
+  if (count != null && total != null) return BatchOcr(count, total);
+  final g = _parseGeneric(rows);
+  return BatchOcr(count ?? g.count, total ?? g.total);
+}
+
+/// قراءة صورة الباتش بـ ML Kit وتجميع النص في صفوف حسب الموقع الرأسي
+Future<BatchOcr> readBatchInfo(String path) async {
+  final rec = mlt.TextRecognizer(script: mlt.TextRecognitionScript.latin);
+  try {
+    final res = await rec.processImage(mlt.InputImage.fromFilePath(path));
+    final lines = <mlt.TextLine>[];
+    for (final b in res.blocks) {
+      lines.addAll(b.lines);
+    }
+    List<String> toRows(List<mlt.TextLine> ls) {
+      ls.sort((a, b) => a.boundingBox.center.dy.compareTo(b.boundingBox.center.dy));
+      final groups = <List<mlt.TextLine>>[];
+      double? cy, ch;
+      for (final l in ls) {
+        final c = l.boundingBox.center.dy, h = l.boundingBox.height;
+        if (cy != null && ch != null && (c - cy).abs() < math.max(ch, h) * 0.6) {
+          groups.last.add(l);
+          cy = (cy + c) / 2;
+        } else {
+          groups.add([l]);
+          cy = c;
+          ch = h;
+        }
+      }
+      final out = <String>[];
+      for (final g in groups) {
+        g.sort((a, b) => a.boundingBox.left.compareTo(b.boundingBox.left));
+        out.add(g.map((l) => l.text).join(' '));
+      }
+      return out;
+    }
+
+    // لو في أكتر من ورقة جنب بعض في الصورة: نفصلهم بالفراغ الرأسي بينهم ونقرا كل واحدة لوحدها
+    final spans = lines.map((l) => [l.boundingBox.left, l.boundingBox.right]).toList()
+      ..sort((a, b) => a[0].compareTo(b[0]));
+    final segs = <List<double>>[];
+    for (final sp in spans) {
+      if (segs.isNotEmpty && sp[0] <= segs.last[1]) {
+        segs.last[1] = math.max(segs.last[1], sp[1]);
+      } else {
+        segs.add([sp[0], sp[1]]);
+      }
+    }
+    if (segs.length > 1) {
+      for (final sg in segs) {
+        final ls = lines
+            .where((l) => l.boundingBox.center.dx >= sg[0] && l.boundingBox.center.dx <= sg[1])
+            .toList();
+        if (ls.length < 6) continue;
+        final r = parseBatchRows(toRows(ls));
+        AppLog.i('batch ocr segment: ${r.count} / ${r.total}');
+        if (r.count != null && r.total != null) return r;
+      }
+    }
+    final rows = toRows(List.of(lines));
+    AppLog.i('batch ocr rows: ${rows.join(' || ')}');
+    return parseBatchRows(rows);
+  } finally {
+    await rec.close();
+  }
+}
+
 String batchCaption(Session s, BatchInfo i) => [
       'الاسم: ${s.name}',
       'الوحده : ${s.unit.name}',
@@ -2000,7 +2182,7 @@ String batchCaption(Session s, BatchInfo i) => [
       'الاجمالي: ${i.total}',
     ].join('\n');
 
-Future<BatchInfo?> askBatchInfo(BuildContext context) async {
+Future<BatchInfo?> askBatchInfo(BuildContext context, String img) async {
   final p = await SharedPreferences.getInstance();
   final init = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
       p.getString('bi_col') ?? '', p.getString('bi_total') ?? '');
@@ -2009,7 +2191,7 @@ Future<BatchInfo?> askBatchInfo(BuildContext context) async {
     context: context,
     isScrollControlled: true,
     builder: (c) =>
-        Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init)),
+        Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img)),
   );
   if (r != null) {
     await p.setString('bi_count', r.count);
@@ -2022,7 +2204,8 @@ Future<BatchInfo?> askBatchInfo(BuildContext context) async {
 
 class _BatchInfoSheet extends StatefulWidget {
   final BatchInfo init;
-  const _BatchInfoSheet({required this.init});
+  final String img;
+  const _BatchInfoSheet({required this.init, required this.img});
   @override
   State<_BatchInfoSheet> createState() => _BatchInfoSheetState();
 }
@@ -2035,6 +2218,36 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
       TextEditingController(text: widget.init.collected.isEmpty ? '0' : widget.init.collected);
   late final c4 = TextEditingController(text: widget.init.total);
   String? err;
+  bool reading = true, d1 = false, d4 = false;
+  String? note;
+
+  @override
+  void initState() {
+    super.initState();
+    _ocr();
+  }
+
+  Future<void> _ocr() async {
+    BatchOcr? r;
+    try {
+      r = await readBatchInfo(widget.img).timeout(const Duration(seconds: 25));
+    } catch (e) {
+      AppLog.i('batch ocr failed: $e');
+    }
+    if (!mounted) return;
+    setState(() {
+      reading = false;
+      if (r?.count != null && !d1) c1.text = r!.count!;
+      if (r?.total != null && !d4) c4.text = r!.total!;
+      if (r?.count == null && r?.total == null) {
+        note = 'معرفتش أقرا الأرقام من الصورة، اكتبها بإيدك';
+      } else if (r?.count == null || r?.total == null) {
+        note = 'اتقرا جزء بس من الصورة، كمّل الباقي وراجع القيم';
+      } else {
+        note = 'اتقرا من الصورة، راجع القيم قبل الإرسال';
+      }
+    });
+  }
 
   @override
   void dispose() {
@@ -2064,11 +2277,13 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
             col.isEmpty ? '0' : '${int.parse(col)}', t.toStringAsFixed(2)));
   }
 
-  Widget _f(TextEditingController c, String label, {bool dec = false, bool selectAll = false}) =>
+  Widget _f(TextEditingController c, String label,
+          {bool dec = false, bool selectAll = false, VoidCallback? onEdit}) =>
       Padding(
         padding: const EdgeInsets.only(bottom: 12),
         child: TextField(
           controller: c,
+          onChanged: onEdit == null ? null : (_) => onEdit(),
           // الخانة اللي قيمتها 0 تتحدد كلها أول ما تدوس عليها، فأي رقم بتكتبه يحل محل الصفر
           onTap: selectAll
               ? () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length)
@@ -2086,10 +2301,24 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
             const Text('بيانات الباتش',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
-            _f(c1, 'عدد المعاملات'),
+            if (reading)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 12),
+                child: Row(children: [
+                  SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                  SizedBox(width: 10),
+                  Text('جاري قراءة الأرقام من صورة الباتش...'),
+                ]),
+              )
+            else if (note != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(note!, style: const TextStyle(color: Colors.grey)),
+              ),
+            _f(c1, 'عدد المعاملات', onEdit: () => d1 = true),
             _f(c2, 'عدد القروش الفاصلة', selectAll: true),
             _f(c3, 'عدد المعاملات المجمعة', selectAll: true),
-            _f(c4, 'الإجمالي', dec: true),
+            _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true),
             if (err != null)
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),
@@ -2106,7 +2335,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
 }
 
 Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
-  final info = await askBatchInfo(context);
+  final info = await askBatchInfo(context, img);
   if (info == null || !context.mounted) return false;
   final caption = batchCaption(s, info);
   Store.working++;
