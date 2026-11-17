@@ -2187,12 +2187,10 @@ Future<BatchInfo?> askBatchInfo(BuildContext context, String img) async {
   final init = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
       p.getString('bi_col') ?? '', p.getString('bi_total') ?? '');
   if (!context.mounted) return null;
-  final r = await showModalBottomSheet<BatchInfo>(
-    context: context,
-    isScrollControlled: true,
+  final r = await Navigator.of(context).push<BatchInfo>(MaterialPageRoute(
     builder: (c) =>
         Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img)),
-  );
+  ));
   if (r != null) {
     await p.setString('bi_count', r.count);
     await p.setString('bi_pi', r.piasters);
@@ -2251,6 +2249,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
 
   @override
   void dispose() {
+    _tc.dispose();
     c1.dispose();
     c2.dispose();
     c3.dispose();
@@ -2293,41 +2292,88 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
         ),
       );
 
+  final _tc = TransformationController();
+  Offset _tap = Offset.zero;
+
+  /// نقرتين: لو متكبرة ترجع للحجم الطبيعي، ولو طبيعية تكبّر عند مكان النقر.
+  void _toggleZoom() {
+    if (_tc.value.getMaxScaleOnAxis() > 1.05) {
+      _tc.value = Matrix4.identity();
+    } else {
+      const z = 3.0;
+      _tc.value = Matrix4(z, 0, 0, 0, 0, z, 0, 0, 0, 0, 1, 0, -_tap.dx * (z - 1),
+          -_tap.dy * (z - 1), 0, 1);
+    }
+  }
+
   @override
-  Widget build(BuildContext context) => Padding(
-        padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + MediaQuery.of(context).viewInsets.bottom),
-        child: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            const Text('بيانات الباتش',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            if (reading)
-              const Padding(
-                padding: EdgeInsets.only(bottom: 12),
-                child: Row(children: [
-                  SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
-                  SizedBox(width: 10),
-                  Text('جاري قراءة الأرقام من صورة الباتش...'),
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('بيانات الباتش')),
+        body: SafeArea(
+          child: Column(children: [
+            Expanded(
+              flex: 3,
+              child: Container(
+                width: double.infinity,
+                color: Colors.black,
+                child: ClipRect(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onDoubleTapDown: (d) => _tap = d.localPosition,
+                    onDoubleTap: _toggleZoom,
+                    child: InteractiveViewer(
+                      transformationController: _tc,
+                      minScale: 1,
+                      maxScale: 8,
+                      child: Image.file(File(widget.img), fit: BoxFit.contain, cacheWidth: 2400),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Flexible(
+              flex: 2,
+              fit: FlexFit.loose,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  if (reading)
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 12),
+                      child: Row(children: [
+                        SizedBox(
+                            width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                        SizedBox(width: 10),
+                        Text('جاري قراءة الأرقام من صورة الباتش...'),
+                      ]),
+                    )
+                  else if (note != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Text(note!, style: const TextStyle(color: Colors.grey)),
+                    ),
+                  Row(children: [
+                    Expanded(child: _f(c1, 'عدد المعاملات', onEdit: () => d1 = true)),
+                    const SizedBox(width: 10),
+                    Expanded(child: _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true)),
+                  ]),
+                  Row(children: [
+                    Expanded(child: _f(c2, 'القروش الفاصلة', selectAll: true)),
+                    const SizedBox(width: 10),
+                    Expanded(child: _f(c3, 'المعاملات المجمعة', selectAll: true)),
+                  ]),
+                  if (err != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(err!, style: const TextStyle(color: Colors.red)),
+                    ),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
+                  ),
                 ]),
-              )
-            else if (note != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Text(note!, style: const TextStyle(color: Colors.grey)),
               ),
-            _f(c1, 'عدد المعاملات', onEdit: () => d1 = true),
-            _f(c2, 'عدد القروش الفاصلة', selectAll: true),
-            _f(c3, 'عدد المعاملات المجمعة', selectAll: true),
-            _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true),
-            if (err != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: Text(err!, style: const TextStyle(color: Colors.red)),
-              ),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
             ),
           ]),
         ),
