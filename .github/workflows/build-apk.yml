@@ -31,7 +31,7 @@ jobs:
 
       - name: Add packages (pinned)
         run: |
-          flutter pub add google_mlkit_document_scanner:0.4.1 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 document_scan:0.5.0 camera:^0.11.0
+          flutter pub add google_mlkit_document_scanner:0.4.1 google_mlkit_text_recognition:^0.15.0 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 document_scan:0.5.0 camera:^0.11.0
           flutter pub add flutter_localizations --sdk=flutter
 
       - name: Add logo asset (shown in the app)
