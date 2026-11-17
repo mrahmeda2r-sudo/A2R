@@ -1994,7 +1994,8 @@ String _digits(String s) {
 /// نتيجة قراءة ورقة إغلاق الباتش من الصورة (أي قيمة ممكن تكون null لو متقرتش)
 class BatchOcr {
   final String? count, total;
-  const BatchOcr(this.count, this.total);
+  final int sheets; // عدد الأوراق اللي اتقرت واتجمعت
+  const BatchOcr(this.count, this.total, [this.sheets = 1]);
 }
 
 final RegExp _ocrDec = RegExp(r'(?<![\d.,])\d[\d,]*[.,]\d{2}(?![\d.,])');
@@ -2083,7 +2084,7 @@ BatchOcr _parseGeneric(List<String> rowsRaw) {
 final RegExp _ocrParen = RegExp(r'[(\[{]\s*([0-9OoIl]{1,6})\s*[)\]}]?');
 
 /// ورقة NBE: تحت GRAND TOTALS في سطر Sale العدد بين أقواس (015) والمبلغ جنبه
-BatchOcr parseBatchRows(List<String> rows) {
+BatchOcr parseBatchRows(List<String> rows, {bool strict = false}) {
   final gi = rows.lastIndexWhere((r) => RegExp(r'grand', caseSensitive: false).hasMatch(r));
   String? count, total;
   if (gi >= 0) {
@@ -2106,6 +2107,7 @@ BatchOcr parseBatchRows(List<String> rows) {
     if (best != null) total = best.toStringAsFixed(2);
   }
   if (count != null && total != null) return BatchOcr(count, total);
+  if (strict) return const BatchOcr(null, null);
   final g = _parseGeneric(rows);
   return BatchOcr(count ?? g.count, total ?? g.total);
 }
@@ -2154,15 +2156,21 @@ Future<BatchOcr> readBatchInfo(String path) async {
       }
     }
     if (segs.length > 1) {
+      var n = 0, cents = 0, sheets = 0;
       for (final sg in segs) {
         final ls = lines
             .where((l) => l.boundingBox.center.dx >= sg[0] && l.boundingBox.center.dx <= sg[1])
             .toList();
         if (ls.length < 6) continue;
-        final r = parseBatchRows(toRows(ls));
+        final r = parseBatchRows(toRows(ls), strict: true);
         AppLog.i('batch ocr segment: ${r.count} / ${r.total}');
-        if (r.count != null && r.total != null) return r;
+        if (r.count != null && r.total != null) {
+          n += int.parse(r.count!);
+          cents += (double.parse(r.total!) * 100).round();
+          sheets++;
+        }
       }
+      if (sheets > 0) return BatchOcr('$n', (cents / 100).toStringAsFixed(2), sheets);
     }
     final rows = toRows(List.of(lines));
     AppLog.i('batch ocr rows: ${rows.join(' || ')}');
@@ -2241,6 +2249,8 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
         note = 'معرفتش أقرا الأرقام من الصورة، اكتبها بإيدك';
       } else if (r?.count == null || r?.total == null) {
         note = 'اتقرا جزء بس من الصورة، كمّل الباقي وراجع القيم';
+      } else if ((r?.sheets ?? 1) > 1) {
+        note = 'اتقرا ${r!.sheets} ورقات واتجمعوا، راجع القيم قبل الإرسال';
       } else {
         note = 'اتقرا من الصورة، راجع القيم قبل الإرسال';
       }
