@@ -30,7 +30,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 const kVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
 
 const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
-const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
+const kTagTop = 0.03; // بُعد ورقة الباتش عن حافة الصورة (أسفلها افتراضيًا)
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
 const kBatchTagW = 0.7; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
@@ -999,9 +999,12 @@ class TagPos {
   final double cx, cy, s;
   const TagPos(this.cx, this.cy, this.s);
 
-  static TagPos initial(Tag ref) {
+  /// المكان الافتراضي: أسفل الصورة (لو عرفنا نسبة الصورة)، وإلا فوق.
+  static TagPos initial(Tag ref, [double? aspect]) {
     final s0 = ref.w / 1000;
-    return TagPos(0.5, kTagTop + s0 * ref.h / ref.w / 2, s0);
+    final th = s0 * ref.h / ref.w; // ارتفاع الورقة كنسبة من عرض الصورة
+    final cy = aspect != null ? aspect - kTagTop - th / 2 : kTagTop + th / 2;
+    return TagPos(0.5, cy, s0);
   }
 
   TagPos copyWith({double? cx, double? cy, double? s}) =>
@@ -1102,13 +1105,6 @@ Future<Tag> _renderTag(double w, Session s, {bool batch = false}) async {
   return Tag(_bytesOf(bd!), cw, ch);
 }
 
-/// ورقة الباتش بحجم الشريط. w = عرض الصورة بالبكسل.
-Future<Tag> batchBandTag(Session s, double w) async {
-  final k = await Store.bandScale();
-  final r = await receiptTag(1000, s, batch: true);
-  return receiptTag(1000 * (w * k) / r.w, s, batch: true);
-}
-
 /// تركيب الباتش بيتم كله على الـ CPU (Isolate) من غير رسم GPU، لأن الرسم الكبير على GPU
 /// كان بيطلّع صورة مشوّهة (ألوان وبلاطات) على الموبايلات الضعيفة.
 Uint8List _composeJob(Map<String, dynamic> a) {
@@ -1182,39 +1178,21 @@ Future<double?> _jpegMeanLum(Uint8List jpg) async {
   }
 }
 
-/// صورة الباتش + الورقة. layout 1: شريط أبيض تحت الصورة (الصورة كاملة من غير تغطية)،
-/// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
+/// صورة الباتش + الورقة فوق الصورة في المكان اللي الموظف اختاره.
 Future<Uint8List> composeBatch(String path, Session s) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src; // من غير ورقة
-  final layout = await Store.batchLayout();
   final sz = await imageSize(src);
   final maxSide = getMaxSide(await Store.perfMode());
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final iw = img.width, ih = img.height;
   final w = iw.toDouble(), h = ih.toDouble();
-  final Tag tag;
-  final Offset tagAt;
-  int imgY = 0, imgX = 0;
-  final int oh;
-  int ow = iw;
-  if (layout == 2) {
-    final ref = await receiptTag(1000, s, batch: true);
-    final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref), ref, h / w);
-    tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
-    tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
-    oh = ih;
-  } else {
-    tag = await batchBandTag(s, w);
-    final pad = w * kBandPad; // الهامش الخارجي
-    final gap = w * kBandGapNear; // الهامش اللي بين الورقة والصورة (صغير)
-    final band = tag.h + pad + gap;
-    ow = math.max(iw, tag.w.ceil());
-    imgX = ((ow - iw) / 2).round();
-    tagAt = Offset((ow - tag.w) / 2, h + gap);
-    imgY = 0;
-    oh = ih + band.ceil();
-  }
+  const imgY = 0, imgX = 0;
+  final ow = iw, oh = ih;
+  final ref = await receiptTag(1000, s, batch: true);
+  final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref, h / w), ref, h / w);
+  final tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
+  final tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
   final tImg = await decodeImage(tag.png);
   final tw = tImg.width, th = tImg.height;
   final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
@@ -1515,8 +1493,7 @@ class Store {
 
   /// شكل ورقة الباتش: 1 شريط تحت الصورة، 2 على الصورة (الشريط فوق اتلغى، والقيمة القديمة 0 بتتحول لـ 1)
   static Future<int> batchLayout() async {
-    final v = (await _p).getInt('batchLayout') ?? 1;
-    return v == 2 ? 2 : 1;
+    return 2; // الورقة دايمًا على الصورة (شريط تحت الصورة اتلغى)
   }
   static Future<void> setBatchLayout(int v) async => (await _p).setInt('batchLayout', v);
 
@@ -1529,11 +1506,12 @@ class Store {
   static Future<TagPos?> pos(String path) async =>
       TagPos.decode((await _p).getString('pos:$path'));
 
-  static Future<TagPos> assignPos(String path, Tag ref, bool batch) async {
+  static Future<TagPos> assignPos(String path, Tag ref, bool batch, [double? aspect]) async {
     final p = await _p;
     var v = TagPos.decode(p.getString('pos:$path'));
     if (v == null) {
-      v = TagPos.decode(p.getString(batch ? 'lastPos_b' : 'lastPos_r')) ?? TagPos.initial(ref);
+      v = TagPos.decode(p.getString(batch ? 'lastPos_b' : 'lastPos_r')) ??
+          TagPos.initial(ref, aspect);
       await p.setString('pos:$path', v.encode());
     }
     return v;
@@ -2445,15 +2423,9 @@ class TaggedImage extends StatelessWidget {
         Widget t = Image.memory(tag.png,
             width: dw, height: dh, fit: BoxFit.fill, gaplessPlayback: true);
         if (onChanged != null) {
-          t = _TagDrag(
-            pos: pos,
-            cw: cw,
-            maxCy: aspect ?? 3,
-            onChanged: onChanged!,
-            child: DecoratedBox(
-                decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
-                child: t),
-          );
+          t = DecoratedBox(
+              decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
+              child: t);
         }
         Widget err(BuildContext _, Object __, StackTrace? ___) =>
             const Center(child: Text('تعذر عرض الصورة'));
@@ -2462,7 +2434,7 @@ class TaggedImage extends StatelessWidget {
                 width: cw, height: ch, fit: BoxFit.fill, cacheWidth: 1000, errorBuilder: err)
             : Image.file(File(path),
                 width: cw, fit: BoxFit.fitWidth, cacheWidth: 1000, errorBuilder: err);
-        final stack = Stack(clipBehavior: Clip.hardEdge, children: [
+        Widget stack = Stack(clipBehavior: Clip.hardEdge, children: [
           img,
           if (showTag)
             Positioned(
@@ -2472,6 +2444,11 @@ class TaggedImage extends StatelessWidget {
                 height: dh,
                 child: t),
         ]);
+        // التحريك والتكبير/التصغير بالصوابع شغالين على الصورة كلها (مش لازم الصوابع تكون على الورقة)
+        if (onChanged != null && showTag) {
+          stack = _TagDrag(
+              pos: pos, cw: cw, maxCy: aspect ?? 3, onChanged: onChanged!, child: stack);
+        }
         return Center(
             child: ch != null
                 ? SizedBox(width: cw, height: ch, child: stack)
@@ -3810,10 +3787,6 @@ class BatchScreen extends StatefulWidget {
 class _BatchScreenState extends State<BatchScreen> {
   String? img;
   Tag? tag;
-  Tag? bandTag;
-  int layout = 1; // 1 تحت الصورة، 2 على الصورة
-  double bandScale = kBatchTagW; // حجم الورقة في وضع الشريط
-  Timer? _bandT;
   TagPos? pos;
   double? aspect;
   bool busy = false;
@@ -3831,22 +3804,6 @@ class _BatchScreenState extends State<BatchScreen> {
     if (path == null) return;
     setState(() => noTag = hide);
     await Store.setNoTag(path, hide);
-  }
-
-  /// تكبير/تصغير الورقة لحظي أثناء السحب (من غير إعادة رسم)، والحفظ بيتأجل لحد ما الإيد تقف.
-  void _setBand(double v) {
-    setState(() => bandScale = v);
-    _bandT?.cancel();
-    _bandT = Timer(const Duration(milliseconds: 300), () {
-      Store.setBandScale(v).catchError((Object e, StackTrace st) {
-        AppLog.e('setBandScale', e, st);
-      });
-    });
-  }
-
-  Future<void> _setLayout(int v) async {
-    setState(() => layout = v);
-    await Store.setBatchLayout(v);
   }
 
   Future<void> _init() async {
@@ -3878,7 +3835,6 @@ class _BatchScreenState extends State<BatchScreen> {
   Future<void> _warmTags() async {
     try {
       tag ??= await receiptTag(1000, widget.session, batch: true);
-      bandTag ??= await receiptTag(2000, widget.session, batch: true);
     } catch (e, st) {
       AppLog.e('warmTags', e, st);
     }
@@ -3888,20 +3844,14 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final t = tag ?? await receiptTag(1000, widget.session, batch: true);
       final a = await imageAspect(path);
-      final p0 = await Store.assignPos(path, t, true);
+      final p0 = await Store.assignPos(path, t, true, a);
       final p = fitTagPos(p0, t, a);
       if (p.cx != p0.cx || p.cy != p0.cy) await Store.savePos(path, p, true);
       final nt = await Store.noTag(path);
-      final lay = await Store.batchLayout();
-      final bt = bandTag ?? await receiptTag(2000, widget.session, batch: true); // نسخة مرجعية عالية الدقة للمعاينة (بتتعمل مرة واحدة)
-      final bsc = await Store.bandScale();
       if (!mounted) return;
       setState(() {
-        bandScale = bsc;
         noTag = nt;
         tag = t;
-        bandTag = bt;
-        layout = lay;
         img = path;
         aspect = a;
         pos = p;
@@ -4022,10 +3972,6 @@ class _BatchScreenState extends State<BatchScreen> {
 
   @override
   void dispose() {
-    if (_bandT?.isActive ?? false) {
-      _bandT!.cancel();
-      Store.setBandScale(bandScale);
-    }
     final t = _saveT;
     if (t != null && t.isActive) {
       t.cancel();
@@ -4091,8 +4037,6 @@ class _BatchScreenState extends State<BatchScreen> {
     setState(() => busy = true);
     try {
       await _flushPos();
-      _bandT?.cancel();
-      await Store.setBandScale(bandScale);
       final ok = await sendBatchFile(context, widget.session, img!);
       if (ok) HapticFeedback.mediumImpact();
       if (ok && mounted) Navigator.pop(context);
@@ -4105,7 +4049,7 @@ class _BatchScreenState extends State<BatchScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final ready = img != null && tag != null && pos != null && aspect != null && bandTag != null;
+    final ready = img != null && tag != null && pos != null && aspect != null;
     return Scaffold(
       appBar: AppBar(title: const Text('الباتش')),
       body: !ready
@@ -4114,30 +4058,36 @@ class _BatchScreenState extends State<BatchScreen> {
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.all(8),
-                  child: layout == 2
-                      ? TaggedImage(
-                          path: img!,
-                          tag: tag!,
-                          pos: pos!,
-                          aspect: aspect,
-                          showTag: !noTag,
-                          onChanged: noTag ? null : _set)
-                      : Center(
-                          child: FittedBox(
-                            fit: BoxFit.contain,
-                            child: SizedBox(
-                              width: 1000 * math.max(1.0, bandScale),
-                              child: ReceiptPreview(
-                                  path: img!,
-                                  tag: bandTag!,
-                                  bandScale: bandScale,
-                                  bottom: layout == 1,
-                                  showTag: !noTag),
-                            ),
-                          ),
-                        ),
+                  child: TaggedImage(
+                      path: img!,
+                      tag: tag!,
+                      pos: pos!,
+                      aspect: aspect,
+                      showTag: !noTag,
+                      onChanged: noTag ? null : _set),
                 ),
               ),
+              if (!noTag)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.symmetric(horizontal: 12),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.withOpacity(0.15),
+                    border: Border.all(color: Colors.orange),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Row(children: [
+                    Icon(Icons.warning_amber_rounded, color: Colors.orange),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                          'تنبيه: حرّك الورقة لمكان فاضي من الصورة، وماتغطّيش أي بيانات (خصوصًا العدد والإجمالي). '
+                          'اسحب بإصبع للتحريك، وبإصبعين للتكبير والتصغير.',
+                          style: TextStyle(fontSize: 12)),
+                    ),
+                  ]),
+                ),
               SwitchListTile(
                 dense: true,
                 title: const Text('ورقة البيانات على الصورة دي'),
@@ -4146,50 +4096,7 @@ class _BatchScreenState extends State<BatchScreen> {
                 value: !noTag,
                 onChanged: busy ? null : (v) => _toggleTag(!v),
               ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: SizedBox(
-                  width: double.infinity,
-                  child: SegmentedButton<int>(
-                    showSelectedIcon: false,
-                    segments: const [
-                      ButtonSegment(value: 1, label: Text('تحت الصورة')),
-                      ButtonSegment(value: 2, label: Text('على الصورة')),
-                    ],
-                    selected: {layout},
-                    onSelectionChanged: (busy || noTag) ? null : (v) => _setLayout(v.first),
-                  ),
-                ),
-              ),
-              if (layout != 2)
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Row(children: [
-                    const Icon(Icons.format_size_rounded),
-                    Expanded(
-                      child: Slider(
-                        value: bandScale.clamp(0.3, kBandMaxScale).toDouble(),
-                        min: 0.3,
-                        max: kBandMaxScale,
-                        onChanged: noTag ? null : _setBand,
-                      ),
-                    ),
-                    SizedBox(
-                        width: 44,
-                        child: Text('${(bandScale * 100).round()}%',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(fontSize: 12, color: Colors.grey))),
-                    IconButton(
-                      tooltip: 'الحجم الأصلي',
-                      icon: const Icon(Icons.restart_alt_rounded),
-                      onPressed: noTag ? null : () => _setBand(kBatchTagW),
-                    ),
-                  ]),
-                ),
-              if (layout == 2) ...[
-                const SizedBox(height: 4),
-                const Text('اسحب الورقة لتحريكها، وبإصبعين لتكبيرها أو تصغيرها',
-                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+              if (!noTag) ...[
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   child: Row(children: [
@@ -4203,9 +4110,9 @@ class _BatchScreenState extends State<BatchScreen> {
                       ),
                     ),
                     IconButton(
-                      tooltip: 'المكان الأصلي',
+                      tooltip: 'رجّع الورقة أسفل الصورة',
                       icon: const Icon(Icons.restart_alt_rounded),
-                      onPressed: noTag ? null : () => _set(TagPos.initial(tag!)),
+                      onPressed: noTag ? null : () => _set(TagPos.initial(tag!, aspect)),
                     ),
                   ]),
                 ),
