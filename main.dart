@@ -4440,6 +4440,8 @@ Future<List<Offset>?> _detectDocQuadImpl(String path) async {
   // المحرك الأصلي أحياناً بيمسك جزء جوه الإيصال (منطقة الكتابة بس): لو الكشف البسيط
   // لقى مساحة أكبر بوضوح (والأصلي جواه) نستخدم البسيط عشان القص يشمل الإيصال كامل.
   final an = _quadArea(native), asimple = _quadArea(simple);
+  // المحرك الأصلي أحياناً بيرجّع الصورة كلها تقريباً (ورقة فاتحة على خشب فاتح): ده مش قص، نستخدم البسيط.
+  if (an > 0.9 && asimple < 0.9) return simple;
   if (asimple < 0.97 && an < asimple * 0.85) return simple;
   return native;
 }
@@ -4542,6 +4544,39 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
 
 /// الجزء المشترك بين كشف الصورة المصوّرة والكشف الحي من الكاميرا.
 /// feat: قيمة 0..255 لكل بكسل (الورقة غالباً أعلى من الخلفية). بيرجّع TL,TR,BR,BL كنسب.
+List<bool> _dilate4(List<bool> m, int w, int h) {
+  final o = List<bool>.filled(w * h, false);
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      final i = y * w + x;
+      o[i] = m[i] ||
+          (x > 0 && m[i - 1]) ||
+          (x < w - 1 && m[i + 1]) ||
+          (y > 0 && m[i - w]) ||
+          (y < h - 1 && m[i + w]);
+    }
+  }
+  return o;
+}
+
+/// تآكل: بكسلات حدود الصورة بتتحسب "فاضية" فالتآكل بيبعد عن الحدود كمان.
+List<bool> _erode4(List<bool> m, int w, int h) {
+  final o = List<bool>.filled(w * h, false);
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = y * w + x;
+      o[i] = m[i] && m[i - 1] && m[i + 1] && m[i - w] && m[i + w];
+    }
+  }
+  return o;
+}
+
+/// الجزء المشترك بين كشف الصورة المصوّرة والكشف الحي من الكاميرا.
+/// feat: قيمة 0..255 لكل بكسل (الورقة غالباً أعلى من الخلفية). بيرجّع TL,TR,BR,BL كنسب.
+///
+/// الفكرة: الورقة الفاتحة على خشب فاتح بتبقى متصلة بالخلفية من خلال فجوات رفيعة (ظل الحافة).
+/// فبنقفل ثقوب الكتابة، وبعدين بنأكّل المنطقة بدرجات مختلفة عشان الورقة تنفصل عن الخلفية،
+/// وبنختار أحسن مكوّن: مستطيلي الشكل (مليان)، مش ملزوق في الحدود، وقريب من نص الصورة.
 List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
   final n = w * h;
   final hist = List<int>.filled(256, 0);
@@ -4568,94 +4603,99 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
       thr = t;
     }
   }
-  List<bool> maskOf(bool bright) =>
-      List<bool>.generate(n, (i) => bright ? feat[i] > thr : feat[i] <= thr);
-  bool onBorder(int i) {
-    final x = i % w, y = i ~/ w;
-    return x <= 2 || y <= 2 || x >= w - 3 || y >= h - 3;
-  }
-
-  double borderFrac(List<bool> m) {
-    var c = 0, t = 0;
-    for (var i = 0; i < n; i++) {
-      if (!onBorder(i)) continue;
-      t++;
-      if (m[i]) c++;
-    }
-    return t == 0 ? 1 : c / t;
-  }
-
-  var mask = maskOf(true);
-  final inv = maskOf(false);
-  // الورقة هي اللي ما بتلزقش في حدود الصورة
-  if (borderFrac(inv) < borderFrac(mask)) mask = inv;
-  // قفل الثقوب الصغيرة (الكتابة) ثم تآكل بسيط لتنضيف النقط الصغيرة
-  final dil = List<bool>.filled(n, false);
-  for (var y = 1; y < h - 1; y++) {
-    for (var x = 1; x < w - 1; x++) {
-      final i = y * w + x;
-      dil[i] = mask[i] || mask[i - 1] || mask[i + 1] || mask[i - w] || mask[i + w];
-    }
-  }
-  final er = List<bool>.filled(n, false);
-  for (var y = 2; y < h - 2; y++) {
-    for (var x = 2; x < w - 2; x++) {
-      final i = y * w + x;
-      er[i] = dil[i] && dil[i - 1] && dil[i + 1] && dil[i - w] && dil[i + w] && mask[i];
-    }
-  }
-  // أكبر مكوّن متصل
+  final sc = w / 160.0;
+  final levels = <int>{0, math.max(1, (2 * sc).round()), math.max(2, (4 * sc).round()), math.max(3, (7 * sc).round())}.toList()
+    ..sort();
   final seen = List<bool>.filled(n, false);
   final queue = List<int>.filled(n, 0);
-  var bestSize = 0;
-  List<int>? best;
-  for (var s0 = 0; s0 < n; s0++) {
-    if (!er[s0] || seen[s0]) continue;
-    var head = 0, tail = 0;
-    queue[tail++] = s0;
-    seen[s0] = true;
-    var tl = s0, tr = s0, br = s0, bl = s0;
-    while (head < tail) {
-      final i = queue[head++];
-      final x = i % w, y = i ~/ w;
-      if (x + y < tl % w + tl ~/ w) tl = i;
-      if (x + y > br % w + br ~/ w) br = i;
-      if (x - y > tr % w - tr ~/ w) tr = i;
-      if (x - y < bl % w - bl ~/ w) bl = i;
-      if (x > 0 && er[i - 1] && !seen[i - 1]) {
-        seen[i - 1] = true;
-        queue[tail++] = i - 1;
+
+  List<Offset>? bestQ;
+  var bestScore = 0.0;
+
+  for (final bright in [true, false]) {
+    var closed = List<bool>.generate(n, (i) => bright ? feat[i] > thr : feat[i] <= thr);
+    // قفل ثقوب الكتابة
+    closed = _dilate4(_dilate4(closed, w, h), w, h);
+    for (final k in levels) {
+      var er = closed;
+      for (var i = 0; i < k + 2; i++) {
+        er = _erode4(er, w, h);
       }
-      if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
-        seen[i + 1] = true;
-        queue[tail++] = i + 1;
+      for (var i = 0; i < n; i++) {
+        seen[i] = false;
       }
-      if (y > 0 && er[i - w] && !seen[i - w]) {
-        seen[i - w] = true;
-        queue[tail++] = i - w;
+      for (var s0 = 0; s0 < n; s0++) {
+        if (!er[s0] || seen[s0]) continue;
+        var head = 0, tail = 0;
+        queue[tail++] = s0;
+        seen[s0] = true;
+        var tl = s0, tr = s0, br = s0, bl = s0;
+        var sx = 0, sy = 0;
+        while (head < tail) {
+          final i = queue[head++];
+          final x = i % w, y = i ~/ w;
+          sx += x;
+          sy += y;
+          if (x + y < tl % w + tl ~/ w) tl = i;
+          if (x + y > br % w + br ~/ w) br = i;
+          if (x - y > tr % w - tr ~/ w) tr = i;
+          if (x - y < bl % w - bl ~/ w) bl = i;
+          if (x > 0 && er[i - 1] && !seen[i - 1]) {
+            seen[i - 1] = true;
+            queue[tail++] = i - 1;
+          }
+          if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
+            seen[i + 1] = true;
+            queue[tail++] = i + 1;
+          }
+          if (y > 0 && er[i - w] && !seen[i - w]) {
+            seen[i - w] = true;
+            queue[tail++] = i - w;
+          }
+          if (y < h - 1 && er[i + w] && !seen[i + w]) {
+            seen[i + w] = true;
+            queue[tail++] = i + w;
+          }
+        }
+        if (tail < n * 0.05) continue;
+        Offset raw(int i) => Offset((i % w).toDouble(), (i ~/ w).toDouble());
+        final rq = [raw(tl), raw(tr), raw(br), raw(bl)];
+        var a2 = 0.0;
+        for (var i = 0; i < 4; i++) {
+          final p = rq[i], q2 = rq[(i + 1) % 4];
+          a2 += p.dx * q2.dy - q2.dx * p.dy;
+        }
+        final qaPx = a2.abs() / 2;
+        if (qaPx < 4) continue;
+        final fill = math.min(1.0, tail / qaPx); // المكوّن المليان = مستطيل، الحلقة/الخطوط = قيمة صغيرة
+        if (fill < 0.72) continue;
+        final d = k.toDouble();
+        Offset pt(int i, double ex, double ey) => Offset(
+              (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
+              (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
+            );
+        final q = [
+          pt(tl, -1.5 - d, -1.5 - d),
+          pt(tr, 1.5 + d, -1.5 - d),
+          pt(br, 1.5 + d, 1.5 + d),
+          pt(bl, -1.5 - d, 1.5 + d),
+        ];
+        if (!_quadConvex(q)) continue;
+        final area = _quadArea(q);
+        if (area < 0.08 || area > 0.94) continue; // 0.94+ = الصورة كلها تقريباً، يعني الكشف غلط
+        final cx = sx / tail / w, cy = sy / tail / h;
+        final cen = (cx - 0.5).abs() + (cy - 0.5).abs();
+        // المكوّن اللي ماسك أغلب الصورة غالباً هو الخلفية مش الورقة: نقلّل درجته
+        final big = area > 0.8 ? math.max(0.0, 1.0 - (area - 0.8) * 5) : 1.0;
+        final score = math.sqrt(area) * math.pow(fill, 4) * (1.0 - cen) * big;
+        if (score > bestScore + 1e-9) {
+          bestScore = score;
+          bestQ = q;
+        }
       }
-      if (y < h - 1 && er[i + w] && !seen[i + w]) {
-        seen[i + w] = true;
-        queue[tail++] = i + w;
-      }
-    }
-    if (tail > bestSize) {
-      bestSize = tail;
-      best = [tl, tr, br, bl];
     }
   }
-  if (best == null || bestSize < n * 0.08) return null;
-  Offset pt(int i, double ex, double ey) => Offset(
-        (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
-        (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
-      );
-  final q = [
-    pt(best[0], -1.5, -1.5),
-    pt(best[1], 1.5, -1.5),
-    pt(best[2], 1.5, 1.5),
-    pt(best[3], -1.5, 1.5),
-  ];
-  return _quadConvex(q) ? q : null;
+  return bestQ;
 }
 
 /// كشف حي من إطار الكاميرا (YUV420): بيلف الإطار لوضع رأسي ويصغّره لشبكة صغيرة.
