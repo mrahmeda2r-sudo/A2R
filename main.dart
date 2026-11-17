@@ -1892,18 +1892,18 @@ const _qualOpts = <(int, String, String)>[
 bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
 
 Future<List<String>> scanImages(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full}) async {
+    {ScannerMode mode = ScannerMode.full, bool camFallback = false}) async {
   if (_scanBusy) return [];
   _scanBusy = true;
   try {
-    return await _scanImagesImpl(context, limit, mode: mode);
+    return await _scanImagesImpl(context, limit, mode: mode, camFallback: camFallback);
   } finally {
     _scanBusy = false;
   }
 }
 
 Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full}) async {
+    {ScannerMode mode = ScannerMode.full, bool camFallback = false}) async {
   _lastScanManual = false;
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
@@ -1928,6 +1928,12 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
       AppLog.e('scanImages.prefs', e, st);
     }
     if (!context.mounted) return [];
+    if (camFallback) {
+      // الطالب بيحول لكاميرا A2R بنفسه: نرجّع فاضي من غير ما نفتح المعرض
+      AppLog.e('scanImages.unavailable', e, StackTrace.current);
+      snack(context, 'ماسح جوجل مش متاح على الموبايل ده، هنستخدم كاميرا A2R');
+      return [];
+    }
     await showDialog<void>(
       context: context,
       builder: (c) => Directionality(
@@ -3916,9 +3922,12 @@ class _BatchScreenState extends State<BatchScreen> {
   /// كاميرا التطبيق: صورة واحدة بس، بعدها شاشة التعديل علطول (من غير عداد).
   Future<void> _capture() async {
     final engine = await Store.scanEngine();
+    final perf = await Store.perfMode();
     if (!mounted) return;
-    if (engine == 1) {
+    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
       await _captureGoogle();
+      // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
+      if (_scannerFailed && mounted) await _captureA2R();
     } else {
       await _captureA2R();
     }
@@ -3926,8 +3935,9 @@ class _BatchScreenState extends State<BatchScreen> {
 
   /// ماسح جوجل الذكي: صورة واحدة مقصوصة، وبعدها شاشة التعديل على الفلاتر.
   Future<void> _captureGoogle() async {
-    final paths = await scanImages(context, 1);
+    final paths = await scanImages(context, 1, camFallback: true);
     if (paths.isEmpty || !mounted) {
+      if (_scannerFailed) return; // الدالة اللي فوق هتفتح كاميرا A2R
       if (mounted && img == null) Navigator.pop(context);
       return;
     }
@@ -7038,9 +7048,12 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   /// كاميرا التطبيق (شكل كام اسكنر): كل صورة بتتحفظ وتتفتح للتعديل، والكاميرا تفضل مفتوحة والعداد بيزيد.
   Future<void> _add() async {
     final engine = await Store.scanEngine();
+    final perf = await Store.perfMode();
     if (!mounted) return;
-    if (engine == 1) {
+    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
       await _addGoogle();
+      // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
+      if (_scannerFailed && mounted) await _addA2R();
     } else {
       await _addA2R();
     }
@@ -7048,7 +7061,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   /// ماسح جوجل الذكي: بيرجّع الصور مقصوصة جاهزة، فبنفتح التعديل على تبويب الفلاتر.
   Future<void> _addGoogle() async {
-    final paths = await scanImages(context, continuous ? 20 : 1);
+    final paths = await scanImages(context, continuous ? 20 : 1, camFallback: true);
     if (paths.isEmpty || !mounted) return;
     // false = جاية مقصوصة من ماسح جوجل، true = الماسح فشل واتحوّلنا للمعرض (يحتاج قص)
     final manual = _lastScanManual;
