@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:google_mlkit_document_scanner/google_mlkit_document_scanner.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart' as mlt;
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
@@ -28,7 +29,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 const kVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
 
 const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
-const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
+const kTagTop = 0.03; // بُعد ورقة الباتش عن حافة الصورة (أسفلها افتراضيًا)
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
 const kBatchTagW = 0.7; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
@@ -884,9 +885,12 @@ class TagPos {
   final double cx, cy, s;
   const TagPos(this.cx, this.cy, this.s);
 
-  static TagPos initial(Tag ref) {
+  /// المكان الافتراضي: أسفل الصورة (لو عرفنا نسبة الصورة)، وإلا فوق.
+  static TagPos initial(Tag ref, [double? aspect]) {
     final s0 = ref.w / 1000;
-    return TagPos(0.5, kTagTop + s0 * ref.h / ref.w / 2, s0);
+    final th = s0 * ref.h / ref.w; // ارتفاع الورقة كنسبة من عرض الصورة
+    final cy = aspect != null ? aspect - kTagTop - th / 2 : kTagTop + th / 2;
+    return TagPos(0.5, cy, s0);
   }
 
   TagPos copyWith({double? cx, double? cy, double? s}) =>
@@ -983,13 +987,6 @@ Future<Tag> _renderTag(double w, Session s, {bool batch = false}) async {
   return Tag(_bytesOf(bd!), cw, ch);
 }
 
-/// ورقة الباتش بحجم الشريط. w = عرض الصورة بالبكسل.
-Future<Tag> batchBandTag(Session s, double w) async {
-  final k = await Store.bandScale();
-  final r = await receiptTag(1000, s, batch: true);
-  return receiptTag(1000 * (w * k) / r.w, s, batch: true);
-}
-
 /// تركيب الباتش بيتم كله على الـ CPU (Isolate) من غير رسم GPU، لأن الرسم الكبير على GPU
 /// كان بيطلّع صورة مشوّهة (ألوان وبلاطات) على الموبايلات الضعيفة.
 Uint8List _composeJob(Map<String, dynamic> a) {
@@ -1063,39 +1060,21 @@ Future<double?> _jpegMeanLum(Uint8List jpg) async {
   }
 }
 
-/// صورة الباتش + الورقة. layout 1: شريط أبيض تحت الصورة (الصورة كاملة من غير تغطية)،
-/// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
+/// صورة الباتش + الورقة فوق الصورة في المكان اللي الموظف اختاره.
 Future<Uint8List> composeBatch(String path, Session s) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src; // من غير ورقة
-  final layout = await Store.batchLayout();
   final sz = await imageSize(src);
   final maxSide = getMaxSide(await Store.perfMode());
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final iw = img.width, ih = img.height;
   final w = iw.toDouble(), h = ih.toDouble();
-  final Tag tag;
-  final Offset tagAt;
-  int imgY = 0, imgX = 0;
-  final int oh;
-  int ow = iw;
-  if (layout == 2) {
-    final ref = await receiptTag(1000, s, batch: true);
-    final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref), ref, h / w);
-    tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
-    tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
-    oh = ih;
-  } else {
-    tag = await batchBandTag(s, w);
-    final pad = w * kBandPad; // الهامش الخارجي
-    final gap = w * kBandGapNear; // الهامش اللي بين الورقة والصورة (صغير)
-    final band = tag.h + pad + gap;
-    ow = math.max(iw, tag.w.ceil());
-    imgX = ((ow - iw) / 2).round();
-    tagAt = Offset((ow - tag.w) / 2, h + gap);
-    imgY = 0;
-    oh = ih + band.ceil();
-  }
+  const imgY = 0, imgX = 0;
+  final ow = iw, oh = ih;
+  final ref = await receiptTag(1000, s, batch: true);
+  final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref, h / w), ref, h / w);
+  final tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
+  final tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
   final tImg = await decodeImage(tag.png);
   final tw = tImg.width, th = tImg.height;
   final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
@@ -1353,6 +1332,11 @@ class Store {
       ((await _p).getInt('palette') ?? 0).clamp(0, AppPalette.values.length - 1).toInt();
   static Future<void> setPaletteSetting(int v) async => (await _p).setInt('palette', v);
 
+  /// القص التلقائي: 0 ذكي (الافتراضي)، 1 مستطيل دايماً، 2 منظور دايماً
+  static Future<int> autoCropSetting() async =>
+      ((await _p).getInt('autoCrop') ?? 0).clamp(0, 2).toInt();
+  static Future<void> setAutoCropSetting(int v) async => (await _p).setInt('autoCrop', v);
+
   static Future<bool> continuous() async => (await _p).getBool('continuous') ?? true;
   static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
 
@@ -1391,8 +1375,7 @@ class Store {
 
   /// شكل ورقة الباتش: 1 شريط تحت الصورة، 2 على الصورة (الشريط فوق اتلغى، والقيمة القديمة 0 بتتحول لـ 1)
   static Future<int> batchLayout() async {
-    final v = (await _p).getInt('batchLayout') ?? 1;
-    return v == 2 ? 2 : 1;
+    return 2; // الورقة دايمًا على الصورة (شريط تحت الصورة اتلغى)
   }
   static Future<void> setBatchLayout(int v) async => (await _p).setInt('batchLayout', v);
 
@@ -1405,11 +1388,12 @@ class Store {
   static Future<TagPos?> pos(String path) async =>
       TagPos.decode((await _p).getString('pos:$path'));
 
-  static Future<TagPos> assignPos(String path, Tag ref, bool batch) async {
+  static Future<TagPos> assignPos(String path, Tag ref, bool batch, [double? aspect]) async {
     final p = await _p;
     var v = TagPos.decode(p.getString('pos:$path'));
     if (v == null) {
-      v = TagPos.decode(p.getString(batch ? 'lastPos_b' : 'lastPos_r')) ?? TagPos.initial(ref);
+      v = TagPos.decode(p.getString(batch ? 'lastPos_b' : 'lastPos_r')) ??
+          TagPos.initial(ref, aspect);
       await p.setString('pos:$path', v.encode());
     }
     return v;
@@ -1867,6 +1851,195 @@ String _digits(String s) {
   return t;
 }
 
+/// نتيجة قراءة ورقة إغلاق الباتش من الصورة (أي قيمة ممكن تكون null لو متقرتش)
+class BatchOcr {
+  final String? count, total;
+  final int sheets; // عدد الأوراق اللي اتقرت واتجمعت
+  const BatchOcr(this.count, this.total, [this.sheets = 1]);
+}
+
+final RegExp _ocrDec = RegExp(r'(?<![\d.,])\d[\d,]*[.,]\d{2}(?![\d.,])');
+final RegExp _ocrCountKw =
+    RegExp(r'count|cnt|txn|trans|no\.?\s*of|number|qty|عدد', caseSensitive: false);
+final RegExp _ocrTotalKw =
+    RegExp(r'total|amount|amt|sum|sales?|net|egp|اجمالي|إجمالي|مبلغ', caseSensitive: false);
+final RegExp _ocrInt = RegExp(r'(?<![\d.,:/\-])\d{1,6}(?![\d.,:/\-])');
+
+double? _ocrNum(String raw) {
+  var t = raw;
+  final m = RegExp(r'[.,](\d{2})$').firstMatch(t);
+  if (m == null) return null;
+  final intPart = t.substring(0, m.start).replaceAll(RegExp(r'[.,]'), '');
+  return double.tryParse('$intPart.${m.group(1)}');
+}
+
+/// بيحلل أسطر النص (كل سطر = صف واحد من الورقة) ويطلع عدد المعاملات والإجمالي
+BatchOcr _parseGeneric(List<String> rowsRaw) {
+  final rows = rowsRaw;
+  // أرقام عربية ← إنجليزي من غير ما نمس الفواصل
+  String norm(String r) {
+    const ar = '٠١٢٣٤٥٦٧٨٩', fa = '۰۱۲۳۴۵۶۷۸۹';
+    final b = StringBuffer();
+    for (final ch in r.split('')) {
+      final i = ar.indexOf(ch), j = fa.indexOf(ch);
+      b.write(i >= 0 ? i : (j >= 0 ? j : (ch == '٫' ? '.' : ch)));
+    }
+    return b.toString();
+  }
+
+  final rs = rows.map(norm).toList();
+
+  // --- الإجمالي: أكبر رقم بكسور في الصفوف اللي فيها كلمة total/amount، وإلا أكبر رقم بكسور في الورقة
+  double? best;
+  int? bestRow;
+  void scan(bool onlyKw) {
+    for (var i = 0; i < rs.length; i++) {
+      if (onlyKw && !_ocrTotalKw.hasMatch(rs[i])) continue;
+      for (final m in _ocrDec.allMatches(rs[i])) {
+        final v = _ocrNum(m.group(0)!);
+        if (v != null && (best == null || v > best!)) {
+          best = v;
+          bestRow = i;
+        }
+      }
+    }
+  }
+
+  scan(true);
+  if (best == null) scan(false);
+
+  // --- العدد
+  String? count;
+  String? firstInt(String r) {
+    final cleaned = r.replaceAll(_ocrDec, ' ');
+    final m = _ocrInt.firstMatch(cleaned);
+    return m?.group(0);
+  }
+
+  for (var i = 0; i < rs.length && count == null; i++) {
+    if (!_ocrCountKw.hasMatch(rs[i])) continue;
+    count = firstInt(rs[i]);
+    // القيمة ممكن تكون في السطر اللي بعده
+    if (count == null && i + 1 < rs.length) {
+      final nx = rs[i + 1];
+      if (!_ocrCountKw.hasMatch(nx) && !_ocrTotalKw.hasMatch(nx)) count = firstInt(nx);
+    }
+  }
+  // لو مفيش كلمة عدد: رقم صحيح قبل الإجمالي في نفس الصف
+  if (count == null && bestRow != null) {
+    final r = rs[bestRow!];
+    final dm = _ocrDec.firstMatch(r);
+    if (dm != null) {
+      final ints = _ocrInt.allMatches(r.substring(0, dm.start)).toList();
+      if (ints.isNotEmpty) count = ints.last.group(0);
+    }
+  }
+
+  return BatchOcr(
+    count == null ? null : '${int.parse(count)}',
+    best == null ? null : best!.toStringAsFixed(2),
+  );
+}
+
+final RegExp _ocrParen = RegExp(r'[(\[{]\s*([0-9OoIl]{1,6})\s*[)\]}]?');
+
+/// ورقة NBE: تحت GRAND TOTALS في سطر Sale العدد بين أقواس (015) والمبلغ جنبه
+BatchOcr parseBatchRows(List<String> rows, {bool strict = false}) {
+  final gi = rows.lastIndexWhere((r) => RegExp(r'grand', caseSensitive: false).hasMatch(r));
+  String? count, total;
+  if (gi >= 0) {
+    double? best;
+    for (var i = gi; i < rows.length; i++) {
+      final r = rows[i];
+      if (count == null) {
+        final m = _ocrParen.firstMatch(r);
+        if (m != null) {
+          final d = m.group(1)!.replaceAll(RegExp(r'[Oo]'), '0').replaceAll(RegExp(r'[Il]'), '1');
+          count = '${int.parse(d)}';
+        }
+      }
+      if (RegExp(r'thank|hotline|nbe', caseSensitive: false).hasMatch(r)) break;
+      for (final m in _ocrDec.allMatches(r)) {
+        final v = _ocrNum(m.group(0)!);
+        if (v != null && (best == null || v > best)) best = v;
+      }
+    }
+    if (best != null) total = best.toStringAsFixed(2);
+  }
+  if (count != null && total != null) return BatchOcr(count, total);
+  if (strict) return const BatchOcr(null, null);
+  final g = _parseGeneric(rows);
+  return BatchOcr(count ?? g.count, total ?? g.total);
+}
+
+/// قراءة صورة الباتش بـ ML Kit وتجميع النص في صفوف حسب الموقع الرأسي
+Future<BatchOcr> readBatchInfo(String path) async {
+  final rec = mlt.TextRecognizer(script: mlt.TextRecognitionScript.latin);
+  try {
+    final res = await rec.processImage(mlt.InputImage.fromFilePath(path));
+    final lines = <mlt.TextLine>[];
+    for (final b in res.blocks) {
+      lines.addAll(b.lines);
+    }
+    List<String> toRows(List<mlt.TextLine> ls) {
+      ls.sort((a, b) => a.boundingBox.center.dy.compareTo(b.boundingBox.center.dy));
+      final groups = <List<mlt.TextLine>>[];
+      double? cy, ch;
+      for (final l in ls) {
+        final c = l.boundingBox.center.dy, h = l.boundingBox.height;
+        if (cy != null && ch != null && (c - cy).abs() < math.max(ch, h) * 0.6) {
+          groups.last.add(l);
+          cy = (cy + c) / 2;
+        } else {
+          groups.add([l]);
+          cy = c;
+          ch = h;
+        }
+      }
+      final out = <String>[];
+      for (final g in groups) {
+        g.sort((a, b) => a.boundingBox.left.compareTo(b.boundingBox.left));
+        out.add(g.map((l) => l.text).join(' '));
+      }
+      return out;
+    }
+
+    // لو في أكتر من ورقة جنب بعض في الصورة: نفصلهم بالفراغ الرأسي بينهم ونقرا كل واحدة لوحدها
+    final spans = lines.map((l) => [l.boundingBox.left, l.boundingBox.right]).toList()
+      ..sort((a, b) => a[0].compareTo(b[0]));
+    final segs = <List<double>>[];
+    for (final sp in spans) {
+      if (segs.isNotEmpty && sp[0] <= segs.last[1]) {
+        segs.last[1] = math.max(segs.last[1], sp[1]);
+      } else {
+        segs.add([sp[0], sp[1]]);
+      }
+    }
+    if (segs.length > 1) {
+      var n = 0, cents = 0, sheets = 0;
+      for (final sg in segs) {
+        final ls = lines
+            .where((l) => l.boundingBox.center.dx >= sg[0] && l.boundingBox.center.dx <= sg[1])
+            .toList();
+        if (ls.length < 6) continue;
+        final r = parseBatchRows(toRows(ls), strict: true);
+        AppLog.i('batch ocr segment: ${r.count} / ${r.total}');
+        if (r.count != null && r.total != null) {
+          n += int.parse(r.count!);
+          cents += (double.parse(r.total!) * 100).round();
+          sheets++;
+        }
+      }
+      if (sheets > 0) return BatchOcr('$n', (cents / 100).toStringAsFixed(2), sheets);
+    }
+    final rows = toRows(List.of(lines));
+    AppLog.i('batch ocr rows: ${rows.join(' || ')}');
+    return parseBatchRows(rows);
+  } finally {
+    await rec.close();
+  }
+}
+
 String batchCaption(Session s, BatchInfo i) => [
       'الاسم: ${s.name}',
       'الوحده : ${s.unitName}',
@@ -1876,17 +2049,15 @@ String batchCaption(Session s, BatchInfo i) => [
       'الاجمالي: ${i.total}',
     ].join('\n');
 
-Future<BatchInfo?> askBatchInfo(BuildContext context) async {
+Future<BatchInfo?> askBatchInfo(BuildContext context, String img) async {
   final p = await SharedPreferences.getInstance();
   final init = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
       p.getString('bi_col') ?? '', p.getString('bi_total') ?? '');
   if (!context.mounted) return null;
-  final r = await showModalBottomSheet<BatchInfo>(
-    context: context,
-    isScrollControlled: true,
+  final r = await Navigator.of(context).push<BatchInfo>(MaterialPageRoute(
     builder: (c) =>
-        Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init)),
-  );
+        Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img)),
+  ));
   if (r != null) {
     await p.setString('bi_count', r.count);
     await p.setString('bi_pi', r.piasters);
@@ -1898,7 +2069,8 @@ Future<BatchInfo?> askBatchInfo(BuildContext context) async {
 
 class _BatchInfoSheet extends StatefulWidget {
   final BatchInfo init;
-  const _BatchInfoSheet({required this.init});
+  final String img;
+  const _BatchInfoSheet({required this.init, required this.img});
   @override
   State<_BatchInfoSheet> createState() => _BatchInfoSheetState();
 }
@@ -1911,9 +2083,42 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
       TextEditingController(text: widget.init.collected.isEmpty ? '0' : widget.init.collected);
   late final c4 = TextEditingController(text: widget.init.total);
   String? err;
+  bool reading = true, d1 = false, d4 = false;
+  String? note;
+
+  @override
+  void initState() {
+    super.initState();
+    _ocr();
+  }
+
+  Future<void> _ocr() async {
+    BatchOcr? r;
+    try {
+      r = await readBatchInfo(widget.img).timeout(const Duration(seconds: 25));
+    } catch (e) {
+      AppLog.i('batch ocr failed: $e');
+    }
+    if (!mounted) return;
+    setState(() {
+      reading = false;
+      if (r?.count != null && !d1) c1.text = r!.count!;
+      if (r?.total != null && !d4) c4.text = r!.total!;
+      if (r?.count == null && r?.total == null) {
+        note = 'معرفتش أقرا الأرقام من الصورة، اكتبها بإيدك';
+      } else if (r?.count == null || r?.total == null) {
+        note = 'اتقرا جزء بس من الصورة، كمّل الباقي وراجع القيم';
+      } else if ((r?.sheets ?? 1) > 1) {
+        note = 'اتقرا ${r!.sheets} ورقات واتجمعوا، راجع القيم قبل الإرسال';
+      } else {
+        note = 'اتقرا من الصورة، راجع القيم قبل الإرسال';
+      }
+    });
+  }
 
   @override
   void dispose() {
+    _tc.dispose();
     c1.dispose();
     c2.dispose();
     c3.dispose();
@@ -1940,11 +2145,13 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
             col.isEmpty ? '0' : '${int.parse(col)}', t.toStringAsFixed(2)));
   }
 
-  Widget _f(TextEditingController c, String label, {bool dec = false, bool selectAll = false}) =>
+  Widget _f(TextEditingController c, String label,
+          {bool dec = false, bool selectAll = false, VoidCallback? onEdit}) =>
       Padding(
         padding: const EdgeInsets.only(bottom: 12),
         child: TextField(
           controller: c,
+          onChanged: onEdit == null ? null : (_) => onEdit(),
           // الخانة اللي قيمتها 0 تتحدد كلها أول ما تدوس عليها، فأي رقم بتكتبه يحل محل الصفر
           onTap: selectAll
               ? () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length)
@@ -1954,27 +2161,88 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
         ),
       );
 
+  final _tc = TransformationController();
+  Offset _tap = Offset.zero;
+
+  /// نقرتين: لو متكبرة ترجع للحجم الطبيعي، ولو طبيعية تكبّر عند مكان النقر.
+  void _toggleZoom() {
+    if (_tc.value.getMaxScaleOnAxis() > 1.05) {
+      _tc.value = Matrix4.identity();
+    } else {
+      const z = 3.0;
+      _tc.value = Matrix4(z, 0, 0, 0, 0, z, 0, 0, 0, 0, 1, 0, -_tap.dx * (z - 1),
+          -_tap.dy * (z - 1), 0, 1);
+    }
+  }
+
   @override
-  Widget build(BuildContext context) => Padding(
-        padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + MediaQuery.of(context).viewInsets.bottom),
-        child: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            const Text('بيانات الباتش',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            _f(c1, 'عدد المعاملات'),
-            _f(c2, 'عدد القروش الفاصلة', selectAll: true),
-            _f(c3, 'عدد المعاملات المجمعة', selectAll: true),
-            _f(c4, 'الإجمالي', dec: true),
-            if (err != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: Text(err!, style: const TextStyle(color: Colors.red)),
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('بيانات الباتش')),
+        body: SafeArea(
+          child: Column(children: [
+            Expanded(
+              flex: 3,
+              child: Container(
+                width: double.infinity,
+                color: Colors.black,
+                child: ClipRect(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onDoubleTapDown: (d) => _tap = d.localPosition,
+                    onDoubleTap: _toggleZoom,
+                    child: InteractiveViewer(
+                      transformationController: _tc,
+                      minScale: 1,
+                      maxScale: 8,
+                      child: Image.file(File(widget.img), fit: BoxFit.contain, cacheWidth: 2400),
+                    ),
+                  ),
+                ),
               ),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
+            ),
+            Flexible(
+              flex: 2,
+              fit: FlexFit.loose,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  if (reading)
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 12),
+                      child: Row(children: [
+                        SizedBox(
+                            width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                        SizedBox(width: 10),
+                        Text('جاري قراءة الأرقام من صورة الباتش...'),
+                      ]),
+                    )
+                  else if (note != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Text(note!, style: const TextStyle(color: Colors.grey)),
+                    ),
+                  Row(children: [
+                    Expanded(child: _f(c1, 'عدد المعاملات', onEdit: () => d1 = true)),
+                    const SizedBox(width: 10),
+                    Expanded(child: _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true)),
+                  ]),
+                  Row(children: [
+                    Expanded(child: _f(c2, 'القروش الفاصلة', selectAll: true)),
+                    const SizedBox(width: 10),
+                    Expanded(child: _f(c3, 'المعاملات المجمعة', selectAll: true)),
+                  ]),
+                  if (err != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(err!, style: const TextStyle(color: Colors.red)),
+                    ),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
+                  ),
+                ]),
+              ),
             ),
           ]),
         ),
@@ -1982,7 +2250,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
 }
 
 Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
-  final info = await askBatchInfo(context);
+  final info = await askBatchInfo(context, img);
   if (info == null || !context.mounted) return false;
   final caption = batchCaption(s, info);
   Store.working++;
@@ -2036,15 +2304,9 @@ class TaggedImage extends StatelessWidget {
         Widget t = Image.memory(tag.png,
             width: dw, height: dh, fit: BoxFit.fill, gaplessPlayback: true);
         if (onChanged != null) {
-          t = _TagDrag(
-            pos: pos,
-            cw: cw,
-            maxCy: aspect ?? 3,
-            onChanged: onChanged!,
-            child: DecoratedBox(
-                decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
-                child: t),
-          );
+          t = DecoratedBox(
+              decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
+              child: t);
         }
         Widget err(BuildContext _, Object __, StackTrace? ___) =>
             const Center(child: Text('تعذر عرض الصورة'));
@@ -2053,7 +2315,7 @@ class TaggedImage extends StatelessWidget {
                 width: cw, height: ch, fit: BoxFit.fill, cacheWidth: 1000, errorBuilder: err)
             : Image.file(File(path),
                 width: cw, fit: BoxFit.fitWidth, cacheWidth: 1000, errorBuilder: err);
-        final stack = Stack(clipBehavior: Clip.hardEdge, children: [
+        Widget stack = Stack(clipBehavior: Clip.hardEdge, children: [
           img,
           if (showTag)
             Positioned(
@@ -2063,6 +2325,11 @@ class TaggedImage extends StatelessWidget {
                 height: dh,
                 child: t),
         ]);
+        // التحريك والتكبير/التصغير بالصوابع شغالين على الصورة كلها (مش لازم الصوابع تكون على الورقة)
+        if (onChanged != null && showTag) {
+          stack = _TagDrag(
+              pos: pos, cw: cw, maxCy: aspect ?? 3, onChanged: onChanged!, child: stack);
+        }
         return Center(
             child: ch != null
                 ? SizedBox(width: cw, height: ch, child: stack)
@@ -2275,6 +2542,7 @@ Future<void> main() async {
   try {
     appThemeMode.value = _themeOf(await Store.themeSetting());
     appPalette.value = AppPalette.values[await Store.paletteSetting()];
+    autoCropMode = await Store.autoCropSetting();
   } catch (_) {}
   try {
     final sp = await SharedPreferences.getInstance();
@@ -2528,7 +2796,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   PerfMode mode = PerfMode.balanced;
-  int scan = 0, qual = 1, pdfSz = 0, theme = 0;
+  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0;
   bool autoEdit = false, trim = false, slow = false;
   AppPalette palSel = AppPalette.gold;
   bool loaded = false;
@@ -2561,6 +2829,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final pz = await Store.pdfSize();
     final th = await Store.themeSetting();
     final pl = await Store.paletteSetting();
+    final cr = await Store.autoCropSetting();
     var sl = false;
     try {
       sl = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
@@ -2575,6 +2844,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       pdfSz = pz;
       theme = th;
       palSel = AppPalette.values[pl];
+      crop = cr;
       slow = sl;
       loaded = true;
     });
@@ -2641,6 +2911,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     appThemeMode.value = _themeOf(v);
   }
 
+  Future<void> _setCrop(int v) async {
+    setState(() => crop = v);
+    autoCropMode = v;
+    await Store.setAutoCropSetting(v);
+  }
+
   Future<void> _setPalette(AppPalette v) async {
     setState(() => palSel = v);
     await Store.setPaletteSetting(v.index);
@@ -2661,6 +2937,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await Store.setTrimMargins(false);
     await _setTheme(0);
     await _setPalette(AppPalette.gold);
+    await _setCrop(0);
     if (mounted) snack(context, 'اتعمل إعادة ضبط');
   }
 
@@ -2847,6 +3124,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Card(
                   shape: kCardShape,
                   child: Column(children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        const Text('القص التلقائي', style: TextStyle(fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 2),
+                        Text(
+                            crop == 0
+                                ? 'ذكي: يعدّل الورقة لو شكلها مستطيل، ولو الكشف مش مظبوط يرجع لمستطيل مستقيم'
+                                : (crop == 1
+                                    ? 'مستطيل مستقيم دايماً، من غير ميلان'
+                                    : 'أربع أركان حرة مع تصحيح المنظور'),
+                            style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: double.infinity,
+                          child: SegmentedButton<int>(
+                            showSelectedIcon: false,
+                            segments: const [
+                              ButtonSegment(value: 0, label: Text('ذكي')),
+                              ButtonSegment(value: 1, label: Text('مستطيل')),
+                              ButtonSegment(value: 2, label: Text('منظور')),
+                            ],
+                            selected: {crop},
+                            onSelectionChanged: (v) => _setCrop(v.first),
+                          ),
+                        ),
+                      ]),
+                    ),
                     SwitchListTile(
                       title: const Text('أوضاع الفلتر بعد كل صورة'),
                       subtitle: const Text('تظهر شاشة الفلاتر والقص بعد كل صورة'),
@@ -3316,10 +3621,6 @@ class BatchScreen extends StatefulWidget {
 class _BatchScreenState extends State<BatchScreen> {
   String? img;
   Tag? tag;
-  Tag? bandTag;
-  int layout = 1; // 1 تحت الصورة، 2 على الصورة
-  double bandScale = kBatchTagW; // حجم الورقة في وضع الشريط
-  Timer? _bandT;
   TagPos? pos;
   double? aspect;
   bool busy = false;
@@ -3337,22 +3638,6 @@ class _BatchScreenState extends State<BatchScreen> {
     if (path == null) return;
     setState(() => noTag = hide);
     await Store.setNoTag(path, hide);
-  }
-
-  /// تكبير/تصغير الورقة لحظي أثناء السحب (من غير إعادة رسم)، والحفظ بيتأجل لحد ما الإيد تقف.
-  void _setBand(double v) {
-    setState(() => bandScale = v);
-    _bandT?.cancel();
-    _bandT = Timer(const Duration(milliseconds: 300), () {
-      Store.setBandScale(v).catchError((Object e, StackTrace st) {
-        AppLog.e('setBandScale', e, st);
-      });
-    });
-  }
-
-  Future<void> _setLayout(int v) async {
-    setState(() => layout = v);
-    await Store.setBatchLayout(v);
   }
 
   Future<void> _init() async {
@@ -3384,7 +3669,6 @@ class _BatchScreenState extends State<BatchScreen> {
   Future<void> _warmTags() async {
     try {
       tag ??= await receiptTag(1000, widget.session, batch: true);
-      bandTag ??= await receiptTag(2000, widget.session, batch: true);
     } catch (e, st) {
       AppLog.e('warmTags', e, st);
     }
@@ -3394,20 +3678,14 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final t = tag ?? await receiptTag(1000, widget.session, batch: true);
       final a = await imageAspect(path);
-      final p0 = await Store.assignPos(path, t, true);
+      final p0 = await Store.assignPos(path, t, true, a);
       final p = fitTagPos(p0, t, a);
       if (p.cx != p0.cx || p.cy != p0.cy) await Store.savePos(path, p, true);
       final nt = await Store.noTag(path);
-      final lay = await Store.batchLayout();
-      final bt = bandTag ?? await receiptTag(2000, widget.session, batch: true); // نسخة مرجعية عالية الدقة للمعاينة (بتتعمل مرة واحدة)
-      final bsc = await Store.bandScale();
       if (!mounted) return;
       setState(() {
-        bandScale = bsc;
         noTag = nt;
         tag = t;
-        bandTag = bt;
-        layout = lay;
         img = path;
         aspect = a;
         pos = p;
@@ -3528,10 +3806,6 @@ class _BatchScreenState extends State<BatchScreen> {
 
   @override
   void dispose() {
-    if (_bandT?.isActive ?? false) {
-      _bandT!.cancel();
-      Store.setBandScale(bandScale);
-    }
     final t = _saveT;
     if (t != null && t.isActive) {
       t.cancel();
@@ -3597,8 +3871,6 @@ class _BatchScreenState extends State<BatchScreen> {
     setState(() => busy = true);
     try {
       await _flushPos();
-      _bandT?.cancel();
-      await Store.setBandScale(bandScale);
       final ok = await sendBatchFile(context, widget.session, img!);
       if (ok) HapticFeedback.mediumImpact();
       if (ok && mounted) Navigator.pop(context);
@@ -3611,7 +3883,7 @@ class _BatchScreenState extends State<BatchScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final ready = img != null && tag != null && pos != null && aspect != null && bandTag != null;
+    final ready = img != null && tag != null && pos != null && aspect != null;
     return Scaffold(
       appBar: AppBar(title: const Text('الباتش')),
       body: !ready
@@ -3620,30 +3892,36 @@ class _BatchScreenState extends State<BatchScreen> {
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.all(8),
-                  child: layout == 2
-                      ? TaggedImage(
-                          path: img!,
-                          tag: tag!,
-                          pos: pos!,
-                          aspect: aspect,
-                          showTag: !noTag,
-                          onChanged: noTag ? null : _set)
-                      : Center(
-                          child: FittedBox(
-                            fit: BoxFit.contain,
-                            child: SizedBox(
-                              width: 1000 * math.max(1.0, bandScale),
-                              child: ReceiptPreview(
-                                  path: img!,
-                                  tag: bandTag!,
-                                  bandScale: bandScale,
-                                  bottom: layout == 1,
-                                  showTag: !noTag),
-                            ),
-                          ),
-                        ),
+                  child: TaggedImage(
+                      path: img!,
+                      tag: tag!,
+                      pos: pos!,
+                      aspect: aspect,
+                      showTag: !noTag,
+                      onChanged: noTag ? null : _set),
                 ),
               ),
+              if (!noTag)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.symmetric(horizontal: 12),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.withOpacity(0.15),
+                    border: Border.all(color: Colors.orange),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Row(children: [
+                    Icon(Icons.warning_amber_rounded, color: Colors.orange),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                          'تنبيه: حرّك الورقة لمكان فاضي من الصورة، وماتغطّيش أي بيانات (خصوصًا العدد والإجمالي). '
+                          'اسحب بإصبع للتحريك، وبإصبعين للتكبير والتصغير.',
+                          style: TextStyle(fontSize: 12)),
+                    ),
+                  ]),
+                ),
               SwitchListTile(
                 dense: true,
                 title: const Text('ورقة البيانات على الصورة دي'),
@@ -3652,50 +3930,7 @@ class _BatchScreenState extends State<BatchScreen> {
                 value: !noTag,
                 onChanged: busy ? null : (v) => _toggleTag(!v),
               ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: SizedBox(
-                  width: double.infinity,
-                  child: SegmentedButton<int>(
-                    showSelectedIcon: false,
-                    segments: const [
-                      ButtonSegment(value: 1, label: Text('تحت الصورة')),
-                      ButtonSegment(value: 2, label: Text('على الصورة')),
-                    ],
-                    selected: {layout},
-                    onSelectionChanged: (busy || noTag) ? null : (v) => _setLayout(v.first),
-                  ),
-                ),
-              ),
-              if (layout != 2)
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Row(children: [
-                    const Icon(Icons.format_size_rounded),
-                    Expanded(
-                      child: Slider(
-                        value: bandScale.clamp(0.3, kBandMaxScale).toDouble(),
-                        min: 0.3,
-                        max: kBandMaxScale,
-                        onChanged: noTag ? null : _setBand,
-                      ),
-                    ),
-                    SizedBox(
-                        width: 44,
-                        child: Text('${(bandScale * 100).round()}%',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(fontSize: 12, color: Colors.grey))),
-                    IconButton(
-                      tooltip: 'الحجم الأصلي',
-                      icon: const Icon(Icons.restart_alt_rounded),
-                      onPressed: noTag ? null : () => _setBand(kBatchTagW),
-                    ),
-                  ]),
-                ),
-              if (layout == 2) ...[
-                const SizedBox(height: 4),
-                const Text('اسحب الورقة لتحريكها، وبإصبعين لتكبيرها أو تصغيرها',
-                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+              if (!noTag) ...[
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   child: Row(children: [
@@ -3709,9 +3944,9 @@ class _BatchScreenState extends State<BatchScreen> {
                       ),
                     ),
                     IconButton(
-                      tooltip: 'المكان الأصلي',
+                      tooltip: 'رجّع الورقة أسفل الصورة',
                       icon: const Icon(Icons.restart_alt_rounded),
-                      onPressed: noTag ? null : () => _set(TagPos.initial(tag!)),
+                      onPressed: noTag ? null : () => _set(TagPos.initial(tag!, aspect)),
                     ),
                   ]),
                 ),
@@ -3951,9 +4186,9 @@ Uint8List _warpJob(Map<String, dynamic> a) {
 Future<List<Offset>?> detectDocQuad(String path) async {
   final swDet = Stopwatch()..start();
   try {
-    // احتفظ بالأركان الأربعة المكتشفة لتصحيح المنظور الحقيقي بدلاً من
-    // تحويلها إلى مستطيل مستقيم قد يقتطع أطراف الإيصال المائل.
-    return await _detectDocQuadImpl(path);
+    final q = await _detectDocQuadImpl(path);
+    if (q == null) return null;
+    return _shapeQuad(q, await imageAspect(path));
   } finally {
     AppLog.i('t detect ${swDet.elapsedMilliseconds}ms');
   }
@@ -4026,6 +4261,35 @@ List<Offset> _rectOf(List<Offset> q) {
     b = math.max(b, p.dy);
   }
   return [Offset(l, t), Offset(r, t), Offset(r, b), Offset(l, b)];
+}
+
+/// شكل القص التلقائي: 0 ذكي (الافتراضي)، 1 مستطيل دايماً، 2 منظور (4 أركان) دايماً.
+int autoCropMode = 0;
+
+/// الفرق بين اتجاهين (بالدرجات) كخطوط، من 0 لـ 90.
+double _angDiff(double a, double b) {
+  final d = (a - b).abs() % 180;
+  return d > 90 ? 180 - d : d;
+}
+
+/// بيقرر شكل الإطار التلقائي. aspect = ارتفاع/عرض الصورة.
+/// الذكي: لو الأركان الأربعة شكلها مستطيل فعلاً (حتى لو ملفوف) بنحتفظ بيها عشان تتعدّل الورقة،
+/// ولو الشكل مائل أو مشوّه (غالباً الكشف غلط أو منظور قوي) بنرجع لمستطيل مستقيم.
+List<Offset> _shapeQuad(List<Offset> q, double aspect) {
+  if (autoCropMode == 2) return q;
+  if (autoCropMode == 1) return _rectOf(q);
+  final p = [for (final o in q) Offset(o.dx, o.dy * aspect)];
+  double dir(Offset a, Offset b) => math.atan2(b.dy - a.dy, b.dx - a.dx) * 180 / math.pi;
+  final top = dir(p[0], p[1]), right = dir(p[3], p[2]);
+  final left = dir(p[0], p[3]), rightSide = dir(p[1], p[2]);
+  final par = math.max(_angDiff(top, right), _angDiff(left, rightSide));
+  var dev = 0.0;
+  for (final a in [top, right]) {
+    for (final b in [left, rightSide]) {
+      dev = math.max(dev, 90 - _angDiff(a, b));
+    }
+  }
+  return (par <= 6 && dev <= 8) ? q : _rectOf(q);
 }
 
 Future<bool> _nativeDetectorAllowed() async {
@@ -4238,7 +4502,7 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
   }
   final q = _quadFromFeature(feat, gw, gh);
   if (q == null || _quadArea(q) > 0.97) return null;
-  return _rectOf(q);
+  return _shapeQuad(q, gh / gw);
 }
 
 class _LiveQuadPainter extends CustomPainter {
