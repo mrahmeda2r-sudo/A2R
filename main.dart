@@ -94,7 +94,38 @@ class AppLog {
   }
 }
 
+/// مستوى الدقة اللي الموظف اختاره: 0 تلقائي (حسب وضع الأداء)، 1..4 من kResLevels.
+int gResLevel = 0;
+
+/// إيصالات الدفع (١٥ إيصال في الصورة الواحدة): بيرفع أقصى ضلع وجودة الـ JPEG طول ما شاشة الإيصالات مفتوحة.
+/// 0 = متعطّل (الإعدادات العادية).
+int gMinSide = 0;
+int gMinQuality = 0;
+const int kSheetHdSide = 4096;
+const int kSheetHdQuality = 90;
+
+/// (رقم، الاسم، الرقم المختصر، أقصى ضلع بالبكسل)
+const kResLevels = <(int, String, String, int)>[
+  (1, 'صغيرة', '720p', 1000),
+  (2, 'متوسطة', '1080p', 1600),
+  (3, 'عالية', '4K', 2400),
+  (4, 'أعلى', 'أقصى دقة', 3200),
+];
+
+String resShort(int l) => l <= 0 || l > kResLevels.length ? 'تلقائي' : kResLevels[l - 1].$3;
+
 int getMaxSide(PerfMode mode) {
+  final v = _getMaxSideBase(mode);
+  // لو الموظف اختار دقة بنفسه نلتزم باختياره، وإلا إيصالات الصور المتعددة بترفع الحد الأدنى
+  if (gResLevel > 0) return v;
+  return gMinSide > v ? gMinSide : v;
+}
+
+int _getMaxSideBase(PerfMode mode) {
+  if (gResLevel > 0 && gResLevel <= kResLevels.length) {
+    final v = kResLevels[gResLevel - 1].$4;
+    return mode == PerfMode.lite ? math.min(v, 1400) : v;
+  }
   switch (mode) {
     case PerfMode.lite:
       return 800;
@@ -1340,8 +1371,13 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
       if (compact) {
         // PDF مضغوط: نسخة أصغر (عرض ~720 وجودة 70) لو طلعت أخف وسليمة، وإلا بنستخدم الأصلية
         try {
+          // صورة فيها ١٥ إيصال: الضغط لـ 720 هيمسح الأرقام، فبنخلّي دقة أعلى بكتير
+          final hd = gMinSide > 0;
           final c = await FlutterImageCompress.compressWithList(bytes,
-              minWidth: 720, minHeight: 720, quality: 70, format: CompressFormat.jpeg);
+              minWidth: hd ? 2600 : 720,
+              minHeight: hd ? 2600 : 720,
+              quality: hd ? 82 : 70,
+              format: CompressFormat.jpeg);
           if (c.isNotEmpty && c.length < bytes.length && await _decodesOk(c)) bytes = c;
         } catch (e, st) {
           AppLog.e('pdf.compact', e, st);
@@ -1435,7 +1471,19 @@ class Store {
   static Future<int> qualitySetting() async => ((await _p).getInt('jpegQ') ?? 1).clamp(0, 2);
   static Future<void> setQualitySetting(int v) async => (await _p).setInt('jpegQ', v);
 
+  /// دقة الصورة: 0 تلقائي (حسب وضع الأداء)، 1 صغيرة 720p، 2 متوسطة 1080p، 3 عالية 4K، 4 أعلى
+  static Future<int> resSetting() async => ((await _p).getInt('resLevel') ?? 0).clamp(0, kResLevels.length);
+  static Future<void> setResSetting(int v) async {
+    gResLevel = v.clamp(0, kResLevels.length);
+    await (await _p).setInt('resLevel', gResLevel);
+  }
+
   static Future<int> jpegQuality() async {
+    final b = await _jpegQualityBase();
+    return gMinQuality > b ? gMinQuality : b;
+  }
+
+  static Future<int> _jpegQualityBase() async {
     switch (await qualitySetting()) {
       case 0:
         return 65;
@@ -1887,6 +1935,14 @@ const _qualOpts = <(int, String, String)>[
   (0, 'صغيرة', 'ملف أخف وأسرع في الإرسال'),
   (1, 'عادية', 'متوازنة (الافتراضي)'),
   (2, 'عالية', 'أوضح وحجم أكبر'),
+];
+
+const _resOpts = <(int, String, String)>[
+  (0, 'تلقائي', 'حسب وضع الأداء (الافتراضي)'),
+  (1, 'صغيرة · 720p', 'أخف ملف وأسرع إرسال'),
+  (2, 'متوسطة · 1080p', 'متوازنة'),
+  (3, 'عالية · 4K', 'أوضح تفاصيل وحجم أكبر'),
+  (4, 'أعلى · أقصى دقة', 'أكبر دقة ممكنة، ممكن يبطّأ على الموبايلات الضعيفة'),
 ];
 
 bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
@@ -2658,6 +2714,7 @@ Future<void> main() async {
       await sp.setBool('det_guard', false);
       AppLog.i('الكشف الأصلي قفل التطبيق المرة اللي فاتت، اتوقف واتحوّل للكشف البسيط');
     }
+    gResLevel = (sp.getInt('resLevel') ?? 0).clamp(0, kResLevels.length);
     final t = sp.getInt('scannerFailedAt') ?? 0;
     _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
   } catch (e, st) {
@@ -2944,7 +3001,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   PerfMode mode = PerfMode.balanced;
-  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0, engine = 1;
+  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0, engine = 1, res = 0;
   bool autoEdit = false, trim = false, slow = false;
   AppPalette palSel = AppPalette.gold;
   bool loaded = false;
@@ -2973,6 +3030,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final sc = await Store.scanSetting();
     final en = await Store.scanEngine();
     final q = await Store.qualitySetting();
+    final rs = await Store.resSetting();
     final ae = await Store.autoEdit();
     final tr = await Store.trimMargins();
     final pz = await Store.pdfSize();
@@ -2989,6 +3047,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       scan = sc;
       engine = en;
       qual = q;
+      res = rs;
       autoEdit = ae;
       trim = tr;
       pdfSz = pz;
@@ -3052,6 +3111,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _setQual(int v) async {
     setState(() => qual = v);
     await Store.setQualitySetting(v);
+  }
+
+  Future<void> _setRes(int v) async {
+    setState(() => res = v);
+    await Store.setResSetting(v);
+    try {
+      (await SharedPreferences.getInstance()).remove('camSlow'); // اختيار الموظف بيلغي التنزيل التلقائي
+    } catch (_) {}
   }
 
   Future<void> _setPdf(int v) async {
@@ -3349,6 +3416,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       const Divider(),
                       _sub('جودة الصورة'),
                       _radioGroup<int>(_qualOpts, qual, _setQual),
+                      const Divider(),
+                      _sub('دقة الصورة'),
+                      const Padding(
+                        padding: EdgeInsets.fromLTRB(16, 0, 16, 4),
+                        child: Text(
+                            'كاميرا A2R: بتصوّر بالدقة دي فعلاً. ماسح جوجل: شاشته من جوجل فبنصغّر الصورة الناتجة للدقة دي (مش بنكبّرها).',
+                            style: TextStyle(fontSize: 12)),
+                      ),
+                      _radioGroup<int>(_resOpts, res, _setRes),
                       const Divider(),
                       _sub('حجم ملف الـ PDF'),
                       _radioGroup<int>(const [
@@ -6428,6 +6504,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   bool _ready = false;
   bool _starting = false; // يمنع تشغيل الكاميرا مرتين في نفس الوقت
   bool _shooting = false;
+  String? _lastShot; // أبعاد آخر صورة اتصوّرت فعلاً (للتأكد من الدقة)
   bool _hd = true;
   int _flash = 0; // 0 مقفول، 1 تلقائي، 2 فلاش، 3 كشاف
   bool _grid = false; // شبكة الأثلاث للمحاذاة
@@ -6501,10 +6578,20 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       // الصورة بتتحفظ بحد أقصى 800/1400/2400، فمفيش داعي لـ 4K غير في الوضع "برو".
       // الجهاز اللي التصوير فيه بطيء بيتنزّل له درجة تلقائياً.
       late final cam.ResolutionPreset preset;
-      if (perf == PerfMode.pro) {
+      if (gMinSide > 0 && gResLevel == 0) {
+        preset = cam.ResolutionPreset.max; // إيصالات متعددة: أعلى دقة متاحة (إلا لو الموظف اختار دقة)
+      } else if (gResLevel > 0) {
+        // الموظف اختار دقة بنفسه من القايمة
+        preset = const [
+          cam.ResolutionPreset.high,
+          cam.ResolutionPreset.veryHigh,
+          cam.ResolutionPreset.ultraHigh,
+          cam.ResolutionPreset.max,
+        ][(gResLevel - 1).clamp(0, 3)];
+      } else if (perf == PerfMode.pro) {
         preset = _hd && !slow ? cam.ResolutionPreset.ultraHigh : cam.ResolutionPreset.veryHigh;
       } else if (perf == PerfMode.balanced) {
-        preset = _hd && !slow ? cam.ResolutionPreset.veryHigh : cam.ResolutionPreset.high;
+        preset = cam.ResolutionPreset.veryHigh; // أقل درجة 1080p (التنزيل التلقائي مبقاش بيرجّع لـ 720p)
       } else {
         preset = cam.ResolutionPreset.high;
       }
@@ -6514,6 +6601,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
           imageFormatGroup:
               Platform.isAndroid ? cam.ImageFormatGroup.yuv420 : cam.ImageFormatGroup.bgra8888);
       await c.initialize();
+      AppLog.i('cam preset=$preset preview=${c.value.previewSize}');
       try {
         await c.lockCaptureOrientation(DeviceOrientation.portraitUp);
       } catch (_) {}
@@ -6619,14 +6707,46 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     if (mounted) snack(context, _flashNames[_flash]);
   }
 
-  Future<void> _toggleHd() async {
+  Future<void> _pickRes() async {
     HapticFeedback.selectionClick();
-    setState(() => _hd = !_hd);
+    final cur = gResLevel;
+    final v = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: const Color(0xFF111111),
+      builder: (c) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: SafeArea(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: Text('دقة التصوير',
+                  style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            ),
+            if (_lastShot != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text('آخر صورة: $_lastShot بكسل',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              ),
+            for (final o in _resOpts)
+              ListTile(
+                dense: true,
+                leading: Icon(o.$1 == cur ? Icons.radio_button_checked : Icons.radio_button_off,
+                    color: o.$1 == cur ? kAccent : Colors.white70),
+                title: Text(o.$2, style: const TextStyle(color: Colors.white)),
+                subtitle: Text(o.$3, style: const TextStyle(color: Colors.white54, fontSize: 11)),
+                onTap: () => Navigator.pop(c, o.$1),
+              ),
+          ]),
+        ),
+      ),
+    );
+    if (v == null || v == cur) return;
+    await Store.setResSetting(v);
     try {
-      final sp = await SharedPreferences.getInstance();
-      await sp.setBool('camHd', _hd);
-      await sp.remove('camSlow'); // اختيار الموظف بيلغي التنزيل التلقائي
+      (await SharedPreferences.getInstance()).remove('camSlow');
     } catch (_) {}
+    if (mounted) setState(() {});
     await _start();
   }
 
@@ -6655,6 +6775,11 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final x = await c.takePicture();
       final shotMs = swShot.elapsedMilliseconds;
       AppLog.i('t takePicture ${shotMs}ms');
+      try {
+        final z = await imageSize(await File(x.path).readAsBytes());
+        _lastShot = '${z.w}×${z.h}';
+        AppLog.i('cam photo $_lastShot');
+      } catch (_) {}
       if (shotMs > 2500) {
         try {
           (await SharedPreferences.getInstance()).setBool('camSlow', true);
@@ -6686,7 +6811,10 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   /// لو كاميرا التطبيق مش شغالة على الموبايل ده: كاميرا النظام بدالها.
   Future<void> _systemCamera() async {
     try {
-      final x = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 2000, imageQuality: 90);
+      final x = await ImagePicker().pickImage(
+          source: ImageSource.camera,
+          maxWidth: gMinSide > 0 ? null : 2000,
+          imageQuality: gMinSide > 0 ? null : 90);
       if (x == null || !mounted) return;
       _apply(await widget.onShot(x.path));
     } catch (e, st) {
@@ -6875,13 +7003,13 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
               child: Text(widget.title,
                   style: TextStyle(color: kAccent, fontSize: 15, fontWeight: FontWeight.w600)),
             ),
-            // صف الأيقونات: إغلاق، فلاش، جودة، معرض
+            // صف الأيقونات: إغلاق، فلاش، دقة، شبكة، معرض
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
               child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
                 _icon(Icons.close_rounded, 'إغلاق', () => Navigator.pop(context)),
                 _icon(_flashIcons[_flash], 'فلاش', _cycleFlash, on: _flash != 0),
-                _icon(Icons.hd_rounded, _hd ? 'جودة عالية' : 'جودة عادية', _toggleHd, on: _hd),
+                _icon(Icons.high_quality_rounded, 'دقة: ${resShort(gResLevel)}', _pickRes, on: gResLevel > 0),
                 _icon(Icons.grid_3x3_rounded, 'شبكة', _toggleGrid, on: _grid),
                 if (widget.onGallery != null) _icon(Icons.photo_library_rounded, 'معرض', _gallery),
               ]),
@@ -6969,7 +7097,16 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   @override
   void initState() {
     super.initState();
+    gMinSide = kSheetHdSide; // دقة عالية لصور الإيصالات المتعددة
+    gMinQuality = kSheetHdQuality;
     _load();
+  }
+
+  @override
+  void dispose() {
+    gMinSide = 0;
+    gMinQuality = 0;
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -7013,8 +7150,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (d.isEmpty && mounted) await _chooseSource();
   }
 
-  /// أول ما تفتح إيصالات الدفع وهي فاضية: اختار كاميرا ولا معرض.
+  /// أول ما تفتح إيصالات الدفع وهي فاضية: اختار ماسح جوجل ولا كاميرا A2R ولا معرض.
   Future<void> _chooseSource() async {
+    if (!mounted) return;
     final c = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
@@ -7023,7 +7161,12 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
           ListTile(
             leading: const Icon(Icons.add_a_photo_rounded),
             title: const Text('كاميرا'),
-            onTap: () => Navigator.pop(ctx, 'camera'),
+            onTap: () => Navigator.pop(ctx, 'google'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.camera_rounded),
+            title: const Text('كاميرا A2R'),
+            onTap: () => Navigator.pop(ctx, 'a2r'),
           ),
           ListTile(
             leading: const Icon(Icons.photo_library_rounded),
@@ -7035,10 +7178,20 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       ),
     );
     if (!mounted) return;
-    if (c == 'camera') {
-      await _add();
-    } else if (c == 'gallery') {
-      await _addGallery();
+    switch (c) {
+      case 'google':
+        await Store.setScanEngine(1);
+        await _addGoogle();
+        // لو ماسح جوجل مش شغال على الموبايل ده، نكمل بكاميرا A2R تلقائياً
+        if (_scannerFailed && mounted && imgs.isEmpty) await _addA2R();
+        break;
+      case 'a2r':
+        await Store.setScanEngine(0);
+        await _addA2R();
+        break;
+      case 'gallery':
+        await _addGallery();
+        break;
     }
   }
 
@@ -7047,16 +7200,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   /// كاميرا التطبيق (شكل كام اسكنر): كل صورة بتتحفظ وتتفتح للتعديل، والكاميرا تفضل مفتوحة والعداد بيزيد.
   Future<void> _add() async {
-    final engine = await Store.scanEngine();
-    final perf = await Store.perfMode();
+    // كاميرا A2R دايماً بأعلى دقة: ماسح جوجل بيصغّر الصورة الناتجة فالأرقام الصغيرة بتضيع.
     if (!mounted) return;
-    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
-      await _addGoogle();
-      // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
-      if (_scannerFailed && mounted) await _addA2R();
-    } else {
-      await _addA2R();
-    }
+    await _addA2R();
   }
 
   /// ماسح جوجل الذكي: بيرجّع الصور مقصوصة جاهزة، فبنفتح التعديل على تبويب الفلاتر.
@@ -7114,7 +7260,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     await markPickTarget('receipts');
     List<XFile> xs;
     try {
-      xs = await ImagePicker().pickMultiImage(maxWidth: 2000, imageQuality: 90);
+      xs = await ImagePicker().pickMultiImage(); // الأصل من غير تصغير أو إعادة ضغط
     } catch (e, st) {
       AppLog.e('_addGallery', e, st);
       if (mounted) snack(context, 'تعذر فتح المعرض');
