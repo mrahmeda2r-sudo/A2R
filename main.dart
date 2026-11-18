@@ -1425,6 +1425,10 @@ String _dayKey() {
 
 class Store {
   static const pdfLife = Duration(hours: 24);
+
+  /// مدة الاحتفاظ بالباتش والإيصالات بعد الإرسال (قابلة للتعديل وإعادة الإرسال).
+  /// بتتمسح تلقائياً مع فتح التطبيق لما المدة تعدّي.
+  static const sentLife = Duration(hours: 12);
   static int working = 0; // عدد العمليات الشغالة (بتمنع التنظيف أثناءها)
   static Future<SharedPreferences> get _p => SharedPreferences.getInstance();
 
@@ -1604,11 +1608,21 @@ class Store {
     return v;
   }
 
-  static Future<void> setBatchImg(String path) async {
+  /// [fresh] = true لما تكون صورة باتش جديدة (تصوير/معرض)، false لما تكون نتيجة تعديل نفس الباتش.
+  /// الباتش الجديد بعد باتش اتبعت بيبدأ من الأول (علامة الإرسال وبيانات الباتش القديمة بتتصفّر).
+  static Future<void> setBatchImg(String path, {bool fresh = false}) async {
     final p = await _p;
     final old = p.getString('batchImg');
     if (old != null && old != path) await del(old);
     await p.setString('batchImg', path);
+    if (fresh && p.getInt('batchSentAt') != null) await _resetBatchMeta(p);
+  }
+
+  static Future<void> _resetBatchMeta(SharedPreferences p) async {
+    await p.remove('batchSentAt');
+    for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
+      await p.remove(k);
+    }
   }
 
   static Future<void> clearBatchImg() async {
@@ -1616,15 +1630,22 @@ class Store {
     final old = p.getString('batchImg');
     if (old != null) await del(old);
     await p.remove('batchImg');
+    await _resetBatchMeta(p);
   }
 
+  /// بعد إرسال الباتش: الصورة وبياناتها بيفضلوا ١٢ ساعة (قابلين للتعديل وإعادة الإرسال).
   static Future<void> afterBatchSent() async {
-    await clearBatchImg();
     final p = await _p;
-    for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
-      await p.remove(k);
-    }
+    await p.setInt('batchSentAt', DateTime.now().millisecondsSinceEpoch);
     await setFlag('batch');
+  }
+
+  /// وقت إرسال الباتش (null لو لسه متبعتش).
+  static Future<DateTime?> batchSentAt() async {
+    final p = await _p;
+    final t = p.getInt('batchSentAt');
+    if (t == null || p.getString('batchImg') == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(t);
   }
 
   // --- صور الإيصالات ---
@@ -1639,8 +1660,14 @@ class Store {
 
   static Future<void> addToDraft(String path) async {
     final l = await draft();
+    final p = await _p;
+    if (l.isEmpty) {
+      // مسودة جديدة بعد ما اتمسح كل حاجة: متفضلش علامة "اتبعت" قديمة
+      await p.remove('rcSentAt');
+      await p.remove('rcSentImgs');
+    }
     l.add(path);
-    await (await _p).setStringList('draft', l);
+    await p.setStringList('draft', l);
   }
 
   static Future<void> removeFromDraft(String path) async {
@@ -1654,7 +1681,10 @@ class Store {
     for (final e in await draft()) {
       await del(e);
     }
-    await (await _p).setStringList('draft', []);
+    final p = await _p;
+    await p.setStringList('draft', []);
+    await p.remove('rcSentAt');
+    await p.remove('rcSentImgs');
   }
 
   // --- نسخة الصورة الأصلية + إعدادات التعديل (تعديل غير مدمّر) ---
@@ -1687,8 +1717,16 @@ class Store {
     } else {
       l[i] = neu;
     }
-    await (await _p).setStringList('draft', l);
+    final p = await _p;
+    await p.setStringList('draft', l);
     if (await noTag(old)) await setNoTag(neu, true); // الاختيار يفضل بعد التعديل
+    // لو الصورة كانت من اللي اتبعتوا: الصورة المعدّلة تاخد مكانها في قايمة "اتبعت"
+    final sent = p.getStringList('rcSentImgs');
+    if (sent != null && sent.contains(old)) {
+      await p.setStringList('rcSentImgs', [for (final x in sent) x == old ? neu : x]);
+    }
+    // الـ PDF القديم مبقاش مظبوط بعد التعديل
+    if ((p.getStringList('pdfImgs') ?? []).contains(old)) await clearPdf();
     await del(old);
   }
 
@@ -1699,8 +1737,12 @@ class Store {
     final t = p.getInt('pdfTime');
     if (path == null || t == null) return null;
     final time = DateTime.fromMillisecondsSinceEpoch(t);
-    final age = DateTime.now().difference(time);
-    if (age > pdfLife || !File(path).existsSync()) {
+    // لو الإيصالات اتبعتت: المدة ١٢ ساعة من وقت الإرسال، وإلا ٢٤ ساعة من وقت إنشاء الـ PDF
+    final sentT = p.getInt('rcSentAt');
+    final age = DateTime.now()
+        .difference(sentT == null ? time : DateTime.fromMillisecondsSinceEpoch(sentT));
+    final life = sentT == null ? pdfLife : sentLife;
+    if (age > life || !File(path).existsSync()) {
       await clearPdf();
       return null;
     }
@@ -1725,17 +1767,59 @@ class Store {
     await p.remove('pdfImgs');
   }
 
+  /// بعد إرسال الإيصالات: الصور والـ PDF بيفضلوا ١٢ ساعة (قابلين للتعديل وإعادة الإرسال).
   static Future<void> afterPdfSent() async {
     final p = await _p;
-    final used = p.getStringList('pdfImgs') ?? [];
+    final used = (p.getStringList('pdfImgs') ?? []).where((e) => File(e).existsSync()).toList();
+    if (used.isNotEmpty) {
+      await p.setInt('rcSentAt', DateTime.now().millisecondsSinceEpoch);
+      await p.setStringList('rcSentImgs', used);
+    }
+    await setFlag('receipts');
+  }
+
+  /// وقت إرسال الإيصالات (null لو مفيش إيصالات متبعتة محتفظ بيها).
+  static Future<DateTime?> receiptsSentAt() async {
+    final p = await _p;
+    final t = p.getInt('rcSentAt');
+    if (t == null) return null;
+    final sent = (p.getStringList('rcSentImgs') ?? []).where((e) => File(e).existsSync());
+    if (sent.isEmpty) {
+      await p.remove('rcSentAt');
+      await p.remove('rcSentImgs');
+      return null;
+    }
+    return DateTime.fromMillisecondsSinceEpoch(t);
+  }
+
+  /// بيمسح الإيصالات اللي اتبعتت بس (الصور اللي لسه متبعتتش بتفضل) مع الـ PDF بتاعها.
+  static Future<void> discardSentReceipts() async {
+    final p = await _p;
+    final sent = p.getStringList('rcSentImgs') ?? [];
     final left = await draft();
-    for (final u in used) {
+    for (final u in sent) {
       await del(u);
       left.remove(u);
     }
     await p.setStringList('draft', left);
-    await p.remove('pdfImgs');
-    await setFlag('receipts');
+    await p.remove('rcSentAt');
+    await p.remove('rcSentImgs');
+    await clearPdf();
+  }
+
+  /// بيتنفّذ مع فتح التطبيق: بيمسح الباتش والإيصالات اللي عدّى عليهم أكتر من ١٢ ساعة من الإرسال.
+  static Future<void> expireSent() async {
+    if (working > 0) return;
+    final p = await _p;
+    final now = DateTime.now();
+    final bt = p.getInt('batchSentAt');
+    if (bt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(bt)) > sentLife) {
+      await clearBatchImg();
+    }
+    final rt = p.getInt('rcSentAt');
+    if (rt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(rt)) > sentLife) {
+      await discardSentReceipts();
+    }
   }
 
   // --- علامة ✓ (بتتصفّر كل يوم جديد) ---
@@ -3473,6 +3557,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   ({File file, DateTime time})? pdf;
   bool batchSent = false;
   bool receiptsSent = false;
+  DateTime? batchSentAt; // لو الباتش اتبعت وسايبينه ١٢ ساعة للتعديل
+  DateTime? receiptsSentAt; // نفس الكلام للإيصالات
   bool busy = false;
 
   @override
@@ -3490,12 +3576,34 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _reload();
+    if (state == AppLifecycleState.resumed) unawaited(_onResume());
+  }
+
+  Future<void> _onResume() async {
+    // التنظيف بعد ١٢ ساعة بس لو الشاشة الرئيسية هي اللي قدام (مش وإحنا في تعديل)
+    if (mounted && (ModalRoute.of(context)?.isCurrent ?? false)) {
+      try {
+        await Store.expireSent();
+      } catch (e, st) {
+        AppLog.e('expireSent', e, st);
+      }
+    }
+    await _reload();
+  }
+
+  /// الوقت المتبقي قبل مسح الملف المتبعت.
+  String _leftText(DateTime sent) {
+    final left = Store.sentLife - DateTime.now().difference(sent);
+    if (left.inMinutes <= 0) return 'أقل من دقيقة';
+    final h = left.inHours, m = left.inMinutes % 60;
+    if (h == 0) return '$m دقيقة';
+    return m == 0 ? '$h ساعة' : '$h ساعة و$m دقيقة';
   }
 
   Future<void> _init() async {
     await requestAllPermissions();
     try {
+      await Store.expireSent(); // مسح اللي عدّى عليه ١٢ ساعة من الإرسال
       await Store.cleanup();
     } catch (e, st) {
       AppLog.e('_init', e, st);
@@ -3509,6 +3617,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final bi = await Store.batchImg();
     final b = await Store.flag('batch');
     final r = await Store.flag('receipts');
+    final bs = await Store.batchSentAt();
+    final rs = await Store.receiptsSentAt();
     if (!mounted) return;
     setState(() {
       draft = d;
@@ -3516,6 +3626,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       batchImg = bi;
       batchSent = b;
       receiptsSent = r;
+      batchSentAt = bs;
+      receiptsSentAt = rs;
     });
   }
 
@@ -3535,6 +3647,48 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       _opening = false;
     }
     _reload();
+  }
+
+  /// باتش جديد: لو فيه باتش اتبعت محتفظين بيه، نأكد قبل ما يتبدل.
+  Future<void> _newBatch() async {
+    if (batchSentAt != null &&
+        !await askYesNo(context, 'باتش جديد؟',
+            'الباتش اللي اتبعت هيتمسح لما تصوّر باتش جديد. لو عايز تعدّله افتحه من "ملفاتي".',
+            yes: 'باتش جديد', no: 'إلغاء')) {
+      return;
+    }
+    if (!mounted) return;
+    await _open(BatchScreen(session: widget.session, fresh: true));
+  }
+
+  /// إيصالات الدفع: لو فيه إيصالات اتبعتت محتفظين بيها، نسأل: نعدّلها ولا نبدأ جديد.
+  Future<void> _openReceipts() async {
+    if (receiptsSentAt != null) {
+      final c = await showDialog<String>(
+        context: context,
+        builder: (ctx) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: AlertDialog(
+            title: const Text('إيصالات اتبعتت'),
+            content: const Text(
+                'عندك إيصالات اتبعتت ومحتفظ بيها للتعديل. تفتحها تعدّل وتبعت تاني، ولا تبدأ إيصالات جديدة؟ (البدء من جديد بيمسح اللي اتبعت)'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+              TextButton(onPressed: () => Navigator.pop(ctx, 'new'), child: const Text('ابدأ جديد')),
+              FilledButton(
+                  onPressed: () => Navigator.pop(ctx, 'edit'), child: const Text('فتح للتعديل')),
+            ],
+          ),
+        ),
+      );
+      if (c == null || !mounted) return;
+      if (c == 'new') {
+        await Store.discardSentReceipts();
+        await _reload();
+      }
+    }
+    if (!mounted) return;
+    await _open(ReceiptsScreen(session: widget.session));
   }
 
   Future<void> _sendBatch() async {
@@ -3757,15 +3911,15 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         Row(children: [
           Expanded(
               child: _big(Icons.receipt_long_rounded, 'الباتش',
-                  () => _open(BatchScreen(session: s, fresh: true)))),
+                  _newBatch)),
           const SizedBox(width: 12),
           Expanded(
               child: _big(
-                  Icons.payments_rounded, 'إيصالات الدفع', () => _open(ReceiptsScreen(session: s)))),
+                  Icons.payments_rounded, 'إيصالات الدفع', _openReceipts)),
         ]),
         if (draft.isNotEmpty || pf != null || bi != null) ...[
           const SizedBox(height: 24),
-          const Text('ملفاتي (لسه متبعتتش)',
+          const Text('ملفاتي',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           if (bi != null)
@@ -3778,7 +3932,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                       width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
                 ),
                 title: Text('الباتش - ${s.batchName}.jpg'),
-                subtitle: const Text('اضغط للمعاينة'),
+                subtitle: Text(batchSentAt == null
+                    ? 'اضغط للمعاينة'
+                    : 'اتبعت ✓ - اضغط للتعديل - يتمسح بعد ${_leftText(batchSentAt!)}'),
                 onTap: () => _open(BatchScreen(session: s)),
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -3802,8 +3958,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                       width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
                 ),
                 title: Text('إيصالات الدفع (${draft.length} صورة)'),
-                subtitle: const Text('اضغط للمعاينة أو لتكمل التصوير'),
-                onTap: () => _open(ReceiptsScreen(session: s)),
+                subtitle: Text(receiptsSentAt == null
+                    ? 'اضغط للمعاينة أو لتكمل التصوير'
+                    : 'اتبعت ✓ - اضغط للتعديل - يتمسح بعد ${_leftText(receiptsSentAt!)}'),
+                onTap: _openReceipts,
                 trailing: IconButton(
                     tooltip: 'مسح',
                     icon: const Icon(Icons.delete_rounded, color: Colors.red),
@@ -3817,8 +3975,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 leading: const Icon(Icons.picture_as_pdf_rounded, size: 36, color: Colors.red),
                 title: Text(pf.file.path.split('/').last,
                     maxLines: 2, overflow: TextOverflow.ellipsis),
-                subtitle: Text(
-                    'اضغط لفتحه - يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
+                subtitle: Text(receiptsSentAt != null
+                    ? 'اتبعت ✓ - اضغط لفتحه - يتمسح بعد ${_leftText(receiptsSentAt!)}'
+                    : 'اضغط لفتحه - يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
                 onTap: _openPdf,
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -3901,7 +4060,7 @@ class _BatchScreenState extends State<BatchScreen> {
         final path = await persistImage(
             lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
             filter: ScanFilter.receipt);
-        await Store.setBatchImg(path);
+        await Store.setBatchImg(path, fresh: true);
         await _show(path);
         _lastScanManual = true;
         if (mounted && img != null) await _edit(tab: 2);
@@ -3966,7 +4125,7 @@ class _BatchScreenState extends State<BatchScreen> {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
           filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
+      await Store.setBatchImg(path, fresh: true);
       await _show(path);
       unawaited(qualityWarning(path).then((warn) {
         if (warn != null && mounted) snack(context, warn);
@@ -3987,7 +4146,7 @@ class _BatchScreenState extends State<BatchScreen> {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
           filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
+      await Store.setBatchImg(path, fresh: true);
       return path;
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
@@ -4145,7 +4304,7 @@ class _BatchScreenState extends State<BatchScreen> {
       final path = await persistImage(
           x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
           filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
+      await Store.setBatchImg(path, fresh: true);
       await _show(path);
       final warn = await qualityWarning(path);
       if (warn != null && mounted) snack(context, warn);
