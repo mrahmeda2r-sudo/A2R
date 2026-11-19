@@ -7,1046 +7,187 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - name: Create pubspec.yaml and place main.dart in lib/
-        run: |
-          mkdir -p lib && cp main.dart lib/main.dart
-          cat > pubspec.yaml <<'YAML'
-          name: a2r_academy_sender
-          description: A2R Academy Sender
-          publish_to: none
-          version: 1.0.0+1
-          environment:
-            sdk: ">=3.0.0 <4.0.0"
-          dependencies:
-            flutter:
-              sdk: flutter
-            flutter_localizations:
-              sdk: flutter
-            path: ^1.9.0
-            path_provider: ^2.1.3
-            file_picker: ^8.0.7
-            excel: 4.0.3
-            archive: ^3.6.1
-            image_picker: ^1.1.2
-          dependency_overrides:
-            archive: ^3.6.1
-            flutter_plugin_android_lifecycle: 2.0.24
-          flutter:
-            uses-material-design: true
-          YAML
+      - uses: actions/checkout@v5
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
+
       - uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.50.0'
           channel: stable
           cache: true
 
-      - name: Generate android + native WhatsApp Business share + floating bubble service
+      - name: Generate android platform
+        run: flutter create --platforms=android --project-name a2r --org com.a2r .
+
+      - name: Add packages (pinned)
         run: |
-          flutter create --platforms=android --org com.a2r --project-name a2r_academy_sender /tmp/gen
-          cp -r /tmp/gen/android android
-          D=android/app/src/main/kotlin/com/a2r/a2r_academy_sender
-          mkdir -p $D android/app/src/main/res/xml
-          rm -f $D/*
-          cat > $D/MainActivity.kt <<'KT'
-          package com.a2r.a2r_academy_sender
+          flutter pub add google_mlkit_document_scanner:0.4.1 google_mlkit_text_recognition:^0.15.0 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 camera:^0.11.0
+          flutter pub add flutter_localizations --sdk=flutter
+          # path_provider_android 2.3.x بيستخدم JNI وبيسبب ClassNotFoundException على بعض الأجهزة: نثبّت آخر نسخة من غير JNI
+          flutter pub add "override:path_provider_android:2.2.23"
+          echo "--- JNI deps (لازم تكون فاضية أو معروفة) ---"
+          flutter pub deps --style=compact | grep -i "jni" || echo "no jni"
 
-          import android.content.ActivityNotFoundException
-          import android.Manifest
-          import android.content.ComponentName
-          import android.content.pm.PackageManager
-          import android.os.Environment
-          import android.content.Intent
-          import android.net.Uri
-          import android.os.Build
-          import android.provider.Settings
-          import io.flutter.embedding.android.FlutterActivity
-          import io.flutter.embedding.engine.FlutterEngine
-          import io.flutter.plugin.common.MethodChannel
-
-          class MainActivity : FlutterActivity() {
-
-              private fun a11yEnabled(): Boolean {
-                  val s = Settings.Secure.getString(
-                      contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-                  ) ?: return false
-                  val me = ComponentName(this, BubbleService::class.java)
-                  for (x in s.split(':')) {
-                      val c = ComponentName.unflattenFromString(x)
-                      if (c != null && c == me) return true
-                  }
-                  return false
-              }
-
-              private fun canOverlay(): Boolean =
-                  if (Build.VERSION.SDK_INT >= 23) Settings.canDrawOverlays(this) else true
-
-          /** هل صلاحية الملفات ممنوحة؟ أندرويد 11+ = الوصول لكل الملفات، أندرويد 10 = صلاحية التخزين العادية. */
-          private fun storageOk(): Boolean {
-              if (Build.VERSION.SDK_INT >= 30) return Environment.isExternalStorageManager()
-              return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
-                  checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-          }
-
-          private fun reqStorage() {
-              if (Build.VERSION.SDK_INT >= 30) {
-                  try {
-                      startActivity(
-                          Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))
-                      )
-                  } catch (e: Exception) {
-                      startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                  }
-              } else {
-                  requestPermissions(
-                      arrayOf(
-                          Manifest.permission.READ_EXTERNAL_STORAGE,
-                          Manifest.permission.WRITE_EXTERNAL_STORAGE
-                      ),
-                      701
-                  )
-              }
-          }
-
-              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-                  super.configureFlutterEngine(flutterEngine)
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/share")
-                      .setMethodCallHandler { call, result ->
-                          try {
-                              when (call.method) {
-                                  "share" -> {
-                                      val text = call.argument<String>("text") ?: ""
-                                      val paths = call.argument<List<String>>("paths") ?: emptyList()
-                                      ShareUtil.send(this, text, paths, false)
-                                      result.success(true)
-                                  }
-                                  "permStatus" -> {
-                                      result.success(
-                                          mapOf(
-                                              "sdk" to Build.VERSION.SDK_INT,
-                                              "storage" to storageOk(),
-                                              "a11y" to a11yEnabled(),
-                                              "overlay" to canOverlay()
-                                          )
-                                      )
-                                  }
-                                  "reqStorage" -> {
-                                      reqStorage()
-                                      result.success(true)
-                                  }
-                                  "svcStatus" -> {
-                                      result.success(
-                                          mapOf(
-                                              "a11y" to a11yEnabled(),
-                                              "live" to (BubbleService.inst != null),
-                                              "overlay" to canOverlay()
-                                          )
-                                      )
-                                  }
-                                  "openA11y" -> {
-                                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                                      result.success(true)
-                                  }
-                                  "openAppInfo" -> {
-                                      startActivity(
-                                          Intent(
-                                              Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                              Uri.parse("package:$packageName")
-                                          )
-                                      )
-                                      result.success(true)
-                                  }
-                                  "openOverlay" -> {
-                                      startActivity(
-                                          Intent(
-                                              Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                              Uri.parse("package:$packageName")
-                                          )
-                                      )
-                                      result.success(true)
-                                  }
-                                  "start" -> {
-                                      val svc = BubbleService.inst
-                                      if (svc == null) {
-                                          result.error("NO_A11Y", "خدمة الفقاعة غير مفعّلة", null)
-                                      } else {
-                                          svc.startSession(
-                                              call.argument<String>("session") ?: "",
-                                              call.argument<Int>("at") ?: -1
-                                          )
-                                          result.success(true)
-                                      }
-                                  }
-                                  "state" -> result.success(BubbleService.stateOf(this))
-                                  "clear" -> {
-                                      BubbleService.clearState(this)
-                                      result.success(true)
-                                  }
-                                  "stop" -> {
-                                      BubbleService.inst?.stopSession()
-                                      result.success(true)
-                                  }
-                                  "setStatus" -> {
-                                      BubbleService.inst?.setStatus(
-                                          call.argument<Int>("i") ?: -1,
-                                          call.argument<Int>("s") ?: 0
-                                      )
-                                      result.success(true)
-                                  }
-                                  else -> result.notImplemented()
-                              }
-                          } catch (e: ActivityNotFoundException) {
-                              result.error("NO_WA_BUSINESS", "WhatsApp Business غير مثبت", null)
-                          } catch (e: Exception) {
-                              result.error("SHARE_FAILED", e.message, null)
-                          }
-                      }
-              }
-          }
-          KT
-          cat > $D/Sess.kt <<'KT'
-          package com.a2r.a2r_academy_sender
-
-          import org.json.JSONArray
-          import org.json.JSONObject
-
-          /** عنصر في الجلسة: st = 0 معلّق، 1 تم، 2 تخطي. launch = يفتح واتساب بالرسالة عند الوصول له. */
-          class SItem(val title: String, val key: String, val launch: Boolean, var st: Int)
-
-          class Sess(
-              val id: String,
-              val text: String,
-              val media: List<String>,
-              val items: List<SItem>,
-              var idx: Int,
-              var active: Boolean
-          ) {
-              fun toJson(): String {
-                  val o = JSONObject()
-                  o.put("id", id)
-                  o.put("text", text)
-                  o.put("media", JSONArray(media))
-                  val a = JSONArray()
-                  for (x in items) {
-                      val j = JSONObject()
-                      j.put("t", x.title)
-                      j.put("k", x.key)
-                      j.put("l", x.launch)
-                      j.put("s", x.st)
-                      a.put(j)
-                  }
-                  o.put("items", a)
-                  o.put("idx", idx)
-                  o.put("active", active)
-                  return o.toString()
-              }
-
-              /** ما يحتاجه Flutter فقط: الحالات والمؤشر وهل الجلسة شغالة. */
-              fun stateJson(): String {
-                  val o = JSONObject()
-                  o.put("id", id)
-                  o.put("active", active)
-                  o.put("idx", idx)
-                  val a = JSONArray()
-                  for (x in items) a.put(x.st)
-                  o.put("st", a)
-                  return o.toString()
-              }
-
-              companion object {
-                  fun parse(s: String): Sess {
-                      val o = JSONObject(s)
-                      val media = ArrayList<String>()
-                      val m = o.optJSONArray("media")
-                      if (m != null) {
-                          for (i in 0 until m.length()) media.add(m.getString(i))
-                      }
-                      val items = ArrayList<SItem>()
-                      val a = o.getJSONArray("items")
-                      for (i in 0 until a.length()) {
-                          val j = a.getJSONObject(i)
-                          items.add(
-                              SItem(
-                                  j.optString("t", ""),
-                                  j.optString("k", ""),
-                                  j.optBoolean("l", true),
-                                  j.optInt("s", 0)
-                              )
-                          )
-                      }
-                      return Sess(
-                          o.optString("id", "job"),
-                          o.optString("text", ""),
-                          media,
-                          items,
-                          o.optInt("idx", -1),
-                          o.optBoolean("active", true)
-                      )
-                  }
-              }
-          }
-          KT
-          cat > $D/ShareUtil.kt <<'KT'
-          package com.a2r.a2r_academy_sender
-
-          import android.content.Context
-          import android.content.Intent
-          import android.net.Uri
-          import androidx.core.content.FileProvider
-          import java.io.File
-
-          object ShareUtil {
-              const val BUSINESS = "com.whatsapp.w4b"
-
-              private fun mimeOf(path: String): String {
-                  val p = path.lowercase()
-                  return when {
-                      p.endsWith(".webp") -> "image/webp"
-                      p.endsWith(".png") -> "image/png"
-                      p.endsWith(".gif") -> "image/gif"
-                      else -> "image/jpeg"
-                  }
-              }
-
-              /** يفتح شاشة المشاركة في واتساب بيزنس. newTask = true عند الاستدعاء من خدمة (وليس من Activity). */
-              fun send(ctx: Context, text: String, paths: List<String>, newTask: Boolean) {
-                  val uris = ArrayList<Uri>()
-                  for (p in paths) {
-                      uris.add(FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", File(p)))
-                  }
-                  val intent = Intent()
-                  intent.setPackage(BUSINESS)
-                  when {
-                      uris.isEmpty() -> {
-                          intent.action = Intent.ACTION_SEND
-                          intent.type = "text/plain"
-                          intent.putExtra(Intent.EXTRA_TEXT, text)
-                      }
-                      uris.size == 1 -> {
-                          intent.action = Intent.ACTION_SEND
-                          intent.type = mimeOf(paths[0])
-                          intent.putExtra(Intent.EXTRA_STREAM, uris[0])
-                          if (text.isNotEmpty()) intent.putExtra(Intent.EXTRA_TEXT, text)
-                      }
-                      else -> {
-                          intent.action = Intent.ACTION_SEND_MULTIPLE
-                          intent.type = "image/*"
-                          intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-                          if (text.isNotEmpty()) intent.putExtra(Intent.EXTRA_TEXT, text)
-                      }
-                  }
-                  intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                  if (newTask) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                  for (u in uris) ctx.grantUriPermission(BUSINESS, u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                  ctx.startActivity(intent)
-              }
-          }
-          KT
-          cat > $D/BubbleService.kt <<'KT'
-          package com.a2r.a2r_academy_sender
-
-          import android.accessibilityservice.AccessibilityService
-          import android.content.ActivityNotFoundException
-          import android.content.ClipData
-          import android.content.ClipboardManager
-          import android.content.Context
-          import android.content.Intent
-          import android.graphics.Color
-          import android.graphics.PixelFormat
-          import android.graphics.Typeface
-          import android.graphics.drawable.GradientDrawable
-          import android.os.Build
-          import android.os.Bundle
-          import android.os.Handler
-          import android.os.Looper
-          import android.text.TextUtils
-          import android.view.Gravity
-          import android.view.MotionEvent
-          import android.view.View
-          import android.view.ViewConfiguration
-          import android.view.WindowManager
-          import android.view.accessibility.AccessibilityEvent
-          import android.view.accessibility.AccessibilityNodeInfo
-          import android.widget.FrameLayout
-          import android.widget.LinearLayout
-          import android.widget.TextView
-
-          /**
-           * خدمة إمكانية الوصول (مقصورة على واتساب بيزنس) + الفقاعة العائمة.
-           * الفقاعة نافذة TYPE_ACCESSIBILITY_OVERLAY فلا تحتاج صلاحية "العرض فوق التطبيقات".
-           * الخدمة تكتب كلمة البحث في خانة بحث واتساب فقط؛ لا تضغط على الجروب ولا على إرسال.
-           */
-          class BubbleService : AccessibilityService() {
-
-              companion object {
-                  @Volatile
-                  var inst: BubbleService? = null
-                  const val WA = "com.whatsapp.w4b"
-                  const val PREFS = "a2r_bubble"
-
-                  fun stateOf(ctx: Context): String? {
-                      val s = inst?.sess
-                      if (s != null) return s.stateJson()
-                      val saved = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                          .getString("sess", null) ?: return null
-                      return try {
-                          val p = Sess.parse(saved)
-                          p.active = false
-                          p.stateJson()
-                      } catch (e: Exception) {
-                          null
-                      }
-                  }
-
-                  fun clearState(ctx: Context) {
-                      val svc = inst
-                      if (svc != null && svc.sess?.active != true) svc.sess = null
-                      ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove("sess").apply()
-                  }
-              }
-
-              private val h = Handler(Looper.getMainLooper())
-              private var wm: WindowManager? = null
-              internal var sess: Sess? = null
-
-              private var bubble: LinearLayout? = null
-              private var bubbleLp: WindowManager.LayoutParams? = null
-              private var tv1: TextView? = null
-              private var tv2: TextView? = null
-              private var scrim: View? = null
-
-              private var token = 0
-              private var noteText: String? = null
-              private var lastAct = 0L
-
-              // سحب الفقاعة
-              private var downX = 0f
-              private var downY = 0f
-              private var startX = 0
-              private var startY = 0
-              private var moved = false
-              private var longFired = false
-              private val longRun = Runnable {
-                  longFired = true
-                  showPanel()
-              }
-
-              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
-              // ---------------------------------------------------------------- دورة حياة الخدمة
-
-              override fun onServiceConnected() {
-                  super.onServiceConnected()
-                  inst = this
-                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-              }
-
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-
-              override fun onInterrupt() {}
-
-              override fun onUnbind(intent: Intent?): Boolean {
-                  hideAll()
-                  inst = null
-                  return super.onUnbind(intent)
-              }
-
-              override fun onDestroy() {
-                  hideAll()
-                  inst = null
-                  super.onDestroy()
-              }
-
-              // ---------------------------------------------------------------- الجلسة
-
-              private fun save() {
-                  val s = sess ?: return
-                  getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("sess", s.toJson()).apply()
-              }
-
-              /** يبدأ الجلسة ويفتح العنصر at (أو أول معلّق) فوراً. */
-              fun startSession(json: String, at: Int) {
-                  val s = Sess.parse(json)
-                  s.active = true
-                  sess = s
-                  var i = at
-                  if (i < 0 || i >= s.items.size) i = s.items.indexOfFirst { x -> x.st == 0 }
-                  s.idx = i
-                  noteText = null
-                  save()
-                  showBubble()
-                  if (i >= 0) openCurrent(true) else render()
-              }
-
-              fun stopSession() {
-                  val s = sess
-                  if (s != null) {
-                      s.active = false
-                      save()
-                  }
-                  hideAll()
-              }
-
-              fun setStatus(i: Int, st: Int) {
-                  val s = sess ?: return
-                  val x = s.items.getOrNull(i) ?: return
-                  x.st = st
-                  save()
-                  render()
-              }
-
-              /** ضغطة الفقاعة: يعلّم الحالي (تم/تخطي) ثم ينتقل لأول معلّق. */
-              private fun advance(st: Int) {
-                  val s = sess ?: return
-                  val cur = s.items.getOrNull(s.idx)
-                  if (cur != null && cur.st == 0) cur.st = st
-                  s.idx = s.items.indexOfFirst { x -> x.st == 0 }
-                  noteText = null
-                  save()
-                  if (s.idx < 0) {
-                      render()
-                  } else {
-                      openCurrent(false)
-                  }
-              }
-
-              /** يفتح واتساب بالرسالة (لو العنصر أول دفعة أو force) ثم يكتب كلمة البحث. */
-              private fun openCurrent(force: Boolean) {
-                  val s = sess ?: return
-                  val item = s.items.getOrNull(s.idx)
-                  if (item == null) {
-                      render()
-                      return
-                  }
-                  noteText = null
-                  render()
-                  token++
-                  val my = token
-                  var delay = 0L
-                  if (item.launch || force) {
-                      try {
-                          ShareUtil.send(this, s.text, s.media, true)
-                          delay = 1300L
-                      } catch (e: ActivityNotFoundException) {
-                          note("واتساب بيزنس غير مثبت")
-                          return
-                      } catch (e: Exception) {
-                          note("تعذر فتح واتساب")
-                          return
-                      }
-                  }
-                  h.postDelayed({ fill(item.key, my, 0, false) }, delay)
-              }
-
-              /** إعادة كتابة كلمة البحث بدون إعادة فتح واتساب. */
-              private fun retype() {
-                  val s = sess ?: return
-                  val item = s.items.getOrNull(s.idx) ?: return
-                  token++
-                  val my = token
-                  fill(item.key, my, 0, false)
-              }
-
-              // ---------------------------------------------------------------- الكتابة في بحث واتساب
-
-              private fun fill(key: String, my: Int, attempt: Int, clickedSearch: Boolean) {
-                  if (my != token) return
-                  if (attempt > 26) {
-                      copyClip(key)
-                      note("لم أجد البحث — الكلمة منسوخة، الصقيها")
-                      return
-                  }
-                  var clicked = clickedSearch
-                  val root = rootInActiveWindow
-                  if (root != null && root.packageName?.toString() == WA) {
-                      val f = findField(root, attempt >= 10)
-                      if (f != null) {
-                          val args = Bundle()
-                          args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, key)
-                          f.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                          if (f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
-                              note("✓ كُتب في البحث")
-                              return
-                          }
-                      } else if (!clicked || attempt % 6 == 5) {
-                          val b = findSearchButton(root)
-                          if (b != null && clickNode(b)) clicked = true
-                      }
-                  }
-                  h.postDelayed({ fill(key, my, attempt + 1, clicked) }, 350)
-              }
-
-              private fun findField(root: AccessibilityNodeInfo, allowAny: Boolean): AccessibilityNodeInfo? {
-                  var best: AccessibilityNodeInfo? = null
-                  var any: AccessibilityNodeInfo? = null
-                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
-                      if (n == null || depth > 40) return
-                      if (n.className?.toString() == "android.widget.EditText" && n.isVisibleToUser) {
-                          val id = n.viewIdResourceName ?: ""
-                          val hint = if (Build.VERSION.SDK_INT >= 26) (n.hintText?.toString() ?: "") else ""
-                          val desc = hint + " " + (n.contentDescription?.toString() ?: "")
-                          if (id.contains("search", true) || desc.contains("بحث") || desc.contains("search", true)) {
-                              if (best == null) best = n
-                          }
-                          if (any == null) any = n
-                      }
-                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
-                  }
-                  walk(root, 0)
-                  return best ?: (if (allowAny) any else null)
-              }
-
-              private fun findSearchButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-                  var found: AccessibilityNodeInfo? = null
-                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
-                      if (n == null || depth > 40 || found != null) return
-                      if (n.className?.toString() != "android.widget.EditText") {
-                          val id = n.viewIdResourceName ?: ""
-                          val d = n.contentDescription?.toString() ?: ""
-                          if (id.contains("search", true) || d.contains("بحث") || d.contains("search", true)) {
-                              found = n
-                              return
-                          }
-                      }
-                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
-                  }
-                  walk(root, 0)
-                  return found
-              }
-
-              private fun clickNode(n: AccessibilityNodeInfo): Boolean {
-                  var c: AccessibilityNodeInfo? = n
-                  var guard = 0
-                  while (c != null && guard < 8) {
-                      if (c.isClickable) return c.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                      c = c.parent
-                      guard++
-                  }
-                  return false
-              }
-
-              private fun copyClip(t: String) {
-                  try {
-                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                      cm.setPrimaryClip(ClipData.newPlainText("a2r", t))
-                  } catch (e: Exception) {
-                  }
-              }
-
-              // ---------------------------------------------------------------- الفقاعة
-
-              private fun note(msg: String) {
-                  noteText = msg
-                  render()
-                  h.postDelayed({
-                      if (noteText == msg) {
-                          noteText = null
-                          render()
-                      }
-                  }, 6000)
-              }
-
-              private fun render() {
-                  val a = tv1 ?: return
-                  val b = tv2 ?: return
-                  val s = sess ?: return
-                  val total = s.items.size
-                  val done = s.items.count { x -> x.st != 0 }
-                  if (s.idx < 0 || s.idx >= total) {
-                      a.text = "اكتمل ✓"
-                      b.text = "$done/$total — اضغطي للإغلاق"
-                  } else {
-                      a.text = "${s.idx + 1}/$total  ◀ التالي"
-                      b.text = noteText ?: s.items[s.idx].key
-                  }
-              }
-
-              private fun prefs() = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-
-              private fun showBubble() {
-                  if (bubble != null) {
-                      render()
-                      return
-                  }
-                  val w = wm ?: return
-                  val root = LinearLayout(this)
-                  root.orientation = LinearLayout.VERTICAL
-                  root.gravity = Gravity.CENTER
-                  root.setPadding(dp(14), dp(8), dp(14), dp(8))
-                  val bg = GradientDrawable()
-                  bg.setColor(Color.parseColor("#F01B7F5C"))
-                  bg.cornerRadius = dp(26).toFloat()
-                  root.background = bg
-
-                  val a = TextView(this)
-                  a.setTextColor(Color.WHITE)
-                  a.textSize = 15f
-                  a.typeface = Typeface.DEFAULT_BOLD
-                  a.gravity = Gravity.CENTER
-                  val b = TextView(this)
-                  b.setTextColor(Color.parseColor("#E6FFFFFF"))
-                  b.textSize = 11f
-                  b.maxLines = 1
-                  b.ellipsize = TextUtils.TruncateAt.END
-                  b.maxWidth = dp(170)
-                  b.gravity = Gravity.CENTER
-                  root.addView(a)
-                  root.addView(b)
-                  tv1 = a
-                  tv2 = b
-
-                  val lp = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.WRAP_CONTENT,
-                      WindowManager.LayoutParams.WRAP_CONTENT,
-                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                      PixelFormat.TRANSLUCENT
-                  )
-                  lp.gravity = Gravity.TOP or Gravity.LEFT
-                  val dm = resources.displayMetrics
-                  lp.x = prefs().getInt("bx", (dm.widthPixels * 0.55f).toInt())
-                  lp.y = prefs().getInt("by", (dm.heightPixels * 0.30f).toInt())
-                  root.setOnTouchListener { v, e -> onTouch(v, e) }
-                  try {
-                      w.addView(root, lp)
-                  } catch (e: Exception) {
-                      tv1 = null
-                      tv2 = null
-                      return
-                  }
-                  bubble = root
-                  bubbleLp = lp
-                  render()
-              }
-
-              private fun onTouch(v: View, e: MotionEvent): Boolean {
-                  val lp = bubbleLp ?: return false
-                  val dm = resources.displayMetrics
-                  when (e.action) {
-                      MotionEvent.ACTION_DOWN -> {
-                          startX = lp.x
-                          startY = lp.y
-                          downX = e.rawX
-                          downY = e.rawY
-                          moved = false
-                          longFired = false
-                          h.postDelayed(longRun, 550)
-                          return true
-                      }
-                      MotionEvent.ACTION_MOVE -> {
-                          val dx = e.rawX - downX
-                          val dy = e.rawY - downY
-                          val slop = ViewConfiguration.get(this).scaledTouchSlop
-                          if (!moved && (Math.abs(dx) > slop || Math.abs(dy) > slop)) {
-                              moved = true
-                              h.removeCallbacks(longRun)
-                          }
-                          if (moved) {
-                              val maxX = (dm.widthPixels - v.width).coerceAtLeast(0)
-                              val maxY = (dm.heightPixels - v.height).coerceAtLeast(0)
-                              lp.x = (startX + dx.toInt()).coerceIn(0, maxX)
-                              lp.y = (startY + dy.toInt()).coerceIn(0, maxY)
-                              try {
-                                  wm?.updateViewLayout(v, lp)
-                              } catch (ex: Exception) {
-                              }
-                          }
-                          return true
-                      }
-                      MotionEvent.ACTION_UP -> {
-                          h.removeCallbacks(longRun)
-                          if (moved) {
-                              prefs().edit().putInt("bx", lp.x).putInt("by", lp.y).apply()
-                          } else if (!longFired) {
-                              onTap()
-                          }
-                          return true
-                      }
-                      MotionEvent.ACTION_CANCEL -> {
-                          h.removeCallbacks(longRun)
-                          return true
-                      }
-                  }
-                  return false
-              }
-
-              private fun onTap() {
-                  val s = sess ?: return
-                  val now = System.currentTimeMillis()
-                  if (now - lastAct < 900) return
-                  lastAct = now
-                  if (s.idx < 0 || s.idx >= s.items.size) {
-                      stopSession()
-                      return
-                  }
-                  advance(1)
-              }
-
-              // ---------------------------------------------------------------- لوحة الخيارات (ضغطة مطوّلة)
-
-              private fun btn(label: String, onClick: () -> Unit): TextView {
-                  val t = TextView(this)
-                  t.text = label
-                  t.textSize = 15f
-                  t.setTextColor(Color.parseColor("#0F4D38"))
-                  t.gravity = Gravity.CENTER
-                  t.setPadding(dp(12), dp(12), dp(12), dp(12))
-                  val bg = GradientDrawable()
-                  bg.setColor(Color.parseColor("#E3F3EB"))
-                  bg.cornerRadius = dp(12).toFloat()
-                  t.background = bg
-                  val lp = LinearLayout.LayoutParams(
-                      LinearLayout.LayoutParams.MATCH_PARENT,
-                      LinearLayout.LayoutParams.WRAP_CONTENT
-                  )
-                  lp.topMargin = dp(8)
-                  t.layoutParams = lp
-                  t.setOnClickListener { onClick() }
-                  return t
-              }
-
-              private fun showPanel() {
-                  if (scrim != null) return
-                  val w = wm ?: return
-                  val s = sess ?: return
-                  val frame = FrameLayout(this)
-                  frame.setBackgroundColor(Color.parseColor("#88000000"))
-                  frame.setOnClickListener { hidePanel() }
-
-                  val card = LinearLayout(this)
-                  card.orientation = LinearLayout.VERTICAL
-                  card.setPadding(dp(16), dp(16), dp(16), dp(16))
-                  val bg = GradientDrawable()
-                  bg.setColor(Color.WHITE)
-                  bg.cornerRadius = dp(18).toFloat()
-                  card.background = bg
-                  card.setOnClickListener { }
-
-                  val cur = s.items.getOrNull(s.idx)
-                  val title = TextView(this)
-                  title.text = if (cur != null) cur.title else "اكتملت القائمة"
-                  title.textSize = 17f
-                  title.setTextColor(Color.BLACK)
-                  title.typeface = Typeface.DEFAULT_BOLD
-                  title.gravity = Gravity.CENTER
-                  card.addView(title)
-                  if (cur != null) {
-                      val sub = TextView(this)
-                      sub.text = "كلمة البحث: " + cur.key
-                      sub.textSize = 13f
-                      sub.setTextColor(Color.DKGRAY)
-                      sub.gravity = Gravity.CENTER
-                      card.addView(sub)
-                  }
-                  card.addView(btn("تخطي هذا الجروب") {
-                      hidePanel()
-                      advance(2)
-                  })
-                  card.addView(btn("إعادة كتابة البحث") {
-                      hidePanel()
-                      retype()
-                  })
-                  card.addView(btn("إعادة فتح واتساب بالرسالة") {
-                      hidePanel()
-                      openCurrent(true)
-                  })
-                  card.addView(btn("إغلاق الفقاعة") {
-                      hidePanel()
-                      stopSession()
-                  })
-                  frame.addView(card, FrameLayout.LayoutParams(dp(300), FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-
-                  val lp = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.MATCH_PARENT,
-                      WindowManager.LayoutParams.MATCH_PARENT,
-                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                      PixelFormat.TRANSLUCENT
-                  )
-                  try {
-                      w.addView(frame, lp)
-                      scrim = frame
-                  } catch (e: Exception) {
-                  }
-              }
-
-              private fun hidePanel() {
-                  val v = scrim ?: return
-                  try {
-                      wm?.removeView(v)
-                  } catch (e: Exception) {
-                  }
-                  scrim = null
-              }
-
-              private fun hideAll() {
-                  h.removeCallbacksAndMessages(null)
-                  token++
-                  hidePanel()
-                  val b = bubble
-                  if (b != null) {
-                      try {
-                          wm?.removeView(b)
-                      } catch (e: Exception) {
-                      }
-                  }
-                  bubble = null
-                  bubbleLp = null
-                  tv1 = null
-                  tv2 = null
-              }
-          }
-          KT
-          mkdir -p android/app/src/main/res/values
-          cat > android/app/src/main/res/xml/a2r_a11y.xml <<'XML'
-          <?xml version="1.0" encoding="utf-8"?>
-          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged"
-              android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagReportViewIds"
-              android:canRetrieveWindowContent="true"
-              android:notificationTimeout="100"
-              android:packageNames="com.whatsapp.w4b"
-              android:description="@string/a2r_a11y_desc" />
-          XML
-          cat > android/app/src/main/res/values/a2r_strings.xml <<'XML'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <string name="a2r_a11y_desc">يكتب كلمة البحث في واتساب بيزنس فقط ويعرض فقاعة التنقل بين الجروبات. لا يقرأ محادثاتك ولا يضغط على إرسال.</string>
-          </resources>
-          XML
-          cat > android/app/src/main/res/xml/file_paths.xml <<'XML'
-          <?xml version="1.0" encoding="utf-8"?>
-          <paths>
-              <files-path name="media" path="media/" />
-          </paths>
-          XML
+      - name: Build app data from data.xlsx
+        run: |
+          python3 -m pip install --break-system-packages openpyxl
+          mkdir -p assets
           python3 - <<'PY'
-          f = 'android/app/src/main/AndroidManifest.xml'
-          s = open(f, encoding='utf-8').read()
-          perms = (
-              '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n'
-              '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n'
-              '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n'
-              '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\n'
-              '    <queries><package android:name="com.whatsapp.w4b"/></queries>\n'
-          )
-          provider = (
-              '        <provider android:name="androidx.core.content.FileProvider"\n'
-              '            android:authorities="${applicationId}.fileprovider"\n'
-              '            android:exported="false" android:grantUriPermissions="true">\n'
-              '            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"\n'
-              '                android:resource="@xml/file_paths"/>\n'
-              '        </provider>\n'
-          )
-          s = s.replace('<application', perms + '    <application android:requestLegacyExternalStorage="true"', 1)
-          service = (
-              '        <service android:name="com.a2r.a2r_academy_sender.BubbleService"\n'
-              '            android:exported="true"\n'
-              '            android:label="A2R Sender - مساعد البحث"\n'
-              '            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">\n'
-              '            <intent-filter>\n'
-              '                <action android:name="android.accessibilityservice.AccessibilityService"/>\n'
-              '            </intent-filter>\n'
-              '            <meta-data android:name="android.accessibilityservice"\n'
-              '                android:resource="@xml/a2r_a11y"/>\n'
-              '        </service>\n'
-          )
-          s = s.replace('</application>', provider + service + '    </application>', 1)
-          s = s.replace('android:label="a2r_academy_sender"', 'android:label="A2R Sender"')
-          open(f, 'w', encoding='utf-8').write(s)
+          import json, re, sys
+          from openpyxl import load_workbook
+
+          wb = load_workbook('data.xlsx', data_only=True)
+          if len(wb.worksheets) < 2:
+              sys.exit('data.xlsx لازم يكون فيه ورقتين: الأسماء ثم الوحدات')
+
+          def txt(v):
+              if v is None:
+                  return ''
+              if isinstance(v, float) and v.is_integer():
+                  v = int(v)
+              return str(v).strip()
+
+          names = []
+          for (v,) in wb.worksheets[0].iter_rows(min_row=2, max_col=1, values_only=True):
+              if txt(v):
+                  names.append(txt(v))
+
+          units = []
+          for i, row in enumerate(wb.worksheets[1].iter_rows(min_row=2, max_col=4, values_only=True), start=2):
+              num, name, tid, bld = (txt(c) for c in row)
+              if not (num or name or tid or bld):
+                  continue
+              if not (num and name and tid):
+                  sys.exit(f'ورقة الوحدات صف {i}: الرقم أو الاسم أو TID فاضي')
+              try:
+                  n = int(float(num))
+              except ValueError:
+                  sys.exit(f'ورقة الوحدات صف {i}: الرقم "{num}" مش رقم')
+              blds = [b.strip() for b in re.split(r'[،,;|\n]', bld) if b.strip()]
+              units.append({'num': n, 'name': name, 'tid': tid, 'buildings': blds})
+
+          if not names or not units:
+              sys.exit('ورقة الأسماء أو الوحدات فاضية')
+          json.dump({'names': names, 'units': units}, open('assets/data.json', 'w', encoding='utf-8'),
+                    ensure_ascii=False, indent=1)
+          print(f'{len(names)} names, {len(units)} units')
           PY
 
-      - name: Cache Gradle (avoids re-downloading from Maven)
-        uses: actions/cache@v4
+      - name: Add logo asset (shown in the app)
+        run: |
+          mkdir -p assets
+          cp logo_splash.png assets/logo.png
+          python3 - <<'PY'
+          import re
+          p = 'pubspec.yaml'
+          s = open(p, encoding='utf-8').read()
+          s, n = re.subn(r'(?m)^flutter:[ \t]*$', 'flutter:\n  assets:\n    - assets/logo.png\n    - assets/data.json', s, count=1)
+          assert n == 1, 'flutter: section not found in pubspec.yaml'
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          sed -n '/^flutter:/,$p' pubspec.yaml
+
+      - name: Move main.dart into lib
+        run: mv -f main.dart lib/
+
+      - name: Analyze code (fail fast on errors)
+        run: flutter analyze lib --no-fatal-infos --no-fatal-warnings
+
+      - name: App label
+        run: sed -i 's/android:label="[^"]*"/android:label="A2R"/' android/app/src/main/AndroidManifest.xml
+
+      - name: Camera permission
+        run: |
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          perms = (
+              '<uses-permission android:name="android.permission.CAMERA"/>\n'
+              '    <uses-feature android:name="android.hardware.camera" android:required="false"/>\n'
+              '    '
+          )
+          intent = '<intent><action android:name="android.media.action.IMAGE_CAPTURE"/></intent>\n        '
+          if '<queries>' in s:
+              s = s.replace('<queries>', '<queries>\n        ' + intent, 1)
+          else:
+              s = s.replace('<application', '<queries>' + intent + '</queries>\n    <application', 1)
+          s = s.replace('<application', perms + '<application', 1)
+          # رامات أكبر للتطبيق: ضغط الصور الكبيرة كان بيخلّص الذاكرة ويقفل التطبيق
+          s = s.replace('<application', '<application android:largeHeap="true"', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print(s)
+          PY
+
+      - name: Support old Android (minSdk 21)
+        run: |
+          sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*.*/minSdk = 21/' android/app/build.gradle.kts
+          grep -n "minSdk" android/app/build.gradle.kts
+
+      - name: App icon and splash screen
+        run: |
+          python3 -m pip install --break-system-packages pillow
+          python3 make_icons.py
+
+      - name: Disable R8 minify (ML Kit crashes with NullPointerException when minified)
+        run: |
+          sed -i -E 's/(signingConfig = signingConfigs.getByName\("[a-z]+"\))/\1\n            isMinifyEnabled = false\n            isShrinkResources = false/' android/app/build.gradle.kts
+          sed -n '/buildTypes/,/^    }/p' android/app/build.gradle.kts
+
+      - name: Skip lint tasks (lint crashes on image_picker)
+        run: |
+          mkdir -p ~/.gradle
+          echo "allprojects { tasks.configureEach { t -> if (t.name.startsWith('lint')) { t.enabled = false } } }" > ~/.gradle/init.gradle
+          cat ~/.gradle/init.gradle
+
+      - name: Cache Gradle and NDK
+        uses: actions/cache@v5
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ github.run_number }}
+            /usr/local/lib/android/sdk/ndk
+          key: gradle-ndk-v2-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
           restore-keys: |
-            gradle-${{ runner.os }}-
+            gradle-ndk-v2-${{ runner.os }}-
 
-      - name: Disable Android lintVital tasks (lint crashes with NoSuchMethodError on JDK 17)
-        run: |
-          mkdir -p ~/.gradle/init.d
-          cat > ~/.gradle/init.d/no-lint-vital.gradle <<'EOF'
-          allprojects {
-            tasks.configureEach { t ->
-              if (t.name.startsWith('lintVital')) { t.enabled = false }
-            }
-          }
-          EOF
+      - name: Build APK
+        run: >
+          flutter build apk --release
+          --target-platform android-arm,android-arm64
+          --build-name=1.${{ github.run_number }}
+          --build-number=${{ github.run_number }}
+          --dart-define=APP_VERSION=1.${{ github.run_number }}
 
-      - run: flutter pub get
-      - name: Build APK (retries on Maven 429 / network errors)
-        run: |
-          for i in 1 2 3; do
-            if flutter build apk --release; then exit 0; fi
-            echo "Build attempt $i failed; waiting before retry..."
-            sleep $((i * 30))
-          done
-          exit 1
-      - name: Publish release with the APK
-        id: rel
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          TAG="build-${{ github.run_number }}"
-          cp build/app/outputs/flutter-apk/app-release.apk "A2R-Sender-$TAG.apk"
-          gh release create "$TAG" "A2R-Sender-$TAG.apk" \
-            --target "${{ github.sha }}" \
-            --title "A2R Sender #${{ github.run_number }}" \
-            --notes "APK build #${{ github.run_number }}"
+      - name: Rename APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk A2R.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.${{ github.run_number }}
+          name: A2R v1.${{ github.run_number }}
+          body: "Commit ${{ github.sha }}"
+          files: A2R.apk
+          fail_on_unmatched_files: true
+          make_latest: true
 
       - name: Keep only the latest 5 releases
-        if: steps.rel.outcome == 'success'
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
-          gh release list --limit 100 --json tagName,createdAt \
-            --jq 'sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
-          while read -r t; do
-            gh release delete "$t" --cleanup-tag --yes
+          gh release list --limit 200 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[5:][].tagName' |
+          while read -r tag; do
+            echo "Deleting old release $tag"
+            gh release delete "$tag" --cleanup-tag --yes
           done
-
-      - name: Delete old artifacts (free storage quota)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          gh api --paginate "repos/$GH_REPO/actions/artifacts?per_page=100" --jq '.artifacts[].id' |
-          while read -r id; do
-            gh api -X DELETE "repos/$GH_REPO/actions/artifacts/$id" || true
-          done
-
-      - name: Upload APK as artifact
-        id: art
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: A2R-Sender-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
-          retention-days: 7
-
-      - name: Verify the APK was delivered
-        if: steps.rel.outcome != 'success' && steps.art.outcome != 'success'
-        run: |
-          echo "::error::APK built but neither the Release nor the Artifact upload worked. Check Settings > Actions > General > Workflow permissions (Read and write) and the Artifacts storage quota."
-          exit 1
