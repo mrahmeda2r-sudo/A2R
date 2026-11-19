@@ -5,7 +5,6 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:camera/camera.dart' as cam;
-import 'package:document_scan/document_scan.dart' as ds;
 import 'package:flutter/foundation.dart' show compute, listEquals;
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/material.dart';
@@ -5016,52 +5015,9 @@ Future<List<Offset>?> detectDocQuad(String path) async {
 }
 
 Future<List<Offset>?> _detectDocQuadImpl(String path) async {
-  final mode = await Store.perfMode();
-  List<Offset>? native;
-  if (mode != PerfMode.lite && await _nativeDetectorAllowed()) {
-    final sp = await SharedPreferences.getInstance();
-    File? tmp;
-    try {
-      // لو التطبيق اتقفل وإحنا جوه الكشف الأصلي، العلامة دي بتفضل true وفي التشغيل الجاي بنوقفه تلقائيًا
-      await sp.setBool('det_guard', true);
-      var input = path;
-      try {
-        tmp = await _smallCopy(path);
-        if (tmp != null) input = tmp.path;
-      } catch (e, st) {
-        AppLog.e('detectDocQuad.smallCopy', e, st);
-      }
-      AppLog.i('native detect start');
-      final c = await ds.DocumentDetector()
-          .detect(ds.ScanInput.file(input))
-          .timeout(const Duration(seconds: 20));
-      AppLog.i('native detect done');
-      if (c != null) {
-        final q = [
-          for (final p in c.toList())
-            Offset(p.x.clamp(0.0, 1.0).toDouble(), p.y.clamp(0.0, 1.0).toDouble())
-        ];
-        if (q.length == 4 && _quadConvex(q)) native = q;
-      }
-    } catch (e, st) {
-      AppLog.e('detectDocQuad', e, st);
-    } finally {
-      try {
-        await sp.setBool('det_guard', false);
-        if (tmp != null && await tmp.exists()) await tmp.delete();
-      } catch (_) {}
-    }
-  }
-  final simple = await _detectDocQuadSimple(path);
-  if (native == null) return simple;
-  if (simple == null) return native;
-  // المحرك الأصلي أحياناً بيمسك جزء جوه الإيصال (منطقة الكتابة بس): لو الكشف البسيط
-  // لقى مساحة أكبر بوضوح (والأصلي جواه) نستخدم البسيط عشان القص يشمل الإيصال كامل.
-  final an = _quadArea(native), asimple = _quadArea(simple);
-  // المحرك الأصلي أحياناً بيرجّع الصورة كلها تقريباً (ورقة فاتحة على خشب فاتح): ده مش قص، نستخدم البسيط.
-  if (an > 0.9 && asimple < 0.9) return simple;
-  if (asimple < 0.97 && an < asimple * 0.85) return simple;
-  return native;
+  // تم إيقاف المحرك الأصلي (document_scan) لأنه كان بيسبب ClassNotFoundException (JNI) بعد التصوير.
+  // بنستخدم الكشف البسيط (Dart) بس.
+  return _detectDocQuadSimple(path);
 }
 
 double _quadArea(List<Offset> q) {
