@@ -18,6 +18,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
+import 'package:sensors_plus/sensors_plus.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -5152,8 +5153,56 @@ List<bool> _erode4(List<bool> m, int w, int h) {
 /// الفكرة: الورقة الفاتحة على خشب فاتح بتبقى متصلة بالخلفية من خلال فجوات رفيعة (ظل الحافة).
 /// فبنقفل ثقوب الكتابة، وبعدين بنأكّل المنطقة بدرجات مختلفة عشان الورقة تنفصل عن الخلفية،
 /// وبنختار أحسن مكوّن: مستطيلي الشكل (مليان)، مش ملزوق في الحدود، وقريب من نص الصورة.
+/// خريطة حواف (Sobel) على نسخة مغبّشة من الخصائص: الكتابة بتتمسح بالغبش وحدود الورقة بتفضل.
+/// بتساعد على فصل الورقة البيضا عن مكتب فاتح لما فرق السطوع لوحده مش كفاية.
+List<bool> _edgeMask(Uint8List feat, int w, int h) {
+  final n = w * h;
+  var a = Int32List(n);
+  for (var i = 0; i < n; i++) {
+    a[i] = feat[i];
+  }
+  for (var pass = 0; pass < 2; pass++) {
+    final b = Int32List(n);
+    for (var y = 0; y < h; y++) {
+      final y0 = y > 0 ? y - 1 : 0, y1 = y < h - 1 ? y + 1 : y;
+      for (var x = 0; x < w; x++) {
+        final x0 = x > 0 ? x - 1 : 0, x1 = x < w - 1 ? x + 1 : x;
+        b[y * w + x] = (a[y0 * w + x0] + a[y0 * w + x] + a[y0 * w + x1] +
+                a[y * w + x0] + a[y * w + x] + a[y * w + x1] +
+                a[y1 * w + x0] + a[y1 * w + x] + a[y1 * w + x1]) ~/
+            9;
+      }
+    }
+    a = b;
+  }
+  final mag = Int32List(n);
+  final hist = List<int>.filled(2048, 0);
+  var tot = 0;
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = y * w + x;
+      final gx = (a[i - w + 1] + 2 * a[i + 1] + a[i + w + 1]) - (a[i - w - 1] + 2 * a[i - 1] + a[i + w - 1]);
+      final gy = (a[i + w - 1] + 2 * a[i + w] + a[i + w + 1]) - (a[i - w - 1] + 2 * a[i - w] + a[i - w + 1]);
+      final m = gx.abs() + gy.abs();
+      mag[i] = m;
+      hist[m > 2047 ? 2047 : m]++;
+      tot++;
+    }
+  }
+  var thr = 24, acc = 0;
+  for (var t = 0; t < 2048; t++) {
+    acc += hist[t];
+    if (acc >= tot * 0.9) {
+      thr = math.max(24, t);
+      break;
+    }
+  }
+  return List<bool>.generate(n, (i) => mag[i] > thr);
+}
+
 List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
   final n = w * h;
+  final edge = _edgeMask(feat, w, h);
   final hist = List<int>.filled(256, 0);
   for (var i = 0; i < n; i++) {
     hist[feat[i]]++;
@@ -5191,8 +5240,11 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
     var closed = List<bool>.generate(n, (i) => bright ? feat[i] > thr : feat[i] <= thr);
     // قفل ثقوب الكتابة
     closed = _dilate4(_dilate4(closed, w, h), w, h);
+    // مرّتين: عادي، وبعد قطع الحواف القوية (بيفصل الورقة الفاتحة عن الخلفية الفاتحة)
+    for (final useEdge in [false, true]) {
+    final basis = useEdge ? List<bool>.generate(n, (i) => closed[i] && !edge[i]) : closed;
     for (final k in levels) {
-      var er = closed;
+      var er = basis;
       for (var i = 0; i < k + 2; i++) {
         er = _erode4(er, w, h);
       }
@@ -5244,7 +5296,7 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
         if (qaPx < 4) continue;
         final fill = math.min(1.0, tail / qaPx); // المكوّن المليان = مستطيل، الحلقة/الخطوط = قيمة صغيرة
         if (fill < 0.72) continue;
-        final d = k.toDouble();
+        final d = k.toDouble() + (useEdge ? 1.5 * sc : 0.0);
         Offset pt(int i, double ex, double ey) => Offset(
               (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
               (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
@@ -5269,12 +5321,22 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
         }
       }
     }
+    }
   }
   return bestQ;
 }
 
-/// كشف حي من إطار الكاميرا (YUV420): بيلف الإطار لوضع رأسي ويصغّره لشبكة صغيرة.
-List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
+/// ناتج استخراج الخصائص من إطار الكاميرا (شبكة صغيرة جداً، أقل من 15KB).
+class _LiveFeat {
+  final Uint8List feat;
+  final int w, h;
+  final double luma; // متوسط سطوع الإطار (لتنبيه الإضاءة الضعيفة)
+  const _LiveFeat(this.feat, this.w, this.h, this.luma);
+}
+
+/// الخطوة الخفيفة (على الـ Main Thread لأن بايتات الإطار لازم تتقرا فوراً): بتلف الإطار لوضع رأسي
+/// وتصغّره لشبكة 96 عرض. الحسابات التقيلة بتتعمل في Isolate في _liveQuadIsolate.
+_LiveFeat? _liveFeature(cam.CameraImage f, int rot) {
   if (f.planes.length < 3) return null;
   final W = f.width, H = f.height;
   final swap = rot == 90 || rot == 270;
@@ -5284,6 +5346,7 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
   final yp = f.planes[0], up = f.planes[1], vp = f.planes[2];
   final ub = up.bytesPerPixel ?? 1, vb = vp.bytesPerPixel ?? 1;
   final feat = Uint8List(gw * gh);
+  var ySum = 0;
   for (var gy = 0; gy < gh; gy++) {
     final int yu = math.min(upH - 1, math.max(0, ((gy + 0.5) * upH / gh).floor()));
     for (var gx = 0; gx < gw; gx++) {
@@ -5307,6 +5370,7 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
           sy = yu;
       }
       final y = yp.bytes[sy * yp.bytesPerRow + sx];
+      ySum += y;
       final cx = sx >> 1, cy = sy >> 1;
       final ci = cy * up.bytesPerRow + cx * ub;
       final vi = cy * vp.bytesPerRow + cx * vb;
@@ -5318,9 +5382,17 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
       feat[gy * gw + gx] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
   }
-  final q = _quadFromFeature(feat, gw, gh);
+  return _LiveFeat(feat, gw, gh, ySum / (gw * gh));
+}
+
+/// الخطوة التقيلة: بتشتغل في Isolate عن طريق compute (لازم تكون top-level).
+/// بترجّع 8 أرقام (TL,TR,BR,BL) أو null. _shapeQuad بتتنفذ في الـ Main لأنها بتقرا autoCropMode (متغير عام).
+List<double>? _liveQuadIsolate(List<Object> a) {
+  final q = _quadFromFeature(a[0] as Uint8List, a[1] as int, a[2] as int);
   if (q == null || _quadArea(q) > 0.97) return null;
-  return _shapeQuad(q, gh / gw);
+  return [
+    for (final p in q) ...[p.dx, p.dy]
+  ];
 }
 
 class _LiveQuadPainter extends CustomPainter {
@@ -6913,11 +6985,14 @@ class A2RCameraScreen extends StatefulWidget {
   final String? thumb;
   final Future<A2RCamState?> Function(String path) onShot;
   final Future<A2RCamState?> Function()? onGallery;
+  /// التصوير السريع: بيحفظ الصورة (ومعاها الحدود الحية) في الخلفية من غير ما يفتح التعديل.
+  final Future<A2RCamState?> Function(String path, List<Offset>? quad)? onQuickShot;
   const A2RCameraScreen({
     super.key,
     required this.title,
     required this.onShot,
     this.onGallery,
+    this.onQuickShot,
     this.single = false,
     this.count = 0,
     this.thumb,
@@ -6943,6 +7018,26 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   List<Offset>? _liveQuad; // التحديد التلقائي الحي فوق المعاينة
   bool _live = false, _liveBusy = false;
   int _lastLive = 0, _liveMiss = 0;
+  // التصوير السريع (Batch) + الإضاءة
+  bool _fastMode = true;
+  bool _flashFx = false; // وميض أبيض سريع كإشارة إن الصورة اتلقطت
+  double _expMin = 0, _expMax = 0, _exp = 0;
+  Future<void> _queue = Future<void>.value(); // طابور حفظ اللقطات السريعة بالترتيب
+  int _pendingN = 0;
+  bool _leaving = false;
+  bool get _fast => _fastMode && widget.onQuickShot != null && !widget.single;
+  // التصوير التلقائي عند الثبات + تنبيه الإضاءة
+  // زر الصوت للتصوير + ميزان الاستقامة
+  static const _keyCh = MethodChannel('a2r/keys');
+  StreamSubscription<AccelerometerEvent>? _accSub;
+  double _tx = 0, _ty = 0;
+  bool _flat = false, _levelOk = false;
+  bool _autoOn = false;
+  List<Offset>? _stableQ, _autoLockQ;
+  int _stableSince = 0;
+  double _autoProg = 0;
+  double _lumaAvg = 128;
+  bool _lowLight = false;
 
   static const _flashIcons = [Icons.flash_off_rounded, Icons.flash_auto_rounded, Icons.flash_on_rounded, Icons.highlight_rounded];
   static const _flashNames = ['الفلاش مقفول', 'فلاش تلقائي', 'فلاش', 'كشاف'];
@@ -6952,10 +7047,19 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     super.initState();
     _thumb = widget.thumb;
     WidgetsBinding.instance.addObserver(this);
+    _keyCh.setMethodCallHandler((call) async {
+      if (call.method == 'vol' && mounted && (ModalRoute.of(context)?.isCurrent ?? false)) {
+        unawaited(_shot());
+      }
+    });
+    unawaited(_setKeys(true));
+    _listenTilt();
     SharedPreferences.getInstance().then((p) {
       _hd = p.getBool('camHd') ?? true;
       _flash = p.getInt('camFlash') ?? 0;
       _grid = p.getBool('camGrid') ?? false;
+      _fastMode = p.getBool('camFast') ?? true;
+      _autoOn = p.getBool('camAuto') ?? false;
       _start();
     }).catchError((Object e, StackTrace st) {
       AppLog.e('cam.prefs', e, st);
@@ -6966,8 +7070,40 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _accSub?.cancel();
+    _keyCh.setMethodCallHandler(null);
+    unawaited(_setKeys(false));
     _c?.dispose();
     super.dispose();
+  }
+
+  /// بيفعّل/يقفل التقاط زر الصوت (كود Android الأصلي في MainActivity). على أي منصة تانية بيتجاهل الخطأ.
+  Future<void> _setKeys(bool on) async {
+    try {
+      await _keyCh.invokeMethod<void>('enable', on);
+    } catch (_) {}
+  }
+
+  /// ميزان استقامة: النقطة بتتحرك ناحية الجنب الأعلى وبتبقى خضرا لما الموبايل موازي للمكتب (أقل من 3 درجات).
+  void _listenTilt() {
+    try {
+      _accSub = accelerometerEventStream(samplingPeriod: SensorInterval.uiInterval).listen((e) {
+        final flat = e.z > 8.9; // الموبايل شبه أفقي (أقل من حوالي 25 درجة)
+        final tx = (e.x / 3.0).clamp(-1.0, 1.0).toDouble();
+        final ty = (-e.y / 3.0).clamp(-1.0, 1.0).toDouble();
+        final tilt = math.atan2(math.sqrt(e.x * e.x + e.y * e.y), e.z) * 180 / math.pi;
+        final ok = flat && tilt < 3.0;
+        if (!mounted) return;
+        if (flat != _flat || ok != _levelOk || (tx - _tx).abs() > 0.04 || (ty - _ty).abs() > 0.04) {
+          setState(() {
+            _flat = flat;
+            _levelOk = ok;
+            _tx = tx;
+            _ty = ty;
+          });
+        }
+      }, onError: (Object _) {});
+    } catch (_) {}
   }
 
   @override
@@ -7040,6 +7176,14 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _minZoom = await c.getMinZoomLevel();
       _maxZoom = math.min(await c.getMaxZoomLevel(), 6.0);
       _zoom = _minZoom;
+      try {
+        _expMin = await c.getMinExposureOffset();
+        _expMax = await c.getMaxExposureOffset();
+      } catch (_) {
+        _expMin = 0;
+        _expMax = 0;
+      }
+      _exp = 0;
       if (!mounted) {
         await c.dispose();
         return;
@@ -7063,6 +7207,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     try {
       if (await Store.perfMode() == PerfMode.lite) return;
       _liveMiss = 0;
+      _resetAuto();
       await c.startImageStream(_onFrame);
       _live = true;
     } catch (e, st) {
@@ -7074,6 +7219,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     final c = _c;
     _live = false;
     _liveQuad = null;
+    _resetAuto();
     if (c == null) return;
     try {
       if (c.value.isStreamingImages) await c.stopImageStream();
@@ -7085,8 +7231,31 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     if (!_live || _liveBusy || now - _lastLive < 200 || !mounted) return;
     _liveBusy = true;
     _lastLive = now;
+    _LiveFeat? ft;
     try {
-      var q = _liveDetect(f, _c?.description.sensorOrientation ?? 90);
+      ft = _liveFeature(f, _c?.description.sensorOrientation ?? 90); // خفيفة: لازم تتنفذ هنا قبل ما الإطار يتعاد استخدامه
+    } catch (e, st) {
+      AppLog.e('cam.liveFeat', e, st);
+    }
+    if (ft == null) {
+      _liveBusy = false;
+      return;
+    }
+    unawaited(_liveCompute(ft));
+  }
+
+  /// الكشف التقيل في Isolate منفصل: المعاينة والواجهة مبتتقطعش.
+  Future<void> _liveCompute(_LiveFeat ft) async {
+    try {
+      final raw = await compute<List<Object>, List<double>?>(
+          _liveQuadIsolate, <Object>[ft.feat, ft.w, ft.h]);
+      if (!mounted || !_live) return;
+      // تنبيه الإضاءة الضعيفة (متوسط متحرك عشان ميومضش)
+      _lumaAvg = _lumaAvg * 0.6 + ft.luma * 0.4;
+      final low = _lumaAvg < 55;
+      var q = raw == null
+          ? null
+          : _shapeQuad([for (var i = 0; i < 8; i += 2) Offset(raw[i], raw[i + 1])], ft.h / ft.w);
       final prev = _liveQuad;
       if (q == null) {
         if (++_liveMiss <= 3) return; // نثبّت آخر تحديد شوية بدل ما يومض
@@ -7096,12 +7265,82 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
           q = [for (var i = 0; i < 4; i++) Offset.lerp(prev[i], q[i], 0.5)!];
         }
       }
-      if (mounted && _live) setState(() => _liveQuad = q);
+      _autoStep(q, DateTime.now().millisecondsSinceEpoch);
+      if (mounted && _live) {
+        setState(() {
+          _liveQuad = q;
+          _lowLight = low;
+        });
+      }
     } catch (e, st) {
       AppLog.e('cam.liveFrame', e, st);
     } finally {
       _liveBusy = false;
     }
+  }
+
+  double _qDist(List<Offset> a, List<Offset> b) {
+    var m = 0.0;
+    for (var i = 0; i < 4; i++) {
+      m = math.max(m, (a[i] - b[i]).distance);
+    }
+    return m;
+  }
+
+  void _resetAuto() {
+    _stableQ = null;
+    _autoLockQ = null;
+    _stableSince = 0;
+    _autoProg = 0;
+  }
+
+  /// تصوير تلقائي: لو حدود الورقة ثابتة (فرق الأركان أقل من 2.5%) لمدة ثانية، بيصوّر لوحده.
+  /// بعد اللقطة بيستنى الورقة تتحرك/تتغيّر عشان ميصوّرش نفس الإيصال تاني.
+  void _autoStep(List<Offset>? q, int now) {
+    if (!_autoOn || !_fast || _shooting || _leaving) {
+      _stableQ = null;
+      _stableSince = 0;
+      _autoProg = 0;
+      return;
+    }
+    if (q == null) {
+      _resetAuto();
+      return;
+    }
+    final lock = _autoLockQ;
+    if (lock != null && _qDist(lock, q) < 0.08) {
+      _autoProg = 0;
+      return;
+    }
+    _autoLockQ = null;
+    final st = _stableQ;
+    if (st == null || _qDist(st, q) > 0.025) {
+      _stableQ = q;
+      _stableSince = now;
+      _autoProg = 0;
+      return;
+    }
+    _autoProg = ((now - _stableSince) / 1000).clamp(0.0, 1.0).toDouble();
+    if (_autoProg >= 1) {
+      _autoLockQ = q;
+      _stableQ = null;
+      _stableSince = 0;
+      _autoProg = 0;
+      HapticFeedback.heavyImpact();
+      unawaited(_shot());
+    }
+  }
+
+  Future<void> _toggleAuto() async {
+    HapticFeedback.selectionClick();
+    setState(() {
+      _autoOn = !_autoOn;
+      _resetAuto();
+    });
+    try {
+      (await SharedPreferences.getInstance()).setBool('camAuto', _autoOn);
+    } catch (_) {}
+    if (mounted) snack(context, _autoOn ? 'تصوير تلقائي: ثبّت الموبايل على الإيصال' : 'التصوير التلقائي مقفول');
   }
 
   Future<void> _applyFlash(cam.CameraController c) async {
@@ -7192,7 +7431,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
 
   Future<void> _shot() async {
     final c = _c;
-    if (c == null || !c.value.isInitialized || _shooting) return;
+    if (c == null || !c.value.isInitialized || _shooting || _leaving) return;
+    if (_fast) return _shotFast(c);
     setState(() => _shooting = true);
     try {
       HapticFeedback.mediumImpact();
@@ -7203,11 +7443,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final x = await c.takePicture();
       final shotMs = swShot.elapsedMilliseconds;
       AppLog.i('t takePicture ${shotMs}ms');
-      try {
-        final z = await imageSize(await File(x.path).readAsBytes());
-        _lastShot = '${z.w}×${z.h}';
-        AppLog.i('cam photo $_lastShot');
-      } catch (_) {}
+      unawaited(_logSize(x.path)); // قراءة الأبعاد بقت في الخلفية (كانت بتبطّأ اللقطة)
       if (shotMs > 2500) {
         try {
           (await SharedPreferences.getInstance()).setBool('camSlow', true);
@@ -7234,6 +7470,175 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         if (cc != null) unawaited(_startLive(cc));
       }
     }
+  }
+
+  Future<void> _logSize(String path) async {
+    try {
+      final z = await imageSize(await File(path).readAsBytes());
+      _lastShot = '${z.w}×${z.h}';
+      AppLog.i('cam photo $_lastShot');
+    } catch (_) {}
+  }
+
+  Future<void> _flashBlink() async {
+    if (!mounted) return;
+    setState(() => _flashFx = true);
+    await Future<void>.delayed(const Duration(milliseconds: 110));
+    if (mounted) setState(() => _flashFx = false);
+  }
+
+  /// تصوير سريع: اللقطة بتتحفظ في طابور في الخلفية، والعداد بيزيد فوراً،
+  /// من غير إيقاف المعاينة ومن غير فتح شاشة التعديل. المراجعة بتبقى مرة واحدة بعد "تم".
+  Future<void> _shotFast(cam.CameraController c) async {
+    setState(() => _shooting = true);
+    try {
+      HapticFeedback.mediumImpact();
+      final lq = _liveQuad == null ? null : List<Offset>.of(_liveQuad!);
+      unawaited(_flashBlink());
+      final sw = Stopwatch()..start();
+      final x = await c.takePicture();
+      AppLog.i('t takePicture(fast) ${sw.elapsedMilliseconds}ms');
+      unawaited(_logSize(x.path));
+      _pendingN++;
+      if (mounted) {
+        setState(() {
+          _count++;
+          _thumb = x.path;
+        });
+      }
+      final cb = widget.onQuickShot!;
+      _queue = _queue.then((_) async {
+        try {
+          final st = await cb(x.path, lq);
+          if (mounted && st != null) {
+            setState(() {
+              _thumb = st.thumb ?? _thumb;
+              if (_pendingN <= 1) _count = st.count;
+            });
+          }
+        } catch (e, stk) {
+          AppLog.e('cam.quick', e, stk);
+          if (mounted) {
+            setState(() {
+              if (_count > 0) _count--;
+            });
+            snack(context, 'تعذر حفظ صورة: ${errText(e)}');
+          }
+        } finally {
+          _pendingN--;
+          if (mounted) setState(() {});
+        }
+      });
+    } catch (e, st) {
+      AppLog.e('cam.shotFast', e, st);
+      if (mounted) snack(context, 'تعذر التصوير: ${errText(e)}');
+    } finally {
+      if (mounted) setState(() => _shooting = false);
+    }
+  }
+
+  /// خروج من الكاميرا بعد ما كل اللقطات السريعة تتحفظ.
+  Future<void> _exit() async {
+    if (_leaving) return;
+    _leaving = true;
+    if (mounted) setState(() {});
+    try {
+      await _queue;
+    } catch (_) {}
+    if (mounted) Navigator.pop(context);
+  }
+
+  Future<void> _toggleFast() async {
+    HapticFeedback.selectionClick();
+    setState(() => _fastMode = !_fastMode);
+    try {
+      (await SharedPreferences.getInstance()).setBool('camFast', _fastMode);
+    } catch (_) {}
+    if (mounted) snack(context, _fastMode ? 'تصوير سريع: الصور بتتراجع كلها في الآخر' : 'تعديل فوري بعد كل صورة');
+  }
+
+  Future<void> _setZoom(cam.CameraController c, double z) async {
+    HapticFeedback.selectionClick();
+    final v = z.clamp(_minZoom, _maxZoom).toDouble();
+    setState(() => _zoom = v);
+    try {
+      await c.setZoomLevel(v);
+    } catch (_) {}
+  }
+
+  Future<void> _setExp(cam.CameraController c, double v) async {
+    try {
+      await c.setExposureOffset(v);
+    } catch (_) {}
+  }
+
+  Widget _zoomBar(cam.CameraController c) {
+    final opts = [1.0, 1.5, 2.0].where((z) => z >= _minZoom - 0.001 && z <= _maxZoom + 0.001).toList();
+    if (opts.length < 2) return const SizedBox();
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      for (final z in opts)
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => _setZoom(c, z),
+          child: Container(
+            width: 40,
+            height: 40,
+            margin: const EdgeInsets.symmetric(horizontal: 4),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Colors.black54,
+              border: Border.all(color: (_zoom - z).abs() < 0.08 ? kAccent : Colors.white24, width: 1.5),
+            ),
+            child: Text(z == z.roundToDouble() ? '${z.toInt()}x' : '${z}x',
+                style: TextStyle(
+                    color: (_zoom - z).abs() < 0.08 ? kAccent : Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold)),
+          ),
+        ),
+    ]);
+  }
+
+  Widget _expBar(cam.CameraController c) {
+    if (!(_expMax > _expMin)) return const SizedBox();
+    return Column(children: [
+      GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          setState(() => _exp = 0);
+          unawaited(_setExp(c, 0));
+        },
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Icon(Icons.wb_sunny_rounded, color: _exp.abs() > 0.05 ? kAccent : Colors.white70, size: 20),
+        ),
+      ),
+      Expanded(
+        child: RotatedBox(
+          quarterTurns: 3,
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 2,
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+              activeTrackColor: kAccent,
+              inactiveTrackColor: Colors.white30,
+              thumbColor: kAccent,
+            ),
+            child: Slider(
+              value: _exp.clamp(_expMin, _expMax).toDouble(),
+              min: _expMin,
+              max: _expMax,
+              onChanged: (v) {
+                setState(() => _exp = v);
+                unawaited(_setExp(c, v));
+              },
+            ),
+          ),
+        ),
+      ),
+    ]);
   }
 
   /// لو كاميرا التطبيق مش شغالة على الموبايل ده: كاميرا النظام بدالها.
@@ -7268,14 +7673,25 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     _apply(s);
   }
 
-  Future<void> _tapFocus(TapDownDetails d, Size box) async {
+  /// الإحداثيات نسبة لمستطيل المعاينة الفعلي (pv) مش للشاشة كلها، عشان الفوكس ميروحش مكان غلط مع الهوامش السودا.
+  Future<void> _tapFocus(TapDownDetails d, Size box, Rect pv) async {
     final c = _c;
     if (c == null || !c.value.isInitialized) return;
-    final p = Offset(d.localPosition.dx / box.width, d.localPosition.dy / box.height);
-    setState(() => _focusAt = d.localPosition);
+    final lp = d.localPosition;
+    if (!pv.contains(lp)) return;
+    if (lp.dy > pv.bottom - 56) return; // منطقة أزرار الزوم
+    if (_fast && lp.dx < pv.left + 100 && lp.dy < pv.top + 48) return; // زر التلقائي
+    if (_expMax > _expMin && lp.dx > box.width - 48) return; // منطقة سلايدر الإضاءة
+    final p = Offset(((lp.dx - pv.left) / pv.width).clamp(0.0, 1.0).toDouble(),
+        ((lp.dy - pv.top) / pv.height).clamp(0.0, 1.0).toDouble());
+    setState(() {
+      _focusAt = lp;
+      _exp = 0; // التركيز الجديد بيصفّر تعويض الإضاءة
+    });
     try {
       await c.setFocusPoint(p);
       await c.setExposurePoint(p);
+      if (_expMax > _expMin) await c.setExposureOffset(0);
     } catch (_) {}
     Future.delayed(const Duration(milliseconds: 900), () {
       if (mounted) setState(() => _focusAt = null);
@@ -7284,15 +7700,14 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
 
   Widget _icon(IconData i, String label, VoidCallback? onTap, {bool on = false}) {
     final col = on ? kAccent : Colors.white;
-    return InkResponse(
-      onTap: onTap,
-      radius: 32,
-      child: SizedBox(
-        width: 64,
+    return Expanded(
+      child: InkResponse(
+        onTap: onTap,
+        radius: 32,
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           Icon(i, color: col, size: 28),
           const SizedBox(height: 2),
-          Text(label, style: TextStyle(color: col, fontSize: 11), maxLines: 1),
+          Text(label, style: TextStyle(color: col, fontSize: 11), maxLines: 1, overflow: TextOverflow.ellipsis),
         ]),
       ),
     );
@@ -7301,7 +7716,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   Widget _thumbBox() {
     final t = _thumb;
     return GestureDetector(
-      onTap: (_count > 0 && !_shooting) ? () => Navigator.pop(context) : null,
+      onTap: (_count > 0 && !_shooting) ? _exit : null,
       child: SizedBox(
         width: 64,
         height: 64,
@@ -7370,13 +7785,14 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final pvW = pw0 * sc, pvH = ph0 * sc;
       final pvL = (box.width - pvW) / 2, pvT = (box.height - pvH) / 2;
       return GestureDetector(
-        onTapDown: (d) => _tapFocus(d, box),
+        onTapDown: (d) => _tapFocus(d, box, Rect.fromLTWH(pvL, pvT, pvW, pvH)),
         onScaleStart: (_) => _zoom0 = _zoom,
         onScaleUpdate: (d) async {
           if (d.pointerCount < 2) return;
           final z = (_zoom0 * d.scale).clamp(_minZoom, _maxZoom).toDouble();
           if ((z - _zoom).abs() < 0.02) return;
           _zoom = z;
+          if (mounted) setState(() {});
           try {
             await c.setZoomLevel(z);
           } catch (_) {}
@@ -7397,6 +7813,98 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
               height: pvH,
               child: IgnorePointer(child: CustomPaint(painter: _LiveQuadPainter(_liveQuad!))),
             ),
+          // ميزان الاستقامة (يظهر لما الموبايل شبه أفقي فوق الورقة)
+          if (_flat)
+            Positioned(
+              left: pvL + pvW / 2 - 28,
+              top: pvT + pvH / 2 - 28,
+              width: 56,
+              height: 56,
+              child: IgnorePointer(
+                child: Stack(children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: _levelOk ? Colors.greenAccent : Colors.white54, width: 1.5),
+                    ),
+                  ),
+                  Align(
+                    alignment: Alignment(_tx * 0.8, _ty * 0.8),
+                    child: Container(
+                      width: 12,
+                      height: 12,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _levelOk ? Colors.greenAccent : Colors.white70,
+                      ),
+                    ),
+                  ),
+                ]),
+              ),
+            ),
+          // زر التصوير التلقائي (في الوضع السريع بس) مع عدّاد الثبات
+          if (_fast)
+            Positioned(
+              left: pvL + 8,
+              top: pvT + 8,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _toggleAuto,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: _autoOn ? kAccent : Colors.white24, width: 1.2),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: _autoOn
+                          ? CircularProgressIndicator(
+                              value: _autoProg, strokeWidth: 2.5, color: kAccent, backgroundColor: Colors.white24)
+                          : const Icon(Icons.radio_button_unchecked, size: 16, color: Colors.white70),
+                    ),
+                    const SizedBox(width: 6),
+                    Text('تلقائي',
+                        style: TextStyle(color: _autoOn ? kAccent : Colors.white70, fontSize: 12)),
+                  ]),
+                ),
+              ),
+            ),
+          // تنبيه الإضاءة الضعيفة
+          if (_lowLight && _flash < 2)
+            Positioned(
+              left: 0,
+              right: 0,
+              top: pvT + 48,
+              child: IgnorePointer(
+                child: Center(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(14)),
+                    child: const Text('الإضاءة ضعيفة — افتح الفلاش / الكشاف',
+                        style: TextStyle(color: Color(0xFFFFC107), fontSize: 12)),
+                  ),
+                ),
+              ),
+            ),
+          // سلايدر الإضاءة (على الجنب)
+          if (_expMax > _expMin)
+            Positioned(right: 4, top: pvT + pvH * 0.2, height: pvH * 0.5, width: 36, child: _expBar(c)),
+          // أزرار الزوم السريعة 1x / 1.5x / 2x
+          Positioned(left: 0, right: 0, top: pvT + pvH - 52, height: 44, child: Center(child: _zoomBar(c))),
+          // وميض اللقطة
+          Positioned.fill(
+            child: IgnorePointer(
+              child: AnimatedOpacity(
+                opacity: _flashFx ? 0.75 : 0.0,
+                duration: Duration(milliseconds: _flashFx ? 20 : 140),
+                child: const ColoredBox(color: Colors.white),
+              ),
+            ),
+          ),
           if (_focusAt != null)
             Positioned(
               left: _focusAt!.dx - 30,
@@ -7421,24 +7929,31 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   Widget build(BuildContext context) {
     return Directionality(
       textDirection: TextDirection.ltr,
-      child: Scaffold(
+      child: PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) _exit();
+        },
+        child: Scaffold(
         backgroundColor: Colors.black,
         body: SafeArea(
           child: Column(children: [
             Expanded(child: _preview()),
             Padding(
               padding: const EdgeInsets.only(top: 6),
-              child: Text(widget.title,
+              child: Text(_leaving && _pendingN > 0 ? 'بيتحفظ $_pendingN صورة…' : widget.title,
                   style: TextStyle(color: kAccent, fontSize: 15, fontWeight: FontWeight.w600)),
             ),
             // صف الأيقونات: إغلاق، فلاش، دقة، شبكة، معرض
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
               child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                _icon(Icons.close_rounded, 'إغلاق', () => Navigator.pop(context)),
+                _icon(Icons.close_rounded, 'إغلاق', _exit),
                 _icon(_flashIcons[_flash], 'فلاش', _cycleFlash, on: _flash != 0),
                 _icon(Icons.high_quality_rounded, 'دقة: ${resShort(gResLevel)}', _pickRes, on: gResLevel > 0),
                 _icon(Icons.grid_3x3_rounded, 'شبكة', _toggleGrid, on: _grid),
+                if (widget.onQuickShot != null && !widget.single)
+                  _icon(_fastMode ? Icons.bolt_rounded : Icons.edit_rounded, _fastMode ? 'سريع' : 'تعديل', _toggleFast, on: _fastMode),
                 if (widget.onGallery != null) _icon(Icons.photo_library_rounded, 'معرض', _gallery),
               ]),
             ),
@@ -7469,7 +7984,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                   width: 64,
                   child: (!widget.single && _count > 0)
                       ? InkResponse(
-                          onTap: _shooting ? null : () => Navigator.pop(context),
+                          onTap: _shooting ? null : _exit,
                           radius: 36,
                           child: Container(
                             height: 48,
@@ -7483,6 +7998,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
               ]),
             ),
           ]),
+        ),
         ),
       ),
     );
@@ -7665,6 +8181,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   Future<void> _addA2R() async {
     if (!await ensureCamera(context)) return;
     if (!mounted) return;
+    final quickPaths = <String>[]; // الصور اللي اتصوّرت بالتصوير السريع (للمراجعة بعد الإغلاق)
     await Navigator.push<void>(
       context,
       MaterialPageRoute(
@@ -7673,6 +8190,24 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
           single: !continuous,
           count: imgs.length,
           thumb: imgs.isEmpty ? null : imgs.last,
+          onQuickShot: (p, quad) async {
+            _lastScanManual = true;
+            final before = imgs.length;
+            await _saveAll([p], quick: true, warn: false);
+            if (imgs.length > before) {
+              final saved = imgs.last;
+              quickPaths.add(saved);
+              if (quad != null && quad.length == 4 && _quadConvex(quad)) {
+                try {
+                  final cur = await Store.editOf(saved);
+                  await Store.setEdit(saved, EditParams(quad: quad, filter: cur?.filter ?? filter));
+                } catch (e, st) {
+                  AppLog.e('receipts.quickQuad', e, st);
+                }
+              }
+            }
+            return _camState();
+          },
           onShot: (p) async {
             _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
             final before = imgs.length;
@@ -7702,6 +8237,26 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
         ),
       ),
     );
+    if (quickPaths.isNotEmpty && mounted) await _reviewQuick(quickPaths);
+  }
+
+  /// مراجعة اللقطات السريعة مرة واحدة: التعديل بيفتح على أول صورة، وتتنقل بين الباقي بالأسهم/السويب.
+  /// أي صورة خرج منها من غير حفظ بنطبّق عليها الفلتر هنا.
+  Future<void> _reviewQuick(List<String> paths) async {
+    _lastScanManual = true;
+    final first = paths.map((p) => imgs.indexOf(p)).firstWhere((i) => i >= 0, orElse: () => -1);
+    if (first >= 0) await _edit(first, tab: 2);
+    if (filter == ScanFilter.original) return;
+    for (final p in paths) {
+      if (!imgs.contains(p)) continue; // اتعدّلت أو اتمسحت
+      try {
+        final f = File(p);
+        await f.writeAsBytes(await applyFilter(await f.readAsBytes(), filter), flush: true);
+        built = null;
+      } catch (e, st) {
+        AppLog.e('receipts.lateFilter', e, st);
+      }
+    }
   }
 
   /// من المعرض: منتقي الصور بتاع النظام مباشرة وتقدر تحدد أكتر من صورة.
@@ -7726,7 +8281,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
-  Future<void> _saveAll(List<String> r, {bool quick = false}) async {
+  Future<void> _saveAll(List<String> r, {bool quick = false, bool warn = true}) async {
     setState(() => busy = true);
     var added = 0;
     try {
@@ -7739,8 +8294,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
         added++;
       }
       built = null;
-      HapticFeedback.lightImpact();
-      if (imgs.isNotEmpty) {
+      if (warn) HapticFeedback.lightImpact();
+      if (warn && imgs.isNotEmpty) {
         unawaited(qualityWarning(imgs.last).then((warn) {
           if (warn != null && mounted) snack(context, warn);
         }));
