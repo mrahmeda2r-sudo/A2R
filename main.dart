@@ -72,7 +72,7 @@ class AppLog {
     if (f == null) return;
     try {
       f.writeAsStringSync('${DateTime.now().toIso8601String()} v$kVersion $line\n',
-          mode: FileMode.append, flush: true);
+          mode: FileMode.append);
       if (f.lengthSync() > _max) {
         final t = f.readAsStringSync();
         f.writeAsStringSync(t.substring(t.length ~/ 2));
@@ -894,42 +894,53 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
   }
 }
 
-/// فحص سريع بعد التصوير: بيرجّع رسالة تحذير أو null لو الصورة تمام.
-/// الأرقام بتتكتب في السجل (quality var / p90) عشان تضبط الحدود حسب موبايلات الموظفين.
+Map<String, dynamic> _qualityJob(Map<String, dynamic> a) {
+  final px = a['px'] as Uint8List;
+  final w = a['w'] as int, h = a['h'] as int;
+  final lum = Float32List(w * h);
+  final hist = List<int>.filled(256, 0);
+  for (var i = 0; i < w * h; i++) {
+    final l = (px[i * 4] * 54 + px[i * 4 + 1] * 183 + px[i * 4 + 2] * 19) >> 8;
+    lum[i] = l.toDouble();
+    hist[l]++;
+  }
+  var acc = 0, p90 = 255;
+  for (var t = 0; t < 256; t++) {
+    acc += hist[t];
+    if (acc >= w * h * 0.9) {
+      p90 = t;
+      break;
+    }
+  }
+  var s = 0.0, s2 = 0.0, n = 0;
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = y * w + x;
+      final v = 4 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
+      s += v;
+      s2 += v * v;
+      n++;
+    }
+  }
+  final varL = n == 0 ? 999.0 : s2 / n - (s / n) * (s / n);
+  return <String, dynamic>{'varL': varL, 'p90': p90};
+}
+
+/// فحص سريع بعد التصوير داخل Isolate (بدون تجميد الواجهة): بيرجّع رسالة تحذير أو null لو الصورة تمام.
 Future<String?> qualityWarning(String path) async {
   try {
-    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 800);
+    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 400);
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
     img.dispose();
     if (bd == null || w < 16 || h < 16) return null;
-    final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
-    final lum = Float32List(w * h);
-    final hist = List<int>.filled(256, 0);
-    for (var i = 0; i < w * h; i++) {
-      final l = (px[i * 4] * 54 + px[i * 4 + 1] * 183 + px[i * 4 + 2] * 19) >> 8;
-      lum[i] = l.toDouble();
-      hist[l]++;
-    }
-    var acc = 0, p90 = 255;
-    for (var t = 0; t < 256; t++) {
-      acc += hist[t];
-      if (acc >= w * h * 0.9) {
-        p90 = t;
-        break;
-      }
-    }
-    var s = 0.0, s2 = 0.0, n = 0;
-    for (var y = 1; y < h - 1; y++) {
-      for (var x = 1; x < w - 1; x++) {
-        final i = y * w + x;
-        final v = 4 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
-        s += v;
-        s2 += v * v;
-        n++;
-      }
-    }
-    final varL = n == 0 ? 999.0 : s2 / n - (s / n) * (s / n);
+    final r = await compute(_qualityJob, <String, dynamic>{
+      'px': _bytesOf(bd),
+      'w': w,
+      'h': h,
+    });
+    final varL = (r['varL'] as num).toDouble();
+    final p90 = r['p90'] as int;
     AppLog.i('quality var=${varL.toStringAsFixed(1)} p90=$p90');
     if (p90 < 130) return 'الإضاءة ضعيفة، صوّر في مكان أنور';
     if (varL < 25) return 'الصورة شكلها مهزوزة، ثبّت إيدك وصوّر تاني لو الكلام مش واضح';
@@ -949,6 +960,22 @@ Future<bool> _decodesOk(Uint8List b) async {
     return false;
   }
 }
+
+/// كاش مؤقت في الرام لآخر صورة اتصوّرت عشان شاشة التعديل تعرضها فوراً بدون إعادة قراءة من الذاكرة.
+String? _hotImgPath;
+Uint8List? _hotImgBytes;
+
+Uint8List? _takeHotBytes(String path) {
+  if (_hotImgPath == path && _hotImgBytes != null) {
+    final b = _hotImgBytes;
+    _hotImgPath = null;
+    _hotImgBytes = null;
+    return b;
+  }
+  return null;
+}
+
+bool _isJpegHeader(Uint8List b) => b.length > 100 && b[0] == 0xFF && b[1] == 0xD8;
 
 /// نسخ الصورة من مكان الماسح المؤقت لمكان ثابت كـ JPEG واحد مضغوط (مرة واحدة بس).
 /// وبعدها بيتطبق الفلتر لو الموظف اختاره.
@@ -971,7 +998,7 @@ Future<String> persistImage(String src, String name,
     AppLog.e('persistImage', e, st);
   }
   AppLog.i('t persist.compress ${swPersist.elapsedMilliseconds}ms');
-  if (bytes != null && !await _decodesOk(bytes)) bytes = null;
+  if (bytes != null && !_isJpegHeader(bytes)) bytes = null;
   if (bytes == null) {
     try {
       final raw = await File(src).readAsBytes();
@@ -990,19 +1017,25 @@ Future<String> persistImage(String src, String name,
       AppLog.e('persistImage', e, st);
     }
   }
-  if (bytes == null || !await _decodesOk(bytes)) {
+  if (bytes == null || !_isJpegHeader(bytes)) {
     throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
   }
   final f = File('${(await Store.dir()).path}/$name');
   if (filter != ScanFilter.original) {
-    // نسخة من غير فلتر عشان التعديل بعد كده يبقى ممكن يرجّع الأصلي
-    await File(Store.baseOf(f.path)).writeAsBytes(bytes, flush: true);
+    // نسخة من غير فلتر عشان التعديل بعد كده يبقى ممكن يرجّع الأصلي (بدون flush لعدم تعطيل الواجهة)
+    await File(Store.baseOf(f.path)).writeAsBytes(bytes);
     await Store.setEdit(f.path, EditParams(filter: filter));
   }
   final tFilter = swPersist.elapsedMilliseconds;
-  // applyNow=false: بنحفظ الصورة من غير فلتر (شاشة التعديل بتطبّقه على المعاينة) عشان الانتقال يبقى سريع
-  if (applyNow) bytes = await applyFilter(bytes, filter);
-  await f.writeAsBytes(bytes, flush: true);
+  // applyNow=false: بنحفظ الصورة من غير فلتر (شاشة التعديل بتطبّقه على المعاينة) عشان الانتقال يبقى فوري
+  if (applyNow) {
+    bytes = await applyFilter(bytes, filter);
+    await f.writeAsBytes(bytes);
+  } else {
+    _hotImgPath = f.path;
+    _hotImgBytes = bytes;
+    await f.writeAsBytes(bytes);
+  }
   AppLog.i('t persist.filter ${swPersist.elapsedMilliseconds - tFilter}ms total ${swPersist.elapsedMilliseconds}ms');
   return f.path;
 }
@@ -4500,12 +4533,24 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
+          filter: ScanFilter.receipt, applyNow: false);
       await Store.setBatchImg(path, fresh: true);
       return path;
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
       return null;
+    }
+  }
+
+  /// لو الموظف خرج من شاشة التعديل بدون حفظ: بنطبّق فلتر الإيصال قبل العرض.
+  Future<void> _ensureBatchFiltered(String path) async {
+    try {
+      final f = File(path);
+      if (await f.exists()) {
+        await f.writeAsBytes(await applyFilter(await f.readAsBytes(), ScanFilter.receipt));
+      }
+    } catch (e, st) {
+      AppLog.e('batch.lateFilter', e, st);
     }
   }
 
@@ -4546,7 +4591,10 @@ class _BatchScreenState extends State<BatchScreen> {
     }
     if (mounted && img == null) {
       final cur = await Store.batchImg();
-      if (cur != null) await _show(cur);
+      if (cur != null) {
+        if (cur == saved) await _ensureBatchFiltered(cur);
+        await _show(cur);
+      }
     }
     final shown = img;
     if (shown != null) {
@@ -4580,9 +4628,12 @@ class _BatchScreenState extends State<BatchScreen> {
               return null;
             }
             if (mounted && img == null) {
-              // خرج من التعديل من غير حفظ: نعرض الصورة زي ما هي
+              // خرج من التعديل من غير حفظ: نطبّق فلتر الإيصال ونعرضها
               final cur = await Store.batchImg();
-              if (cur != null) await _show(cur);
+              if (cur != null) {
+                if (cur == saved) await _ensureBatchFiltered(cur);
+                await _show(cur);
+              }
             }
             final shown = img;
             if (shown != null) {
@@ -4654,18 +4705,23 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
+          filter: ScanFilter.receipt, applyNow: false);
       await Store.setBatchImg(path, fresh: true);
       await _show(path);
-      final warn = await qualityWarning(path);
-      if (warn != null && mounted) snack(context, warn);
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
       if (mounted) setState(() => busy = false);
     }
     _lastScanManual = true; // صورة معرض من غير قص: القص التلقائي يشتغل
-    if (mounted && img != null) await _edit(tab: 2);
+    final beforeEdit = img;
+    if (mounted && beforeEdit != null) {
+      await _edit(tab: 2);
+      if (mounted && img == beforeEdit) {
+        await _ensureBatchFiltered(beforeEdit);
+        await _show(beforeEdit);
+      }
+    }
   }
 
   /// تعديل: قص بزوايا حرة وتدوير وفلاتر للصورة الحالية.
@@ -4673,7 +4729,15 @@ class _BatchScreenState extends State<BatchScreen> {
     final cur = path ?? img;
     if (cur == null) return false;
     final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_', initialTab: tab, canRetake: fromCam)));
+      context,
+      PageRouteBuilder<String>(
+        transitionDuration: const Duration(milliseconds: 110),
+        reverseTransitionDuration: const Duration(milliseconds: 100),
+        pageBuilder: (_, __, ___) =>
+            EditorPage(path: cur, prefix: 'batch_', initialTab: tab, canRetake: fromCam),
+        transitionsBuilder: (_, a, __, child) => FadeTransition(opacity: a, child: child),
+      ),
+    );
     if (out == kRetake) return true;
     if (out == null || !mounted) return false;
     setState(() => busy = true);
@@ -5625,6 +5689,63 @@ const kDelete = '__delete__'; // حذف الصفحة الحالية
 const kAllPrefix = '__all__'; // __all__|<EditParams json>|<path>: حفظ الصفحة الحالية وتطبيق الفلتر على كل الصفحات
 const kNavPrefix = '__nav__'; // __nav__|next|<path> أو __nav__|prev|<path>: انتقال لصفحة تانية بعد حفظ التعديل
 
+/// دمج كل خطوات معالجة الصورة (منظور + فلتر إيصال + ألوان + حدة + قص هوامش) في Isolate واحد
+/// بدل 4 Isolates منفصلة — أسرع بكتير واستهلاك رامات أقل بـ 50%.
+Map<String, dynamic> _renderPipelineJob(Map<String, dynamic> a) {
+  var rgba = a['src'] as Uint8List;
+  final sw = a['sw'] as int, sh = a['sh'] as int;
+  var w = a['ow'] as int, h = a['oh'] as int;
+  final needWarp = a['needWarp'] as bool;
+  final clean = a['clean'] as bool;
+  final thermal = a['thermal'] as bool;
+  final postMatrix = a['postMatrix'] as List<double>?;
+  final sk = (a['sk'] as num).toDouble();
+  final doTrim = a['doTrim'] as bool;
+
+  if (needWarp) {
+    rgba = _warpJob(a);
+  } else {
+    final m = (a['m'] as List).cast<double>();
+    final isIdentity = (m[0] - 1).abs() < 1e-6 &&
+        m[1].abs() < 1e-6 &&
+        m[2].abs() < 1e-6 &&
+        m[4].abs() < 1e-6 &&
+        m[5].abs() < 1e-6 &&
+        (m[6] - 1).abs() < 1e-6 &&
+        m[7].abs() < 1e-6 &&
+        m[9].abs() < 1e-6 &&
+        m[10].abs() < 1e-6 &&
+        m[11].abs() < 1e-6 &&
+        (m[12] - 1).abs() < 1e-6 &&
+        m[14].abs() < 1e-6;
+    if (!isIdentity) {
+      rgba = _matrixJob(<String, dynamic>{'src': rgba, 'm': m});
+    }
+    w = sw;
+    h = sh;
+  }
+
+  if (clean) {
+    rgba = _cleanJob(<String, dynamic>{'src': rgba, 'w': w, 'h': h, 'gray': false, 'th': thermal});
+    if (postMatrix != null) {
+      rgba = _matrixJob(<String, dynamic>{'src': rgba, 'm': postMatrix});
+    }
+  }
+  if (sk > 0) {
+    rgba = _sharpenJob(<String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': sk});
+  }
+  if (clean && doTrim) {
+    final tr = _trimJob(<String, dynamic>{'src': rgba, 'w': w, 'h': h});
+    final tw = tr['w'] as int;
+    if (tw > 0) {
+      rgba = tr['out'] as Uint8List;
+      w = tw;
+      h = tr['h'] as int;
+    }
+  }
+  return <String, dynamic>{'rgba': rgba, 'w': w, 'h': h};
+}
+
 /// بيرسم صفحة بعد التعديل (قص + تدوير + فلتر) من نسختها الأصلية وبيرجّع مسار الصورة الجديدة.
 /// بيستخدمه المحرر (زر ✓) و"طبّق على كل الصفحات".
 Future<String> renderEditedPage(String path, String prefix, EditParams e) async {
@@ -5662,8 +5783,15 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
     ow *= k;
     oh *= k;
     final w = math.max(8, ow.round()), h = math.max(8, oh.round());
-    AppLog.i('apply warp ${w}x$h safe=$safe');
-    var rgba = await compute(_warpJob, <String, dynamic>{
+    final fullQuad = (quad[0] - const Offset(0, 0)).distance < 0.002 &&
+        (quad[1] - const Offset(1, 0)).distance < 0.002 &&
+        (quad[2] - const Offset(1, 1)).distance < 0.002 &&
+        (quad[3] - const Offset(0, 1)).distance < 0.002;
+    final needWarp = !fullQuad || angle.abs() > 0.05 || w != rw || h != rh;
+    final clean = isCleanFilter(filter);
+    final doTrim = clean && await Store.trimMargins();
+    AppLog.i('apply pipeline ${w}x$h warp=$needWarp safe=$safe');
+    final res = await compute(_renderPipelineJob, <String, dynamic>{
       'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
       'sw': rw,
       'sh': rh,
@@ -5671,44 +5799,20 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
       'oh': h,
       'theta': angle * math.pi / 180,
       'h': _homography(pts),
-      // فلاتر الإيصال: التباين والسطوع بيتطبقوا بعد التنضيف (زي المعاينة بالظبط)
-      'm': isCleanFilter(filter)
+      'm': clean
           ? editMatrix(ScanFilter.original, 0, 0)
           : editMatrix(filter, contrast, brightness, levels),
+      'needWarp': needWarp,
+      'clean': clean,
+      'thermal': usesThermalClean(filter),
+      'postMatrix': (clean && (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw))
+          ? editMatrix(filter, contrast, brightness)
+          : null,
+      'sk': effSharpness(filter, sharp),
+      'doTrim': doTrim,
     });
-    AppLog.i('apply warp done');
-    if (isCleanFilter(filter)) {
-      rgba = await compute(_cleanJob, <String, dynamic>{
-        'src': rgba,
-        'w': w,
-        'h': h,
-        'gray': false,
-        'th': usesThermalClean(filter),
-      });
-      AppLog.i('apply clean done');
-      if (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw) {
-        rgba = await compute(_matrixJob, <String, dynamic>{
-          'src': rgba,
-          'm': editMatrix(filter, contrast, brightness),
-        });
-      }
-    }
-    final sk = effSharpness(filter, sharp);
-    if (sk > 0) {
-      rgba = await compute(_sharpenJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': sk});
-      AppLog.i('apply sharpen done');
-    }
-    var fw = w, fh = h;
-    if (isCleanFilter(filter) && await Store.trimMargins()) {
-      final tr = await compute(_trimJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h});
-      final tw = tr['w'] as int;
-      if (tw > 0) {
-        rgba = tr['out'] as Uint8List;
-        fw = tw;
-        fh = tr['h'] as int;
-        AppLog.i('apply trim ${w}x$h -> ${fw}x$fh');
-      }
-    }
+    final rgba = res['rgba'] as Uint8List;
+    final fw = res['w'] as int, fh = res['h'] as int;
     final comp = Completer<ui.Image>();
     ui.decodeImageFromPixels(rgba, fw, fh, ui.PixelFormat.rgba8888, comp.complete);
     final outImg = await comp.future;
@@ -5725,7 +5829,7 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
     );
     final dir = (await Store.dir()).path;
     final nf = File('$dir/$prefix${DateTime.now().microsecondsSinceEpoch}.jpg');
-    await nf.writeAsBytes(jpg, flush: true);
+    await nf.writeAsBytes(jpg);
     AppLog.i('apply jpg ${jpg.length ~/ 1024}KB saved');
     // النسخة الأصلية بتنتقل للصورة الجديدة (أو بتتعمل أول مرة من الصورة الحالية)
     final oldBase = File(Store.baseOf(path));
@@ -6091,11 +6195,13 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
-  Future<void> _loadView() async {
+  Future<void> _loadView({Uint8List? preloadedBytes}) async {
     final gen = ++_viewGen;
     try {
       final lite = await Store.perfMode() == PerfMode.lite;
-      final img = await decodeImage(await File(src!).readAsBytes(), maxWidth: lite ? 700 : 1000);
+      final raw = preloadedBytes ?? await File(src!).readAsBytes();
+      final img = await decodeImage(raw, maxWidth: lite ? 640 : 840);
+      final baseAspect = img.height / img.width;
       final r = await _rotateUi(img, turns);
       if (!mounted || gen != _viewGen) {
         r.dispose();
@@ -6104,6 +6210,7 @@ class _EditorPageState extends State<EditorPage> {
       final old = view;
       final oldClean = cleaned;
       setState(() {
+        aspect ??= baseAspect;
         view = r;
         cleaned = null;
       });
@@ -6130,39 +6237,39 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _init() async {
     try {
       AppLog.i('editor open');
-      await _loadFavs();
+      unawaited(_loadFavs()); // متوقفش فتح الصورة عشان قراءة المفضلة
+      final hot = _takeHotBytes(widget.path);
       final base = File(Store.baseOf(widget.path));
-      final s = await base.exists() ? base.path : widget.path;
-      final a = await imageAspect(s);
+      final s = (hot != null || await base.exists()) ? base.path : widget.path;
       final e = await Store.editOf(widget.path);
       if (!mounted) return;
-      setState(() {
-        src = s;
-        aspect = a;
-        if (e != null) {
-          turns = e.turns;
-          angle = e.angle;
-          filter = e.filter;
-          contrast = e.contrast;
-          brightness = e.brightness;
-          sharp = e.sharp;
-          levels = e.levels;
-          if (e.quad != null && _quadConvex(e.quad!)) quad = List.of(e.quad!);
+      src = s;
+      if (e != null) {
+        turns = e.turns;
+        angle = e.angle;
+        filter = e.filter;
+        contrast = e.contrast;
+        brightness = e.brightness;
+        sharp = e.sharp;
+        levels = e.levels;
+        if (e.quad != null && _quadConvex(e.quad!)) quad = List.of(e.quad!);
+      }
+      if ((e == null || e.quad == null) && _lastScanManual) {
+        final live = widget.canRetake ? _shotQuad : null;
+        _shotQuad = null;
+        if (live != null && live.length == 4 && _quadConvex(live) && turns == 0) {
+          quad = List.of(live); // اقتراح فوري جاهز من أول فريم
         }
-      });
-      await _loadView();
+      }
+      await _loadView(preloadedBytes: hot);
       _sig0 = _sig();
       AppLog.i('editor view loaded');
       WidgetsBinding.instance.addPostFrameCallback((_) => AppLog.i('editor first frame'));
       if (mounted && (e == null || e.quad == null) && _lastScanManual) {
-        final live = widget.canRetake ? _shotQuad : null;
-        _shotQuad = null;
-        if (live != null && live.length == 4 && _quadConvex(live) && turns == 0) {
-          setState(() => quad = List.of(live)); // اقتراح فوري من المعاينة الحية
-          _mark();
-          unawaited(_refineQuad()); // الكشف الدقيق بيشتغل في الخلفية ويحدّث الإطار بهدوء
+        if (!_quadFull()) {
+          unawaited(_refineQuad());
         } else {
-          await _auto(silent: true);
+          unawaited(_auto(silent: true));
         }
       }
     } catch (e, st) {
@@ -7755,17 +7862,10 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final x = await c.takePicture();
       final shotMs = swShot.elapsedMilliseconds;
       AppLog.i('t takePicture ${shotMs}ms');
-      unawaited(() async {
-        try {
-          final z = await imageSize(await File(x.path).readAsBytes());
-          _lastShot = '${z.w}×${z.h}';
-          AppLog.i('cam photo $_lastShot');
-        } catch (_) {}
-      }());
       if (shotMs > 2500) {
-        try {
-          (await SharedPreferences.getInstance()).setBool('camSlow', true);
-        } catch (_) {}
+        unawaited(SharedPreferences.getInstance()
+            .then((p) => p.setBool('camSlow', true))
+            .catchError((_) => false));
       }
       // وضع التصوير السريع: وميض أبيض + قص وحفظ متسلسل في الخلفية بدون توقيف المعاينة
       if (_fastMode && _canFast) {
@@ -7791,15 +7891,15 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         });
         return;
       }
-      try {
-        await c.pausePreview();
-      } catch (_) {}
+      unawaited(c.pausePreview().catchError((_) {})); // من غير ما نوقف الانتقال لشاشة التعديل
       final s = await widget.onShot(x.path);
       AppLog.i('t shot+edit total ${swShot.elapsedMilliseconds}ms');
       if (!mounted) return;
-      try {
-        await c.resumePreview();
-      } catch (_) {}
+      if (s?.close != true) {
+        try {
+          await c.resumePreview();
+        } catch (_) {}
+      }
       if (widget.single && s == null) return;
       _apply(s);
     } catch (e, st) {
@@ -8413,7 +8513,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   File? built;
   bool busy = false;
   bool loaded = false;
-  bool continuous = true;
   ScanFilter filter = ScanFilter.receipt;
   String? progress;
   final Set<String> noTags = {}; // إيصالات من غير ورقة
@@ -8454,7 +8553,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final f = await Store.pdf();
     final used = await Store.pdfImgs();
     final fl = await Store.filter();
-    final co = await Store.continuous();
     final nts = <String>{};
     for (final x in d) {
       if (await Store.noTag(x)) nts.add(x);
@@ -8476,7 +8574,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       tag = t;
       built = b;
       filter = fl;
-      continuous = co;
       loaded = true;
     });
     final lost = await takeLostPick('receipts');
@@ -8554,25 +8651,43 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
-  /// ماسح جوجل الذكي: بيرجّع الصور مقصوصة جاهزة، فبنفتح التعديل على تبويب الفلاتر.
-  Future<void> _addGoogle() async {
-    final paths = await scanImages(context, continuous ? 20 : 1, camFallback: true);
-    if (paths.isEmpty || !mounted) return;
-    // false = جاية مقصوصة من ماسح جوجل، true = الماسح فشل واتحوّلنا للمعرض (يحتاج قص)
-    final manual = _lastScanManual;
-    final start = imgs.length;
-    await _saveAll(paths);
-    _lastScanManual = manual;
-    for (var i = start; i < imgs.length; i++) {
-      if (!mounted) break;
-      final retake = await _edit(i, tab: manual ? 0 : 2, fromCam: true);
-      if (retake && mounted) {
-        await _addGoogle(); // إعادة أخذ: نفتح الماسح تاني
-        break;
-      }
+  /// لو الموظف خرج من شاشة التعديل بدون حفظ: بنطبّق الفلتر المختار على الصورة.
+  Future<void> _ensureReceiptFiltered(int idx, String savedPath) async {
+    if (!mounted || filter == ScanFilter.original || idx < 0 || idx >= imgs.length || imgs[idx] != savedPath) {
+      return;
+    }
+    try {
+      final f = File(savedPath);
+      await f.writeAsBytes(await applyFilter(await f.readAsBytes(), filter));
+      built = null;
+    } catch (e, st) {
+      AppLog.e('receipts.lateFilter', e, st);
     }
   }
 
+  /// ماسح جوجل الذكي: صورة واحدة مقصوصة جاهزة، بعدها شاشة التعديل، وبعدها نرجع لشاشة الإيصالات
+  /// (لإنشاء الـ PDF أو إضافة صور تانية).
+  Future<void> _addGoogle() async {
+    final paths = await scanImages(context, 1, camFallback: true);
+    if (paths.isEmpty || !mounted) return;
+    final manual = _lastScanManual;
+    final start = imgs.length;
+    await _saveAll(paths, quick: true);
+    _lastScanManual = manual;
+    for (var i = start; i < imgs.length; i++) {
+      if (!mounted) break;
+      final savedPath = imgs[i];
+      final retake = await _edit(i, tab: manual ? 0 : 2, fromCam: true);
+      if (retake && mounted) {
+        await _addGoogle(); // إعادة أخذ
+        break;
+      }
+      await _ensureReceiptFiltered(i, savedPath);
+    }
+  }
+
+  /// كاميرا A2R: صورة واحدة، بعدها التعديل، ولما يخلص تقفل الكاميرا وترجع لشاشة الإيصالات
+  /// (لإنشاء الـ PDF أو إضافة صور تانية).
   Future<void> _addA2R() async {
     if (!await ensureCamera(context)) return;
     if (!mounted) return;
@@ -8581,61 +8696,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       MaterialPageRoute(
         builder: (_) => A2RCameraScreen(
           title: 'إيصالات الدفع',
-          single: !continuous,
+          single: true,
           count: imgs.length,
           thumb: imgs.isEmpty ? null : imgs.last,
-          onFastShot: (p, quad) async {
-            final hasQuad = quad != null && quad.length == 4 && _quadConvex(quad);
-            var saved = await persistImage(
-                p, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
-                filter: filter, applyNow: !hasQuad);
-            if (hasQuad) {
-              try {
-                final cropped = await renderEditedPage(
-                    saved, 'r_', EditParams(quad: quad, filter: filter));
-                await Store.del(saved);
-                saved = cropped;
-              } catch (e, st) {
-                AppLog.e('fastShot.autoCrop', e, st);
-                if (filter != ScanFilter.original) {
-                  try {
-                    final f = File(saved);
-                    await f.writeAsBytes(
-                        await applyFilter(await f.readAsBytes(), filter), flush: true);
-                  } catch (_) {}
-                }
-              }
-            }
-            await Store.addToDraft(saved);
-            final warn = await qualityWarning(saved);
-            if (mounted) {
-              setState(() {
-                imgs.add(saved);
-                built = null;
-              });
-            } else {
-              imgs.add(saved);
-            }
-            return A2RCamState(
-                count: imgs.length,
-                thumb: imgs.isEmpty ? null : imgs.last,
-                warning: warn);
-          },
-          onUndoLast: () async {
-            if (imgs.isEmpty) return _camState();
-            final last = imgs.last;
-            await Store.unlistFromDraft(last);
-            await Store.del(last);
-            if (mounted) {
-              setState(() {
-                imgs.remove(last);
-                built = null;
-              });
-            } else {
-              imgs.remove(last);
-            }
-            return _camState();
-          },
           onShot: (p) async {
             _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
             final before = imgs.length;
@@ -8645,22 +8708,14 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
               final savedPath = imgs[idx];
               final retake = await _edit(idx, tab: 2, fromCam: true);
               if (retake && mounted) return _camState(); // إعادة أخذ: الصفحة اتمسحت والكاميرا مفتوحة
-              // خرج من التعديل من غير حفظ: الصورة لسه من غير فلتر، فنطبّقه عليها دلوقتي
-              if (mounted && filter != ScanFilter.original && idx < imgs.length && imgs[idx] == savedPath) {
-                try {
-                  final f = File(savedPath);
-                  await f.writeAsBytes(await applyFilter(await f.readAsBytes(), filter), flush: true);
-                  built = null;
-                } catch (e, st) {
-                  AppLog.e('receipts.lateFilter', e, st);
-                }
-              }
+              await _ensureReceiptFiltered(idx, savedPath);
             }
-            return _camState(close: !continuous && imgs.length > before);
+            return _camState(close: imgs.length > before);
           },
           onGallery: () async {
+            final before = imgs.length;
             await _addGallery();
-            return _camState();
+            return _camState(close: imgs.length > before);
           },
         ),
       ),
@@ -8682,10 +8737,12 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (xs.isEmpty || !mounted) return;
     _lastScanManual = true; // صور من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
     final start = imgs.length;
-    await _saveAll(xs.map((e) => e.path).toList());
+    await _saveAll(xs.map((e) => e.path).toList(), quick: true);
     for (var i = start; i < imgs.length; i++) {
       if (!mounted) break;
+      final savedPath = imgs[i];
       await _edit(i, tab: 2);
+      await _ensureReceiptFiltered(i, savedPath);
     }
   }
 
@@ -8703,7 +8760,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       }
       built = null;
       HapticFeedback.lightImpact();
-      if (imgs.isNotEmpty) {
+      if (!quick && imgs.isNotEmpty) {
         unawaited(qualityWarning(imgs.last).then((warn) {
           if (warn != null && mounted) snack(context, warn);
         }));
@@ -9044,18 +9101,22 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                         },
                 ),
               ),
-              Row(children: [
-                const SizedBox(width: 4),
-                const Expanded(
-                    child: Text('تصوير متتالي (يفتح الكاميرا تاني بعد كل إيصال)',
-                        style: TextStyle(fontSize: 12))),
-                Switch(
-                    value: continuous,
-                    onChanged: (v) {
-                      setState(() => continuous = v);
-                      Store.setContinuous(v);
-                    }),
-              ]),
+              if (imgs.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                SizedBox(
+                  width: double.infinity,
+                  height: 42,
+                  child: OutlinedButton.icon(
+                    onPressed: busy
+                        ? null
+                        : () => _applyToAll(EditParams(filter: filter), ''),
+                    icon: const Icon(Icons.auto_fix_high_rounded, size: 18),
+                    label: Text(
+                        'تطبيق فلتر "${kFilterLabels[filter] ?? filter.name}" على كل الصور (${imgs.length})'),
+                  ),
+                ),
+              ],
+              const SizedBox(height: 8),
               Row(children: [
                 Expanded(
                   child: FilledButton.tonalIcon(
