@@ -697,7 +697,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   final w = a['w'] as int, h = a['h'] as int;
   final gray = a['gray'] as bool;
   final th = (a['th'] as bool?) ?? false; // حراري باهت: منحنى أقوى وحدة أعلى
-  final bs = math.max(16, (math.max(w, h) / 40).round());
+  final bs = math.max(th ? 12 : 16, (math.max(w, h) / (th ? 48 : 40)).round());
   final gw = (w + bs - 1) ~/ bs, gh = (h + bs - 1) ~/ bs;
   final bg = List.generate(3, (_) => List<double>.filled(gw * gh, 255.0));
   final hist = List<int>.filled(256, 0);
@@ -765,10 +765,17 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
     bg[c] = blur(blur(bg[c]));
   }
 
-  // أي قيمة من 238 لفوق = أبيض صافي (بيضغط أحسن بكتير)، وجاما خفيفة بتغمّق الحبر
-  final wp = th ? 245.0 : 238.0, gam = th ? 2.0 : 1.25;
-  final lut = List<int>.generate(
-      256, (i) => (255 * math.pow(math.min(1.0, i / wp), gam)).round().clamp(0, 255).toInt());
+  // أي قيمة من 238 لفوق = أبيض صافي، وفي وضع الحراري الباهت بنطبّق تعزيز ذكي للحبر الخفيف مع إزالة الظلال
+  final wp = th ? 242.0 : 238.0, gam = th ? 2.35 : 1.25;
+  final lut = List<int>.generate(256, (i) {
+    if (th && i >= 238) return 255;
+    var v = 255.0 * math.pow(math.min(1.0, i / wp), gam);
+    if (th && v < 195) {
+      // تغميق تدريجي للحبر الباهت بدون تقطيع الأرقام الصغيرة
+      v = (v - 18.0) * 0.92;
+    }
+    return v.round().clamp(0, 255).toInt();
+  });
 
   final cx0 = List<int>.filled(w, 0), cx1 = List<int>.filled(w, 0);
   final ctx = List<double>.filled(w, 0);
@@ -815,13 +822,14 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
     }
   }
 
-  // حدة خفيفة (Unsharp) تحسّن النص المهتز شوية
-  final k = th ? 0.6 : 0.35;
+  // حدة ذكية تحسّن النص وتمنع تشويش الورق الأبيض
+  final k = th ? 0.65 : 0.35;
   final cp = Uint8List.fromList(out);
   final row = w * 4;
   for (var y = 1; y < h - 1; y++) {
     for (var x = 1; x < w - 1; x++) {
       final i = (y * w + x) * 4;
+      if (th && cp[i] > 246 && cp[i + 1] > 246 && cp[i + 2] > 246) continue;
       for (var c = 0; c < 3; c++) {
         final j = i + c;
         final v = cp[j] * (1 + 4 * k) - k * (cp[j - 4] + cp[j + 4] + cp[j - row] + cp[j + row]);
@@ -1148,24 +1156,22 @@ Future<bool> _tagLooksOk(Uint8List png) async {
 }
 
 /// بترسم الورقة وتتأكد إنها سليمة، ولو طلعت مشوّهة بتعيد الرسم (لحد 3 مرات).
-Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
+Future<Tag> receiptTag(double w, Session s, {bool batch = false, String? pageLabel}) async {
   late Tag t;
   for (var i = 0; i < 3; i++) {
-    t = await _renderTag(w, s, batch: batch);
+    t = await _renderTag(w, s, batch: batch, pageLabel: pageLabel);
     if (await _tagLooksOk(t.png)) return t;
     AppLog.i('tag garbled, retry ${i + 1}');
   }
   return t;
 }
 
-Future<Tag> _renderTag(double w, Session s, {bool batch = false}) async {
+Future<Tag> _renderTag(double w, Session s, {bool batch = false, String? pageLabel}) async {
   final fs = w * kTagFont;
   final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
   final l1 = _tp('${s.name}  |  $unitLine', fs, TextDirection.rtl);
-  final l2 = _tp(
-      batch ? _isoLtr(s.date) : '${_isoLtr('TID: ${s.unit.tid}')}  |  ${_isoLtr(s.date)}',
-      fs,
-      TextDirection.rtl);
+  final baseL2 = batch ? _isoLtr(s.date) : '${_isoLtr('TID: ${s.unit.tid}')}  |  ${_isoLtr(s.date)}';
+  final l2 = _tp(pageLabel == null ? baseL2 : '$baseL2  |  ${_isoLtr(pageLabel)}', fs, TextDirection.rtl);
   final pad = fs * 0.6;
   final gap = fs * 0.25;
   final textW = l1.width > l2.width ? l1.width : l2.width;
@@ -1355,14 +1361,14 @@ Future<Uint8List> composeBatch(String path, Session s) async {
 
 /// صورة الإيصال النهائية للمشاركة: نفس صفحة الـ PDF (شريط أبيض فيه الورقة فوق الإيصال).
 /// من غير ورقة (إخفاء الورقة) بترجع الصورة زي ما هي.
-Future<Uint8List> composeReceiptImage(String path, Session s) async {
+Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel}) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src;
   final sz = await imageSize(src);
   final maxSide = getMaxSide(await Store.perfMode());
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final iw = img.width, ih = img.height;
-  final tag = await receiptTag(iw.toDouble(), s);
+  final tag = await receiptTag(iw.toDouble(), s, pageLabel: pageLabel);
   final pad = iw * kBandPad;
   final band = (tag.h + pad * 2).ceil();
   final oh = ih + band;
@@ -1413,18 +1419,20 @@ Future<Uint8List> composeReceiptImage(String path, Session s) async {
 /// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال الأصلية (JPEG بيتحط في الـ PDF زي ما هو
 /// من غير إعادة رسم ولا إعادة ضغط، فالجودة أحسن والذاكرة أقل بكتير).
 Future<File> buildReceiptsPdf(Session s, List<String> receipts,
-    {void Function(int done, int total)? onProgress}) async {
+    {bool? forceCompact, void Function(int done, int total)? onProgress}) async {
   Store.working++;
   try {
     final doc = pw.Document();
     const pageW = 595.0;
-    final tag = await receiptTag(1000, s);
-    final tagImg = pw.MemoryImage(tag.png);
-    final tw = pageW * tag.w / 1000;
-    final th = pageW * tag.h / 1000;
     final pad = pageW * kBandPad;
-    final bandH = th + pad * 2;
-    final compact = (await Store.pdfSize()) == 1;
+    final compact = forceCompact ?? ((await Store.pdfSize()) == 1);
+    final multi = receipts.length > 1;
+    Tag? sharedTag;
+    pw.MemoryImage? sharedTagImg;
+    if (!multi) {
+      sharedTag = await receiptTag(1000, s);
+      sharedTagImg = pw.MemoryImage(sharedTag.png);
+    }
     for (var i = 0; i < receipts.length; i++) {
       onProgress?.call(i, receipts.length);
       var bytes = await File(receipts[i]).readAsBytes();
@@ -1434,9 +1442,9 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
           // صورة فيها ١٥ إيصال: الضغط لـ 720 هيمسح الأرقام، فبنخلّي دقة أعلى بكتير
           final hd = gMinSide > 0;
           final c = await FlutterImageCompress.compressWithList(bytes,
-              minWidth: hd ? 2600 : 720,
-              minHeight: hd ? 2600 : 720,
-              quality: hd ? 82 : 70,
+              minWidth: hd ? 2200 : 720,
+              minHeight: hd ? 2200 : 720,
+              quality: hd ? 78 : 70,
               format: CompressFormat.jpeg);
           if (c.isNotEmpty && c.length < bytes.length && await _decodesOk(c)) bytes = c;
         } catch (e, st) {
@@ -1446,18 +1454,28 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
       final sz = await imageSize(bytes);
       final imgH = pageW * sz.h / sz.w;
       final hide = await Store.noTag(receipts[i]);
+      Tag? pTag;
+      pw.MemoryImage? pTagImg;
+      var tw = 0.0, th = 0.0, bandH = 0.0;
+      if (!hide) {
+        pTag = multi ? await receiptTag(1000, s, pageLabel: '${i + 1} / ${receipts.length}') : sharedTag!;
+        pTagImg = multi ? pw.MemoryImage(pTag.png) : sharedTagImg!;
+        tw = pageW * pTag.w / 1000;
+        th = pageW * pTag.h / 1000;
+        bandH = th + pad * 2;
+      }
       final pageH = (hide ? 0.0 : bandH) + imgH + 1;
       final image = pw.MemoryImage(bytes);
       doc.addPage(pw.Page(
         pageFormat: PdfPageFormat(pageW, pageH),
         margin: pw.EdgeInsets.zero,
         build: (_) => pw.Column(children: [
-          if (!hide)
+          if (!hide && pTagImg != null)
             pw.Container(
               width: pageW,
               height: bandH,
               alignment: pw.Alignment.center,
-              child: pw.Image(tagImg, width: tw, height: th),
+              child: pw.Image(pTagImg, width: tw, height: th),
             ),
           pw.Image(image, width: pageW, height: imgH),
         ]),
@@ -2269,7 +2287,105 @@ class BatchOcr {
   final int parts; // عدد الأوراق اللي اتجمعت (1 = ورقة واحدة)
   final int missing; // عدد الأوراق اللي اتشافت بس متقرتش كويس
   final String detail; // تفاصيل الجمع لما يكون في أكتر من ورقة
-  const BatchOcr(this.count, this.total, {this.parts = 1, this.missing = 0, this.detail = ''});
+  final List<String> tids; // أرقام الماكينات المقروءة من الورقة
+  final String? receiptDate; // تاريخ الباتش المقروء من الورقة (DD/MM/YYYY)
+  final bool dateIsToday; // هل تاريخ الورقة يطابق تاريخ النهارده
+  final bool isReprint; // هل مكتوب عليها REPRINT
+  final bool isSummary; // هل مكتوب عليها SUMMARY REPORT / GRAND TOTALS
+  const BatchOcr(
+    this.count,
+    this.total, {
+    this.parts = 1,
+    this.missing = 0,
+    this.detail = '',
+    this.tids = const [],
+    this.receiptDate,
+    this.dateIsToday = true,
+    this.isReprint = false,
+    this.isSummary = true,
+  });
+
+  BatchOcr withMeta({
+    List<String>? tids,
+    String? receiptDate,
+    bool? dateIsToday,
+    bool? isReprint,
+    bool? isSummary,
+  }) =>
+      BatchOcr(
+        count,
+        total,
+        parts: parts,
+        missing: missing,
+        detail: detail,
+        tids: tids ?? this.tids,
+        receiptDate: receiptDate ?? this.receiptDate,
+        dateIsToday: dateIsToday ?? this.dateIsToday,
+        isReprint: isReprint ?? this.isReprint,
+        isSummary: isSummary ?? this.isSummary,
+      );
+}
+
+final RegExp _ocrTidKw = RegExp(r'(?:terminal|tid)\s*(?:id)?\s*[:#\-]?\s*(\d{8})', caseSensitive: false);
+final RegExp _ocrTid50 = RegExp(r'(?<!\d)(50\d{6})(?!\d)');
+final RegExp _ocrDateIso = RegExp(r'(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)');
+final RegExp _ocrDateDmy = RegExp(r'(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})(?!\d)');
+final RegExp _ocrReprint = RegExp(r'reprint|duplicate', caseSensitive: false);
+final RegExp _ocrSummaryKw = RegExp(r'summary|grand\s*total|batch\s*close|settlement', caseSensitive: false);
+
+BatchOcr _attachBatchMeta(BatchOcr base, List<String> rows) {
+  final joined = rows.join('\n');
+  final tidSet = <String>{};
+  for (final m in _ocrTidKw.allMatches(joined)) {
+    tidSet.add(m.group(1)!);
+  }
+  for (final m in _ocrTid50.allMatches(joined)) {
+    tidSet.add(m.group(1)!);
+  }
+  String? rDate;
+  var isToday = true;
+  final now = DateTime.now();
+  final mIso = _ocrDateIso.firstMatch(joined);
+  final mDmy = _ocrDateDmy.firstMatch(joined);
+  int? y, mo, d;
+  if (mIso != null) {
+    y = int.tryParse(mIso.group(1)!);
+    mo = int.tryParse(mIso.group(2)!);
+    d = int.tryParse(mIso.group(3)!);
+  } else if (mDmy != null) {
+    d = int.tryParse(mDmy.group(1)!);
+    mo = int.tryParse(mDmy.group(2)!);
+    y = int.tryParse(mDmy.group(3)!);
+  }
+  if (y != null && mo != null && d != null && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+    rDate = '${d.toString().padLeft(2, '0')}/${mo.toString().padLeft(2, '0')}/$y';
+    isToday = (y == now.year && mo == now.month && d == now.day);
+  }
+  return base.withMeta(
+    tids: tidSet.toList(),
+    receiptDate: rDate,
+    dateIsToday: isToday,
+    isReprint: _ocrReprint.hasMatch(joined),
+    isSummary: rows.isEmpty ? true : _ocrSummaryKw.hasMatch(joined),
+  );
+}
+
+/// تحذيرات ذكية لمطابقة ورقة الباتش مع الوحدة المختارة وتاريخ اليوم.
+List<String> batchOcrWarnings(BatchOcr r, Session s) {
+  final w = <String>[];
+  if (r.tids.isNotEmpty && !r.tids.contains(s.unit.tid)) {
+    w.add('رقم الماكينة في الصورة (${r.tids.join('، ')}) مختلف عن الوحدة المختارة (${s.unit.name} · ${s.unit.tid})');
+  }
+  if (r.receiptDate != null && !r.dateIsToday) {
+    w.add('تاريخ الباتش في الصورة (${r.receiptDate}) مختلف عن تاريخ النهارده (${s.date})');
+  }
+  if (r.isReprint) {
+    w.add('الورقة مكتوب عليها REPRINT (إعادة طباعة)');
+  }
+  if (!r.isSummary && (r.count != null || r.total != null)) {
+    w.add('الورقة مش مكتوب عليها SUMMARY REPORT — اتأكد إنها ورقة إغلاق الباتش');
+  }
+  return w;
 }
 
 final RegExp _ocrDec = RegExp(r'(?<![\d.,])\d[\d,]*[.,]\d{2}(?![\d.,])');
@@ -2494,10 +2610,10 @@ Future<BatchOcr> readBatchInfo(String path) async {
       if (!broken && found.isNotEmpty) {
         final r = sumBatchSheets(found);
         AppLog.i('batch ocr segments: ${r.parts} parts ${r.count} / ${r.total}');
-        if (r.parts >= whole.parts) return r;
+        if (r.parts >= whole.parts) return _attachBatchMeta(r, allRows);
       }
     }
-    return whole;
+    return _attachBatchMeta(whole, allRows);
   } finally {
     await rec.close();
   }
@@ -2513,15 +2629,15 @@ String batchCaption(Session s, BatchInfo i) => [
       'الاجمالي: ${i.total}',
     ].join('\n');
 
-Future<BatchInfo?> askBatchInfo(BuildContext context, String img) async {
+Future<BatchInfo?> askBatchInfo(BuildContext context, String img, Session s) async {
   final p = await SharedPreferences.getInstance();
   final init = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
       p.getString('bi_col') ?? '', p.getString('bi_total') ?? '');
   if (!context.mounted) return null;
   final r = await Navigator.of(context).push<BatchInfo>(
     MaterialPageRoute(
-      builder: (c) =>
-          Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img)),
+      builder: (c) => Directionality(
+          textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img, session: s)),
     ),
   );
   if (r != null) {
@@ -2606,7 +2722,8 @@ class _ZoomImageState extends State<_ZoomImage> {
 class _BatchInfoSheet extends StatefulWidget {
   final BatchInfo init;
   final String img;
-  const _BatchInfoSheet({required this.init, required this.img});
+  final Session session;
+  const _BatchInfoSheet({required this.init, required this.img, required this.session});
   @override
   State<_BatchInfoSheet> createState() => _BatchInfoSheetState();
 }
@@ -2621,6 +2738,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
   String? err;
   bool reading = true, d1 = false, d4 = false;
   String? note;
+  List<String> alerts = const [];
 
   @override
   void initState() {
@@ -2636,8 +2754,11 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
       AppLog.i('batch ocr failed: $e');
     }
     if (!mounted) return;
+    final ws = r == null ? const <String>[] : batchOcrWarnings(r, widget.session);
+    if (ws.isNotEmpty) HapticFeedback.vibrate();
     setState(() {
       reading = false;
+      alerts = ws;
       if (r?.count != null && !d1) c1.text = r!.count!;
       if (r?.total != null && !d4) c4.text = r!.total!;
       if (r?.count == null && r?.total == null) {
@@ -2663,7 +2784,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     super.dispose();
   }
 
-  void _ok() {
+  Future<void> _ok() async {
     final count = _digits(c1.text), pi = _digits(c2.text);
     final col = _digits(c3.text), tot = _digits(c4.text);
     bool isInt(String s) => RegExp(r'^\d+$').hasMatch(s);
@@ -2676,6 +2797,10 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     }
     final t = double.tryParse(tot);
     if (t == null || t < 0) return setState(() => err = 'اكتب الإجمالي صح (مثال 28107.19)');
+    if (alerts.isNotEmpty) {
+      final go = await confirmWarnings(context, alerts, title: 'تنبيه في ورقة الباتش', go: 'متابعة برضه');
+      if (!go || !mounted) return;
+    }
     Navigator.pop(
         context,
         BatchInfo('${int.parse(count)}', pi.isEmpty ? '0' : '${int.parse(pi)}',
@@ -2724,8 +2849,33 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
                       )
                     else if (note != null)
                       Padding(
-                        padding: const EdgeInsets.only(bottom: 10),
+                        padding: const EdgeInsets.only(bottom: 8),
                         child: Text(note!, style: const TextStyle(color: Colors.grey, fontSize: 13)),
+                      ),
+                    if (alerts.isNotEmpty)
+                      Container(
+                        width: double.infinity,
+                        margin: const EdgeInsets.only(bottom: 10),
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: Colors.red.withAlpha(28),
+                          border: Border.all(color: Colors.redAccent.withAlpha(170)),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            for (final a in alerts)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 4),
+                                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                  const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 17),
+                                  const SizedBox(width: 6),
+                                  Expanded(child: Text(a, style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600))),
+                                ]),
+                              ),
+                          ],
+                        ),
                       ),
                     Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       Expanded(child: _f(c1, 'عدد المعاملات', onEdit: () => d1 = true)),
@@ -2880,7 +3030,7 @@ Future<bool> preSendCheckReceipts(BuildContext context, Session s, List<String> 
 }
 
 Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
-  final info = await askBatchInfo(context, img);
+  final info = await askBatchInfo(context, img, s);
   if (info == null || !context.mounted) return false;
   final caption = batchCaption(s, info);
   Store.working++;
@@ -5428,7 +5578,53 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
       }
     }
   }
-  return bestQ;
+  if (bestQ == null) return null;
+  // تحسين نهائي (Edge Snapping): تحريك كل ضلع ±2 بكسل نحو أقوى حافة فعلية (Sobel) ليلتصق بحدود الورقة بدقة
+  return _snapQuadToSobel(mag, bestQ, w, h);
+}
+
+List<Offset> _snapQuadToSobel(Uint16List mag, List<Offset> q, int w, int h) {
+  final pts = [for (final o in q) Offset(o.dx * w - 0.5, o.dy * h - 0.5)];
+  double sideAvg(Offset a, Offset b) {
+    final dist = math.sqrt((b.dx - a.dx) * (b.dx - a.dx) + (b.dy - a.dy) * (b.dy - a.dy));
+    final steps = math.max(8, dist.round());
+    var acc = 0.0;
+    for (var s = 1; s < steps; s++) {
+      final t = s / steps;
+      final cx = (a.dx + (b.dx - a.dx) * t).round().clamp(0, w - 1).toInt();
+      final cy = (a.dy + (b.dy - a.dy) * t).round().clamp(0, h - 1).toInt();
+      acc += mag[cy * w + cx];
+    }
+    return acc / (steps - 1);
+  }
+
+  for (var i = 0; i < 4; i++) {
+    final j = (i + 1) % 4;
+    final p0 = pts[i], p1 = pts[j];
+    final dx = p1.dx - p0.dx, dy = p1.dy - p0.dy;
+    final len = math.sqrt(dx * dx + dy * dy);
+    if (len < 6) continue;
+    final nx = -dy / len, ny = dx / len;
+    var bestShift = 0.0;
+    var bestVal = sideAvg(p0, p1);
+    for (final sh in const [-2.0, -1.0, 1.0, 2.0]) {
+      final a = Offset(p0.dx + nx * sh, p0.dy + ny * sh);
+      final b = Offset(p1.dx + nx * sh, p1.dy + ny * sh);
+      final v = sideAvg(a, b);
+      if (v > bestVal * 1.06) {
+        bestVal = v;
+        bestShift = sh;
+      }
+    }
+    if (bestShift != 0) {
+      pts[i] = Offset((p0.dx + nx * bestShift).clamp(0.0, w - 1.0), (p0.dy + ny * bestShift).clamp(0.0, h - 1.0));
+      pts[j] = Offset((p1.dx + nx * bestShift).clamp(0.0, w - 1.0), (p1.dy + ny * bestShift).clamp(0.0, h - 1.0));
+    }
+  }
+  final out = [
+    for (final p in pts) Offset(((p.dx + 0.5) / w).clamp(0.0, 1.0), ((p.dy + 0.5) / h).clamp(0.0, 1.0))
+  ];
+  return _quadConvex(out) ? out : q;
 }
 
 /// استخراج شبكة مصغّرة (72px) + متوسط السطوع من إطار الكاميرا (سريع جداً < 1ms).
@@ -6772,7 +6968,17 @@ class _EditorPageState extends State<EditorPage> {
                       },
               ),
             ),
-            const Text('حدة', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ActionChip(
+              visualDensity: VisualDensity.compact,
+              label: Text(sharp >= 0.5 ? 'وضوح ✓' : 'وضوح نص', style: const TextStyle(fontSize: 11)),
+              onPressed: busy
+                  ? null
+                  : () {
+                      setState(() => sharp = sharp >= 0.5 ? 0.0 : 0.6);
+                      _resharp();
+                      _mark();
+                    },
+            ),
             _favBtn(),
           ]),
         ]);
@@ -7089,6 +7295,9 @@ class PdfResultScreen extends StatefulWidget {
 }
 
 class _PdfResultScreenState extends State<PdfResultScreen> {
+  late File _pdf = widget.pdf;
+  int? _pdfBytes;
+  bool _compressed = false;
   Tag? tag;
   final Set<String> noTags = {};
   bool busy = false;
@@ -7101,6 +7310,11 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
     _load();
   }
 
+  String _fmtBytes(int b) {
+    if (b >= 1024 * 1024) return '${(b / (1024 * 1024)).toStringAsFixed(2)} MB';
+    return '${(b / 1024).round()} KB';
+  }
+
   Future<void> _load() async {
     try {
       final t = await receiptTag(1000, widget.session);
@@ -7108,9 +7322,13 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
       for (final x in widget.imgs) {
         if (await Store.noTag(x)) nts.add(x);
       }
+      final sz = await _pdf.exists() ? await _pdf.length() : null;
+      final isComp = (await Store.pdfSize()) == 1;
       if (!mounted) return;
       setState(() {
         tag = t;
+        _pdfBytes = sz;
+        _compressed = isComp;
         noTags
           ..clear()
           ..addAll(nts);
@@ -7118,6 +7336,40 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
     } catch (e, st) {
       AppLog.e('PdfResultScreen._load', e, st);
       if (mounted) snack(context, 'تعذر تجهيز المعاينة');
+    }
+  }
+
+  Future<void> _compressNow() async {
+    if (busy) return;
+    final before = _pdfBytes ?? 0;
+    setState(() {
+      busy = true;
+      progress = '0/${widget.imgs.length}';
+    });
+    try {
+      final f = await buildReceiptsPdf(widget.session, widget.imgs, forceCompact: true,
+          onProgress: (d, t) {
+        if (mounted) setState(() => progress = '$d/$t');
+      });
+      await Store.setPdf(f, List.of(widget.imgs));
+      final after = await f.length();
+      if (!mounted) return;
+      setState(() {
+        _pdf = f;
+        _pdfBytes = after;
+        _compressed = true;
+      });
+      snack(context,
+          before > 0 ? 'اتضغط الملف من ${_fmtBytes(before)} إلى ${_fmtBytes(after)}' : 'تم ضغط الملف');
+    } catch (e) {
+      if (mounted) snack(context, 'تعذر الضغط: ${errText(e)}');
+    } finally {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          progress = null;
+        });
+      }
     }
   }
 
@@ -7131,7 +7383,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
 
   Future<void> _sharePdf() async {
     if (busy) return;
-    final ok = await shareFiles(context, [widget.pdf.path]);
+    final ok = await shareFiles(context, [_pdf.path]);
     if (ok) _markShared('PDF');
   }
 
@@ -7146,7 +7398,8 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
     try {
       final dir = await getTemporaryDirectory();
       for (var i = 0; i < n; i++) {
-        final bytes = await composeReceiptImage(widget.imgs[i], widget.session);
+        final bytes = await composeReceiptImage(widget.imgs[i], widget.session,
+            pageLabel: n > 1 ? '${i + 1} / $n' : null);
         final f = File('${dir.path}/${widget.session.pdfName}_${i + 1}.jpg');
         await f.writeAsBytes(bytes, flush: true);
         files.add(f.path);
@@ -7207,6 +7460,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
   @override
   Widget build(BuildContext context) {
     final n = widget.imgs.length;
+    final sz = _pdfBytes;
     return Scaffold(
       appBar: AppBar(
         title: Text('معاينة الملف ($n صفحة)'),
@@ -7220,6 +7474,28 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
         ],
       ),
       body: Column(children: [
+        if (sz != null)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            color: Theme.of(context).colorScheme.surfaceContainerHigh,
+            child: Row(children: [
+              const Icon(Icons.picture_as_pdf_rounded, size: 18, color: Colors.redAccent),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'حجم الـ PDF: ${_fmtBytes(sz)}${n > 1 ? '  •  مرقّم تلقائياً (1 / $n)' : ''}',
+                  style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+                ),
+              ),
+              if (!_compressed && sz > 500 * 1024)
+                TextButton.icon(
+                  onPressed: busy ? null : _compressNow,
+                  icon: const Icon(Icons.compress_rounded, size: 17),
+                  label: const Text('ضغط'),
+                ),
+            ]),
+          ),
         Expanded(
           child: tag == null
               ? const Center(child: CircularProgressIndicator())
