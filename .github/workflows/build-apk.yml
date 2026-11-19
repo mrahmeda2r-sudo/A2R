@@ -35,6 +35,8 @@ jobs:
           flutter pub add flutter_localizations --sdk=flutter
           # path_provider_android 2.3.x بيستخدم JNI وبيسبب ClassNotFoundException على بعض الأجهزة: نثبّت آخر نسخة من غير JNI
           flutter pub add "override:path_provider_android:2.2.23"
+          # shared_preferences_android 2.5.x كمان بيستخدم JNI: نثبّت آخر نسخة قبلها
+          flutter pub add "override:shared_preferences_android:2.4.29"
           echo "--- JNI deps (لازم تكون فاضية أو معروفة) ---"
           flutter pub deps --style=compact | grep -i "jni" || echo "no jni"
 
