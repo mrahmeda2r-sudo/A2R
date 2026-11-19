@@ -980,22 +980,40 @@ bool _isJpegHeader(Uint8List b) => b.length > 100 && b[0] == 0xFF && b[1] == 0xD
 /// نسخ الصورة من مكان الماسح المؤقت لمكان ثابت كـ JPEG واحد مضغوط (مرة واحدة بس).
 /// وبعدها بيتطبق الفلتر لو الموظف اختاره.
 Future<String> persistImage(String src, String name,
-    {ScanFilter filter = ScanFilter.original, bool applyNow = true}) async {
+    {ScanFilter filter = ScanFilter.original,
+    bool applyNow = true,
+    bool keepOriginal = false}) async {
   final swPersist = Stopwatch()..start();
   final mode = await Store.perfMode();
   final maxSide = getMaxSide(mode);
   Uint8List? bytes;
-  try {
-    bytes = await FlutterImageCompress.compressWithFile(
-      src,
-      minWidth: maxSide,
-      minHeight: maxSide,
-      quality: await Store.jpegQuality(),
-      format: CompressFormat.jpeg,
-      keepExif: false,
-    );
-  } catch (e, st) {
-    AppLog.e('persistImage', e, st);
+  if (keepOriginal) {
+    // صور ماسح جوجل بتيجي مقصوصة ومعدولة جاهزة: نحفظها بأصلها بدون إعادة ضغط أو تصغير عشان متقلش جودتها
+    try {
+      final raw = await File(src).readAsBytes();
+      if (_isJpegHeader(raw)) {
+        final sz = await imageSize(raw);
+        if (sz.w > 0 && sz.h > 0 && math.max(sz.w, sz.h) <= 4096) {
+          bytes = raw;
+        }
+      }
+    } catch (e, st) {
+      AppLog.e('persistImage.orig', e, st);
+    }
+  }
+  if (bytes == null) {
+    try {
+      bytes = await FlutterImageCompress.compressWithFile(
+        src,
+        minWidth: maxSide,
+        minHeight: maxSide,
+        quality: await Store.jpegQuality(),
+        format: CompressFormat.jpeg,
+        keepExif: false,
+      );
+    } catch (e, st) {
+      AppLog.e('persistImage', e, st);
+    }
   }
   AppLog.i('t persist.compress ${swPersist.elapsedMilliseconds}ms');
   if (bytes != null && !_isJpegHeader(bytes)) bytes = null;
@@ -2110,27 +2128,6 @@ Future<List<String>> _manualPick(BuildContext context, {bool multi = false}) asy
   return r;
 }
 
-ScannerMode _scanModeOf(int i, ScannerMode fallback) {
-  switch (i) {
-    case 1:
-      return ScannerMode.base;
-    case 2:
-      // الوضع الأوسط (قص + فلتر): بنختاره بالترتيب عشان اسمه بيختلف بين نسخ الحزمة
-      return ScannerMode.values.length > 2 ? ScannerMode.values[1] : ScannerMode.base;
-    case 3:
-      return ScannerMode.full;
-    default:
-      return fallback;
-  }
-}
-
-const _scanOpts = <(int, String, String)>[
-  (0, 'تلقائي', 'الباتش كامل والإيصالات قص بس (الافتراضي)'),
-  (1, 'قص بس', 'أسرع وأخف، من غير تحسينات'),
-  (2, 'قص + فلتر', 'قص مع تحسين تلقائي للألوان'),
-  (3, 'كامل', 'قص وتنضيف الصورة وإزالة الصوابع'),
-];
-
 const _engineOpts = <(int, String, String)>[
   (1, 'ماسح جوجل', 'قص ذكي بالذكاء الاصطناعي زي CamScanner (الافتراضي)'),
   (0, 'كاميرا A2R', 'كاميرا التطبيق المخصصة مع القص اليدوي/التلقائي'),
@@ -2153,7 +2150,7 @@ const _resOpts = <(int, String, String)>[
 bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
 
 Future<List<String>> scanImages(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full, bool camFallback = false}) async {
+    {ScannerMode mode = ScannerMode.base, bool camFallback = false}) async {
   if (_scanBusy) return [];
   _scanBusy = true;
   try {
@@ -2164,16 +2161,15 @@ Future<List<String>> scanImages(BuildContext context, int limit,
 }
 
 Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full, bool camFallback = false}) async {
+    {ScannerMode mode = ScannerMode.base, bool camFallback = false}) async {
   _lastScanManual = false;
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
   final perf = await Store.perfMode();
   if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1);
-  final sm = await Store.scanSetting();
-  final effMode = _scanModeOf(sm, perf == PerfMode.pro ? ScannerMode.full : mode);
+  // ماسح جوجل للقص فقط (ScannerMode.base) عشان يرجّع الصورة الأصلية بدون أي فلتر مزدوج
   final scanner = DocumentScanner(
-    options: DocumentScannerOptions(mode: effMode, pageLimit: limit, isGalleryImport: true),
+    options: DocumentScannerOptions(mode: ScannerMode.base, pageLimit: limit, isGalleryImport: true),
   );
   try {
     final r = await scanner.scanDocument();
@@ -3188,7 +3184,10 @@ Future<void> main() async {
     if (sp.getBool('apply_guard') == true) {
       await sp.setBool('apply_safe', true);
       await sp.setBool('apply_guard', false);
-      AppLog.i('التطبيق اتقفل أثناء حفظ التعديل، اتفعّل الوضع الآمن (دقة أقل)');
+      AppLog.i('التطبيق اتقفل أثناء حفظ التعديل، اتفعّل الوضع الآمن مؤقتاً');
+    } else if (sp.getBool('apply_safe') == true) {
+      // نفك الوضع الآمن القديم عشان ميفضلش مقلل الجودة للأبد
+      await sp.setBool('apply_safe', false);
     }
     if (sp.getBool('det_guard') == true) {
       await sp.setBool('det_off', true);
@@ -3891,9 +3890,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       const Divider(),
                       _sub('الكاميرا / الماسح'),
                       _radioGroup<int>(_engineOpts, engine, _setEngine),
-                      const Divider(),
-                      _sub('وضع ماسح جوجل'),
-                      _radioGroup<int>(_scanOpts, scan, _setScan),
+
                       const Divider(),
                       _sub('جودة الصورة'),
                       _radioGroup<int>(_qualOpts, qual, _setQual),
@@ -4529,11 +4526,11 @@ class _BatchScreenState extends State<BatchScreen> {
 
   /// نسخة سريعة للتصوير بالكاميرا: بتحفظ الصورة بس وترجّع مسارها، من غير تجهيز المعاينة
   /// ولا فحص الجودة قبل شاشة التعديل (دول بيتعملوا بعد ما الموظف يخلّص التعديل).
-  Future<String?> _ingestQuick(String src) async {
+  Future<String?> _ingestQuick(String src, {bool keepOriginal = false}) async {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt, applyNow: false);
+          filter: ScanFilter.receipt, applyNow: false, keepOriginal: keepOriginal);
       await Store.setBatchImg(path, fresh: true);
       return path;
     } catch (e) {
@@ -4548,6 +4545,7 @@ class _BatchScreenState extends State<BatchScreen> {
       final f = File(path);
       if (await f.exists()) {
         await f.writeAsBytes(await applyFilter(await f.readAsBytes(), ScanFilter.receipt));
+        await FileImage(f).evict();
       }
     } catch (e, st) {
       AppLog.e('batch.lateFilter', e, st);
@@ -4577,7 +4575,7 @@ class _BatchScreenState extends State<BatchScreen> {
       return;
     }
     final manual = _lastScanManual; // true لو الماسح فشل واتحوّلنا للمعرض
-    final saved = await _ingestQuick(paths.first);
+    final saved = await _ingestQuick(paths.first, keepOriginal: !manual);
     if (saved == null) {
       if (mounted && img == null) Navigator.pop(context);
       return;
@@ -5778,7 +5776,7 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
     var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
     final mode = await Store.perfMode();
     final safe = sp.getBool('apply_safe') ?? false;
-    final maxSide = safe ? math.min(900, getMaxSide(mode)) : getMaxSide(mode);
+    final maxSide = safe ? math.min(1400, getMaxSide(mode)) : getMaxSide(mode);
     final k = math.min(1.0, maxSide / math.max(ow, oh));
     ow *= k;
     oh *= k;
@@ -5850,6 +5848,7 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
             brightness: brightness,
             sharp: sharp,
             levels: levels));
+    if (safe) await sp.setBool('apply_safe', false);
     AppLog.i('apply done');
     return nf.path;
   } finally {
@@ -6200,7 +6199,7 @@ class _EditorPageState extends State<EditorPage> {
     try {
       final lite = await Store.perfMode() == PerfMode.lite;
       final raw = preloadedBytes ?? await File(src!).readAsBytes();
-      final img = await decodeImage(raw, maxWidth: lite ? 640 : 840);
+      final img = await decodeImage(raw, maxWidth: lite ? 700 : 1200);
       final baseAspect = img.height / img.width;
       final r = await _rotateUi(img, turns);
       if (!mounted || gen != _viewGen) {
@@ -8659,7 +8658,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     try {
       final f = File(savedPath);
       await f.writeAsBytes(await applyFilter(await f.readAsBytes(), filter));
-      built = null;
+      await FileImage(f).evict();
+      if (mounted) setState(() => built = null);
     } catch (e, st) {
       AppLog.e('receipts.lateFilter', e, st);
     }
@@ -8672,7 +8672,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (paths.isEmpty || !mounted) return;
     final manual = _lastScanManual;
     final start = imgs.length;
-    await _saveAll(paths, quick: true);
+    await _saveAll(paths, quick: true, keepOriginal: !manual);
     _lastScanManual = manual;
     for (var i = start; i < imgs.length; i++) {
       if (!mounted) break;
@@ -8746,14 +8746,14 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
-  Future<void> _saveAll(List<String> r, {bool quick = false}) async {
+  Future<void> _saveAll(List<String> r, {bool quick = false, bool keepOriginal = false}) async {
     setState(() => busy = true);
     var added = 0;
     try {
       for (final p in r) {
         final saved = await persistImage(
             p, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
-            filter: filter, applyNow: !quick);
+            filter: filter, applyNow: !quick, keepOriginal: keepOriginal);
         await Store.addToDraft(saved);
         imgs.add(saved);
         added++;
