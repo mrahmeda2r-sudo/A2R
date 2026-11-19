@@ -31,7 +31,7 @@ jobs:
 
       - name: Add packages (pinned)
         run: |
-          flutter pub add google_mlkit_document_scanner:0.4.1 google_mlkit_text_recognition:^0.15.0 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 camera:^0.11.0
+          flutter pub add google_mlkit_document_scanner:0.4.1 google_mlkit_text_recognition:^0.15.0 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 camera:^0.11.0 sensors_plus:^6.1.0
           flutter pub add flutter_localizations --sdk=flutter
           # path_provider_android 2.3.x بيستخدم JNI وبيسبب ClassNotFoundException على بعض الأجهزة: نثبّت آخر نسخة من غير JNI
           flutter pub add "override:path_provider_android:2.2.23"
@@ -128,6 +128,55 @@ jobs:
           s = s.replace('<application', '<application android:largeHeap="true"', 1)
           open(p, 'w', encoding='utf-8').write(s)
           print(s)
+          PY
+
+      - name: Volume keys take photos (native MainActivity)
+        run: |
+          python3 - <<'PY'
+          import glob, re, os
+          cands = glob.glob('android/app/src/main/**/MainActivity.kt', recursive=True)
+          assert cands, 'MainActivity.kt not found'
+          p = cands[0]
+          pkg = re.search(r'(?m)^package\s+([\w.]+)', open(p, encoding='utf-8').read()).group(1)
+          code = """package PKG
+
+          import android.view.KeyEvent
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              private var channel: MethodChannel? = null
+              private var enabled = false
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/keys")
+                  ch.setMethodCallHandler { call, result ->
+                      if (call.method == "enable") {
+                          enabled = (call.arguments as? Boolean) ?: false
+                          result.success(null)
+                      } else {
+                          result.notImplemented()
+                      }
+                  }
+                  channel = ch
+              }
+
+              override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                  val k = event.keyCode
+                  if (enabled && (k == KeyEvent.KEYCODE_VOLUME_UP || k == KeyEvent.KEYCODE_VOLUME_DOWN)) {
+                      if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                          channel?.invokeMethod("vol", null)
+                      }
+                      return true
+                  }
+                  return super.dispatchKeyEvent(event)
+              }
+          }
+          """.replace('PKG', pkg)
+          open(p, 'w', encoding='utf-8').write(code)
+          print(p, pkg)
           PY
 
       - name: Support old Android (minSdk 21)
