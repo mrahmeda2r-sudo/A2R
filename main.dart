@@ -2291,7 +2291,9 @@ class BatchOcr {
   final String? receiptDate; // تاريخ الباتش المقروء من الورقة (DD/MM/YYYY)
   final bool dateIsToday; // هل تاريخ الورقة يطابق تاريخ النهارده
   final bool isReprint; // هل مكتوب عليها REPRINT
-  final bool isSummary; // هل مكتوب عليها SUMMARY REPORT / GRAND TOTALS
+  final bool isSummaryReport; // هل مكتوب عليها SUMMARY REPORT (سمري مش إغلاق باتش)
+  final bool isBatchClosed; // هل مكتوب عليها BATCH CLOSED SUCCESSFULLY
+  final bool hasText; // هل الـ OCR قرأ نص من الورقة
   const BatchOcr(
     this.count,
     this.total, {
@@ -2302,7 +2304,9 @@ class BatchOcr {
     this.receiptDate,
     this.dateIsToday = true,
     this.isReprint = false,
-    this.isSummary = true,
+    this.isSummaryReport = false,
+    this.isBatchClosed = false,
+    this.hasText = false,
   });
 
   BatchOcr withMeta({
@@ -2310,7 +2314,9 @@ class BatchOcr {
     String? receiptDate,
     bool? dateIsToday,
     bool? isReprint,
-    bool? isSummary,
+    bool? isSummaryReport,
+    bool? isBatchClosed,
+    bool? hasText,
   }) =>
       BatchOcr(
         count,
@@ -2322,7 +2328,9 @@ class BatchOcr {
         receiptDate: receiptDate ?? this.receiptDate,
         dateIsToday: dateIsToday ?? this.dateIsToday,
         isReprint: isReprint ?? this.isReprint,
-        isSummary: isSummary ?? this.isSummary,
+        isSummaryReport: isSummaryReport ?? this.isSummaryReport,
+        isBatchClosed: isBatchClosed ?? this.isBatchClosed,
+        hasText: hasText ?? this.hasText,
       );
 }
 
@@ -2331,7 +2339,8 @@ final RegExp _ocrTid50 = RegExp(r'(?<!\d)(50\d{6})(?!\d)');
 final RegExp _ocrDateIso = RegExp(r'(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)');
 final RegExp _ocrDateDmy = RegExp(r'(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})(?!\d)');
 final RegExp _ocrReprint = RegExp(r'reprint|duplicate', caseSensitive: false);
-final RegExp _ocrSummaryKw = RegExp(r'summary|grand\s*total|batch\s*close|settlement', caseSensitive: false);
+final RegExp _ocrSummaryReport = RegExp(r'summary\s*(?:report)?', caseSensitive: false);
+final RegExp _ocrBatchClosed = RegExp(r'batch\s*closed\s*success\w*', caseSensitive: false);
 
 BatchOcr _attachBatchMeta(BatchOcr base, List<String> rows) {
   final joined = rows.join('\n');
@@ -2366,24 +2375,30 @@ BatchOcr _attachBatchMeta(BatchOcr base, List<String> rows) {
     receiptDate: rDate,
     dateIsToday: isToday,
     isReprint: _ocrReprint.hasMatch(joined),
-    isSummary: rows.isEmpty ? true : _ocrSummaryKw.hasMatch(joined),
+    isSummaryReport: _ocrSummaryReport.hasMatch(joined),
+    isBatchClosed: _ocrBatchClosed.hasMatch(joined),
+    hasText: rows.isNotEmpty,
   );
 }
 
-/// تحذيرات ذكية لمطابقة ورقة الباتش مع الوحدة المختارة وتاريخ اليوم.
+/// تحذيرات ذكية لمطابقة ورقة الباتش: لازم يكون مكتوب عليها BATCH CLOSED SUCCESSFULLY
+/// غير كده (زي SUMMARY REPORT أو REPRINT أو أي إيصال تاني) يطلع تنبيه فوري.
 List<String> batchOcrWarnings(BatchOcr r, Session s) {
   final w = <String>[];
+  if (r.isSummaryReport) {
+    w.add('الورقة دي SUMMARY REPORT (سمري) ومش إغلاق باتش صحيح!');
+  }
+  if (r.isReprint) {
+    w.add('الورقة مكتوب عليها REPRINT (إعادة طباعة) وليست إغلاق باتش أصلي!');
+  }
+  if (r.hasText && !r.isBatchClosed && !r.isSummaryReport) {
+    w.add('لم يتم العثور على جملة "BATCH CLOSED SUCCESSFULLY" — اتأكد إن الورقة إغلاق باتش صحيح');
+  }
   if (r.tids.isNotEmpty && !r.tids.contains(s.unit.tid)) {
     w.add('رقم الماكينة في الصورة (${r.tids.join('، ')}) مختلف عن الوحدة المختارة (${s.unit.name} · ${s.unit.tid})');
   }
   if (r.receiptDate != null && !r.dateIsToday) {
     w.add('تاريخ الباتش في الصورة (${r.receiptDate}) مختلف عن تاريخ النهارده (${s.date})');
-  }
-  if (r.isReprint) {
-    w.add('الورقة مكتوب عليها REPRINT (إعادة طباعة)');
-  }
-  if (!r.isSummary && (r.count != null || r.total != null)) {
-    w.add('الورقة مش مكتوب عليها SUMMARY REPORT — اتأكد إنها ورقة إغلاق الباتش');
   }
   return w;
 }
