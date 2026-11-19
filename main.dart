@@ -1,11 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:camera/camera.dart' as cam;
-import 'package:document_scan/document_scan.dart' as ds;
 import 'package:flutter/foundation.dart' show compute, listEquals;
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/material.dart';
@@ -29,7 +29,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 const kVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
 
 const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
-const kTagTop = 0.03; // بُعد ورقة الباتش عن حافة الصورة (أسفلها افتراضيًا)
+const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
 const kBatchTagW = 0.7; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
@@ -71,7 +71,7 @@ class AppLog {
     if (f == null) return;
     try {
       f.writeAsStringSync('${DateTime.now().toIso8601String()} v$kVersion $line\n',
-          mode: FileMode.append, flush: true);
+          mode: FileMode.append);
       if (f.lengthSync() > _max) {
         final t = f.readAsStringSync();
         f.writeAsStringSync(t.substring(t.length ~/ 2));
@@ -93,7 +93,38 @@ class AppLog {
   }
 }
 
+/// مستوى الدقة اللي الموظف اختاره: 0 تلقائي (حسب وضع الأداء)، 1..4 من kResLevels.
+int gResLevel = 0;
+
+/// إيصالات الدفع (١٥ إيصال في الصورة الواحدة): بيرفع أقصى ضلع وجودة الـ JPEG طول ما شاشة الإيصالات مفتوحة.
+/// 0 = متعطّل (الإعدادات العادية).
+int gMinSide = 0;
+int gMinQuality = 0;
+const int kSheetHdSide = 4096;
+const int kSheetHdQuality = 90;
+
+/// (رقم، الاسم، الرقم المختصر، أقصى ضلع بالبكسل)
+const kResLevels = <(int, String, String, int)>[
+  (1, 'صغيرة', '720p', 1000),
+  (2, 'متوسطة', '1080p', 1600),
+  (3, 'عالية', '4K', 2400),
+  (4, 'أعلى', 'أقصى دقة', 3200),
+];
+
+String resShort(int l) => l <= 0 || l > kResLevels.length ? 'تلقائي' : kResLevels[l - 1].$3;
+
 int getMaxSide(PerfMode mode) {
+  final v = _getMaxSideBase(mode);
+  // لو الموظف اختار دقة بنفسه نلتزم باختياره، وإلا إيصالات الصور المتعددة بترفع الحد الأدنى
+  if (gResLevel > 0) return v;
+  return gMinSide > v ? gMinSide : v;
+}
+
+int _getMaxSideBase(PerfMode mode) {
+  if (gResLevel > 0 && gResLevel <= kResLevels.length) {
+    final v = kResLevels[gResLevel - 1].$4;
+    return mode == PerfMode.lite ? math.min(v, 1400) : v;
+  }
   switch (mode) {
     case PerfMode.lite:
       return 800;
@@ -552,7 +583,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   final w = a['w'] as int, h = a['h'] as int;
   final gray = a['gray'] as bool;
   final th = (a['th'] as bool?) ?? false; // حراري باهت: منحنى أقوى وحدة أعلى
-  final bs = math.max(16, (math.max(w, h) / 40).round());
+  final bs = math.max(th ? 12 : 16, (math.max(w, h) / (th ? 48 : 40)).round());
   final gw = (w + bs - 1) ~/ bs, gh = (h + bs - 1) ~/ bs;
   final bg = List.generate(3, (_) => List<double>.filled(gw * gh, 255.0));
   final hist = List<int>.filled(256, 0);
@@ -620,10 +651,17 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
     bg[c] = blur(blur(bg[c]));
   }
 
-  // أي قيمة من 238 لفوق = أبيض صافي (بيضغط أحسن بكتير)، وجاما خفيفة بتغمّق الحبر
-  final wp = th ? 245.0 : 238.0, gam = th ? 2.0 : 1.25;
-  final lut = List<int>.generate(
-      256, (i) => (255 * math.pow(math.min(1.0, i / wp), gam)).round().clamp(0, 255).toInt());
+  // أي قيمة من 238 لفوق = أبيض صافي، وفي وضع الحراري الباهت بنطبّق تعزيز ذكي للحبر الخفيف مع إزالة الظلال
+  final wp = th ? 242.0 : 238.0, gam = th ? 2.35 : 1.25;
+  final lut = List<int>.generate(256, (i) {
+    if (th && i >= 238) return 255;
+    var v = 255.0 * math.pow(math.min(1.0, i / wp), gam);
+    if (th && v < 195) {
+      // تغميق تدريجي للحبر الباهت بدون تقطيع الأرقام الصغيرة
+      v = (v - 18.0) * 0.92;
+    }
+    return v.round().clamp(0, 255).toInt();
+  });
 
   final cx0 = List<int>.filled(w, 0), cx1 = List<int>.filled(w, 0);
   final ctx = List<double>.filled(w, 0);
@@ -670,13 +708,14 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
     }
   }
 
-  // حدة خفيفة (Unsharp) تحسّن النص المهتز شوية
-  final k = th ? 0.6 : 0.35;
+  // حدة ذكية تحسّن النص وتمنع تشويش الورق الأبيض
+  final k = th ? 0.65 : 0.35;
   final cp = Uint8List.fromList(out);
   final row = w * 4;
   for (var y = 1; y < h - 1; y++) {
     for (var x = 1; x < w - 1; x++) {
       final i = (y * w + x) * 4;
+      if (th && cp[i] > 246 && cp[i + 1] > 246 && cp[i + 2] > 246) continue;
       for (var c = 0; c < 3; c++) {
         final j = i + c;
         final v = cp[j] * (1 + 4 * k) - k * (cp[j - 4] + cp[j + 4] + cp[j - row] + cp[j + row]);
@@ -749,42 +788,53 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
   }
 }
 
-/// فحص سريع بعد التصوير: بيرجّع رسالة تحذير أو null لو الصورة تمام.
-/// الأرقام بتتكتب في السجل (quality var / p90) عشان تضبط الحدود حسب موبايلات الموظفين.
+Map<String, dynamic> _qualityJob(Map<String, dynamic> a) {
+  final px = a['px'] as Uint8List;
+  final w = a['w'] as int, h = a['h'] as int;
+  final lum = Float32List(w * h);
+  final hist = List<int>.filled(256, 0);
+  for (var i = 0; i < w * h; i++) {
+    final l = (px[i * 4] * 54 + px[i * 4 + 1] * 183 + px[i * 4 + 2] * 19) >> 8;
+    lum[i] = l.toDouble();
+    hist[l]++;
+  }
+  var acc = 0, p90 = 255;
+  for (var t = 0; t < 256; t++) {
+    acc += hist[t];
+    if (acc >= w * h * 0.9) {
+      p90 = t;
+      break;
+    }
+  }
+  var s = 0.0, s2 = 0.0, n = 0;
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = y * w + x;
+      final v = 4 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
+      s += v;
+      s2 += v * v;
+      n++;
+    }
+  }
+  final varL = n == 0 ? 999.0 : s2 / n - (s / n) * (s / n);
+  return <String, dynamic>{'varL': varL, 'p90': p90};
+}
+
+/// فحص سريع بعد التصوير داخل Isolate (بدون تجميد الواجهة): بيرجّع رسالة تحذير أو null لو الصورة تمام.
 Future<String?> qualityWarning(String path) async {
   try {
-    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 800);
+    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 400);
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
     img.dispose();
     if (bd == null || w < 16 || h < 16) return null;
-    final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
-    final lum = Float32List(w * h);
-    final hist = List<int>.filled(256, 0);
-    for (var i = 0; i < w * h; i++) {
-      final l = (px[i * 4] * 54 + px[i * 4 + 1] * 183 + px[i * 4 + 2] * 19) >> 8;
-      lum[i] = l.toDouble();
-      hist[l]++;
-    }
-    var acc = 0, p90 = 255;
-    for (var t = 0; t < 256; t++) {
-      acc += hist[t];
-      if (acc >= w * h * 0.9) {
-        p90 = t;
-        break;
-      }
-    }
-    var s = 0.0, s2 = 0.0, n = 0;
-    for (var y = 1; y < h - 1; y++) {
-      for (var x = 1; x < w - 1; x++) {
-        final i = y * w + x;
-        final v = 4 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
-        s += v;
-        s2 += v * v;
-        n++;
-      }
-    }
-    final varL = n == 0 ? 999.0 : s2 / n - (s / n) * (s / n);
+    final r = await compute(_qualityJob, <String, dynamic>{
+      'px': _bytesOf(bd),
+      'w': w,
+      'h': h,
+    });
+    final varL = (r['varL'] as num).toDouble();
+    final p90 = r['p90'] as int;
     AppLog.i('quality var=${varL.toStringAsFixed(1)} p90=$p90');
     if (p90 < 130) return 'الإضاءة ضعيفة، صوّر في مكان أنور';
     if (varL < 25) return 'الصورة شكلها مهزوزة، ثبّت إيدك وصوّر تاني لو الكلام مش واضح';
@@ -805,28 +855,62 @@ Future<bool> _decodesOk(Uint8List b) async {
   }
 }
 
+/// كاش مؤقت في الرام لآخر صورة اتصوّرت عشان شاشة التعديل تعرضها فوراً بدون إعادة قراءة من الذاكرة.
+String? _hotImgPath;
+Uint8List? _hotImgBytes;
+
+Uint8List? _takeHotBytes(String path) {
+  if (_hotImgPath == path && _hotImgBytes != null) {
+    final b = _hotImgBytes;
+    _hotImgPath = null;
+    _hotImgBytes = null;
+    return b;
+  }
+  return null;
+}
+
+bool _isJpegHeader(Uint8List b) => b.length > 100 && b[0] == 0xFF && b[1] == 0xD8;
+
 /// نسخ الصورة من مكان الماسح المؤقت لمكان ثابت كـ JPEG واحد مضغوط (مرة واحدة بس).
 /// وبعدها بيتطبق الفلتر لو الموظف اختاره.
 Future<String> persistImage(String src, String name,
-    {ScanFilter filter = ScanFilter.original}) async {
+    {ScanFilter filter = ScanFilter.original,
+    bool applyNow = true,
+    bool keepOriginal = false}) async {
   final swPersist = Stopwatch()..start();
   final mode = await Store.perfMode();
   final maxSide = getMaxSide(mode);
   Uint8List? bytes;
-  try {
-    bytes = await FlutterImageCompress.compressWithFile(
-      src,
-      minWidth: maxSide,
-      minHeight: maxSide,
-      quality: await Store.jpegQuality(),
-      format: CompressFormat.jpeg,
-      keepExif: false,
-    );
-  } catch (e, st) {
-    AppLog.e('persistImage', e, st);
+  if (keepOriginal) {
+    // صور ماسح جوجل بتيجي مقصوصة ومعدولة جاهزة: نحفظها بأصلها بدون إعادة ضغط أو تصغير عشان متقلش جودتها
+    try {
+      final raw = await File(src).readAsBytes();
+      if (_isJpegHeader(raw)) {
+        final sz = await imageSize(raw);
+        if (sz.w > 0 && sz.h > 0 && math.max(sz.w, sz.h) <= 4096) {
+          bytes = raw;
+        }
+      }
+    } catch (e, st) {
+      AppLog.e('persistImage.orig', e, st);
+    }
+  }
+  if (bytes == null) {
+    try {
+      bytes = await FlutterImageCompress.compressWithFile(
+        src,
+        minWidth: maxSide,
+        minHeight: maxSide,
+        quality: await Store.jpegQuality(),
+        format: CompressFormat.jpeg,
+        keepExif: false,
+      );
+    } catch (e, st) {
+      AppLog.e('persistImage', e, st);
+    }
   }
   AppLog.i('t persist.compress ${swPersist.elapsedMilliseconds}ms');
-  if (bytes != null && !await _decodesOk(bytes)) bytes = null;
+  if (bytes != null && !_isJpegHeader(bytes)) bytes = null;
   if (bytes == null) {
     try {
       final raw = await File(src).readAsBytes();
@@ -845,18 +929,25 @@ Future<String> persistImage(String src, String name,
       AppLog.e('persistImage', e, st);
     }
   }
-  if (bytes == null || !await _decodesOk(bytes)) {
+  if (bytes == null || !_isJpegHeader(bytes)) {
     throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
   }
   final f = File('${(await Store.dir()).path}/$name');
   if (filter != ScanFilter.original) {
-    // نسخة من غير فلتر عشان التعديل بعد كده يبقى ممكن يرجّع الأصلي
-    await File(Store.baseOf(f.path)).writeAsBytes(bytes, flush: true);
+    // نسخة من غير فلتر عشان التعديل بعد كده يبقى ممكن يرجّع الأصلي (بدون flush لعدم تعطيل الواجهة)
+    await File(Store.baseOf(f.path)).writeAsBytes(bytes);
     await Store.setEdit(f.path, EditParams(filter: filter));
   }
   final tFilter = swPersist.elapsedMilliseconds;
-  bytes = await applyFilter(bytes, filter);
-  await f.writeAsBytes(bytes, flush: true);
+  // applyNow=false: بنحفظ الصورة من غير فلتر (شاشة التعديل بتطبّقه على المعاينة) عشان الانتقال يبقى فوري
+  if (applyNow) {
+    bytes = await applyFilter(bytes, filter);
+    await f.writeAsBytes(bytes);
+  } else {
+    _hotImgPath = f.path;
+    _hotImgBytes = bytes;
+    await f.writeAsBytes(bytes);
+  }
   AppLog.i('t persist.filter ${swPersist.elapsedMilliseconds - tFilter}ms total ${swPersist.elapsedMilliseconds}ms');
   return f.path;
 }
@@ -885,12 +976,9 @@ class TagPos {
   final double cx, cy, s;
   const TagPos(this.cx, this.cy, this.s);
 
-  /// المكان الافتراضي: أسفل الصورة (لو عرفنا نسبة الصورة)، وإلا فوق.
-  static TagPos initial(Tag ref, [double? aspect]) {
+  static TagPos initial(Tag ref) {
     final s0 = ref.w / 1000;
-    final th = s0 * ref.h / ref.w; // ارتفاع الورقة كنسبة من عرض الصورة
-    final cy = aspect != null ? aspect - kTagTop - th / 2 : kTagTop + th / 2;
-    return TagPos(0.5, cy, s0);
+    return TagPos(0.5, kTagTop + s0 * ref.h / ref.w / 2, s0);
   }
 
   TagPos copyWith({double? cx, double? cy, double? s}) =>
@@ -906,7 +994,7 @@ class TagPos {
     if (a == null || b == null || c == null) return null;
     if (!a.isFinite || !b.isFinite || !c.isFinite) return null;
     return TagPos(a.clamp(0.0, 1.0).toDouble(), b.clamp(0.0, 10.0).toDouble(),
-        c.clamp(0.1, 0.98).toDouble());
+        c.clamp(0.1, 1.0).toDouble());
   }
 }
 
@@ -916,6 +1004,14 @@ TagPos fitTagPos(TagPos p, Tag t, double aspect) {
   final cx = p.cx.clamp(p.s / 2, 1 - p.s / 2).toDouble();
   final cy = th >= aspect ? aspect / 2 : p.cy.clamp(th / 2, aspect - th / 2).toDouble();
   return p.copyWith(cx: cx, cy: cy);
+}
+
+/// ورقة الباتش: في أسفل الصورة خالص وبعرض الصورة كلها، وبتتكيف تلقائياً مع أي حجم أو أبعاد للصورة.
+/// [aspect] = ارتفاع الصورة ÷ عرضها.
+TagPos bottomTagPos(Tag t, double aspect) {
+  final th = t.h / t.w; // ارتفاع الورقة كنسبة من عرضها
+  final sc = th >= aspect ? aspect / th : 1.0; // لو الصورة قصيرة جداً بنصغّر الورقة عشان تفضل جوه الصورة
+  return TagPos(0.5, aspect - sc * th / 2, sc);
 }
 
 /// فحص إن صورة الورقة سليمة: الورقة أبيض وأسود بس، فأي ألوان كتير أو غياب الأبيض = تشويه من الرسم.
@@ -946,20 +1042,21 @@ Future<bool> _tagLooksOk(Uint8List png) async {
 }
 
 /// بترسم الورقة وتتأكد إنها سليمة، ولو طلعت مشوّهة بتعيد الرسم (لحد 3 مرات).
-Future<Tag> receiptTag(double w, Session s, {bool batch = false}) async {
+Future<Tag> receiptTag(double w, Session s, {bool batch = false, String? pageLabel}) async {
   late Tag t;
   for (var i = 0; i < 3; i++) {
-    t = await _renderTag(w, s, batch: batch);
+    t = await _renderTag(w, s, batch: batch, pageLabel: pageLabel);
     if (await _tagLooksOk(t.png)) return t;
     AppLog.i('tag garbled, retry ${i + 1}');
   }
   return t;
 }
 
-Future<Tag> _renderTag(double w, Session s, {bool batch = false}) async {
+Future<Tag> _renderTag(double w, Session s, {bool batch = false, String? pageLabel}) async {
   final fs = w * kTagFont;
   final l1 = _tp('${s.name}  |  ${s.unitName}', fs, TextDirection.rtl);
-  final l2 = _tp(_isoLtr(s.date), fs, TextDirection.rtl);
+  final baseL2 = _isoLtr(s.date);
+  final l2 = _tp(pageLabel == null ? baseL2 : '$baseL2  |  ${_isoLtr(pageLabel)}', fs, TextDirection.rtl);
   final pad = fs * 0.6;
   final gap = fs * 0.25;
   final textW = l1.width > l2.width ? l1.width : l2.width;
@@ -985,6 +1082,13 @@ Future<Tag> _renderTag(double w, Session s, {bool batch = false}) async {
   final bd = await img.toByteData(format: ui.ImageByteFormat.png);
   img.dispose();
   return Tag(_bytesOf(bd!), cw, ch);
+}
+
+/// ورقة الباتش بحجم الشريط. w = عرض الصورة بالبكسل.
+Future<Tag> batchBandTag(Session s, double w) async {
+  final k = await Store.bandScale();
+  final r = await receiptTag(1000, s, batch: true);
+  return receiptTag(1000 * (w * k) / r.w, s, batch: true);
 }
 
 /// تركيب الباتش بيتم كله على الـ CPU (Isolate) من غير رسم GPU، لأن الرسم الكبير على GPU
@@ -1060,21 +1164,39 @@ Future<double?> _jpegMeanLum(Uint8List jpg) async {
   }
 }
 
-/// صورة الباتش + الورقة فوق الصورة في المكان اللي الموظف اختاره.
+/// صورة الباتش + الورقة. layout 1: شريط أبيض تحت الصورة (الصورة كاملة من غير تغطية)،
+/// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
 Future<Uint8List> composeBatch(String path, Session s) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src; // من غير ورقة
+  final layout = await Store.batchLayout();
   final sz = await imageSize(src);
   final maxSide = getMaxSide(await Store.perfMode());
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final iw = img.width, ih = img.height;
   final w = iw.toDouble(), h = ih.toDouble();
-  const imgY = 0, imgX = 0;
-  final ow = iw, oh = ih;
-  final ref = await receiptTag(1000, s, batch: true);
-  final pos = fitTagPos(await Store.pos(path) ?? TagPos.initial(ref, h / w), ref, h / w);
-  final tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
-  final tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
+  final Tag tag;
+  final Offset tagAt;
+  int imgY = 0, imgX = 0;
+  final int oh;
+  int ow = iw;
+  if (layout == 2) {
+    final ref = await receiptTag(1000, s, batch: true);
+    final pos = fitTagPos(await Store.pos(path) ?? bottomTagPos(ref, h / w), ref, h / w);
+    tag = await receiptTag(1000 * (w * pos.s) / ref.w, s, batch: true);
+    tagAt = Offset(pos.cx * w - tag.w / 2, pos.cy * w - tag.h / 2);
+    oh = ih;
+  } else {
+    tag = await batchBandTag(s, w);
+    final pad = w * kBandPad; // الهامش الخارجي
+    final gap = w * kBandGapNear; // الهامش اللي بين الورقة والصورة (صغير)
+    final band = tag.h + pad + gap;
+    ow = math.max(iw, tag.w.ceil());
+    imgX = ((ow - iw) / 2).round();
+    tagAt = Offset((ow - tag.w) / 2, h + gap);
+    imgY = 0;
+    oh = ih + band.ceil();
+  }
   final tImg = await decodeImage(tag.png);
   final tw = tImg.width, th = tImg.height;
   final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
@@ -1124,14 +1246,14 @@ Future<Uint8List> composeBatch(String path, Session s) async {
 
 /// صورة الإيصال النهائية للمشاركة: نفس صفحة الـ PDF (شريط أبيض فيه الورقة فوق الإيصال).
 /// من غير ورقة (إخفاء الورقة) بترجع الصورة زي ما هي.
-Future<Uint8List> composeReceiptImage(String path, Session s) async {
+Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel}) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src;
   final sz = await imageSize(src);
   final maxSide = getMaxSide(await Store.perfMode());
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final iw = img.width, ih = img.height;
-  final tag = await receiptTag(iw.toDouble(), s);
+  final tag = await receiptTag(iw.toDouble(), s, pageLabel: pageLabel);
   final pad = iw * kBandPad;
   final band = (tag.h + pad * 2).ceil();
   final oh = ih + band;
@@ -1182,26 +1304,33 @@ Future<Uint8List> composeReceiptImage(String path, Session s) async {
 /// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال الأصلية (JPEG بيتحط في الـ PDF زي ما هو
 /// من غير إعادة رسم ولا إعادة ضغط، فالجودة أحسن والذاكرة أقل بكتير).
 Future<File> buildReceiptsPdf(Session s, List<String> receipts,
-    {void Function(int done, int total)? onProgress}) async {
+    {bool? forceCompact, void Function(int done, int total)? onProgress}) async {
   Store.working++;
   try {
     final doc = pw.Document();
     const pageW = 595.0;
-    final tag = await receiptTag(1000, s);
-    final tagImg = pw.MemoryImage(tag.png);
-    final tw = pageW * tag.w / 1000;
-    final th = pageW * tag.h / 1000;
     final pad = pageW * kBandPad;
-    final bandH = th + pad * 2;
-    final compact = (await Store.pdfSize()) == 1;
+    final compact = forceCompact ?? ((await Store.pdfSize()) == 1);
+    final multi = receipts.length > 1;
+    Tag? sharedTag;
+    pw.MemoryImage? sharedTagImg;
+    if (!multi) {
+      sharedTag = await receiptTag(1000, s);
+      sharedTagImg = pw.MemoryImage(sharedTag.png);
+    }
     for (var i = 0; i < receipts.length; i++) {
       onProgress?.call(i, receipts.length);
       var bytes = await File(receipts[i]).readAsBytes();
       if (compact) {
         // PDF مضغوط: نسخة أصغر (عرض ~720 وجودة 70) لو طلعت أخف وسليمة، وإلا بنستخدم الأصلية
         try {
+          // صورة فيها ١٥ إيصال: الضغط لـ 720 هيمسح الأرقام، فبنخلّي دقة أعلى بكتير
+          final hd = gMinSide > 0;
           final c = await FlutterImageCompress.compressWithList(bytes,
-              minWidth: 720, minHeight: 720, quality: 70, format: CompressFormat.jpeg);
+              minWidth: hd ? 2200 : 720,
+              minHeight: hd ? 2200 : 720,
+              quality: hd ? 78 : 70,
+              format: CompressFormat.jpeg);
           if (c.isNotEmpty && c.length < bytes.length && await _decodesOk(c)) bytes = c;
         } catch (e, st) {
           AppLog.e('pdf.compact', e, st);
@@ -1210,18 +1339,28 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
       final sz = await imageSize(bytes);
       final imgH = pageW * sz.h / sz.w;
       final hide = await Store.noTag(receipts[i]);
+      Tag? pTag;
+      pw.MemoryImage? pTagImg;
+      var tw = 0.0, th = 0.0, bandH = 0.0;
+      if (!hide) {
+        pTag = multi ? await receiptTag(1000, s, pageLabel: '${i + 1} / ${receipts.length}') : sharedTag!;
+        pTagImg = multi ? pw.MemoryImage(pTag.png) : sharedTagImg!;
+        tw = pageW * pTag.w / 1000;
+        th = pageW * pTag.h / 1000;
+        bandH = th + pad * 2;
+      }
       final pageH = (hide ? 0.0 : bandH) + imgH + 1;
       final image = pw.MemoryImage(bytes);
       doc.addPage(pw.Page(
         pageFormat: PdfPageFormat(pageW, pageH),
         margin: pw.EdgeInsets.zero,
         build: (_) => pw.Column(children: [
-          if (!hide)
+          if (!hide && pTagImg != null)
             pw.Container(
               width: pageW,
               height: bandH,
               alignment: pw.Alignment.center,
-              child: pw.Image(tagImg, width: tw, height: th),
+              child: pw.Image(pTagImg, width: tw, height: th),
             ),
           pw.Image(image, width: pageW, height: imgH),
         ]),
@@ -1249,6 +1388,10 @@ String _dayKey() {
 
 class Store {
   static const pdfLife = Duration(hours: 24);
+
+  /// مدة الاحتفاظ بالباتش والإيصالات بعد الإرسال (قابلة للتعديل وإعادة الإرسال).
+  /// بتتمسح تلقائياً مع فتح التطبيق لما المدة تعدّي.
+  static const sentLife = Duration(hours: 12);
   static int working = 0; // عدد العمليات الشغالة (بتمنع التنظيف أثناءها)
   static Future<SharedPreferences> get _p => SharedPreferences.getInstance();
 
@@ -1287,11 +1430,42 @@ class Store {
   static Future<int> scanSetting() async => ((await _p).getInt('scanMode') ?? 0).clamp(0, 3);
   static Future<void> setScanSetting(int v) async => (await _p).setInt('scanMode', v);
 
+  /// محرك التصوير: 0 كاميرا A2R المخصصة، 1 ماسح جوجل (ML Kit) — الافتراضي ماسح جوجل
+  /// محرك التصوير الافتراضي للتطبيق كله (والباتش): 1 ماسح جوجل (الافتراضي)، 0 كاميرا A2R. من الإعدادات بس.
+  static Future<int> scanEngine() async {
+    final p = await _p;
+    // مرة واحدة: النسخ القديمة كانت بتغيّر المحرك العام لما تختار كاميرا A2R في إيصالات الدفع، فبنرجّعه لماسح جوجل
+    if (p.getBool('engMig1') != true) {
+      await p.setInt('scanEngine', 1);
+      await p.setBool('engMig1', true);
+    }
+    return (p.getInt('scanEngine') ?? 1).clamp(0, 1);
+  }
+
+  static Future<void> setScanEngine(int v) async => (await _p).setInt('scanEngine', v);
+
+  /// محرك التصوير بتاع إيصالات الدفع بس (اختيارك في أول الملف). مبيأثرش على الباتش ولا على باقي التطبيق.
+  static Future<int> scanEngineReceipts() async =>
+      ((await _p).getInt('scanEngineR') ?? await scanEngine()).clamp(0, 1);
+  static Future<void> setScanEngineReceipts(int v) async => (await _p).setInt('scanEngineR', v);
+
   /// جودة الصورة: 0 صغيرة، 1 عادية، 2 عالية
   static Future<int> qualitySetting() async => ((await _p).getInt('jpegQ') ?? 1).clamp(0, 2);
   static Future<void> setQualitySetting(int v) async => (await _p).setInt('jpegQ', v);
 
+  /// دقة الصورة: 0 تلقائي (حسب وضع الأداء)، 1 صغيرة 720p، 2 متوسطة 1080p، 3 عالية 4K، 4 أعلى
+  static Future<int> resSetting() async => ((await _p).getInt('resLevel') ?? 0).clamp(0, kResLevels.length);
+  static Future<void> setResSetting(int v) async {
+    gResLevel = v.clamp(0, kResLevels.length);
+    await (await _p).setInt('resLevel', gResLevel);
+  }
+
   static Future<int> jpegQuality() async {
+    final b = await _jpegQualityBase();
+    return gMinQuality > b ? gMinQuality : b;
+  }
+
+  static Future<int> _jpegQualityBase() async {
     switch (await qualitySetting()) {
       case 0:
         return 65;
@@ -1373,10 +1547,8 @@ class Store {
   static Future<bool> autoEdit() async => (await _p).getBool('autoEdit') ?? false;
   static Future<void> setAutoEdit(bool v) async => (await _p).setBool('autoEdit', v);
 
-  /// شكل ورقة الباتش: 1 شريط تحت الصورة، 2 على الصورة (الشريط فوق اتلغى، والقيمة القديمة 0 بتتحول لـ 1)
-  static Future<int> batchLayout() async {
-    return 2; // الورقة دايمًا على الصورة (شريط تحت الصورة اتلغى)
-  }
+  /// ورقة الباتش بقت على الصورة بس (الشريط تحت وفوق اتلغوا)، فالقيمة دايماً 2.
+  static Future<int> batchLayout() async => 2;
   static Future<void> setBatchLayout(int v) async => (await _p).setInt('batchLayout', v);
 
   /// حجم الورقة في وضع الشريط (نسبة من عرض الصورة)
@@ -1388,16 +1560,36 @@ class Store {
   static Future<TagPos?> pos(String path) async =>
       TagPos.decode((await _p).getString('pos:$path'));
 
-  static Future<TagPos> assignPos(String path, Tag ref, bool batch, [double? aspect]) async {
+  static Future<TagPos> assignPos(String path, Tag ref, bool batch) async {
     final p = await _p;
     var v = TagPos.decode(p.getString('pos:$path'));
     if (v == null) {
-      v = TagPos.decode(p.getString(batch ? 'lastPos_b' : 'lastPos_r')) ??
-          TagPos.initial(ref, aspect);
+      v = TagPos.decode(p.getString(batch ? 'lastPos_b' : 'lastPos_r')) ?? TagPos.initial(ref);
       await p.setString('pos:$path', v.encode());
     }
     return v;
   }
+
+  /// مكان الورقة لصورة باتش: بيتحفظ للصورة دي، وكمان كأساس للباتشات الجاية.
+  /// اللي بيتحفظ هو المسافة من أسفل الصورة (مش من فوق) عشان المكان يتكيف مع أي ارتفاع للصورة.
+  static Future<void> saveBatchPos(String path, TagPos v, double aspect) async {
+    final p = await _p;
+    await p.setString('pos:$path', v.encode());
+    await p.setString('lastBot_b', '${v.cx},${aspect - v.cy},${v.s}');
+  }
+
+  /// آخر مكان ظبطه الموظف للورقة، متحوّل لصورة بالارتفاع ده (null لو لسه محدش حركها).
+  static Future<TagPos?> lastBatchPos(double aspect) async {
+    final v = (await _p).getString('lastBot_b')?.split(',');
+    if (v == null || v.length != 3) return null;
+    final a = double.tryParse(v[0]), b = double.tryParse(v[1]), c = double.tryParse(v[2]);
+    if (a == null || b == null || c == null || !a.isFinite || !b.isFinite || !c.isFinite) return null;
+    return TagPos(a.clamp(0.0, 1.0).toDouble(), aspect - b, c.clamp(0.1, 1.0).toDouble());
+  }
+
+  /// بيحفظ مكان الورقة لصورة واحدة بس من غير ما يغيّر المكان الافتراضي المحفوظ للباتشات الجاية.
+  static Future<void> setPosFor(String path, TagPos v) async =>
+      (await _p).setString('pos:$path', v.encode());
 
   static Future<void> savePos(String path, TagPos v, bool batch) async {
     final p = await _p;
@@ -1412,11 +1604,21 @@ class Store {
     return v;
   }
 
-  static Future<void> setBatchImg(String path) async {
+  /// [fresh] = true لما تكون صورة باتش جديدة (تصوير/معرض)، false لما تكون نتيجة تعديل نفس الباتش.
+  /// الباتش الجديد بعد باتش اتبعت بيبدأ من الأول (علامة الإرسال وبيانات الباتش القديمة بتتصفّر).
+  static Future<void> setBatchImg(String path, {bool fresh = false}) async {
     final p = await _p;
     final old = p.getString('batchImg');
     if (old != null && old != path) await del(old);
     await p.setString('batchImg', path);
+    if (fresh && p.getInt('batchSentAt') != null) await _resetBatchMeta(p);
+  }
+
+  static Future<void> _resetBatchMeta(SharedPreferences p) async {
+    await p.remove('batchSentAt');
+    for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
+      await p.remove(k);
+    }
   }
 
   static Future<void> clearBatchImg() async {
@@ -1424,15 +1626,22 @@ class Store {
     final old = p.getString('batchImg');
     if (old != null) await del(old);
     await p.remove('batchImg');
+    await _resetBatchMeta(p);
   }
 
+  /// بعد إرسال الباتش: الصورة وبياناتها بيفضلوا ١٢ ساعة (قابلين للتعديل وإعادة الإرسال).
   static Future<void> afterBatchSent() async {
-    await clearBatchImg();
     final p = await _p;
-    for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
-      await p.remove(k);
-    }
+    await p.setInt('batchSentAt', DateTime.now().millisecondsSinceEpoch);
     await setFlag('batch');
+  }
+
+  /// وقت إرسال الباتش (null لو لسه متبعتش).
+  static Future<DateTime?> batchSentAt() async {
+    final p = await _p;
+    final t = p.getInt('batchSentAt');
+    if (t == null || p.getString('batchImg') == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(t);
   }
 
   // --- صور الإيصالات ---
@@ -1447,8 +1656,14 @@ class Store {
 
   static Future<void> addToDraft(String path) async {
     final l = await draft();
+    final p = await _p;
+    if (l.isEmpty) {
+      // مسودة جديدة بعد ما اتمسح كل حاجة: متفضلش علامة "اتبعت" قديمة
+      await p.remove('rcSentAt');
+      await p.remove('rcSentImgs');
+    }
     l.add(path);
-    await (await _p).setStringList('draft', l);
+    await p.setStringList('draft', l);
   }
 
   static Future<void> removeFromDraft(String path) async {
@@ -1462,7 +1677,10 @@ class Store {
     for (final e in await draft()) {
       await del(e);
     }
-    await (await _p).setStringList('draft', []);
+    final p = await _p;
+    await p.setStringList('draft', []);
+    await p.remove('rcSentAt');
+    await p.remove('rcSentImgs');
   }
 
   // --- نسخة الصورة الأصلية + إعدادات التعديل (تعديل غير مدمّر) ---
@@ -1495,8 +1713,16 @@ class Store {
     } else {
       l[i] = neu;
     }
-    await (await _p).setStringList('draft', l);
+    final p = await _p;
+    await p.setStringList('draft', l);
     if (await noTag(old)) await setNoTag(neu, true); // الاختيار يفضل بعد التعديل
+    // لو الصورة كانت من اللي اتبعتوا: الصورة المعدّلة تاخد مكانها في قايمة "اتبعت"
+    final sent = p.getStringList('rcSentImgs');
+    if (sent != null && sent.contains(old)) {
+      await p.setStringList('rcSentImgs', [for (final x in sent) x == old ? neu : x]);
+    }
+    // الـ PDF القديم مبقاش مظبوط بعد التعديل
+    if ((p.getStringList('pdfImgs') ?? []).contains(old)) await clearPdf();
     await del(old);
   }
 
@@ -1507,8 +1733,12 @@ class Store {
     final t = p.getInt('pdfTime');
     if (path == null || t == null) return null;
     final time = DateTime.fromMillisecondsSinceEpoch(t);
-    final age = DateTime.now().difference(time);
-    if (age > pdfLife || !File(path).existsSync()) {
+    // لو الإيصالات اتبعتت: المدة ١٢ ساعة من وقت الإرسال، وإلا ٢٤ ساعة من وقت إنشاء الـ PDF
+    final sentT = p.getInt('rcSentAt');
+    final age = DateTime.now()
+        .difference(sentT == null ? time : DateTime.fromMillisecondsSinceEpoch(sentT));
+    final life = sentT == null ? pdfLife : sentLife;
+    if (age > life || !File(path).existsSync()) {
       await clearPdf();
       return null;
     }
@@ -1533,17 +1763,59 @@ class Store {
     await p.remove('pdfImgs');
   }
 
+  /// بعد إرسال الإيصالات: الصور والـ PDF بيفضلوا ١٢ ساعة (قابلين للتعديل وإعادة الإرسال).
   static Future<void> afterPdfSent() async {
     final p = await _p;
-    final used = p.getStringList('pdfImgs') ?? [];
+    final used = (p.getStringList('pdfImgs') ?? []).where((e) => File(e).existsSync()).toList();
+    if (used.isNotEmpty) {
+      await p.setInt('rcSentAt', DateTime.now().millisecondsSinceEpoch);
+      await p.setStringList('rcSentImgs', used);
+    }
+    await setFlag('receipts');
+  }
+
+  /// وقت إرسال الإيصالات (null لو مفيش إيصالات متبعتة محتفظ بيها).
+  static Future<DateTime?> receiptsSentAt() async {
+    final p = await _p;
+    final t = p.getInt('rcSentAt');
+    if (t == null) return null;
+    final sent = (p.getStringList('rcSentImgs') ?? []).where((e) => File(e).existsSync());
+    if (sent.isEmpty) {
+      await p.remove('rcSentAt');
+      await p.remove('rcSentImgs');
+      return null;
+    }
+    return DateTime.fromMillisecondsSinceEpoch(t);
+  }
+
+  /// بيمسح الإيصالات اللي اتبعتت بس (الصور اللي لسه متبعتتش بتفضل) مع الـ PDF بتاعها.
+  static Future<void> discardSentReceipts() async {
+    final p = await _p;
+    final sent = p.getStringList('rcSentImgs') ?? [];
     final left = await draft();
-    for (final u in used) {
+    for (final u in sent) {
       await del(u);
       left.remove(u);
     }
     await p.setStringList('draft', left);
-    await p.remove('pdfImgs');
-    await setFlag('receipts');
+    await p.remove('rcSentAt');
+    await p.remove('rcSentImgs');
+    await clearPdf();
+  }
+
+  /// بيتنفّذ مع فتح التطبيق: بيمسح الباتش والإيصالات اللي عدّى عليهم أكتر من ١٢ ساعة من الإرسال.
+  static Future<void> expireSent() async {
+    if (working > 0) return;
+    final p = await _p;
+    final now = DateTime.now();
+    final bt = p.getInt('batchSentAt');
+    if (bt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(bt)) > sentLife) {
+      await clearBatchImg();
+    }
+    final rt = p.getInt('rcSentAt');
+    if (rt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(rt)) > sentLife) {
+      await discardSentReceipts();
+    }
   }
 
   // --- علامة ✓ (بتتصفّر كل يوم جديد) ---
@@ -1561,6 +1833,52 @@ class Store {
     await flag(k);
     await (await _p).setBool('f_$k', true);
   }
+
+  // --- سجل الإرسال (بيفضل ٣٠ يوم، ومبيتمسحش مع تنظيف الصور) ---
+  static const logKeep = Duration(days: 30);
+  static const _logMax = 300;
+
+  static Future<List<SendLogEntry>> readLog() async {
+    final raw = (await _p).getString('sendLog');
+    if (raw == null) return [];
+    try {
+      final l = <SendLogEntry>[];
+      for (final e in jsonDecode(raw) as List) {
+        try {
+          l.add(SendLogEntry.fromJson(Map<String, dynamic>.from(e as Map)));
+        } catch (_) {}
+      }
+      final cut = DateTime.now().subtract(logKeep);
+      l.removeWhere((e) => e.time.isBefore(cut));
+      l.sort((a, b) => b.time.compareTo(a.time));
+      return l;
+    } catch (e, st) {
+      AppLog.e('readLog', e, st);
+      return [];
+    }
+  }
+
+  /// [kind]: batch | receipts. بيتسجل بعد ما الإرسال يتأكد بس.
+  static Future<void> addLog(Session s, String kind, String detail) async {
+    try {
+      final l = await readLog();
+      l.insert(
+          0,
+          SendLogEntry(
+              time: DateTime.now(),
+              kind: kind,
+              name: s.name,
+              unit: s.unitName,
+              building: null,
+              detail: detail));
+      if (l.length > _logMax) l.removeRange(_logMax, l.length);
+      await (await _p).setString('sendLog', jsonEncode([for (final e in l) e.toJson()]));
+    } catch (e, st) {
+      AppLog.e('addLog', e, st);
+    }
+  }
+
+  static Future<void> clearLog() async => (await _p).remove('sendLog');
 
   /// مسح أي ملفات مؤقتة مش تابعة لمسودة أو PDF شغّال. مبتشتغلش لو فيه عملية شغالة.
   static Future<void> cleanup() async {
@@ -1713,25 +2031,9 @@ Future<List<String>> _manualPick(BuildContext context, {bool multi = false}) asy
   return r;
 }
 
-ScannerMode _scanModeOf(int i, ScannerMode fallback) {
-  switch (i) {
-    case 1:
-      return ScannerMode.base;
-    case 2:
-      // الوضع الأوسط (قص + فلتر): بنختاره بالترتيب عشان اسمه بيختلف بين نسخ الحزمة
-      return ScannerMode.values.length > 2 ? ScannerMode.values[1] : ScannerMode.base;
-    case 3:
-      return ScannerMode.full;
-    default:
-      return fallback;
-  }
-}
-
-const _scanOpts = <(int, String, String)>[
-  (0, 'تلقائي', 'الباتش كامل والإيصالات قص بس (الافتراضي)'),
-  (1, 'قص بس', 'أسرع وأخف، من غير تحسينات'),
-  (2, 'قص + فلتر', 'قص مع تحسين تلقائي للألوان'),
-  (3, 'كامل', 'قص وتنضيف الصورة وإزالة الصوابع'),
+const _engineOpts = <(int, String, String)>[
+  (1, 'ماسح جوجل', 'قص ذكي بالذكاء الاصطناعي زي CamScanner (الافتراضي)'),
+  (0, 'كاميرا A2R', 'كاميرا التطبيق المخصصة مع القص اليدوي/التلقائي'),
 ];
 
 const _qualOpts = <(int, String, String)>[
@@ -1740,30 +2042,37 @@ const _qualOpts = <(int, String, String)>[
   (2, 'عالية', 'أوضح وحجم أكبر'),
 ];
 
+const _resOpts = <(int, String, String)>[
+  (0, 'تلقائي', 'حسب وضع الأداء (الافتراضي)'),
+  (1, 'صغيرة · 720p', 'أخف ملف وأسرع إرسال'),
+  (2, 'متوسطة · 1080p', 'متوازنة'),
+  (3, 'عالية · 4K', 'أوضح تفاصيل وحجم أكبر'),
+  (4, 'أعلى · أقصى دقة', 'أكبر دقة ممكنة، ممكن يبطّأ على الموبايلات الضعيفة'),
+];
+
 bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
 
 Future<List<String>> scanImages(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full}) async {
+    {ScannerMode mode = ScannerMode.base, bool camFallback = false}) async {
   if (_scanBusy) return [];
   _scanBusy = true;
   try {
-    return await _scanImagesImpl(context, limit, mode: mode);
+    return await _scanImagesImpl(context, limit, mode: mode, camFallback: camFallback);
   } finally {
     _scanBusy = false;
   }
 }
 
 Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.full}) async {
+    {ScannerMode mode = ScannerMode.base, bool camFallback = false}) async {
   _lastScanManual = false;
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
   final perf = await Store.perfMode();
   if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1);
-  final sm = await Store.scanSetting();
-  final effMode = _scanModeOf(sm, perf == PerfMode.pro ? ScannerMode.full : mode);
+  // ماسح جوجل للقص فقط (ScannerMode.base) عشان يرجّع الصورة الأصلية بدون أي فلتر مزدوج
   final scanner = DocumentScanner(
-    options: DocumentScannerOptions(mode: effMode, pageLimit: limit, isGalleryImport: true),
+    options: DocumentScannerOptions(mode: ScannerMode.base, pageLimit: limit, isGalleryImport: true),
   );
   try {
     final r = await scanner.scanDocument();
@@ -1779,6 +2088,12 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
       AppLog.e('scanImages.prefs', e, st);
     }
     if (!context.mounted) return [];
+    if (camFallback) {
+      // الطالب بيحول لكاميرا A2R بنفسه: نرجّع فاضي من غير ما نفتح المعرض
+      AppLog.e('scanImages.unavailable', e, StackTrace.current);
+      snack(context, 'ماسح جوجل مش متاح على الموبايل ده، هنستخدم كاميرا A2R');
+      return [];
+    }
     await showDialog<void>(
       context: context,
       builder: (c) => Directionality(
@@ -1854,8 +2169,106 @@ String _digits(String s) {
 /// نتيجة قراءة ورقة إغلاق الباتش من الصورة (أي قيمة ممكن تكون null لو متقرتش)
 class BatchOcr {
   final String? count, total;
-  final int sheets; // عدد الأوراق اللي اتقرت واتجمعت
-  const BatchOcr(this.count, this.total, [this.sheets = 1]);
+  final int parts; // عدد الأوراق اللي اتجمعت (1 = ورقة واحدة)
+  final int missing; // عدد الأوراق اللي اتشافت بس متقرتش كويس
+  final String detail; // تفاصيل الجمع لما يكون في أكتر من ورقة
+  final String? receiptDate; // تاريخ الباتش المقروء من الورقة (DD/MM/YYYY)
+  final bool dateIsToday; // هل تاريخ الورقة يطابق تاريخ النهارده
+  final bool isReprint; // هل مكتوب عليها REPRINT
+  final bool isSummaryReport; // هل مكتوب عليها SUMMARY REPORT (سمري مش إغلاق باتش)
+  final bool isBatchClosed; // هل مكتوب عليها BATCH CLOSED SUCCESSFULLY
+  final bool hasText; // هل الـ OCR قرأ نص من الورقة
+  const BatchOcr(
+    this.count,
+    this.total, {
+    this.parts = 1,
+    this.missing = 0,
+    this.detail = '',
+    this.receiptDate,
+    this.dateIsToday = true,
+    this.isReprint = false,
+    this.isSummaryReport = false,
+    this.isBatchClosed = false,
+    this.hasText = false,
+  });
+
+  BatchOcr withMeta({
+    String? receiptDate,
+    bool? dateIsToday,
+    bool? isReprint,
+    bool? isSummaryReport,
+    bool? isBatchClosed,
+    bool? hasText,
+  }) =>
+      BatchOcr(
+        count,
+        total,
+        parts: parts,
+        missing: missing,
+        detail: detail,
+        receiptDate: receiptDate ?? this.receiptDate,
+        dateIsToday: dateIsToday ?? this.dateIsToday,
+        isReprint: isReprint ?? this.isReprint,
+        isSummaryReport: isSummaryReport ?? this.isSummaryReport,
+        isBatchClosed: isBatchClosed ?? this.isBatchClosed,
+        hasText: hasText ?? this.hasText,
+      );
+}
+
+final RegExp _ocrDateIso = RegExp(r'(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)');
+final RegExp _ocrDateDmy = RegExp(r'(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})(?!\d)');
+final RegExp _ocrReprint = RegExp(r'reprint|duplicate', caseSensitive: false);
+final RegExp _ocrSummaryReport = RegExp(r'summary\s*(?:report)?', caseSensitive: false);
+final RegExp _ocrBatchClosed = RegExp(r'batch\s*closed\s*success\w*', caseSensitive: false);
+
+BatchOcr _attachBatchMeta(BatchOcr base, List<String> rows) {
+  final joined = rows.join('\n');
+  String? rDate;
+  var isToday = true;
+  final now = DateTime.now();
+  final mIso = _ocrDateIso.firstMatch(joined);
+  final mDmy = _ocrDateDmy.firstMatch(joined);
+  int? y, mo, d;
+  if (mIso != null) {
+    y = int.tryParse(mIso.group(1)!);
+    mo = int.tryParse(mIso.group(2)!);
+    d = int.tryParse(mIso.group(3)!);
+  } else if (mDmy != null) {
+    d = int.tryParse(mDmy.group(1)!);
+    mo = int.tryParse(mDmy.group(2)!);
+    y = int.tryParse(mDmy.group(3)!);
+  }
+  if (y != null && mo != null && d != null && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+    rDate = '${d.toString().padLeft(2, '0')}/${mo.toString().padLeft(2, '0')}/$y';
+    isToday = (y == now.year && mo == now.month && d == now.day);
+  }
+  return base.withMeta(
+    receiptDate: rDate,
+    dateIsToday: isToday,
+    isReprint: _ocrReprint.hasMatch(joined),
+    isSummaryReport: _ocrSummaryReport.hasMatch(joined),
+    isBatchClosed: _ocrBatchClosed.hasMatch(joined),
+    hasText: rows.isNotEmpty,
+  );
+}
+
+/// تحذيرات ذكية لمطابقة ورقة الباتش: لازم يكون مكتوب عليها BATCH CLOSED SUCCESSFULLY
+/// غير كده (زي SUMMARY REPORT أو REPRINT أو أي إيصال تاني) يطلع تنبيه فوري.
+List<String> batchOcrWarnings(BatchOcr r, Session s) {
+  final w = <String>[];
+  if (r.isSummaryReport) {
+    w.add('الورقة دي SUMMARY REPORT (سمري) ومش إغلاق باتش صحيح!');
+  }
+  if (r.isReprint) {
+    w.add('الورقة مكتوب عليها REPRINT (إعادة طباعة) وليست إغلاق باتش أصلي!');
+  }
+  if (r.hasText && !r.isBatchClosed && !r.isSummaryReport) {
+    w.add('لم يتم العثور على جملة "BATCH CLOSED SUCCESSFULLY" — اتأكد إن الورقة إغلاق باتش صحيح');
+  }
+  if (r.receiptDate != null && !r.dateIsToday) {
+    w.add('تاريخ الباتش في الصورة (${r.receiptDate}) مختلف عن تاريخ النهارده (${s.date})');
+  }
+  return w;
 }
 
 final RegExp _ocrDec = RegExp(r'(?<![\d.,])\d[\d,]*[.,]\d{2}(?![\d.,])');
@@ -1942,37 +2355,78 @@ BatchOcr _parseGeneric(List<String> rowsRaw) {
 }
 
 final RegExp _ocrParen = RegExp(r'[(\[{]\s*([0-9OoIl]{1,6})\s*[)\]}]?');
+final RegExp _ocrGrand = RegExp(r'grand', caseSensitive: false);
+final RegExp _ocrEnd = RegExp(r'thank|hotline|nbe', caseSensitive: false);
 
-/// ورقة NBE: تحت GRAND TOTALS في سطر Sale العدد بين أقواس (015) والمبلغ جنبه
-BatchOcr parseBatchRows(List<String> rows, {bool strict = false}) {
-  final gi = rows.lastIndexWhere((r) => RegExp(r'grand', caseSensitive: false).hasMatch(r));
-  String? count, total;
-  if (gi >= 0) {
-    double? best;
-    for (var i = gi; i < rows.length; i++) {
-      final r = rows[i];
-      if (count == null) {
-        final m = _ocrParen.firstMatch(r);
-        if (m != null) {
-          final d = m.group(1)!.replaceAll(RegExp(r'[Oo]'), '0').replaceAll(RegExp(r'[Il]'), '1');
-          count = '${int.parse(d)}';
-        }
-      }
-      if (RegExp(r'thank|hotline|nbe', caseSensitive: false).hasMatch(r)) break;
-      for (final m in _ocrDec.allMatches(r)) {
-        final v = _ocrNum(m.group(0)!);
-        if (v != null && (best == null || v > best)) best = v;
+/// ورقة NBE واحدة: من سطر GRAND TOTALS لحد سطر THANK. العدد بين أقواس (015) والمبلغ جنبه.
+/// أي قيمة متقرتش بترجع null.
+BatchOcr _parseGrandBlock(List<String> rows, int from, int to) {
+  String? count;
+  double? best;
+  for (var i = from; i < to; i++) {
+    final r = rows[i];
+    if (count == null) {
+      final m = _ocrParen.firstMatch(r);
+      if (m != null) {
+        final d = m.group(1)!.replaceAll(RegExp(r'[Oo]'), '0').replaceAll(RegExp(r'[Il]'), '1');
+        count = '${int.parse(d)}';
       }
     }
-    if (best != null) total = best.toStringAsFixed(2);
+    if (_ocrEnd.hasMatch(r)) break;
+    for (final m in _ocrDec.allMatches(r)) {
+      final v = _ocrNum(m.group(0)!);
+      if (v != null && (best == null || v > best)) best = v;
+    }
   }
-  if (count != null && total != null) return BatchOcr(count, total);
-  if (strict) return const BatchOcr(null, null);
-  final g = _parseGeneric(rows);
-  return BatchOcr(count ?? g.count, total ?? g.total);
+  return BatchOcr(count, best?.toStringAsFixed(2));
 }
 
-/// قراءة صورة الباتش بـ ML Kit وتجميع النص في صفوف حسب الموقع الرأسي
+/// كل ورقة في الصفوف دي (ممكن أكتر من ورقة فوق بعض): كل GRAND TOTALS ليه عدد وإجمالي.
+List<BatchOcr> parseBatchSheets(List<String> rows) {
+  final gis = <int>[
+    for (var i = 0; i < rows.length; i++)
+      if (_ocrGrand.hasMatch(rows[i])) i
+  ];
+  return [
+    for (var k = 0; k < gis.length; k++)
+      _parseGrandBlock(rows, gis[k], k + 1 < gis.length ? gis[k + 1] : rows.length)
+  ];
+}
+
+/// جمع الأوراق: العدد والإجمالي (بالقروش عشان مفيش خطأ في الكسور).
+BatchOcr sumBatchSheets(List<BatchOcr> sheets) {
+  var n = 0, cents = 0, parts = 0, missing = 0;
+  final cs = <String>[], ts = <String>[];
+  for (final x in sheets) {
+    if (x.count == null || x.total == null) {
+      missing++;
+      continue;
+    }
+    n += int.parse(x.count!);
+    cents += (double.parse(x.total!) * 100).round();
+    parts++;
+    cs.add(x.count!);
+    ts.add(x.total!);
+  }
+  if (parts == 0) return BatchOcr(null, null, missing: missing);
+  return BatchOcr('$n', (cents / 100).toStringAsFixed(2),
+      parts: parts,
+      missing: missing,
+      detail: parts > 1 ? 'العدد ${cs.join(' + ')} - الإجمالي ${ts.join(' + ')}' : '');
+}
+
+/// صفوف نص الباتش (ورقة أو أكتر فوق بعض). لو مفيش GRAND TOTALS واضح بنرجع للطريقة العامة.
+BatchOcr parseBatchRows(List<String> rows) {
+  final sheets = parseBatchSheets(rows);
+  if (sheets.length > 1) return sumBatchSheets(sheets);
+  final a = sheets.isEmpty ? const BatchOcr(null, null) : sheets.first;
+  if (a.count != null && a.total != null) return a;
+  final g = _parseGeneric(rows);
+  return BatchOcr(a.count ?? g.count, a.total ?? g.total);
+}
+
+/// قراءة صورة الباتش بـ ML Kit وتجميع النص في صفوف حسب الموقع الرأسي.
+/// لو في أكتر من ورقة باتش في الصورة (جنب بعض أو فوق بعض) بيقرا كل ورقة لوحدها ويجمعهم.
 Future<BatchOcr> readBatchInfo(String path) async {
   final rec = mlt.TextRecognizer(script: mlt.TextRecognitionScript.latin);
   try {
@@ -2004,7 +2458,12 @@ Future<BatchOcr> readBatchInfo(String path) async {
       return out;
     }
 
-    // لو في أكتر من ورقة جنب بعض في الصورة: نفصلهم بالفراغ الرأسي بينهم ونقرا كل واحدة لوحدها
+    // قراءة الصورة كلها (بتغطي الورقة الواحدة، والأوراق اللي فوق بعض)
+    final allRows = toRows(List.of(lines));
+    AppLog.i('batch ocr rows: ${allRows.join(' || ')}');
+    final whole = parseBatchRows(allRows);
+
+    // لو في أكتر من ورقة جنب بعض: نفصلهم بالفراغ الأفقي بينهم ونقرا كل واحدة لوحدها ونجمع
     final spans = lines.map((l) => [l.boundingBox.left, l.boundingBox.right]).toList()
       ..sort((a, b) => a[0].compareTo(b[0]));
     final segs = <List<double>>[];
@@ -2016,25 +2475,28 @@ Future<BatchOcr> readBatchInfo(String path) async {
       }
     }
     if (segs.length > 1) {
-      var n = 0, cents = 0, sheets = 0;
+      final found = <BatchOcr>[];
+      var broken = false;
       for (final sg in segs) {
         final ls = lines
             .where((l) => l.boundingBox.center.dx >= sg[0] && l.boundingBox.center.dx <= sg[1])
             .toList();
         if (ls.length < 6) continue;
-        final r = parseBatchRows(toRows(ls), strict: true);
-        AppLog.i('batch ocr segment: ${r.count} / ${r.total}');
-        if (r.count != null && r.total != null) {
-          n += int.parse(r.count!);
-          cents += (double.parse(r.total!) * 100).round();
-          sheets++;
+        for (final x in parseBatchSheets(toRows(ls))) {
+          if (x.count == null || x.total == null) {
+            broken = true; // الورقة اتقسمت بالغلط، نعتمد على القراءة الكاملة
+          } else {
+            found.add(x);
+          }
         }
       }
-      if (sheets > 0) return BatchOcr('$n', (cents / 100).toStringAsFixed(2), sheets);
+      if (!broken && found.isNotEmpty) {
+        final r = sumBatchSheets(found);
+        AppLog.i('batch ocr segments: ${r.parts} parts ${r.count} / ${r.total}');
+        if (r.parts >= whole.parts) return _attachBatchMeta(r, allRows);
+      }
     }
-    final rows = toRows(List.of(lines));
-    AppLog.i('batch ocr rows: ${rows.join(' || ')}');
-    return parseBatchRows(rows);
+    return _attachBatchMeta(whole, allRows);
   } finally {
     await rec.close();
   }
@@ -2049,15 +2511,17 @@ String batchCaption(Session s, BatchInfo i) => [
       'الاجمالي: ${i.total}',
     ].join('\n');
 
-Future<BatchInfo?> askBatchInfo(BuildContext context, String img) async {
+Future<BatchInfo?> askBatchInfo(BuildContext context, String img, Session s) async {
   final p = await SharedPreferences.getInstance();
   final init = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
       p.getString('bi_col') ?? '', p.getString('bi_total') ?? '');
   if (!context.mounted) return null;
-  final r = await Navigator.of(context).push<BatchInfo>(MaterialPageRoute(
-    builder: (c) =>
-        Directionality(textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img)),
-  ));
+  final r = await Navigator.of(context).push<BatchInfo>(
+    MaterialPageRoute(
+      builder: (c) => Directionality(
+          textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img, session: s)),
+    ),
+  );
   if (r != null) {
     await p.setString('bi_count', r.count);
     await p.setString('bi_pi', r.piasters);
@@ -2067,10 +2531,81 @@ Future<BatchInfo?> askBatchInfo(BuildContext context, String img) async {
   return r;
 }
 
+/// صورة بتتكبّر وتتصغّر بإصبعين، ونقرتين بتكبّر عند مكان النقر (ونقرتين تاني بترجّع).
+class _ZoomImage extends StatefulWidget {
+  final String path;
+  const _ZoomImage({required this.path});
+  @override
+  State<_ZoomImage> createState() => _ZoomImageState();
+}
+
+class _ZoomImageState extends State<_ZoomImage> {
+  final _tc = TransformationController();
+  Offset _tap = Offset.zero;
+  static const _zoom = 2.5;
+
+  @override
+  void dispose() {
+    _tc.dispose();
+    super.dispose();
+  }
+
+  void _toggle(Size size) {
+    if (_tc.value.getMaxScaleOnAxis() > 1.05) {
+      _tc.value = Matrix4.identity();
+    } else {
+      final tx = (-_tap.dx * (_zoom - 1)).clamp(-size.width * (_zoom - 1), 0.0).toDouble();
+      final ty = (-_tap.dy * (_zoom - 1)).clamp(-size.height * (_zoom - 1), 0.0).toDouble();
+      _tc.value = Matrix4(_zoom, 0, 0, 0, 0, _zoom, 0, 0, 0, 0, 1, 0, tx, ty, 0, 1);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
+        final size = Size(cons.maxWidth, cons.maxHeight);
+        return Container(
+          color: Colors.black,
+          child: Stack(fit: StackFit.expand, children: [
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onDoubleTapDown: (d) => _tap = d.localPosition,
+              onDoubleTap: () => _toggle(size),
+              child: InteractiveViewer(
+                transformationController: _tc,
+                minScale: 1,
+                maxScale: 8,
+                child: Center(
+                  child: Image.file(
+                    File(widget.path),
+                    fit: BoxFit.contain,
+                    cacheWidth: 2200,
+                    filterQuality: FilterQuality.medium,
+                    errorBuilder: (_, __, ___) =>
+                        const Center(child: Text('تعذر عرض الصورة', style: TextStyle(color: Colors.white))),
+                  ),
+                ),
+              ),
+            ),
+            const Positioned(
+              left: 0,
+              right: 0,
+              bottom: 4,
+              child: IgnorePointer(
+                child: Text('إصبعين للتكبير والتصغير - نقرتين للتقريب',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white54, fontSize: 11)),
+              ),
+            ),
+          ]),
+        );
+      });
+}
+
 class _BatchInfoSheet extends StatefulWidget {
   final BatchInfo init;
   final String img;
-  const _BatchInfoSheet({required this.init, required this.img});
+  final Session session;
+  const _BatchInfoSheet({required this.init, required this.img, required this.session});
   @override
   State<_BatchInfoSheet> createState() => _BatchInfoSheetState();
 }
@@ -2085,6 +2620,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
   String? err;
   bool reading = true, d1 = false, d4 = false;
   String? note;
+  List<String> alerts = const [];
 
   @override
   void initState() {
@@ -2100,16 +2636,21 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
       AppLog.i('batch ocr failed: $e');
     }
     if (!mounted) return;
+    final ws = r == null ? const <String>[] : batchOcrWarnings(r, widget.session);
+    if (ws.isNotEmpty) HapticFeedback.vibrate();
     setState(() {
       reading = false;
+      alerts = ws;
       if (r?.count != null && !d1) c1.text = r!.count!;
       if (r?.total != null && !d4) c4.text = r!.total!;
       if (r?.count == null && r?.total == null) {
         note = 'معرفتش أقرا الأرقام من الصورة، اكتبها بإيدك';
       } else if (r?.count == null || r?.total == null) {
         note = 'اتقرا جزء بس من الصورة، كمّل الباقي وراجع القيم';
-      } else if ((r?.sheets ?? 1) > 1) {
-        note = 'اتقرا ${r!.sheets} ورقات واتجمعوا، راجع القيم قبل الإرسال';
+      } else if ((r?.missing ?? 0) > 0) {
+        note = 'في ورقة باتش مش واضحة في الصورة، الإجمالي والعدد ممكن يكونوا ناقصين. راجعهم من الصورة';
+      } else if ((r?.parts ?? 1) > 1) {
+        note = 'اتقرا ${r!.parts} أوراق باتش في الصورة واتجمعوا (${r!.detail}). راجع القيم قبل الإرسال';
       } else {
         note = 'اتقرا من الصورة، راجع القيم قبل الإرسال';
       }
@@ -2118,7 +2659,6 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
 
   @override
   void dispose() {
-    _tc.dispose();
     c1.dispose();
     c2.dispose();
     c3.dispose();
@@ -2126,7 +2666,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     super.dispose();
   }
 
-  void _ok() {
+  Future<void> _ok() async {
     final count = _digits(c1.text), pi = _digits(c2.text);
     final col = _digits(c3.text), tot = _digits(c4.text);
     bool isInt(String s) => RegExp(r'^\d+$').hasMatch(s);
@@ -2139,6 +2679,10 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     }
     final t = double.tryParse(tot);
     if (t == null || t < 0) return setState(() => err = 'اكتب الإجمالي صح (مثال 28107.19)');
+    if (alerts.isNotEmpty) {
+      final go = await confirmWarnings(context, alerts, title: 'تنبيه في ورقة الباتش', go: 'متابعة برضه');
+      if (!go || !mounted) return;
+    }
     Navigator.pop(
         context,
         BatchInfo('${int.parse(count)}', pi.isEmpty ? '0' : '${int.parse(pi)}',
@@ -2161,96 +2705,214 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
         ),
       );
 
-  final _tc = TransformationController();
-  Offset _tap = Offset.zero;
-
-  /// نقرتين: لو متكبرة ترجع للحجم الطبيعي، ولو طبيعية تكبّر عند مكان النقر.
-  void _toggleZoom() {
-    if (_tc.value.getMaxScaleOnAxis() > 1.05) {
-      _tc.value = Matrix4.identity();
-    } else {
-      const z = 3.0;
-      _tc.value = Matrix4(z, 0, 0, 0, 0, z, 0, 0, 0, 0, 1, 0, -_tap.dx * (z - 1),
-          -_tap.dy * (z - 1), 0, 1);
-    }
-  }
-
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(title: const Text('بيانات الباتش')),
-        body: SafeArea(
-          child: Column(children: [
-            Expanded(
-              flex: 3,
-              child: Container(
-                width: double.infinity,
-                color: Colors.black,
-                child: ClipRect(
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onDoubleTapDown: (d) => _tap = d.localPosition,
-                    onDoubleTap: _toggleZoom,
-                    child: InteractiveViewer(
-                      transformationController: _tc,
-                      minScale: 1,
-                      maxScale: 8,
-                      child: Image.file(File(widget.img), fit: BoxFit.contain, cacheWidth: 2400),
+        body: LayoutBuilder(builder: (ctx, cons) {
+          // الصورة فوق (قابلة للتكبير) والخانات تحتها ظاهرة طول الوقت
+          return Column(children: [
+            Expanded(child: _ZoomImage(path: widget.img)),
+            ConstrainedBox(
+              constraints: BoxConstraints(maxHeight: cons.maxHeight * 0.6),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                child: SafeArea(
+                  top: false,
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    if (reading)
+                      const Padding(
+                        padding: EdgeInsets.only(bottom: 10),
+                        child: Row(children: [
+                          SizedBox(
+                              width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                          SizedBox(width: 10),
+                          Expanded(child: Text('جاري قراءة الأرقام من صورة الباتش...')),
+                        ]),
+                      )
+                    else if (note != null)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text(note!, style: const TextStyle(color: Colors.grey, fontSize: 13)),
+                      ),
+                    if (alerts.isNotEmpty)
+                      Container(
+                        width: double.infinity,
+                        margin: const EdgeInsets.only(bottom: 10),
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: Colors.red.withAlpha(28),
+                          border: Border.all(color: Colors.redAccent.withAlpha(170)),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            for (final a in alerts)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 4),
+                                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                  const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 17),
+                                  const SizedBox(width: 6),
+                                  Expanded(child: Text(a, style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600))),
+                                ]),
+                              ),
+                          ],
+                        ),
+                      ),
+                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Expanded(child: _f(c1, 'عدد المعاملات', onEdit: () => d1 = true)),
+                      const SizedBox(width: 10),
+                      Expanded(child: _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true)),
+                    ]),
+                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Expanded(child: _f(c2, 'القروش الفاصلة', selectAll: true)),
+                      const SizedBox(width: 10),
+                      Expanded(child: _f(c3, 'المعاملات المجمعة', selectAll: true)),
+                    ]),
+                    if (err != null)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text(err!, style: const TextStyle(color: Colors.red)),
+                      ),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50,
+                      child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
                     ),
-                  ),
+                  ]),
                 ),
               ),
             ),
-            Flexible(
-              flex: 2,
-              fit: FlexFit.loose,
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-                child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  if (reading)
-                    const Padding(
-                      padding: EdgeInsets.only(bottom: 12),
-                      child: Row(children: [
-                        SizedBox(
-                            width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
-                        SizedBox(width: 10),
-                        Text('جاري قراءة الأرقام من صورة الباتش...'),
-                      ]),
-                    )
-                  else if (note != null)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 12),
-                      child: Text(note!, style: const TextStyle(color: Colors.grey)),
-                    ),
-                  Row(children: [
-                    Expanded(child: _f(c1, 'عدد المعاملات', onEdit: () => d1 = true)),
-                    const SizedBox(width: 10),
-                    Expanded(child: _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true)),
-                  ]),
-                  Row(children: [
-                    Expanded(child: _f(c2, 'القروش الفاصلة', selectAll: true)),
-                    const SizedBox(width: 10),
-                    Expanded(child: _f(c3, 'المعاملات المجمعة', selectAll: true)),
-                  ]),
-                  if (err != null)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Text(err!, style: const TextStyle(color: Colors.red)),
-                    ),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 50,
-                    child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
-                  ),
-                ]),
-              ),
-            ),
-          ]),
-        ),
+          ]);
+        }),
       );
 }
 
+// =====================================================================
+//  تنبيه قبل الإرسال
+// =====================================================================
+
+/// بيعرض دايلوج تحميل أثناء تنفيذ [job] وبيقفله لما يخلص.
+Future<T> _runWithProgress<T>(BuildContext context, String text, Future<T> Function() job) async {
+  final nav = Navigator.of(context, rootNavigator: true);
+  unawaited(showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    useRootNavigator: true,
+    builder: (_) => Directionality(
+      textDirection: TextDirection.rtl,
+      child: PopScope(
+        canPop: false,
+        child: AlertDialog(
+          content: Row(children: [
+            const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5)),
+            const SizedBox(width: 16),
+            Expanded(child: Text(text)),
+          ]),
+        ),
+      ),
+    ),
+  ));
+  try {
+    return await job();
+  } finally {
+    nav.pop();
+  }
+}
+
+/// لو فيه تحذيرات يعرضها ويسأل: نكمل ولا نرجع. من غير تحذيرات بيكمّل علطول.
+/// الخروج بالضغط بره الدايلوج = رجوع (آمن).
+Future<bool> confirmWarnings(BuildContext context, List<String> warnings,
+    {String title = 'راجع قبل الإرسال', String go = 'ابعت برضه'}) async {
+  if (warnings.isEmpty) return true;
+  final r = await showDialog<bool>(
+    context: context,
+    builder: (c) => Directionality(
+      textDirection: TextDirection.rtl,
+      child: AlertDialog(
+        title: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: Colors.orange),
+          const SizedBox(width: 8),
+          Expanded(child: Text(title)),
+        ]),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            for (final w in warnings)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Padding(
+                    padding: EdgeInsets.only(top: 2),
+                    child: Icon(Icons.circle, size: 8, color: Colors.orange),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(w)),
+                ]),
+              ),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('رجوع')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: Text(go)),
+        ],
+      ),
+    ),
+  );
+  return r ?? false;
+}
+
+/// فحص الباتش قبل الإرسال. بيرجّع true لو نكمل.
+Future<bool> preSendCheckBatch(BuildContext context, Session s, String img) async {
+  if (!File(img).existsSync()) {
+    snack(context, 'صورة الباتش مش موجودة');
+    return false;
+  }
+  final w = <String>[];
+  try {
+    final q = await _runWithProgress<String?>(context, 'بنراجع صورة الباتش...', () => qualityWarning(img));
+    if (q != null) w.add('صورة الباتش: $q');
+    if (await Store.noTag(img)) w.add('ورقة البيانات (الاسم والوحدة) مخفية في صورة الباتش');
+    if (await Store.flag('batch')) {
+      w.add('الباتش اتبعت النهارده قبل كده. لو بتبعت نسخة معدّلة تمام، غير كده اتأكد إنه مش مكرر');
+    }
+  } catch (e, st) {
+    AppLog.e('preSendCheckBatch', e, st);
+  }
+  if (!context.mounted) return false;
+  return confirmWarnings(context, w);
+}
+
+/// فحص إيصالات الدفع قبل الإرسال. بيرجّع true لو نكمل.
+Future<bool> preSendCheckReceipts(BuildContext context, Session s, List<String> imgs) async {
+  final w = <String>[];
+  try {
+    final blur = <String, List<int>>{};
+    final hidden = <int>[];
+    await _runWithProgress<void>(context, 'بنراجع الإيصالات...', () async {
+      for (var i = 0; i < imgs.length; i++) {
+        final q = await qualityWarning(imgs[i]);
+        if (q != null) blur.putIfAbsent(q, () => []).add(i + 1);
+        if (await Store.noTag(imgs[i])) hidden.add(i + 1);
+        await Future<void>.delayed(Duration.zero); // عشان الدايلوج يفضل بيتحرك
+      }
+    });
+    blur.forEach((msg, nums) => w.add('إيصال رقم ${nums.join('، ')}: $msg'));
+    if (hidden.isNotEmpty) {
+      w.add('إيصال رقم ${hidden.join('، ')}: من غير ورقة البيانات (الاسم والوحدة)');
+    }
+    if (!await Store.flag('batch')) w.add('الباتش لسه ما اتبعتش النهارده');
+    if (await Store.flag('receipts')) {
+      w.add('إيصالات الدفع اتبعتت النهارده قبل كده. لو بتبعت نسخة معدّلة تمام، غير كده اتأكد إنها مش مكررة');
+    }
+  } catch (e, st) {
+    AppLog.e('preSendCheckReceipts', e, st);
+  }
+  if (!context.mounted) return false;
+  return confirmWarnings(context, w);
+}
+
 Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
-  final info = await askBatchInfo(context, img);
+  final info = await askBatchInfo(context, img, s);
   if (info == null || !context.mounted) return false;
   final caption = batchCaption(s, info);
   Store.working++;
@@ -2264,7 +2926,10 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
   }
   if (!context.mounted) return false;
   final ok = await shareFiles(context, [out.path], text: caption);
-  if (ok) await Store.afterBatchSent();
+  if (ok) {
+    await Store.afterBatchSent();
+    await Store.addLog(s, 'batch', 'عدد المعاملات ${info.count} - الإجمالي ${info.total}');
+  }
   return ok;
 }
 
@@ -2304,9 +2969,15 @@ class TaggedImage extends StatelessWidget {
         Widget t = Image.memory(tag.png,
             width: dw, height: dh, fit: BoxFit.fill, gaplessPlayback: true);
         if (onChanged != null) {
-          t = DecoratedBox(
-              decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
-              child: t);
+          t = _TagDrag(
+            pos: pos,
+            cw: cw,
+            maxCy: aspect ?? 3,
+            onChanged: onChanged!,
+            child: DecoratedBox(
+                decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
+                child: t),
+          );
         }
         Widget err(BuildContext _, Object __, StackTrace? ___) =>
             const Center(child: Text('تعذر عرض الصورة'));
@@ -2315,7 +2986,7 @@ class TaggedImage extends StatelessWidget {
                 width: cw, height: ch, fit: BoxFit.fill, cacheWidth: 1000, errorBuilder: err)
             : Image.file(File(path),
                 width: cw, fit: BoxFit.fitWidth, cacheWidth: 1000, errorBuilder: err);
-        Widget stack = Stack(clipBehavior: Clip.hardEdge, children: [
+        final stack = Stack(clipBehavior: Clip.hardEdge, children: [
           img,
           if (showTag)
             Positioned(
@@ -2325,11 +2996,6 @@ class TaggedImage extends StatelessWidget {
                 height: dh,
                 child: t),
         ]);
-        // التحريك والتكبير/التصغير بالصوابع شغالين على الصورة كلها (مش لازم الصوابع تكون على الورقة)
-        if (onChanged != null && showTag) {
-          stack = _TagDrag(
-              pos: pos, cw: cw, maxCy: aspect ?? 3, onChanged: onChanged!, child: stack);
-        }
         return Center(
             child: ch != null
                 ? SizedBox(width: cw, height: ch, child: stack)
@@ -2361,7 +3027,7 @@ class _TagDragState extends State<_TagDrag> {
         onScaleStart: (_) => startS = widget.pos.s,
         onScaleUpdate: (d) {
           final p = widget.pos;
-          final s = (startS * d.scale).clamp(0.1, 0.98).toDouble();
+          final s = (startS * d.scale).clamp(0.1, 1.0).toDouble();
           final cx = (p.cx + d.focalPointDelta.dx / widget.cw).clamp(0.0, 1.0).toDouble();
           final cy =
               (p.cy + d.focalPointDelta.dy / widget.cw).clamp(0.0, widget.maxCy).toDouble();
@@ -2549,13 +3215,17 @@ Future<void> main() async {
     if (sp.getBool('apply_guard') == true) {
       await sp.setBool('apply_safe', true);
       await sp.setBool('apply_guard', false);
-      AppLog.i('التطبيق اتقفل أثناء حفظ التعديل، اتفعّل الوضع الآمن (دقة أقل)');
+      AppLog.i('التطبيق اتقفل أثناء حفظ التعديل، اتفعّل الوضع الآمن مؤقتاً');
+    } else if (sp.getBool('apply_safe') == true) {
+      // نفك الوضع الآمن القديم عشان ميفضلش مقلل الجودة للأبد
+      await sp.setBool('apply_safe', false);
     }
     if (sp.getBool('det_guard') == true) {
       await sp.setBool('det_off', true);
       await sp.setBool('det_guard', false);
       AppLog.i('الكشف الأصلي قفل التطبيق المرة اللي فاتت، اتوقف واتحوّل للكشف البسيط');
     }
+    gResLevel = (sp.getInt('resLevel') ?? 0).clamp(0, kResLevels.length);
     final t = sp.getInt('scannerFailedAt') ?? 0;
     _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
   } catch (e, st) {
@@ -2796,7 +3466,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   PerfMode mode = PerfMode.balanced;
-  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0;
+  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0, engine = 1, res = 0;
   bool autoEdit = false, trim = false, slow = false;
   AppPalette palSel = AppPalette.gold;
   bool loaded = false;
@@ -2823,7 +3493,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _load() async {
     final m = await Store.perfMode();
     final sc = await Store.scanSetting();
+    final en = await Store.scanEngine();
     final q = await Store.qualitySetting();
+    final rs = await Store.resSetting();
     final ae = await Store.autoEdit();
     final tr = await Store.trimMargins();
     final pz = await Store.pdfSize();
@@ -2838,7 +3510,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() {
       mode = m;
       scan = sc;
+      engine = en;
       qual = q;
+      res = rs;
       autoEdit = ae;
       trim = tr;
       pdfSz = pz;
@@ -2889,6 +3563,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await Store.setPerfMode(v);
   }
 
+  Future<void> _setEngine(int v) async {
+    setState(() => engine = v);
+    await Store.setScanEngine(v);
+  }
+
   Future<void> _setScan(int v) async {
     setState(() => scan = v);
     await Store.setScanSetting(v);
@@ -2897,6 +3576,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _setQual(int v) async {
     setState(() => qual = v);
     await Store.setQualitySetting(v);
+  }
+
+  Future<void> _setRes(int v) async {
+    setState(() => res = v);
+    await Store.setResSetting(v);
+    try {
+      (await SharedPreferences.getInstance()).remove('camSlow'); // اختيار الموظف بيلغي التنزيل التلقائي
+    } catch (_) {}
   }
 
   Future<void> _setPdf(int v) async {
@@ -3186,11 +3873,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _sub('الأداء'),
                       _radioGroup<PerfMode>(_perfOpts, mode, _setMode),
                       const Divider(),
-                      _sub('وضع الماسح'),
-                      _radioGroup<int>(_scanOpts, scan, _setScan),
+                      _sub('الكاميرا / الماسح'),
+                      _radioGroup<int>(_engineOpts, engine, _setEngine),
+
                       const Divider(),
                       _sub('جودة الصورة'),
                       _radioGroup<int>(_qualOpts, qual, _setQual),
+                      const Divider(),
+                      _sub('دقة الصورة'),
+                      const Padding(
+                        padding: EdgeInsets.fromLTRB(16, 0, 16, 4),
+                        child: Text(
+                            'كاميرا A2R: بتصوّر بالدقة دي فعلاً. ماسح جوجل: شاشته من جوجل فبنصغّر الصورة الناتجة للدقة دي (مش بنكبّرها).',
+                            style: TextStyle(fontSize: 12)),
+                      ),
+                      _radioGroup<int>(_resOpts, res, _setRes),
                       const Divider(),
                       _sub('حجم ملف الـ PDF'),
                       _radioGroup<int>(const [
@@ -3239,6 +3936,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   ({File file, DateTime time})? pdf;
   bool batchSent = false;
   bool receiptsSent = false;
+  DateTime? batchSentAt; // لو الباتش اتبعت وسايبينه ١٢ ساعة للتعديل
+  DateTime? receiptsSentAt; // نفس الكلام للإيصالات
   bool busy = false;
 
   @override
@@ -3256,12 +3955,34 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _reload();
+    if (state == AppLifecycleState.resumed) unawaited(_onResume());
+  }
+
+  Future<void> _onResume() async {
+    // التنظيف بعد ١٢ ساعة بس لو الشاشة الرئيسية هي اللي قدام (مش وإحنا في تعديل)
+    if (mounted && (ModalRoute.of(context)?.isCurrent ?? false)) {
+      try {
+        await Store.expireSent();
+      } catch (e, st) {
+        AppLog.e('expireSent', e, st);
+      }
+    }
+    await _reload();
+  }
+
+  /// الوقت المتبقي قبل مسح الملف المتبعت.
+  String _leftText(DateTime sent) {
+    final left = Store.sentLife - DateTime.now().difference(sent);
+    if (left.inMinutes <= 0) return 'أقل من دقيقة';
+    final h = left.inHours, m = left.inMinutes % 60;
+    if (h == 0) return '$m دقيقة';
+    return m == 0 ? '$h ساعة' : '$h ساعة و$m دقيقة';
   }
 
   Future<void> _init() async {
     await requestAllPermissions();
     try {
+      await Store.expireSent(); // مسح اللي عدّى عليه ١٢ ساعة من الإرسال
       await Store.cleanup();
     } catch (e, st) {
       AppLog.e('_init', e, st);
@@ -3275,6 +3996,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final bi = await Store.batchImg();
     final b = await Store.flag('batch');
     final r = await Store.flag('receipts');
+    final bs = await Store.batchSentAt();
+    final rs = await Store.receiptsSentAt();
     if (!mounted) return;
     setState(() {
       draft = d;
@@ -3282,6 +4005,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       batchImg = bi;
       batchSent = b;
       receiptsSent = r;
+      batchSentAt = bs;
+      receiptsSentAt = rs;
     });
   }
 
@@ -3303,11 +4028,55 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _reload();
   }
 
+  /// باتش جديد: لو فيه باتش اتبعت محتفظين بيه، نأكد قبل ما يتبدل.
+  Future<void> _newBatch() async {
+    if (batchSentAt != null &&
+        !await askYesNo(context, 'باتش جديد؟',
+            'الباتش اللي اتبعت هيتمسح لما تصوّر باتش جديد. لو عايز تعدّله افتحه من "ملفاتي".',
+            yes: 'باتش جديد', no: 'إلغاء')) {
+      return;
+    }
+    if (!mounted) return;
+    await _open(BatchScreen(session: widget.session, fresh: true));
+  }
+
+  /// إيصالات الدفع: لو فيه إيصالات اتبعتت محتفظين بيها، نسأل: نعدّلها ولا نبدأ جديد.
+  Future<void> _openReceipts() async {
+    if (receiptsSentAt != null) {
+      final c = await showDialog<String>(
+        context: context,
+        builder: (ctx) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: AlertDialog(
+            title: const Text('إيصالات اتبعتت'),
+            content: const Text(
+                'عندك إيصالات اتبعتت ومحتفظ بيها للتعديل. تفتحها تعدّل وتبعت تاني، ولا تبدأ إيصالات جديدة؟ (البدء من جديد بيمسح اللي اتبعت)'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+              TextButton(onPressed: () => Navigator.pop(ctx, 'new'), child: const Text('ابدأ جديد')),
+              FilledButton(
+                  onPressed: () => Navigator.pop(ctx, 'edit'), child: const Text('فتح للتعديل')),
+            ],
+          ),
+        ),
+      );
+      if (c == null || !mounted) return;
+      if (c == 'new') {
+        await Store.discardSentReceipts();
+        await _reload();
+      }
+    }
+    if (!mounted) return;
+    await _open(ReceiptsScreen(session: widget.session));
+  }
+
   Future<void> _sendBatch() async {
     final b = batchImg;
     if (b == null) return;
     setState(() => busy = true);
     try {
+      if (!await preSendCheckBatch(context, widget.session, b)) return;
+      if (!mounted) return;
       final ok = await sendBatchFile(context, widget.session, b);
       if (ok) {
         HapticFeedback.mediumImpact();
@@ -3351,12 +4120,15 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       if (await File(x).exists()) used.add(x);
     }
     if (!mounted) return;
+    if (!await preSendCheckReceipts(context, widget.session, used)) return;
+    if (!mounted) return;
     if (used.isEmpty) {
       // مفيش صور نعرضها: مشاركة الـ PDF مباشرة زي الأول
       final ok = await shareFiles(context, [f.file.path]);
       if (ok) {
         HapticFeedback.mediumImpact();
         await Store.afterPdfSent();
+        await Store.addLog(widget.session, 'receipts', 'PDF');
         await _reload();
       }
       return;
@@ -3459,6 +4231,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         centerTitle: true,
         actions: [
           IconButton(
+              tooltip: 'سجل الإرسال',
+              icon: const Icon(Icons.history_rounded),
+              onPressed: () => _open(const SendLogScreen())),
+          IconButton(
               tooltip: 'إعدادات الأداء',
               icon: const Icon(Icons.settings_rounded),
               onPressed: _showSettings),
@@ -3523,15 +4299,15 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         Row(children: [
           Expanded(
               child: _big(Icons.receipt_long_rounded, 'الباتش',
-                  () => _open(BatchScreen(session: s, fresh: true)))),
+                  _newBatch)),
           const SizedBox(width: 12),
           Expanded(
               child: _big(
-                  Icons.payments_rounded, 'إيصالات الدفع', () => _open(ReceiptsScreen(session: s)))),
+                  Icons.payments_rounded, 'إيصالات الدفع', _openReceipts)),
         ]),
         if (draft.isNotEmpty || pf != null || bi != null) ...[
           const SizedBox(height: 24),
-          const Text('ملفاتي (لسه متبعتتش)',
+          const Text('ملفاتي',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           if (bi != null)
@@ -3544,7 +4320,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                       width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
                 ),
                 title: Text('الباتش - ${s.batchName}.jpg'),
-                subtitle: const Text('اضغط للمعاينة'),
+                subtitle: Text(batchSentAt == null
+                    ? 'اضغط للمعاينة'
+                    : 'اتبعت ✓ - اضغط للتعديل - يتمسح بعد ${_leftText(batchSentAt!)}'),
                 onTap: () => _open(BatchScreen(session: s)),
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -3568,8 +4346,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                       width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
                 ),
                 title: Text('إيصالات الدفع (${draft.length} صورة)'),
-                subtitle: const Text('اضغط للمعاينة أو لتكمل التصوير'),
-                onTap: () => _open(ReceiptsScreen(session: s)),
+                subtitle: Text(receiptsSentAt == null
+                    ? 'اضغط للمعاينة أو لتكمل التصوير'
+                    : 'اتبعت ✓ - اضغط للتعديل - يتمسح بعد ${_leftText(receiptsSentAt!)}'),
+                onTap: _openReceipts,
                 trailing: IconButton(
                     tooltip: 'مسح',
                     icon: const Icon(Icons.delete_rounded, color: Colors.red),
@@ -3583,8 +4363,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 leading: const Icon(Icons.picture_as_pdf_rounded, size: 36, color: Colors.red),
                 title: Text(pf.file.path.split('/').last,
                     maxLines: 2, overflow: TextOverflow.ellipsis),
-                subtitle: Text(
-                    'اضغط لفتحه - يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
+                subtitle: Text(receiptsSentAt != null
+                    ? 'اتبعت ✓ - اضغط لفتحه - يتمسح بعد ${_leftText(receiptsSentAt!)}'
+                    : 'اضغط لفتحه - يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
                 onTap: _openPdf,
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -3647,7 +4428,7 @@ class _BatchScreenState extends State<BatchScreen> {
         final path = await persistImage(
             lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
             filter: ScanFilter.receipt);
-        await Store.setBatchImg(path);
+        await Store.setBatchImg(path, fresh: true);
         await _show(path);
         _lastScanManual = true;
         if (mounted && img != null) await _edit(tab: 2);
@@ -3678,9 +4459,18 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final t = tag ?? await receiptTag(1000, widget.session, batch: true);
       final a = await imageAspect(path);
-      final p0 = await Store.assignPos(path, t, true, a);
+      var p0 = await Store.pos(path);
+      if (p0 == null) {
+        final last = await Store.lastBatchPos(a);
+        if (last != null) {
+          p0 = last;
+          await Store.setPosFor(path, last);
+        } else {
+          p0 = bottomTagPos(t, a); // أول مرة: أسفل الصورة بعرضها كله (من غير حفظ، بيتحسب مع كل صورة)
+        }
+      }
       final p = fitTagPos(p0, t, a);
-      if (p.cx != p0.cx || p.cy != p0.cy) await Store.savePos(path, p, true);
+      if (p.cx != p0.cx || p.cy != p0.cy) await Store.setPosFor(path, p);
       final nt = await Store.noTag(path);
       if (!mounted) return;
       setState(() {
@@ -3704,8 +4494,8 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
+          filter: ScanFilter.receipt, applyNow: false);
+      await Store.setBatchImg(path, fresh: true);
       await _show(path);
       unawaited(qualityWarning(path).then((warn) {
         if (warn != null && mounted) snack(context, warn);
@@ -3721,12 +4511,12 @@ class _BatchScreenState extends State<BatchScreen> {
 
   /// نسخة سريعة للتصوير بالكاميرا: بتحفظ الصورة بس وترجّع مسارها، من غير تجهيز المعاينة
   /// ولا فحص الجودة قبل شاشة التعديل (دول بيتعملوا بعد ما الموظف يخلّص التعديل).
-  Future<String?> _ingestQuick(String src) async {
+  Future<String?> _ingestQuick(String src, {bool keepOriginal = false}) async {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
+          filter: ScanFilter.receipt, applyNow: false, keepOriginal: keepOriginal);
+      await Store.setBatchImg(path, fresh: true);
       return path;
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
@@ -3734,8 +4524,71 @@ class _BatchScreenState extends State<BatchScreen> {
     }
   }
 
+  /// لو الموظف خرج من شاشة التعديل بدون حفظ: بنطبّق فلتر الإيصال قبل العرض.
+  Future<void> _ensureBatchFiltered(String path) async {
+    try {
+      final f = File(path);
+      if (await f.exists()) {
+        await f.writeAsBytes(await applyFilter(await f.readAsBytes(), ScanFilter.receipt));
+        await FileImage(f).evict();
+      }
+    } catch (e, st) {
+      AppLog.e('batch.lateFilter', e, st);
+    }
+  }
+
   /// كاميرا التطبيق: صورة واحدة بس، بعدها شاشة التعديل علطول (من غير عداد).
   Future<void> _capture() async {
+    final engine = await Store.scanEngine();
+    final perf = await Store.perfMode();
+    if (!mounted) return;
+    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
+      await _captureGoogle();
+      // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
+      if (_scannerFailed && mounted) await _captureA2R();
+    } else {
+      await _captureA2R();
+    }
+  }
+
+  /// ماسح جوجل الذكي: صورة واحدة مقصوصة، وبعدها شاشة التعديل على الفلاتر.
+  Future<void> _captureGoogle() async {
+    final paths = await scanImages(context, 1, camFallback: true);
+    if (paths.isEmpty || !mounted) {
+      if (_scannerFailed) return; // الدالة اللي فوق هتفتح كاميرا A2R
+      if (mounted && img == null) Navigator.pop(context);
+      return;
+    }
+    final manual = _lastScanManual; // true لو الماسح فشل واتحوّلنا للمعرض
+    final saved = await _ingestQuick(paths.first, keepOriginal: !manual);
+    if (saved == null) {
+      if (mounted && img == null) Navigator.pop(context);
+      return;
+    }
+    _lastScanManual = manual;
+    if (mounted && await _edit(tab: manual ? 0 : 2, fromCam: true, path: saved)) {
+      await Store.clearBatchImg();
+      if (mounted) setState(() => img = null);
+      await _captureGoogle(); // إعادة أخذ
+      return;
+    }
+    if (mounted && img == null) {
+      final cur = await Store.batchImg();
+      if (cur != null) {
+        if (cur == saved) await _ensureBatchFiltered(cur);
+        await _show(cur);
+      }
+    }
+    final shown = img;
+    if (shown != null) {
+      unawaited(qualityWarning(shown).then((warn) {
+        if (warn != null && mounted) snack(context, warn);
+      }));
+    }
+    if (mounted && img == null) Navigator.pop(context);
+  }
+
+  Future<void> _captureA2R() async {
     if (!await ensureCamera(context)) {
       if (mounted && img == null) Navigator.pop(context);
       return;
@@ -3758,9 +4611,12 @@ class _BatchScreenState extends State<BatchScreen> {
               return null;
             }
             if (mounted && img == null) {
-              // خرج من التعديل من غير حفظ: نعرض الصورة زي ما هي
+              // خرج من التعديل من غير حفظ: نطبّق فلتر الإيصال ونعرضها
               final cur = await Store.batchImg();
-              if (cur != null) await _show(cur);
+              if (cur != null) {
+                if (cur == saved) await _ensureBatchFiltered(cur);
+                await _show(cur);
+              }
             }
             final shown = img;
             if (shown != null) {
@@ -3786,11 +4642,11 @@ class _BatchScreenState extends State<BatchScreen> {
   void _set(TagPos p) {
     setState(() => pos = p);
     _saveT?.cancel();
-    final path = img;
-    if (path == null) return;
+    final path = img, a = aspect;
+    if (path == null || a == null) return;
     _saveT = Timer(const Duration(milliseconds: 400), () {
-      Store.savePos(path, p, true).catchError((Object e, StackTrace st) {
-        AppLog.e('savePos', e, st);
+      Store.saveBatchPos(path, p, a).catchError((Object e, StackTrace st) {
+        AppLog.e('saveBatchPos', e, st);
       });
     });
   }
@@ -3799,8 +4655,8 @@ class _BatchScreenState extends State<BatchScreen> {
     final t = _saveT;
     if (t != null && t.isActive) {
       t.cancel();
-      final path = img, p = pos;
-      if (path != null && p != null) await Store.savePos(path, p, true);
+      final path = img, p = pos, a = aspect;
+      if (path != null && p != null && a != null) await Store.saveBatchPos(path, p, a);
     }
   }
 
@@ -3809,8 +4665,8 @@ class _BatchScreenState extends State<BatchScreen> {
     final t = _saveT;
     if (t != null && t.isActive) {
       t.cancel();
-      final path = img, p = pos;
-      if (path != null && p != null) Store.savePos(path, p, true);
+      final path = img, p = pos, a = aspect;
+      if (path != null && p != null && a != null) Store.saveBatchPos(path, p, a);
     }
     super.dispose();
   }
@@ -3832,18 +4688,23 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
-      await Store.setBatchImg(path);
+          filter: ScanFilter.receipt, applyNow: false);
+      await Store.setBatchImg(path, fresh: true);
       await _show(path);
-      final warn = await qualityWarning(path);
-      if (warn != null && mounted) snack(context, warn);
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
       if (mounted) setState(() => busy = false);
     }
     _lastScanManual = true; // صورة معرض من غير قص: القص التلقائي يشتغل
-    if (mounted && img != null) await _edit(tab: 2);
+    final beforeEdit = img;
+    if (mounted && beforeEdit != null) {
+      await _edit(tab: 2);
+      if (mounted && img == beforeEdit) {
+        await _ensureBatchFiltered(beforeEdit);
+        await _show(beforeEdit);
+      }
+    }
   }
 
   /// تعديل: قص بزوايا حرة وتدوير وفلاتر للصورة الحالية.
@@ -3851,7 +4712,15 @@ class _BatchScreenState extends State<BatchScreen> {
     final cur = path ?? img;
     if (cur == null) return false;
     final out = await Navigator.push<String>(
-        context, MaterialPageRoute(builder: (_) => EditorPage(path: cur, prefix: 'batch_', initialTab: tab, canRetake: fromCam)));
+      context,
+      PageRouteBuilder<String>(
+        transitionDuration: const Duration(milliseconds: 110),
+        reverseTransitionDuration: const Duration(milliseconds: 100),
+        pageBuilder: (_, __, ___) =>
+            EditorPage(path: cur, prefix: 'batch_', initialTab: tab, canRetake: fromCam),
+        transitionsBuilder: (_, a, __, child) => FadeTransition(opacity: a, child: child),
+      ),
+    );
     if (out == kRetake) return true;
     if (out == null || !mounted) return false;
     setState(() => busy = true);
@@ -3871,6 +4740,9 @@ class _BatchScreenState extends State<BatchScreen> {
     setState(() => busy = true);
     try {
       await _flushPos();
+      if (!mounted) return;
+      if (!await preSendCheckBatch(context, widget.session, img!)) return;
+      if (!mounted) return;
       final ok = await sendBatchFile(context, widget.session, img!);
       if (ok) HapticFeedback.mediumImpact();
       if (ok && mounted) Navigator.pop(context);
@@ -3903,22 +4775,21 @@ class _BatchScreenState extends State<BatchScreen> {
               ),
               if (!noTag)
                 Container(
-                  width: double.infinity,
-                  margin: const EdgeInsets.symmetric(horizontal: 12),
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+                  padding: const EdgeInsets.all(10),
                   decoration: BoxDecoration(
-                    color: Colors.orange.withOpacity(0.15),
-                    border: Border.all(color: Colors.orange),
-                    borderRadius: BorderRadius.circular(10),
+                    color: Colors.orange.withAlpha(28),
+                    border: Border.all(color: Colors.orange.withAlpha(150)),
+                    borderRadius: BorderRadius.circular(12),
                   ),
-                  child: const Row(children: [
-                    Icon(Icons.warning_amber_rounded, color: Colors.orange),
+                  child: const Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 22),
                     SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                          'تنبيه: حرّك الورقة لمكان فاضي من الصورة، وماتغطّيش أي بيانات (خصوصًا العدد والإجمالي). '
+                          'تنبيه: حرّك الورقة لمكان فاضي من الصورة، وماتغطيش أي بيانات (خصوصًا العدد والإجمالي). '
                           'اسحب بإصبع للتحريك، وبإصبعين للتكبير والتصغير.',
-                          style: TextStyle(fontSize: 12)),
+                          style: TextStyle(fontSize: 12.5)),
                     ),
                   ]),
                 ),
@@ -3930,27 +4801,25 @@ class _BatchScreenState extends State<BatchScreen> {
                 value: !noTag,
                 onChanged: busy ? null : (v) => _toggleTag(!v),
               ),
-              if (!noTag) ...[
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Row(children: [
-                    const Icon(Icons.format_size_rounded),
-                    Expanded(
-                      child: Slider(
-                        value: pos!.s.clamp(0.1, 0.98).toDouble(),
-                        min: 0.1,
-                        max: 0.98,
-                        onChanged: noTag ? null : (v) => _set(pos!.copyWith(s: v)),
-                      ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Row(children: [
+                  const Icon(Icons.format_size_rounded),
+                  Expanded(
+                    child: Slider(
+                      value: pos!.s.clamp(0.1, 1.0).toDouble(),
+                      min: 0.1,
+                      max: 1.0,
+                      onChanged: noTag ? null : (v) => _set(pos!.copyWith(s: v)),
                     ),
-                    IconButton(
-                      tooltip: 'رجّع الورقة أسفل الصورة',
-                      icon: const Icon(Icons.restart_alt_rounded),
-                      onPressed: noTag ? null : () => _set(TagPos.initial(tag!, aspect)),
-                    ),
-                  ]),
-                ),
-              ],
+                  ),
+                  IconButton(
+                    tooltip: 'أسفل الصورة بعرضها كله',
+                    icon: const Icon(Icons.restart_alt_rounded),
+                    onPressed: noTag ? null : () => _set(bottomTagPos(tag!, aspect!)),
+                  ),
+                ]),
+              ),
               SafeArea(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
@@ -4195,50 +5064,9 @@ Future<List<Offset>?> detectDocQuad(String path) async {
 }
 
 Future<List<Offset>?> _detectDocQuadImpl(String path) async {
-  final mode = await Store.perfMode();
-  List<Offset>? native;
-  if (mode != PerfMode.lite && await _nativeDetectorAllowed()) {
-    final sp = await SharedPreferences.getInstance();
-    File? tmp;
-    try {
-      // لو التطبيق اتقفل وإحنا جوه الكشف الأصلي، العلامة دي بتفضل true وفي التشغيل الجاي بنوقفه تلقائيًا
-      await sp.setBool('det_guard', true);
-      var input = path;
-      try {
-        tmp = await _smallCopy(path);
-        if (tmp != null) input = tmp.path;
-      } catch (e, st) {
-        AppLog.e('detectDocQuad.smallCopy', e, st);
-      }
-      AppLog.i('native detect start');
-      final c = await ds.DocumentDetector()
-          .detect(ds.ScanInput.file(input))
-          .timeout(const Duration(seconds: 20));
-      AppLog.i('native detect done');
-      if (c != null) {
-        final q = [
-          for (final p in c.toList())
-            Offset(p.x.clamp(0.0, 1.0).toDouble(), p.y.clamp(0.0, 1.0).toDouble())
-        ];
-        if (q.length == 4 && _quadConvex(q)) native = q;
-      }
-    } catch (e, st) {
-      AppLog.e('detectDocQuad', e, st);
-    } finally {
-      try {
-        await sp.setBool('det_guard', false);
-        if (tmp != null && await tmp.exists()) await tmp.delete();
-      } catch (_) {}
-    }
-  }
-  final simple = await _detectDocQuadSimple(path);
-  if (native == null) return simple;
-  if (simple == null) return native;
-  // المحرك الأصلي أحياناً بيمسك جزء جوه الإيصال (منطقة الكتابة بس): لو الكشف البسيط
-  // لقى مساحة أكبر بوضوح (والأصلي جواه) نستخدم البسيط عشان القص يشمل الإيصال كامل.
-  final an = _quadArea(native), asimple = _quadArea(simple);
-  if (asimple < 0.97 && an < asimple * 0.85) return simple;
-  return native;
+  // تم إيقاف المحرك الأصلي (document_scan) لأنه كان بيسبب ClassNotFoundException (JNI) بعد التصوير.
+  // بنستخدم الكشف البسيط (Dart) بس.
+  return _detectDocQuadSimple(path);
 }
 
 double _quadArea(List<Offset> q) {
@@ -4275,9 +5103,10 @@ double _angDiff(double a, double b) {
 /// بيقرر شكل الإطار التلقائي. aspect = ارتفاع/عرض الصورة.
 /// الذكي: لو الأركان الأربعة شكلها مستطيل فعلاً (حتى لو ملفوف) بنحتفظ بيها عشان تتعدّل الورقة،
 /// ولو الشكل مائل أو مشوّه (غالباً الكشف غلط أو منظور قوي) بنرجع لمستطيل مستقيم.
-List<Offset> _shapeQuad(List<Offset> q, double aspect) {
-  if (autoCropMode == 2) return q;
-  if (autoCropMode == 1) return _rectOf(q);
+List<Offset> _shapeQuad(List<Offset> q, double aspect, [int? mode]) {
+  final m = mode ?? autoCropMode;
+  if (m == 2) return q;
+  if (m == 1) return _rectOf(q);
   final p = [for (final o in q) Offset(o.dx, o.dy * aspect)];
   double dir(Offset a, Offset b) => math.atan2(b.dy - a.dy, b.dx - a.dx) * 180 / math.pi;
   final top = dir(p[0], p[1]), right = dir(p[3], p[2]);
@@ -4289,7 +5118,7 @@ List<Offset> _shapeQuad(List<Offset> q, double aspect) {
       dev = math.max(dev, 90 - _angDiff(a, b));
     }
   }
-  return (par <= 6 && dev <= 8) ? q : _rectOf(q);
+  return (par <= 12 && dev <= 14) ? q : _rectOf(q);
 }
 
 Future<bool> _nativeDetectorAllowed() async {
@@ -4325,9 +5154,9 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
     for (var i = 0; i < n; i++) {
       final int r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
       final int y = (r * 54 + g * 183 + b * 19) >> 8;
-      final int hi = r > g ? (r > b ? r : b) : (g > b ? g : b);
-      final int lo = r < g ? (r < b ? r : b) : (g < b ? g : b);
-      final int v = y - 2 * (hi - lo); // الخشب ملوّن فبيبقى أغمق، والورقة رمادية فبتفضل فاتحة
+      // نغمّق الألوان الدافية بس (الخشب/المكتب)، ومنلمسش الأزرق الفاتح بتاع الورق الحراري
+      final int warm = r > b ? (r - b) : 0;
+      final int v = y - ((warm * 6) >> 3);
       feat[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
     return _quadFromFeature(feat, w, h);
@@ -4339,23 +5168,105 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
 
 /// الجزء المشترك بين كشف الصورة المصوّرة والكشف الحي من الكاميرا.
 /// feat: قيمة 0..255 لكل بكسل (الورقة غالباً أعلى من الخلفية). بيرجّع TL,TR,BR,BL كنسب.
-List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
-  final n = w * h;
-  final hist = List<int>.filled(256, 0);
-  for (var i = 0; i < n; i++) {
-    hist[feat[i]]++;
+List<bool> _dilate4(List<bool> m, int w, int h) {
+  final o = List<bool>.filled(w * h, false);
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      final i = y * w + x;
+      o[i] = m[i] ||
+          (x > 0 && m[i - 1]) ||
+          (x < w - 1 && m[i + 1]) ||
+          (y > 0 && m[i - w]) ||
+          (y < h - 1 && m[i + w]);
+    }
   }
-  // Otsu
+  return o;
+}
+
+/// تآكل: بكسلات حدود الصورة بتتحسب "فاضية" فالتآكل بيبعد عن الحدود كمان.
+List<bool> _erode4(List<bool> m, int w, int h) {
+  final o = List<bool>.filled(w * h, false);
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = y * w + x;
+      o[i] = m[i] && m[i - 1] && m[i + 1] && m[i - w] && m[i + w];
+    }
+  }
+  return o;
+}
+
+/// الجزء المشترك بين كشف الصورة المصوّرة والكشف الحي من الكاميرا.
+/// feat: قيمة 0..255 لكل بكسل (الورقة غالباً أعلى من الخلفية). بيرجّع TL,TR,BR,BL كنسب.
+///
+/// الفكرة: الورقة الفاتحة على خشب فاتح بتبقى متصلة بالخلفية من خلال فجوات رفيعة (ظل الحافة).
+/// فبنقفل ثقوب الكتابة، وبعدين بنأكّل المنطقة بدرجات مختلفة عشان الورقة تنفصل عن الخلفية،
+/// وبنختار أحسن مكوّن: مستطيلي الشكل (مليان)، مش ملزوق في الحدود، وقريب من نص الصورة.
+/// كشف حدود الورقة الهجين: يدمج كشف Otsu (فرق السطوع واللون) مع كشف الحواف (Sobel Edge-Barrier)
+/// عشان يقدر يمسك حدود الورقة البيضا حتى لو محطوطة على مكتب فاتح أو قريب من لونها.
+/// حساب قوة الحواف (Sobel 3x3) على الصورة المصغرة مرة واحدة لتقييم كل المرشحين.
+Uint16List _sobelMag(Uint8List feat, int w, int h) {
+  final mag = Uint16List(w * h);
+  for (var y = 1; y < h - 1; y++) {
+    final row = y * w;
+    for (var x = 1; x < w - 1; x++) {
+      final i = row + x;
+      final tl = feat[i - w - 1], t = feat[i - w], tr = feat[i - w + 1];
+      final l = feat[i - 1], r = feat[i + 1];
+      final bl = feat[i + w - 1], b = feat[i + w], br = feat[i + w + 1];
+      final gx = -tl + tr - 2 * l + 2 * r - bl + br;
+      final gy = -tl - 2 * t - tr + bl + 2 * b + br;
+      mag[i] = gx.abs() + gy.abs();
+    }
+  }
+  return mag;
+}
+
+/// قياس حدة الحافة الفعلية على طول الأضلاع الأربعة للرباعي (الضلع الوهمي على المكتب يأخذ درجة ضعيفة جداً).
+double _edgeScoreQuad(Uint16List mag, List<Offset> pts, int w, int h) {
+  var sumSide = 0.0;
+  var minSide = 1e9;
+  for (var i = 0; i < 4; i++) {
+    final p0 = pts[i], p1 = pts[(i + 1) % 4];
+    final dist = math.sqrt((p1.dx - p0.dx) * (p1.dx - p0.dx) + (p1.dy - p0.dy) * (p1.dy - p0.dy));
+    final steps = math.max(8, dist.round());
+    var acc = 0.0;
+    var cnt = 0;
+    for (var s = 1; s < steps; s++) {
+      final t = s / steps;
+      final cx = (p0.dx + (p1.dx - p0.dx) * t).round();
+      final cy = (p0.dy + (p1.dy - p0.dy) * t).round();
+      final x0 = math.max(0, cx - 1), x1 = math.min(w - 1, cx + 1);
+      final y0 = math.max(0, cy - 1), y1 = math.min(h - 1, cy + 1);
+      var mx = 0;
+      for (var y = y0; y <= y1; y++) {
+        final r = y * w;
+        for (var x = x0; x <= x1; x++) {
+          final v = mag[r + x];
+          if (v > mx) mx = v;
+        }
+      }
+      acc += mx;
+      cnt++;
+    }
+    final avg = cnt == 0 ? 0.0 : acc / cnt;
+    sumSide += avg;
+    if (avg < minSide) minSide = avg;
+  }
+  return 0.5 * (sumSide / 4.0) + 0.5 * minSide;
+}
+
+int _otsuOf(List<int> hist, int totalN, int from, int to) {
+  if (totalN <= 0) return (from + to) ~/ 2;
   var sum = 0.0;
-  for (var t = 0; t < 256; t++) {
+  for (var t = from; t <= to; t++) {
     sum += t * hist[t];
   }
   var sumB = 0.0, wB = 0.0, bestV = -1.0;
-  var thr = 128;
-  for (var t = 0; t < 256; t++) {
+  var thr = (from + to) ~/ 2;
+  for (var t = from; t <= to; t++) {
     wB += hist[t];
     if (wB == 0) continue;
-    final wF = n - wB;
+    final wF = totalN - wB;
     if (wF == 0) break;
     sumB += t * hist[t];
     final mB = sumB / wB, mF = (sum - sumB) / wF;
@@ -4365,107 +5276,204 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
       thr = t;
     }
   }
-  List<bool> maskOf(bool bright) =>
-      List<bool>.generate(n, (i) => bright ? feat[i] > thr : feat[i] <= thr);
-  bool onBorder(int i) {
-    final x = i % w, y = i ~/ w;
-    return x <= 2 || y <= 2 || x >= w - 3 || y >= h - 3;
-  }
-
-  double borderFrac(List<bool> m) {
-    var c = 0, t = 0;
-    for (var i = 0; i < n; i++) {
-      if (!onBorder(i)) continue;
-      t++;
-      if (m[i]) c++;
-    }
-    return t == 0 ? 1 : c / t;
-  }
-
-  var mask = maskOf(true);
-  final inv = maskOf(false);
-  // الورقة هي اللي ما بتلزقش في حدود الصورة
-  if (borderFrac(inv) < borderFrac(mask)) mask = inv;
-  // قفل الثقوب الصغيرة (الكتابة) ثم تآكل بسيط لتنضيف النقط الصغيرة
-  final dil = List<bool>.filled(n, false);
-  for (var y = 1; y < h - 1; y++) {
-    for (var x = 1; x < w - 1; x++) {
-      final i = y * w + x;
-      dil[i] = mask[i] || mask[i - 1] || mask[i + 1] || mask[i - w] || mask[i + w];
-    }
-  }
-  final er = List<bool>.filled(n, false);
-  for (var y = 2; y < h - 2; y++) {
-    for (var x = 2; x < w - 2; x++) {
-      final i = y * w + x;
-      er[i] = dil[i] && dil[i - 1] && dil[i + 1] && dil[i - w] && dil[i + w] && mask[i];
-    }
-  }
-  // أكبر مكوّن متصل
-  final seen = List<bool>.filled(n, false);
-  final queue = List<int>.filled(n, 0);
-  var bestSize = 0;
-  List<int>? best;
-  for (var s0 = 0; s0 < n; s0++) {
-    if (!er[s0] || seen[s0]) continue;
-    var head = 0, tail = 0;
-    queue[tail++] = s0;
-    seen[s0] = true;
-    var tl = s0, tr = s0, br = s0, bl = s0;
-    while (head < tail) {
-      final i = queue[head++];
-      final x = i % w, y = i ~/ w;
-      if (x + y < tl % w + tl ~/ w) tl = i;
-      if (x + y > br % w + br ~/ w) br = i;
-      if (x - y > tr % w - tr ~/ w) tr = i;
-      if (x - y < bl % w - bl ~/ w) bl = i;
-      if (x > 0 && er[i - 1] && !seen[i - 1]) {
-        seen[i - 1] = true;
-        queue[tail++] = i - 1;
-      }
-      if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
-        seen[i + 1] = true;
-        queue[tail++] = i + 1;
-      }
-      if (y > 0 && er[i - w] && !seen[i - w]) {
-        seen[i - w] = true;
-        queue[tail++] = i - w;
-      }
-      if (y < h - 1 && er[i + w] && !seen[i + w]) {
-        seen[i + w] = true;
-        queue[tail++] = i + w;
-      }
-    }
-    if (tail > bestSize) {
-      bestSize = tail;
-      best = [tl, tr, br, bl];
-    }
-  }
-  if (best == null || bestSize < n * 0.08) return null;
-  Offset pt(int i, double ex, double ey) => Offset(
-        (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
-        (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
-      );
-  final q = [
-    pt(best[0], -1.5, -1.5),
-    pt(best[1], 1.5, -1.5),
-    pt(best[2], 1.5, 1.5),
-    pt(best[3], -1.5, 1.5),
-  ];
-  return _quadConvex(q) ? q : null;
+  return thr;
 }
 
-/// كشف حي من إطار الكاميرا (YUV420): بيلف الإطار لوضع رأسي ويصغّره لشبكة صغيرة.
-List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
+int _histPct(List<int> hist, int n, double p) {
+  final target = (n * p).floor();
+  var acc = 0;
+  for (var t = 0; t < 256; t++) {
+    acc += hist[t];
+    if (acc >= target) return t;
+  }
+  return 255;
+}
+
+/// كشف حدود الورقة السريع والدقيق: عتبات متعددة + تقييم كل مرشح بحدة الحواف الفعلية (Sobel) على الأضلاع الأربعة.
+List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
+  if (w < 12 || h < 12) return null;
+  final n = w * h;
+  final hist = List<int>.filled(256, 0);
+  for (var i = 0; i < n; i++) {
+    hist[feat[i]]++;
+  }
+  final mag = _sobelMag(feat, w, h);
+  // تقدير مرجع الحواف (أقوى 5%) للتطبيع
+  var sumM = 0;
+  for (var i = 0; i < n; i++) {
+    sumM += mag[i];
+  }
+  final magRef = math.max(40.0, (sumM / n) * 3.5);
+
+  final tOtsu = _otsuOf(hist, n, 0, 255);
+  var upperN = 0;
+  for (var t = tOtsu + 1; t < 256; t++) {
+    upperN += hist[t];
+  }
+  final tUpper = upperN > n * 0.08 ? _otsuOf(hist, upperN, tOtsu + 1, 255) : tOtsu;
+  final med = _histPct(hist, n, 0.50);
+  final p75 = _histPct(hist, n, 0.75);
+  final p82 = _histPct(hist, n, 0.82);
+  final p88 = _histPct(hist, n, 0.88);
+  final thresholds = <int>{tOtsu, tUpper, (tOtsu + tUpper) ~/ 2, p75, p82, p88}.toList()..sort();
+
+  final seen = List<bool>.filled(n, false);
+  final queue = List<int>.filled(n, 0);
+  List<Offset>? bestQ;
+  var bestScore = 0.0;
+
+  for (final thr in thresholds) {
+    final rawMask = List<bool>.generate(n, (i) => feat[i] > thr);
+    final er = _erode4(_dilate4(rawMask, w, h), w, h);
+    for (var i = 0; i < n; i++) {
+      seen[i] = false;
+    }
+    for (var s0 = 0; s0 < n; s0++) {
+      if (!er[s0] || seen[s0]) continue;
+      var head = 0, tail = 0;
+      queue[tail++] = s0;
+      seen[s0] = true;
+      var tl = s0, tr = s0, br = s0, bl = s0;
+      var sx = 0, sy = 0, sFeat = 0;
+      var minX = w, maxX = 0, minY = h, maxY = 0;
+      while (head < tail) {
+        final i = queue[head++];
+        final x = i % w, y = i ~/ w;
+        sx += x;
+        sy += y;
+        sFeat += feat[i];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (x + y < tl % w + tl ~/ w) tl = i;
+        if (x + y > br % w + br ~/ w) br = i;
+        if (x - y > tr % w - tr ~/ w) tr = i;
+        if (x - y < bl % w - bl ~/ w) bl = i;
+        if (x > 0 && er[i - 1] && !seen[i - 1]) {
+          seen[i - 1] = true;
+          queue[tail++] = i - 1;
+        }
+        if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
+          seen[i + 1] = true;
+          queue[tail++] = i + 1;
+        }
+        if (y > 0 && er[i - w] && !seen[i - w]) {
+          seen[i - w] = true;
+          queue[tail++] = i - w;
+        }
+        if (y < h - 1 && er[i + w] && !seen[i + w]) {
+          seen[i + w] = true;
+          queue[tail++] = i + w;
+        }
+      }
+      if (tail < n * 0.04) continue;
+      final compMean = sFeat / tail;
+      if (compMean < med + 6) continue;
+      Offset raw(int i) => Offset((i % w).toDouble(), (i ~/ w).toDouble());
+      final rq = [raw(tl), raw(tr), raw(br), raw(bl)];
+      var a2 = 0.0;
+      for (var i = 0; i < 4; i++) {
+        final p = rq[i], q2 = rq[(i + 1) % 4];
+        a2 += p.dx * q2.dy - q2.dx * p.dy;
+      }
+      final qaPx = a2.abs() / 2;
+      if (qaPx < 4) continue;
+      final fill = math.min(1.0, tail / qaPx);
+      if (fill < 0.72) continue;
+      final q = [
+        Offset(((rq[0].dx + 0.5) / w).clamp(0.0, 1.0), ((rq[0].dy + 0.5) / h).clamp(0.0, 1.0)),
+        Offset(((rq[1].dx + 0.5) / w).clamp(0.0, 1.0), ((rq[1].dy + 0.5) / h).clamp(0.0, 1.0)),
+        Offset(((rq[2].dx + 0.5) / w).clamp(0.0, 1.0), ((rq[2].dy + 0.5) / h).clamp(0.0, 1.0)),
+        Offset(((rq[3].dx + 0.5) / w).clamp(0.0, 1.0), ((rq[3].dy + 0.5) / h).clamp(0.0, 1.0)),
+      ];
+      if (!_quadConvex(q)) continue;
+      final area = _quadArea(q);
+      if (area < 0.05 || area > 0.90) continue;
+      var touch = 0;
+      if (minX <= 2) touch++;
+      if (maxX >= w - 3) touch++;
+      if (minY <= 2) touch++;
+      if (maxY >= h - 3) touch++;
+      final borderPen = touch == 0 ? 1.0 : (touch == 1 ? 0.80 : (touch == 2 ? 0.20 : 0.05));
+      final cx = sx / tail / w, cy = sy / tail / h;
+      final cen = (cx - 0.5).abs() + (cy - 0.5).abs();
+      final es = _edgeScoreQuad(mag, rq, w, h);
+      final edgeFactor = math.min(1.8, (es / magRef) * 2.0 + 0.15);
+      final contrastBoost = ((compMean - med) / 40.0 + 0.5).clamp(0.2, 1.5).toDouble();
+      final score = math.pow(area, 0.30) *
+          math.pow(fill, 3) *
+          math.max(0.15, 1.0 - cen * 0.6) *
+          borderPen *
+          contrastBoost *
+          math.pow(edgeFactor, 1.5);
+      if (score > bestScore + 1e-9) {
+        bestScore = score;
+        bestQ = q;
+      }
+    }
+  }
+  if (bestQ == null) return null;
+  // تحسين نهائي (Edge Snapping): تحريك كل ضلع ±2 بكسل نحو أقوى حافة فعلية (Sobel) ليلتصق بحدود الورقة بدقة
+  return _snapQuadToSobel(mag, bestQ, w, h);
+}
+
+List<Offset> _snapQuadToSobel(Uint16List mag, List<Offset> q, int w, int h) {
+  final pts = [for (final o in q) Offset(o.dx * w - 0.5, o.dy * h - 0.5)];
+  double sideAvg(Offset a, Offset b) {
+    final dist = math.sqrt((b.dx - a.dx) * (b.dx - a.dx) + (b.dy - a.dy) * (b.dy - a.dy));
+    final steps = math.max(8, dist.round());
+    var acc = 0.0;
+    for (var s = 1; s < steps; s++) {
+      final t = s / steps;
+      final cx = (a.dx + (b.dx - a.dx) * t).round().clamp(0, w - 1).toInt();
+      final cy = (a.dy + (b.dy - a.dy) * t).round().clamp(0, h - 1).toInt();
+      acc += mag[cy * w + cx];
+    }
+    return acc / (steps - 1);
+  }
+
+  for (var i = 0; i < 4; i++) {
+    final j = (i + 1) % 4;
+    final p0 = pts[i], p1 = pts[j];
+    final dx = p1.dx - p0.dx, dy = p1.dy - p0.dy;
+    final len = math.sqrt(dx * dx + dy * dy);
+    if (len < 6) continue;
+    final nx = -dy / len, ny = dx / len;
+    var bestShift = 0.0;
+    var bestVal = sideAvg(p0, p1);
+    for (final sh in const [-2.0, -1.0, 1.0, 2.0]) {
+      final a = Offset(p0.dx + nx * sh, p0.dy + ny * sh);
+      final b = Offset(p1.dx + nx * sh, p1.dy + ny * sh);
+      final v = sideAvg(a, b);
+      if (v > bestVal * 1.06) {
+        bestVal = v;
+        bestShift = sh;
+      }
+    }
+    if (bestShift != 0) {
+      pts[i] = Offset((p0.dx + nx * bestShift).clamp(0.0, w - 1.0), (p0.dy + ny * bestShift).clamp(0.0, h - 1.0));
+      pts[j] = Offset((p1.dx + nx * bestShift).clamp(0.0, w - 1.0), (p1.dy + ny * bestShift).clamp(0.0, h - 1.0));
+    }
+  }
+  final out = [
+    for (final p in pts) Offset(((p.dx + 0.5) / w).clamp(0.0, 1.0), ((p.dy + 0.5) / h).clamp(0.0, 1.0))
+  ];
+  return _quadConvex(out) ? out : q;
+}
+
+/// استخراج شبكة مصغّرة (72px) + متوسط السطوع من إطار الكاميرا (سريع جداً < 1ms).
+({Uint8List feat, int w, int h, double meanY})? _liveExtract(cam.CameraImage f, int rot) {
   if (f.planes.length < 3) return null;
   final W = f.width, H = f.height;
   final swap = rot == 90 || rot == 270;
   final upW = swap ? H : W, upH = swap ? W : H;
-  const gw = 96;
+  const gw = 72;
   final gh = math.max(8, (gw * upH / upW).round());
   final yp = f.planes[0], up = f.planes[1], vp = f.planes[2];
   final ub = up.bytesPerPixel ?? 1, vb = vp.bytesPerPixel ?? 1;
   final feat = Uint8List(gw * gh);
+  var sumY = 0;
   for (var gy = 0; gy < gh; gy++) {
     final int yu = math.min(upH - 1, math.max(0, ((gy + 0.5) * upH / gh).floor()));
     for (var gx = 0; gx < gw; gx++) {
@@ -4489,37 +5497,202 @@ List<Offset>? _liveDetect(cam.CameraImage f, int rot) {
           sy = yu;
       }
       final y = yp.bytes[sy * yp.bytesPerRow + sx];
+      sumY += y;
       final cx = sx >> 1, cy = sy >> 1;
       final ci = cy * up.bytesPerRow + cx * ub;
       final vi = cy * vp.bytesPerRow + cx * vb;
-      var chroma = 0;
+      var warm = 0;
       if (ci < up.bytes.length && vi < vp.bytes.length) {
-        chroma = (up.bytes[ci] - 128).abs() + (vp.bytes[vi] - 128).abs();
+        final diff = ((vp.bytes[vi] - 128) * 14 - (up.bytes[ci] - 128) * 14) ~/ 10;
+        if (diff > 0) warm = diff;
       }
-      final int v = y - (chroma * 1.5).round();
+      final int v = y - ((warm * 6) >> 3);
       feat[gy * gw + gx] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
   }
-  final q = _quadFromFeature(feat, gw, gh);
-  if (q == null || _quadArea(q) > 0.97) return null;
-  return _shapeQuad(q, gh / gw);
+  return (feat: feat, w: gw, h: gh, meanY: sumY / (gw * gh));
+}
+
+/// عامل خلفي ثابت (Persistent Isolate) لكشف الحدود الحي بدون إعادة إنشاء Isolate كل فريم (أسرع 5x).
+void _liveDetEntry(SendPort mainPort) {
+  final port = ReceivePort();
+  mainPort.send(port.sendPort);
+  port.listen((msg) {
+    if (msg is List && msg.length == 5) {
+      final reply = msg[0] as SendPort;
+      final feat = (msg[1] as TransferableTypedData).materialize().asUint8List();
+      final w = msg[2] as int, h = msg[3] as int, mode = msg[4] as int;
+      final q = _quadFromFeature(feat, w, h);
+      if (q == null || _quadArea(q) > 0.97) {
+        reply.send(null);
+      } else {
+        final shaped = _shapeQuad(q, h / w, mode);
+        reply.send(<double>[
+          for (final o in shaped) ...[o.dx, o.dy]
+        ]);
+      }
+    }
+  });
+}
+
+class _LiveDetWorker {
+  Isolate? _iso;
+  SendPort? _send;
+  bool _starting = false;
+
+  Future<void> start() async {
+    if (_send != null || _starting) return;
+    _starting = true;
+    try {
+      final rp = ReceivePort();
+      _iso = await Isolate.spawn(_liveDetEntry, rp.sendPort);
+      _send = await rp.first as SendPort;
+      rp.close();
+    } catch (e, st) {
+      AppLog.e('liveWorker.start', e, st);
+    } finally {
+      _starting = false;
+    }
+  }
+
+  Future<List<double>?> detect(Uint8List feat, int w, int h, int mode) async {
+    final s = _send;
+    if (s == null) return null;
+    final rp = ReceivePort();
+    s.send([rp.sendPort, TransferableTypedData.fromList([feat]), w, h, mode]);
+    final res = await rp.first;
+    rp.close();
+    return res is List ? res.cast<double>() : null;
+  }
+
+  void dispose() {
+    _iso?.kill(priority: Isolate.immediate);
+    _iso = null;
+    _send = null;
+  }
+}
+
+/// ميزان استقامة حي في منتصف الشاشة: يتحول للأخضر لما الموبايل يكون موازي تماماً للمكتب.
+class _TiltLevelPainter extends CustomPainter {
+  final double ax, ay; // م/ث² من حساس التسارع
+  final bool aligned;
+  const _TiltLevelPainter(this.ax, this.ay, this.aligned);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = Offset(size.width / 2, size.height / 2);
+    final col = aligned ? Colors.greenAccent : Colors.white70;
+    // الدائرة المرجعية الثابتة في المنتصف
+    canvas.drawCircle(
+        c,
+        18,
+        Paint()
+          ..color = col.withValues(alpha: aligned ? 0.9 : 0.45)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = aligned ? 2.5 : 1.5);
+    // علامة + صغيرة في المركز
+    final cross = Paint()
+      ..color = col.withValues(alpha: 0.6)
+      ..strokeWidth = 1.2;
+    canvas.drawLine(Offset(c.dx - 7, c.dy), Offset(c.dx + 7, c.dy), cross);
+    canvas.drawLine(Offset(c.dx, c.dy - 7), Offset(c.dx, c.dy + 7), cross);
+    // النقطة المتحركة حسب ميل الموبايل
+    final dx = (-ax / 9.81).clamp(-1.0, 1.0) * 34.0;
+    final dy = (ay / 9.81).clamp(-1.0, 1.0) * 34.0;
+    final dot = Offset(c.dx + dx, c.dy + dy);
+    canvas.drawCircle(dot, 6, Paint()..color = aligned ? Colors.greenAccent : kAccent);
+    canvas.drawCircle(
+        dot,
+        6,
+        Paint()
+          ..color = Colors.black45
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1);
+  }
+
+  @override
+  bool shouldRepaint(covariant _TiltLevelPainter old) =>
+      (old.ax - ax).abs() > 0.05 || (old.ay - ay).abs() > 0.05 || old.aligned != aligned;
+}
+
+/// إطار إرشادي بنسبة ورقة A4 لتظبيط تصوير عدة إيصالات (حتى 15 إيصال) في صورة واحدة بدون قص الحواف.
+class _A4GuidePainter extends CustomPainter {
+  const _A4GuidePainter();
+  @override
+  void paint(Canvas canvas, Size size) {
+    const a4Ratio = 1.0 / 1.4142; // عرض / ارتفاع
+    final padX = size.width * 0.04;
+    final padY = size.height * 0.04;
+    final availW = size.width - padX * 2;
+    final availH = size.height - padY * 2;
+    var w = availW;
+    var h = w / a4Ratio;
+    if (h > availH) {
+      h = availH;
+      w = h * a4Ratio;
+    }
+    final rect = Rect.fromCenter(
+      center: Offset(size.width / 2, size.height / 2),
+      width: w,
+      height: h,
+    );
+    // تظليل خفيف خارج إطار A4
+    final outer = Path()..addRect(Offset.zero & size);
+    final inner = Path()..addRect(rect);
+    canvas.drawPath(
+      Path.combine(PathOperation.difference, outer, inner),
+      Paint()..color = Colors.black.withValues(alpha: 0.32),
+    );
+    // حدود الإطار
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..color = Colors.white70
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5,
+    );
+    // زوايا واضحة بلون التطبيق
+    final corner = Paint()
+      ..color = kAccent
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.5
+      ..strokeCap = StrokeCap.round;
+    const cl = 22.0;
+    // أعلى يسار
+    canvas.drawLine(rect.topLeft, rect.topLeft + const Offset(cl, 0), corner);
+    canvas.drawLine(rect.topLeft, rect.topLeft + const Offset(0, cl), corner);
+    // أعلى يمين
+    canvas.drawLine(rect.topRight, rect.topRight + const Offset(-cl, 0), corner);
+    canvas.drawLine(rect.topRight, rect.topRight + const Offset(0, cl), corner);
+    // أسفل يسار
+    canvas.drawLine(rect.bottomLeft, rect.bottomLeft + const Offset(cl, 0), corner);
+    canvas.drawLine(rect.bottomLeft, rect.bottomLeft + const Offset(0, -cl), corner);
+    // أسفل يمين
+    canvas.drawLine(rect.bottomRight, rect.bottomRight + const Offset(-cl, 0), corner);
+    canvas.drawLine(rect.bottomRight, rect.bottomRight + const Offset(0, -cl), corner);
+  }
+
+  @override
+  bool shouldRepaint(covariant _A4GuidePainter old) => false;
 }
 
 class _LiveQuadPainter extends CustomPainter {
   final List<Offset> q;
-  const _LiveQuadPainter(this.q);
+  final double lockProgress; // 0..1 تقدم الثبات في وضع التصوير التلقائي
+  const _LiveQuadPainter(this.q, {this.lockProgress = 0});
   @override
   void paint(Canvas canvas, Size size) {
     final pts = [for (final o in q) Offset(o.dx * size.width, o.dy * size.height)];
     final path = Path()..addPolygon(pts, true);
-    final col = kAccent;
-    canvas.drawPath(path, Paint()..color = col.withValues(alpha: 0.18));
+    final col = lockProgress > 0
+        ? Color.lerp(kAccent, Colors.greenAccent, lockProgress.clamp(0.0, 1.0))!
+        : kAccent;
+    canvas.drawPath(path, Paint()..color = col.withValues(alpha: 0.18 + 0.08 * lockProgress));
     canvas.drawPath(
         path,
         Paint()
           ..color = col
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 3
+          ..strokeWidth = 3 + lockProgress * 1.5
           ..strokeJoin = StrokeJoin.round);
     for (final p in pts) {
       canvas.drawCircle(p, 6, Paint()..color = Colors.white);
@@ -4534,7 +5707,8 @@ class _LiveQuadPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _LiveQuadPainter old) => old.q != q;
+  bool shouldRepaint(covariant _LiveQuadPainter old) =>
+      old.q != q || (old.lockProgress - lockProgress).abs() > 0.01;
 }
 
 /// بترجّع مسار الصورة الجديدة بعد التعديل، أو null لو الموظف رجع من غير تأكيد.
@@ -4543,6 +5717,63 @@ const kRetake = '__retake__'; // EditorPage بترجّعه لما الموظف �
 const kDelete = '__delete__'; // حذف الصفحة الحالية
 const kAllPrefix = '__all__'; // __all__|<EditParams json>|<path>: حفظ الصفحة الحالية وتطبيق الفلتر على كل الصفحات
 const kNavPrefix = '__nav__'; // __nav__|next|<path> أو __nav__|prev|<path>: انتقال لصفحة تانية بعد حفظ التعديل
+
+/// دمج كل خطوات معالجة الصورة (منظور + فلتر إيصال + ألوان + حدة + قص هوامش) في Isolate واحد
+/// بدل 4 Isolates منفصلة — أسرع بكتير واستهلاك رامات أقل بـ 50%.
+Map<String, dynamic> _renderPipelineJob(Map<String, dynamic> a) {
+  var rgba = a['src'] as Uint8List;
+  final sw = a['sw'] as int, sh = a['sh'] as int;
+  var w = a['ow'] as int, h = a['oh'] as int;
+  final needWarp = a['needWarp'] as bool;
+  final clean = a['clean'] as bool;
+  final thermal = a['thermal'] as bool;
+  final postMatrix = a['postMatrix'] as List<double>?;
+  final sk = (a['sk'] as num).toDouble();
+  final doTrim = a['doTrim'] as bool;
+
+  if (needWarp) {
+    rgba = _warpJob(a);
+  } else {
+    final m = (a['m'] as List).cast<double>();
+    final isIdentity = (m[0] - 1).abs() < 1e-6 &&
+        m[1].abs() < 1e-6 &&
+        m[2].abs() < 1e-6 &&
+        m[4].abs() < 1e-6 &&
+        m[5].abs() < 1e-6 &&
+        (m[6] - 1).abs() < 1e-6 &&
+        m[7].abs() < 1e-6 &&
+        m[9].abs() < 1e-6 &&
+        m[10].abs() < 1e-6 &&
+        m[11].abs() < 1e-6 &&
+        (m[12] - 1).abs() < 1e-6 &&
+        m[14].abs() < 1e-6;
+    if (!isIdentity) {
+      rgba = _matrixJob(<String, dynamic>{'src': rgba, 'm': m});
+    }
+    w = sw;
+    h = sh;
+  }
+
+  if (clean) {
+    rgba = _cleanJob(<String, dynamic>{'src': rgba, 'w': w, 'h': h, 'gray': false, 'th': thermal});
+    if (postMatrix != null) {
+      rgba = _matrixJob(<String, dynamic>{'src': rgba, 'm': postMatrix});
+    }
+  }
+  if (sk > 0) {
+    rgba = _sharpenJob(<String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': sk});
+  }
+  if (clean && doTrim) {
+    final tr = _trimJob(<String, dynamic>{'src': rgba, 'w': w, 'h': h});
+    final tw = tr['w'] as int;
+    if (tw > 0) {
+      rgba = tr['out'] as Uint8List;
+      w = tw;
+      h = tr['h'] as int;
+    }
+  }
+  return <String, dynamic>{'rgba': rgba, 'w': w, 'h': h};
+}
 
 /// بيرسم صفحة بعد التعديل (قص + تدوير + فلتر) من نسختها الأصلية وبيرجّع مسار الصورة الجديدة.
 /// بيستخدمه المحرر (زر ✓) و"طبّق على كل الصفحات".
@@ -4576,13 +5807,20 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
     var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
     final mode = await Store.perfMode();
     final safe = sp.getBool('apply_safe') ?? false;
-    final maxSide = safe ? math.min(900, getMaxSide(mode)) : getMaxSide(mode);
+    final maxSide = safe ? math.min(1400, getMaxSide(mode)) : getMaxSide(mode);
     final k = math.min(1.0, maxSide / math.max(ow, oh));
     ow *= k;
     oh *= k;
     final w = math.max(8, ow.round()), h = math.max(8, oh.round());
-    AppLog.i('apply warp ${w}x$h safe=$safe');
-    var rgba = await compute(_warpJob, <String, dynamic>{
+    final fullQuad = (quad[0] - const Offset(0, 0)).distance < 0.002 &&
+        (quad[1] - const Offset(1, 0)).distance < 0.002 &&
+        (quad[2] - const Offset(1, 1)).distance < 0.002 &&
+        (quad[3] - const Offset(0, 1)).distance < 0.002;
+    final needWarp = !fullQuad || angle.abs() > 0.05 || w != rw || h != rh;
+    final clean = isCleanFilter(filter);
+    final doTrim = clean && await Store.trimMargins();
+    AppLog.i('apply pipeline ${w}x$h warp=$needWarp safe=$safe');
+    final res = await compute(_renderPipelineJob, <String, dynamic>{
       'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
       'sw': rw,
       'sh': rh,
@@ -4590,44 +5828,20 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
       'oh': h,
       'theta': angle * math.pi / 180,
       'h': _homography(pts),
-      // فلاتر الإيصال: التباين والسطوع بيتطبقوا بعد التنضيف (زي المعاينة بالظبط)
-      'm': isCleanFilter(filter)
+      'm': clean
           ? editMatrix(ScanFilter.original, 0, 0)
           : editMatrix(filter, contrast, brightness, levels),
+      'needWarp': needWarp,
+      'clean': clean,
+      'thermal': usesThermalClean(filter),
+      'postMatrix': (clean && (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw))
+          ? editMatrix(filter, contrast, brightness)
+          : null,
+      'sk': effSharpness(filter, sharp),
+      'doTrim': doTrim,
     });
-    AppLog.i('apply warp done');
-    if (isCleanFilter(filter)) {
-      rgba = await compute(_cleanJob, <String, dynamic>{
-        'src': rgba,
-        'w': w,
-        'h': h,
-        'gray': false,
-        'th': usesThermalClean(filter),
-      });
-      AppLog.i('apply clean done');
-      if (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw) {
-        rgba = await compute(_matrixJob, <String, dynamic>{
-          'src': rgba,
-          'm': editMatrix(filter, contrast, brightness),
-        });
-      }
-    }
-    final sk = effSharpness(filter, sharp);
-    if (sk > 0) {
-      rgba = await compute(_sharpenJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h, 'k': sk});
-      AppLog.i('apply sharpen done');
-    }
-    var fw = w, fh = h;
-    if (isCleanFilter(filter) && await Store.trimMargins()) {
-      final tr = await compute(_trimJob, <String, dynamic>{'src': rgba, 'w': w, 'h': h});
-      final tw = tr['w'] as int;
-      if (tw > 0) {
-        rgba = tr['out'] as Uint8List;
-        fw = tw;
-        fh = tr['h'] as int;
-        AppLog.i('apply trim ${w}x$h -> ${fw}x$fh');
-      }
-    }
+    final rgba = res['rgba'] as Uint8List;
+    final fw = res['w'] as int, fh = res['h'] as int;
     final comp = Completer<ui.Image>();
     ui.decodeImageFromPixels(rgba, fw, fh, ui.PixelFormat.rgba8888, comp.complete);
     final outImg = await comp.future;
@@ -4644,7 +5858,7 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
     );
     final dir = (await Store.dir()).path;
     final nf = File('$dir/$prefix${DateTime.now().microsecondsSinceEpoch}.jpg');
-    await nf.writeAsBytes(jpg, flush: true);
+    await nf.writeAsBytes(jpg);
     AppLog.i('apply jpg ${jpg.length ~/ 1024}KB saved');
     // النسخة الأصلية بتنتقل للصورة الجديدة (أو بتتعمل أول مرة من الصورة الحالية)
     final oldBase = File(Store.baseOf(path));
@@ -4665,6 +5879,7 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
             brightness: brightness,
             sharp: sharp,
             levels: levels));
+    if (safe) await sp.setBool('apply_safe', false);
     AppLog.i('apply done');
     return nf.path;
   } finally {
@@ -5010,11 +6225,13 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
-  Future<void> _loadView() async {
+  Future<void> _loadView({Uint8List? preloadedBytes}) async {
     final gen = ++_viewGen;
     try {
       final lite = await Store.perfMode() == PerfMode.lite;
-      final img = await decodeImage(await File(src!).readAsBytes(), maxWidth: lite ? 700 : 1000);
+      final raw = preloadedBytes ?? await File(src!).readAsBytes();
+      final img = await decodeImage(raw, maxWidth: lite ? 700 : 1200);
+      final baseAspect = img.height / img.width;
       final r = await _rotateUi(img, turns);
       if (!mounted || gen != _viewGen) {
         r.dispose();
@@ -5023,6 +6240,7 @@ class _EditorPageState extends State<EditorPage> {
       final old = view;
       final oldClean = cleaned;
       setState(() {
+        aspect ??= baseAspect;
         view = r;
         cleaned = null;
       });
@@ -5049,39 +6267,39 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _init() async {
     try {
       AppLog.i('editor open');
-      await _loadFavs();
+      unawaited(_loadFavs()); // متوقفش فتح الصورة عشان قراءة المفضلة
+      final hot = _takeHotBytes(widget.path);
       final base = File(Store.baseOf(widget.path));
-      final s = await base.exists() ? base.path : widget.path;
-      final a = await imageAspect(s);
+      final s = (hot != null || await base.exists()) ? base.path : widget.path;
       final e = await Store.editOf(widget.path);
       if (!mounted) return;
-      setState(() {
-        src = s;
-        aspect = a;
-        if (e != null) {
-          turns = e.turns;
-          angle = e.angle;
-          filter = e.filter;
-          contrast = e.contrast;
-          brightness = e.brightness;
-          sharp = e.sharp;
-          levels = e.levels;
-          if (e.quad != null && _quadConvex(e.quad!)) quad = List.of(e.quad!);
+      src = s;
+      if (e != null) {
+        turns = e.turns;
+        angle = e.angle;
+        filter = e.filter;
+        contrast = e.contrast;
+        brightness = e.brightness;
+        sharp = e.sharp;
+        levels = e.levels;
+        if (e.quad != null && _quadConvex(e.quad!)) quad = List.of(e.quad!);
+      }
+      if ((e == null || e.quad == null) && _lastScanManual) {
+        final live = widget.canRetake ? _shotQuad : null;
+        _shotQuad = null;
+        if (live != null && live.length == 4 && _quadConvex(live) && turns == 0) {
+          quad = List.of(live); // اقتراح فوري جاهز من أول فريم
         }
-      });
-      await _loadView();
+      }
+      await _loadView(preloadedBytes: hot);
       _sig0 = _sig();
       AppLog.i('editor view loaded');
       WidgetsBinding.instance.addPostFrameCallback((_) => AppLog.i('editor first frame'));
       if (mounted && (e == null || e.quad == null) && _lastScanManual) {
-        final live = widget.canRetake ? _shotQuad : null;
-        _shotQuad = null;
-        if (live != null && live.length == 4 && _quadConvex(live) && turns == 0) {
-          setState(() => quad = List.of(live)); // اقتراح فوري من المعاينة الحية
-          _mark();
-          unawaited(_refineQuad()); // الكشف الدقيق بيشتغل في الخلفية ويحدّث الإطار بهدوء
+        if (!_quadFull()) {
+          unawaited(_refineQuad());
         } else {
-          await _auto(silent: true);
+          unawaited(_auto(silent: true));
         }
       }
     } catch (e, st) {
@@ -5585,7 +6803,17 @@ class _EditorPageState extends State<EditorPage> {
                       },
               ),
             ),
-            const Text('حدة', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ActionChip(
+              visualDensity: VisualDensity.compact,
+              label: Text(sharp >= 0.5 ? 'وضوح ✓' : 'وضوح نص', style: const TextStyle(fontSize: 11)),
+              onPressed: busy
+                  ? null
+                  : () {
+                      setState(() => sharp = sharp >= 0.5 ? 0.0 : 0.6);
+                      _resharp();
+                      _mark();
+                    },
+            ),
             _favBtn(),
           ]),
         ]);
@@ -5902,6 +7130,9 @@ class PdfResultScreen extends StatefulWidget {
 }
 
 class _PdfResultScreenState extends State<PdfResultScreen> {
+  late File _pdf = widget.pdf;
+  int? _pdfBytes;
+  bool _compressed = false;
   Tag? tag;
   final Set<String> noTags = {};
   bool busy = false;
@@ -5914,6 +7145,11 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
     _load();
   }
 
+  String _fmtBytes(int b) {
+    if (b >= 1024 * 1024) return '${(b / (1024 * 1024)).toStringAsFixed(2)} MB';
+    return '${(b / 1024).round()} KB';
+  }
+
   Future<void> _load() async {
     try {
       final t = await receiptTag(1000, widget.session);
@@ -5921,9 +7157,13 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
       for (final x in widget.imgs) {
         if (await Store.noTag(x)) nts.add(x);
       }
+      final sz = await _pdf.exists() ? await _pdf.length() : null;
+      final isComp = (await Store.pdfSize()) == 1;
       if (!mounted) return;
       setState(() {
         tag = t;
+        _pdfBytes = sz;
+        _compressed = isComp;
         noTags
           ..clear()
           ..addAll(nts);
@@ -5934,8 +7174,43 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
     }
   }
 
-  void _markShared() {
+  Future<void> _compressNow() async {
+    if (busy) return;
+    final before = _pdfBytes ?? 0;
+    setState(() {
+      busy = true;
+      progress = '0/${widget.imgs.length}';
+    });
+    try {
+      final f = await buildReceiptsPdf(widget.session, widget.imgs, forceCompact: true,
+          onProgress: (d, t) {
+        if (mounted) setState(() => progress = '$d/$t');
+      });
+      await Store.setPdf(f, List.of(widget.imgs));
+      final after = await f.length();
+      if (!mounted) return;
+      setState(() {
+        _pdf = f;
+        _pdfBytes = after;
+        _compressed = true;
+      });
+      snack(context,
+          before > 0 ? 'اتضغط الملف من ${_fmtBytes(before)} إلى ${_fmtBytes(after)}' : 'تم ضغط الملف');
+    } catch (e) {
+      if (mounted) snack(context, 'تعذر الضغط: ${errText(e)}');
+    } finally {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          progress = null;
+        });
+      }
+    }
+  }
+
+  void _markShared(String how) {
     HapticFeedback.mediumImpact();
+    unawaited(Store.addLog(widget.session, 'receipts', '${widget.imgs.length} صفحة - $how'));
     if (!mounted) return;
     setState(() => shared = true);
     snack(context, 'اتبعت ✓ اضغط "تم" لما تخلص');
@@ -5943,8 +7218,8 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
 
   Future<void> _sharePdf() async {
     if (busy) return;
-    final ok = await shareFiles(context, [widget.pdf.path]);
-    if (ok) _markShared();
+    final ok = await shareFiles(context, [_pdf.path]);
+    if (ok) _markShared('PDF');
   }
 
   Future<void> _shareImages() async {
@@ -5958,7 +7233,8 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
     try {
       final dir = await getTemporaryDirectory();
       for (var i = 0; i < n; i++) {
-        final bytes = await composeReceiptImage(widget.imgs[i], widget.session);
+        final bytes = await composeReceiptImage(widget.imgs[i], widget.session,
+            pageLabel: n > 1 ? '${i + 1} / $n' : null);
         final f = File('${dir.path}/${widget.session.pdfName}_${i + 1}.jpg');
         await f.writeAsBytes(bytes, flush: true);
         files.add(f.path);
@@ -5978,7 +7254,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
     }
     if (files.isEmpty || !mounted) return;
     final ok = await shareFiles(context, files);
-    if (ok) _markShared();
+    if (ok) _markShared('صور');
   }
 
   Future<void> _done() async {
@@ -6019,6 +7295,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
   @override
   Widget build(BuildContext context) {
     final n = widget.imgs.length;
+    final sz = _pdfBytes;
     return Scaffold(
       appBar: AppBar(
         title: Text('معاينة الملف ($n صفحة)'),
@@ -6032,6 +7309,28 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
         ],
       ),
       body: Column(children: [
+        if (sz != null)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            color: Theme.of(context).colorScheme.surfaceContainerHigh,
+            child: Row(children: [
+              const Icon(Icons.picture_as_pdf_rounded, size: 18, color: Colors.redAccent),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'حجم الـ PDF: ${_fmtBytes(sz)}${n > 1 ? '  •  مرقّم تلقائياً (1 / $n)' : ''}',
+                  style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+                ),
+              ),
+              if (!_compressed && sz > 500 * 1024)
+                TextButton.icon(
+                  onPressed: busy ? null : _compressNow,
+                  icon: const Icon(Icons.compress_rounded, size: 17),
+                  label: const Text('ضغط'),
+                ),
+            ]),
+          ),
         Expanded(
           child: tag == null
               ? const Center(child: CircularProgressIndicator())
@@ -6084,7 +7383,8 @@ class A2RCamState {
   final int count; // عدد الصور المحفوظة لحد دلوقتي
   final String? thumb; // آخر صورة (للمصغّرة)
   final bool close; // اقفل الكاميرا (الباتش بعد أول صورة)
-  const A2RCamState({this.count = 0, this.thumb, this.close = false});
+  final String? warning; // تنبيه جودة/اهتزاز فوري بعد اللقطة السريعة
+  const A2RCamState({this.count = 0, this.thumb, this.close = false, this.warning});
 }
 
 class A2RCameraScreen extends StatefulWidget {
@@ -6093,11 +7393,17 @@ class A2RCameraScreen extends StatefulWidget {
   final int count;
   final String? thumb;
   final Future<A2RCamState?> Function(String path) onShot;
+  /// للتصوير السريع المتتالي: بيقص ويحفظ الصورة مباشرة في الخلفية بدون فتح شاشة التعديل.
+  final Future<A2RCamState?> Function(String path, List<Offset>? quad)? onFastShot;
+  /// مسح آخر صورة اتلقطت من جوه الكاميرا مباشرة.
+  final Future<A2RCamState?> Function()? onUndoLast;
   final Future<A2RCamState?> Function()? onGallery;
   const A2RCameraScreen({
     super.key,
     required this.title,
     required this.onShot,
+    this.onFastShot,
+    this.onUndoLast,
     this.onGallery,
     this.single = false,
     this.count = 0,
@@ -6113,18 +7419,48 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   bool _ready = false;
   bool _starting = false; // يمنع تشغيل الكاميرا مرتين في نفس الوقت
   bool _shooting = false;
+  bool _shutterFlash = false; // وميض أبيض سريع عند الالتقاط في الوضع السريع
+  String? _lastShot; // أبعاد آخر صورة اتصوّرت فعلاً (للتأكد من الدقة)
   bool _hd = true;
   int _flash = 0; // 0 مقفول، 1 تلقائي، 2 فلاش، 3 كشاف
   bool _grid = false; // شبكة الأثلاث للمحاذاة
+  bool _a4Frame = false; // إطار إرشادي A4 لتصوير شيت الإيصالات
+  bool _fastMode = false; // وضع التصوير السريع المتتالي (للإيصالات)
+  bool _autoCap = false; // التصوير التلقائي عند ثبات الورقة
+  bool _lowLight = false; // تنبيه الإضاءة الضعيفة الحي
+  bool _aeAfLocked = false; // قفل الفوكس والإضاءة بالضغط المطوّل
+  String? _camWarning; // تنبيه الاهتزاز/الإضاءة الفوري بعد اللقطة السريعة
+  Timer? _warnTimer;
+  bool _showLevel = true; // ميزان الاستقامة (التوازي مع المكتب)
+  bool _tiltFlat = false;
+  double _tiltX = 0, _tiltY = 0;
+  static const _hwChannel = MethodChannel('a2r/cam_hw');
+  static const _tiltChannel = EventChannel('a2r/tilt');
+  StreamSubscription<dynamic>? _tiltSub;
   late int _count = widget.count;
   String? _thumb;
   double _minZoom = 1, _maxZoom = 1, _zoom = 1, _zoom0 = 1;
+  double _minExp = 0, _maxExp = 0, _exp = 0;
+  bool _showExp = false;
   Offset? _focusAt;
   List<Offset>? _liveQuad; // التحديد التلقائي الحي فوق المعاينة
+  List<Offset>? _stableRef; // مرجع الثبات للتصوير التلقائي
+  int _stableHits = 0;
+  int _lastAutoShot = 0;
   bool _live = false, _liveBusy = false;
+  final _LiveDetWorker _detWorker = _LiveDetWorker();
   int _lastLive = 0, _liveMiss = 0;
+  Future<void> _saveQueue = Future.value();
+  int _pendingCount = 0;
 
-  static const _flashIcons = [Icons.flash_off_rounded, Icons.flash_auto_rounded, Icons.flash_on_rounded, Icons.highlight_rounded];
+  bool get _canFast => widget.onFastShot != null && !widget.single;
+
+  static const _flashIcons = [
+    Icons.flash_off_rounded,
+    Icons.flash_auto_rounded,
+    Icons.flash_on_rounded,
+    Icons.highlight_rounded
+  ];
   static const _flashNames = ['الفلاش مقفول', 'فلاش تلقائي', 'فلاش', 'كشاف'];
 
   @override
@@ -6136,6 +7472,12 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _hd = p.getBool('camHd') ?? true;
       _flash = p.getInt('camFlash') ?? 0;
       _grid = p.getBool('camGrid') ?? false;
+      _a4Frame = p.getBool('camA4Frame') ?? false;
+      _fastMode = _canFast && (p.getBool('camFastMode') ?? true);
+      _autoCap = p.getBool('camAutoCap') ?? false;
+      _showLevel = p.getBool('camLevel') ?? true;
+      _setVolumeCapture(true);
+      if (_showLevel) _startTilt();
       _start();
     }).catchError((Object e, StackTrace st) {
       AppLog.e('cam.prefs', e, st);
@@ -6143,8 +7485,87 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     });
   }
 
+  Future<void> _setVolumeCapture(bool on) async {
+    try {
+      if (on) {
+        _hwChannel.setMethodCallHandler((call) async {
+          if (call.method == 'volumeShot' && mounted) unawaited(_shot());
+        });
+      } else {
+        _hwChannel.setMethodCallHandler(null);
+      }
+      await _hwChannel.invokeMethod<void>('setVolumeCapture', on);
+    } catch (_) {}
+  }
+
+  void _startTilt() {
+    _tiltSub?.cancel();
+    _tiltSub = null;
+    try {
+      _tiltSub = _tiltChannel.receiveBroadcastStream().listen((ev) {
+        if (!mounted || !_showLevel) return;
+        if (ev is List && ev.length >= 3) {
+          final ax = (ev[0] as num).toDouble();
+          final ay = (ev[1] as num).toDouble();
+          final az = (ev[2] as num).toDouble();
+          final flat = az > 5.0; // الموبايل موجّه لتحت ناحية المكتب
+          if (flat != _tiltFlat || (ax - _tiltX).abs() > 0.12 || (ay - _tiltY).abs() > 0.12) {
+            setState(() {
+              _tiltFlat = flat;
+              _tiltX = ax;
+              _tiltY = ay;
+            });
+          }
+        }
+      }, onError: (_) {});
+    } catch (_) {}
+  }
+
+  void _stopTilt() {
+    _tiltSub?.cancel();
+    _tiltSub = null;
+  }
+
+  Future<void> _toggleLevel() async {
+    HapticFeedback.selectionClick();
+    setState(() {
+      _showLevel = !_showLevel;
+      if (!_showLevel) _tiltFlat = false;
+    });
+    if (_showLevel) {
+      _startTilt();
+    } else {
+      _stopTilt();
+    }
+    try {
+      (await SharedPreferences.getInstance()).setBool('camLevel', _showLevel);
+    } catch (_) {}
+  }
+
+  Future<void> _toggleA4Frame() async {
+    HapticFeedback.selectionClick();
+    setState(() => _a4Frame = !_a4Frame);
+    try {
+      (await SharedPreferences.getInstance()).setBool('camA4Frame', _a4Frame);
+    } catch (_) {}
+  }
+
+  void _showCamWarning(String msg) {
+    _warnTimer?.cancel();
+    HapticFeedback.vibrate();
+    if (!mounted) return;
+    setState(() => _camWarning = msg);
+    _warnTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _camWarning = null);
+    });
+  }
+
   @override
   void dispose() {
+    _warnTimer?.cancel();
+    _detWorker.dispose();
+    _setVolumeCapture(false);
+    _stopTilt();
     WidgetsBinding.instance.removeObserver(this);
     _c?.dispose();
     super.dispose();
@@ -6153,15 +7574,22 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      _setVolumeCapture(true);
+      if (_showLevel) _startTilt();
       if (_c == null && !_starting) _start();
       return;
     }
     final c = _c;
     if (c == null) return;
     if (state == AppLifecycleState.inactive) {
+      _setVolumeCapture(false);
+      _stopTilt();
       _c = null;
       _live = false;
       _liveQuad = null;
+      _aeAfLocked = false;
+      _stableHits = 0;
+      _stableRef = null;
       c.dispose();
       if (mounted) setState(() => _ready = false);
     }
@@ -6175,6 +7603,9 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _c = null;
       _live = false;
       _liveQuad = null;
+      _aeAfLocked = false;
+      _stableHits = 0;
+      _stableRef = null;
       if (mounted) setState(() => _ready = false);
       await old?.dispose();
       final cams = await cam.availableCameras();
@@ -6183,32 +7614,49 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
           orElse: () => cams.first);
       final perf = await Store.perfMode();
       final slow = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
-      // الصورة بتتحفظ بحد أقصى 800/1400/2400، فمفيش داعي لـ 4K غير في الوضع "برو".
-      // الجهاز اللي التصوير فيه بطيء بيتنزّل له درجة تلقائياً.
       late final cam.ResolutionPreset preset;
-      if (perf == PerfMode.pro) {
+      if (gMinSide > 0 && gResLevel == 0) {
+        preset = cam.ResolutionPreset.max;
+      } else if (gResLevel > 0) {
+        preset = const [
+          cam.ResolutionPreset.high,
+          cam.ResolutionPreset.veryHigh,
+          cam.ResolutionPreset.ultraHigh,
+          cam.ResolutionPreset.max,
+        ][(gResLevel - 1).clamp(0, 3)];
+      } else if (perf == PerfMode.pro) {
         preset = _hd && !slow ? cam.ResolutionPreset.ultraHigh : cam.ResolutionPreset.veryHigh;
       } else if (perf == PerfMode.balanced) {
-        preset = _hd && !slow ? cam.ResolutionPreset.veryHigh : cam.ResolutionPreset.high;
+        preset = cam.ResolutionPreset.veryHigh;
       } else {
         preset = cam.ResolutionPreset.high;
       }
-      // YUV420 عشان نقدر نحلل الإطارات للتحديد الحي (التصوير نفسه لسه JPEG)
       final c = cam.CameraController(back, preset,
           enableAudio: false,
           imageFormatGroup:
               Platform.isAndroid ? cam.ImageFormatGroup.yuv420 : cam.ImageFormatGroup.bgra8888);
       await c.initialize();
+      AppLog.i('cam preset=$preset preview=${c.value.previewSize}');
       try {
         await c.lockCaptureOrientation(DeviceOrientation.portraitUp);
       } catch (_) {}
       await _applyFlash(c);
       try {
         await c.setFocusMode(cam.FocusMode.auto);
+        await c.setExposureMode(cam.ExposureMode.auto);
       } catch (_) {}
       _minZoom = await c.getMinZoomLevel();
       _maxZoom = math.min(await c.getMaxZoomLevel(), 6.0);
       _zoom = _minZoom;
+      try {
+        _minExp = await c.getMinExposureOffset();
+        _maxExp = await c.getMaxExposureOffset();
+        _exp = 0;
+      } catch (_) {
+        _minExp = 0;
+        _maxExp = 0;
+        _exp = 0;
+      }
       if (!mounted) {
         await c.dispose();
         return;
@@ -6232,6 +7680,9 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     try {
       if (await Store.perfMode() == PerfMode.lite) return;
       _liveMiss = 0;
+      _stableHits = 0;
+      _stableRef = null;
+      await _detWorker.start();
       await c.startImageStream(_onFrame);
       _live = true;
     } catch (e, st) {
@@ -6243,34 +7694,89 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     final c = _c;
     _live = false;
     _liveQuad = null;
+    _stableHits = 0;
+    _stableRef = null;
     if (c == null) return;
     try {
       if (c.value.isStreamingImages) await c.stopImageStream();
     } catch (_) {}
   }
 
+  double _maxQuadDelta(List<Offset> a, List<Offset> b) {
+    var mx = 0.0;
+    for (var i = 0; i < 4; i++) {
+      final d = (a[i] - b[i]).distance;
+      if (d > mx) mx = d;
+    }
+    return mx;
+  }
+
   void _onFrame(cam.CameraImage f) {
     final now = DateTime.now().millisecondsSinceEpoch;
-    if (!_live || _liveBusy || now - _lastLive < 200 || !mounted) return;
+    if (!_live || _liveBusy || _shooting || now - _lastLive < 85 || !mounted) return;
     _liveBusy = true;
     _lastLive = now;
-    try {
-      var q = _liveDetect(f, _c?.description.sensorOrientation ?? 90);
+    final ex = _liveExtract(f, _c?.description.sensorOrientation ?? 90);
+    if (ex == null) {
+      _liveBusy = false;
+      return;
+    }
+    final isLow = ex.meanY < 72 && _flash == 0;
+    _detWorker.detect(ex.feat, ex.w, ex.h, autoCropMode).then((raw) {
+      if (!mounted || !_live) return;
+      List<Offset>? q;
+      if (raw != null && raw.length == 8) {
+        q = [for (var i = 0; i < 8; i += 2) Offset(raw[i], raw[i + 1])];
+      }
       final prev = _liveQuad;
+      var shouldAutoShoot = false;
       if (q == null) {
-        if (++_liveMiss <= 3) return; // نثبّت آخر تحديد شوية بدل ما يومض
+        if (++_liveMiss >= 2) {
+          _stableHits = 0;
+          _stableRef = null;
+        }
+        if (_liveMiss <= 3) {
+          if (_lowLight != isLow) setState(() => _lowLight = isLow);
+          return;
+        }
       } else {
         _liveMiss = 0;
         if (prev != null) {
-          q = [for (var i = 0; i < 4; i++) Offset.lerp(prev[i], q[i], 0.5)!];
+          q = [for (var i = 0; i < 4; i++) Offset.lerp(prev[i], q[i], 0.65)!];
+        }
+        if (_autoCap && !_shooting) {
+          final ts = DateTime.now().millisecondsSinceEpoch;
+          if (ts - _lastAutoShot > 1100) {
+            if (_stableRef != null && _maxQuadDelta(_stableRef!, q) < 0.035) {
+              _stableHits++;
+              if (_stableHits >= 3) {
+                _stableHits = 0;
+                _stableRef = null;
+                _lastAutoShot = ts;
+                shouldAutoShoot = true;
+              }
+            } else {
+              _stableRef = q;
+              _stableHits = 1;
+            }
+          }
+        } else {
+          _stableHits = 0;
+          _stableRef = null;
         }
       }
-      if (mounted && _live) setState(() => _liveQuad = q);
-    } catch (e, st) {
+      setState(() {
+        _liveQuad = q;
+        _lowLight = isLow;
+      });
+      if (shouldAutoShoot) {
+        unawaited(_shot());
+      }
+    }).catchError((Object e, StackTrace st) {
       AppLog.e('cam.liveFrame', e, st);
-    } finally {
+    }).whenComplete(() {
       _liveBusy = false;
-    }
+    });
   }
 
   Future<void> _applyFlash(cam.CameraController c) async {
@@ -6292,6 +7798,59 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     } catch (_) {}
   }
 
+  Future<void> _toggleFastMode() async {
+    if (!_canFast) return;
+    HapticFeedback.selectionClick();
+    setState(() => _fastMode = !_fastMode);
+    try {
+      (await SharedPreferences.getInstance()).setBool('camFastMode', _fastMode);
+    } catch (_) {}
+    if (mounted) {
+      snack(
+          context,
+          _fastMode
+              ? 'التصوير السريع: يقص ويحفظ الإيصالات ورا بعض بدون توقف'
+              : 'التعديل الفوري: يفتح التعديل بعد كل صورة');
+    }
+  }
+
+  Future<void> _toggleAutoCap() async {
+    HapticFeedback.selectionClick();
+    setState(() {
+      _autoCap = !_autoCap;
+      _stableHits = 0;
+      _stableRef = null;
+    });
+    try {
+      (await SharedPreferences.getInstance()).setBool('camAutoCap', _autoCap);
+    } catch (_) {}
+    if (mounted) {
+      snack(context,
+          _autoCap ? 'التصوير التلقائي شغّال: ثبّت الموبايل على الورقة وهيصوّر لوحده' : 'التصوير التلقائي مقفول');
+    }
+  }
+
+  Future<void> _setZoom(double z) async {
+    final c = _c;
+    if (c == null || !c.value.isInitialized) return;
+    final clamped = z.clamp(_minZoom, _maxZoom).toDouble();
+    HapticFeedback.selectionClick();
+    setState(() => _zoom = clamped);
+    try {
+      await c.setZoomLevel(clamped);
+    } catch (_) {}
+  }
+
+  Future<void> _setExposure(double v) async {
+    final c = _c;
+    if (c == null || !c.value.isInitialized) return;
+    final clamped = v.clamp(_minExp, _maxExp).toDouble();
+    setState(() => _exp = clamped);
+    try {
+      await c.setExposureOffset(clamped);
+    } catch (_) {}
+  }
+
   Future<void> _cycleFlash() async {
     final c = _c;
     if (c == null) return;
@@ -6304,15 +7863,80 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     if (mounted) snack(context, _flashNames[_flash]);
   }
 
-  Future<void> _toggleHd() async {
+  Future<void> _pickRes() async {
     HapticFeedback.selectionClick();
-    setState(() => _hd = !_hd);
+    final cur = gResLevel;
+    final v = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: const Color(0xFF111111),
+      builder: (c) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: SafeArea(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: Text('دقة التصوير',
+                  style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            ),
+            if (_lastShot != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text('آخر صورة: $_lastShot بكسل',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              ),
+            for (final o in _resOpts)
+              ListTile(
+                dense: true,
+                leading: Icon(o.$1 == cur ? Icons.radio_button_checked : Icons.radio_button_off,
+                    color: o.$1 == cur ? kAccent : Colors.white70),
+                title: Text(o.$2, style: const TextStyle(color: Colors.white)),
+                subtitle: Text(o.$3, style: const TextStyle(color: Colors.white54, fontSize: 11)),
+                onTap: () => Navigator.pop(c, o.$1),
+              ),
+          ]),
+        ),
+      ),
+    );
+    if (v == null || v == cur) return;
+    await Store.setResSetting(v);
     try {
-      final sp = await SharedPreferences.getInstance();
-      await sp.setBool('camHd', _hd);
-      await sp.remove('camSlow'); // اختيار الموظف بيلغي التنزيل التلقائي
+      (await SharedPreferences.getInstance()).remove('camSlow');
     } catch (_) {}
+    if (mounted) setState(() {});
     await _start();
+  }
+
+  Future<void> _finish() async {
+    if (_shooting) return;
+    if (_pendingCount > 0) {
+      setState(() => _shooting = true);
+      try {
+        await _saveQueue;
+      } finally {
+        if (mounted) setState(() => _shooting = false);
+      }
+    }
+    if (mounted) Navigator.pop(context);
+  }
+
+  Future<void> _undoLastShot() async {
+    final fn = widget.onUndoLast;
+    if (fn == null || _shooting || (_count <= 0 && _pendingCount <= 0)) return;
+    HapticFeedback.mediumImpact();
+    setState(() => _shooting = true);
+    try {
+      await _saveQueue;
+      final st = await fn();
+      if (!mounted) return;
+      _warnTimer?.cancel();
+      setState(() => _camWarning = null);
+      _apply(st);
+      snack(context, 'اتمسحت آخر صورة');
+    } catch (e, st) {
+      AppLog.e('cam.undoLast', e, st);
+    } finally {
+      if (mounted) setState(() => _shooting = false);
+    }
   }
 
   void _apply(A2RCamState? s) {
@@ -6325,36 +7949,68 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _count = s.count;
       _thumb = s.thumb;
     });
+    if (s.warning != null && s.warning!.isNotEmpty) {
+      _showCamWarning(s.warning!);
+    }
   }
 
   Future<void> _shot() async {
     final c = _c;
     if (c == null || !c.value.isInitialized || _shooting) return;
-    setState(() => _shooting = true);
+    setState(() {
+      _shooting = true;
+      _stableHits = 0;
+      _stableRef = null;
+    });
     try {
       HapticFeedback.mediumImpact();
       final lq = _liveQuad;
-      _shotQuad = lq == null ? null : List<Offset>.of(lq);
+      final quadCopy = lq == null ? null : List<Offset>.of(lq);
+      _shotQuad = quadCopy;
       final swShot = Stopwatch()..start();
       await _stopLive();
       final x = await c.takePicture();
       final shotMs = swShot.elapsedMilliseconds;
       AppLog.i('t takePicture ${shotMs}ms');
       if (shotMs > 2500) {
-        try {
-          (await SharedPreferences.getInstance()).setBool('camSlow', true);
-        } catch (_) {}
+        unawaited(SharedPreferences.getInstance()
+            .then((p) => p.setBool('camSlow', true))
+            .catchError((_) => false));
       }
-      try {
-        await c.pausePreview();
-      } catch (_) {}
+      // وضع التصوير السريع: وميض أبيض + قص وحفظ متسلسل في الخلفية بدون توقيف المعاينة
+      if (_fastMode && _canFast) {
+        if (mounted) {
+          setState(() {
+            _shutterFlash = true;
+            _pendingCount++;
+          });
+        }
+        Future.delayed(const Duration(milliseconds: 110), () {
+          if (mounted) setState(() => _shutterFlash = false);
+        });
+        _saveQueue = _saveQueue.then((_) async {
+          try {
+            final st = await widget.onFastShot!(x.path, quadCopy);
+            _apply(st);
+          } catch (e, st) {
+            AppLog.e('cam.fastShot', e, st);
+            if (mounted) snack(context, 'تعذر حفظ الصورة: ${errText(e)}');
+          } finally {
+            if (mounted) setState(() => _pendingCount = math.max(0, _pendingCount - 1));
+          }
+        });
+        return;
+      }
+      unawaited(c.pausePreview().catchError((_) {})); // من غير ما نوقف الانتقال لشاشة التعديل
       final s = await widget.onShot(x.path);
       AppLog.i('t shot+edit total ${swShot.elapsedMilliseconds}ms');
       if (!mounted) return;
-      try {
-        await c.resumePreview();
-      } catch (_) {}
-      if (widget.single && s == null) return; // الموظف رجع من التعديل: يصوّر تاني
+      if (s?.close != true) {
+        try {
+          await c.resumePreview();
+        } catch (_) {}
+      }
+      if (widget.single && s == null) return;
       _apply(s);
     } catch (e, st) {
       AppLog.e('cam.shot', e, st);
@@ -6371,7 +8027,10 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   /// لو كاميرا التطبيق مش شغالة على الموبايل ده: كاميرا النظام بدالها.
   Future<void> _systemCamera() async {
     try {
-      final x = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 2000, imageQuality: 90);
+      final x = await ImagePicker().pickImage(
+          source: ImageSource.camera,
+          maxWidth: gMinSide > 0 ? null : 2000,
+          imageQuality: gMinSide > 0 ? null : 90);
       if (x == null || !mounted) return;
       _apply(await widget.onShot(x.path));
     } catch (e, st) {
@@ -6397,18 +8056,122 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     _apply(s);
   }
 
-  Future<void> _tapFocus(TapDownDetails d, Size box) async {
+  /// قفل الفوكس والإضاءة بالضغط المطوّل (ممتاز لتصوير كذا إيصال من نفس المسافة).
+  Future<void> _lockFocus(LongPressStartDetails d, Rect pvRect) async {
     final c = _c;
     if (c == null || !c.value.isInitialized) return;
-    final p = Offset(d.localPosition.dx / box.width, d.localPosition.dy / box.height);
-    setState(() => _focusAt = d.localPosition);
+    if (!pvRect.contains(d.localPosition)) return;
+    final dx = ((d.localPosition.dx - pvRect.left) / pvRect.width).clamp(0.0, 1.0).toDouble();
+    final dy = ((d.localPosition.dy - pvRect.top) / pvRect.height).clamp(0.0, 1.0).toDouble();
+    HapticFeedback.heavyImpact();
+    setState(() {
+      _focusAt = d.localPosition;
+      _aeAfLocked = true;
+    });
     try {
-      await c.setFocusPoint(p);
-      await c.setExposurePoint(p);
+      await c.setFocusPoint(Offset(dx, dy));
+      await c.setExposurePoint(Offset(dx, dy));
+      await c.setFocusMode(cam.FocusMode.locked);
+      await c.setExposureMode(cam.ExposureMode.locked);
+    } catch (_) {}
+  }
+
+  Future<void> _unlockFocus() async {
+    final c = _c;
+    HapticFeedback.selectionClick();
+    setState(() {
+      _aeAfLocked = false;
+      _focusAt = null;
+    });
+    if (c == null || !c.value.isInitialized) return;
+    try {
+      await c.setFocusMode(cam.FocusMode.auto);
+      await c.setExposureMode(cam.ExposureMode.auto);
+    } catch (_) {}
+  }
+
+  /// إصلاح حساب نقطة التركيز نسبةً لمستطيل المعاينة الفعلي مش الشاشة كلها.
+  Future<void> _tapFocus(TapDownDetails d, Rect pvRect) async {
+    final c = _c;
+    if (c == null || !c.value.isInitialized) return;
+    if (!pvRect.contains(d.localPosition)) return;
+    final dx = ((d.localPosition.dx - pvRect.left) / pvRect.width).clamp(0.0, 1.0).toDouble();
+    final dy = ((d.localPosition.dy - pvRect.top) / pvRect.height).clamp(0.0, 1.0).toDouble();
+    final wasLocked = _aeAfLocked;
+    setState(() {
+      _focusAt = d.localPosition;
+      _aeAfLocked = false;
+    });
+    try {
+      if (wasLocked) {
+        await c.setFocusMode(cam.FocusMode.auto);
+        await c.setExposureMode(cam.ExposureMode.auto);
+      }
+      await c.setFocusPoint(Offset(dx, dy));
+      await c.setExposurePoint(Offset(dx, dy));
     } catch (_) {}
     Future.delayed(const Duration(milliseconds: 900), () {
-      if (mounted) setState(() => _focusAt = null);
+      if (mounted && !_aeAfLocked) setState(() => _focusAt = null);
     });
+  }
+
+  Widget _pill(IconData icon, String label, bool on, VoidCallback onTap) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: on ? kAccent.withValues(alpha: 0.9) : Colors.black54,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: on ? kAccent : Colors.white30),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, size: 15, color: on ? pal.onAccent : Colors.white),
+            const SizedBox(width: 4),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    color: on ? pal.onAccent : Colors.white)),
+          ]),
+        ),
+      );
+
+  Widget _zoomBar() {
+    final presets = <double>[
+      if (_minZoom <= 1.0 && _maxZoom >= 1.0) 1.0,
+      if (_minZoom <= 1.5 && _maxZoom >= 1.5) 1.5,
+      if (_minZoom <= 2.0 && _maxZoom >= 2.0) 2.0,
+    ];
+    if (presets.length < 2) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        for (final z in presets)
+          GestureDetector(
+            onTap: () => _setZoom(z),
+            child: Container(
+              margin: const EdgeInsets.symmetric(horizontal: 2),
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+              decoration: BoxDecoration(
+                color: (_zoom - z).abs() < 0.15 ? kAccent : Colors.transparent,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Text(
+                z == z.roundToDouble() ? '${z.toInt()}x' : '${z}x',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.bold,
+                  color: (_zoom - z).abs() < 0.15 ? pal.onAccent : Colors.white,
+                ),
+              ),
+            ),
+          ),
+      ]),
+    );
   }
 
   Widget _icon(IconData i, String label, VoidCallback? onTap, {bool on = false}) {
@@ -6429,45 +8192,84 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
 
   Widget _thumbBox() {
     final t = _thumb;
-    return GestureDetector(
-      onTap: (_count > 0 && !_shooting) ? () => Navigator.pop(context) : null,
-      child: SizedBox(
-        width: 64,
-        height: 64,
-        child: Stack(clipBehavior: Clip.none, children: [
-          Positioned.fill(
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.white54, width: 1.5),
-                color: Colors.white10,
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      GestureDetector(
+        onTap: ((_count > 0 || _pendingCount > 0) && !_shooting) ? _finish : null,
+        child: SizedBox(
+          width: 60,
+          height: 60,
+          child: Stack(clipBehavior: Clip.none, children: [
+            Positioned.fill(
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white54, width: 1.5),
+                  color: Colors.white10,
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: t != null
+                    ? Image.file(File(t),
+                        fit: BoxFit.cover, cacheWidth: 160, errorBuilder: (_, __, ___) => const SizedBox())
+                    : const Icon(Icons.photo_library_rounded, color: Colors.white38),
               ),
-              clipBehavior: Clip.antiAlias,
-              child: t != null
-                  ? Image.file(File(t), fit: BoxFit.cover, cacheWidth: 160, errorBuilder: (_, __, ___) => const SizedBox())
-                  : const Icon(Icons.photo_library_rounded, color: Colors.white38),
+            ),
+            if (_pendingCount > 0)
+              Positioned.fill(
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.black45,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  alignment: Alignment.center,
+                  child: const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  ),
+                ),
+              ),
+            if (_count > 0)
+              Positioned(
+                top: -8,
+                left: -8,
+                child: Container(
+                  constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFF6A4D),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.black, width: 1.5),
+                  ),
+                  child: Text('$_count',
+                      style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
+                ),
+              ),
+          ]),
+        ),
+      ),
+      if (_count > 0 && widget.onUndoLast != null)
+        Padding(
+          padding: const EdgeInsets.only(left: 8),
+          child: Tooltip(
+            message: 'مسح آخر لقطة',
+            child: InkResponse(
+              onTap: _shooting ? null : _undoLastShot,
+              radius: 22,
+              child: Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.red.withValues(alpha: 0.25),
+                  border: Border.all(color: Colors.redAccent.withValues(alpha: 0.7)),
+                ),
+                child: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent, size: 20),
+              ),
             ),
           ),
-          if (_count > 0)
-            Positioned(
-              top: -8,
-              left: -8,
-              child: Container(
-                constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
-                padding: const EdgeInsets.symmetric(horizontal: 6),
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: const Color(0xFFFF6A4D),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.black, width: 1.5),
-                ),
-                child: Text('$_count',
-                    style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
-              ),
-            ),
-        ]),
-      ),
-    );
+        ),
+    ]);
   }
 
   Widget _preview() {
@@ -6498,14 +8300,16 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final sc = math.min(box.width / pw0, box.height / ph0);
       final pvW = pw0 * sc, pvH = ph0 * sc;
       final pvL = (box.width - pvW) / 2, pvT = (box.height - pvH) / 2;
+      final pvRect = Rect.fromLTWH(pvL, pvT, pvW, pvH);
       return GestureDetector(
-        onTapDown: (d) => _tapFocus(d, box),
+        onTapDown: (d) => _tapFocus(d, pvRect),
+        onLongPressStart: (d) => _lockFocus(d, pvRect),
         onScaleStart: (_) => _zoom0 = _zoom,
         onScaleUpdate: (d) async {
           if (d.pointerCount < 2) return;
           final z = (_zoom0 * d.scale).clamp(_minZoom, _maxZoom).toDouble();
           if ((z - _zoom).abs() < 0.02) return;
-          _zoom = z;
+          setState(() => _zoom = z);
           try {
             await c.setZoomLevel(z);
           } catch (_) {}
@@ -6517,14 +8321,53 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
               child: SizedBox(width: ar * 1000, height: 1000, child: cam.CameraPreview(c)),
             ),
           ),
-          if (_grid) const Positioned.fill(child: IgnorePointer(child: CustomPaint(painter: _GridPainter()))),
+          if (_grid)
+            Positioned(
+              left: pvL,
+              top: pvT,
+              width: pvW,
+              height: pvH,
+              child: const IgnorePointer(child: CustomPaint(painter: _GridPainter())),
+            ),
+          if (_a4Frame)
+            Positioned(
+              left: pvL,
+              top: pvT,
+              width: pvW,
+              height: pvH,
+              child: const IgnorePointer(child: CustomPaint(painter: _A4GuidePainter())),
+            ),
+          if (_showLevel && _tiltFlat)
+            Positioned(
+              left: pvL,
+              top: pvT,
+              width: pvW,
+              height: pvH,
+              child: IgnorePointer(
+                child: CustomPaint(
+                  painter: _TiltLevelPainter(
+                    _tiltX,
+                    _tiltY,
+                    math.sqrt(_tiltX * _tiltX + _tiltY * _tiltY) < 0.85,
+                  ),
+                ),
+              ),
+            ),
           if (_liveQuad != null)
             Positioned(
               left: pvL,
               top: pvT,
               width: pvW,
               height: pvH,
-              child: IgnorePointer(child: CustomPaint(painter: _LiveQuadPainter(_liveQuad!))),
+              child: IgnorePointer(
+                child: CustomPaint(
+                  painter: _LiveQuadPainter(_liveQuad!, lockProgress: _autoCap ? _stableHits / 3.0 : 0),
+                ),
+              ),
+            ),
+          if (_shutterFlash)
+            Positioned.fill(
+              child: IgnorePointer(child: Container(color: Colors.white.withValues(alpha: 0.75))),
             ),
           if (_focusAt != null)
             Positioned(
@@ -6534,13 +8377,151 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                 child: Container(
                   width: 60,
                   height: 60,
+                  alignment: Alignment.topRight,
+                  padding: const EdgeInsets.all(3),
                   decoration: BoxDecoration(
-                    border: Border.all(color: kAccent, width: 2),
+                    border: Border.all(color: _aeAfLocked ? Colors.amber : kAccent, width: 2),
                     borderRadius: BorderRadius.circular(8),
                   ),
+                  child: _aeAfLocked
+                      ? const Icon(Icons.lock_rounded, size: 14, color: Colors.amber)
+                      : null,
                 ),
               ),
             ),
+          // شريط التحكم العلوي: التصوير السريع + التلقائي + الميزان + إطار A4 + الإضاءة
+          Positioned(
+            top: 10,
+            left: 10,
+            right: 10,
+            child: Directionality(
+              textDirection: TextDirection.rtl,
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  alignment: WrapAlignment.center,
+                  children: [
+                    if (_canFast)
+                      _pill(Icons.bolt_rounded, _fastMode ? 'تصوير سريع' : 'تعديل فوري', _fastMode, _toggleFastMode),
+                    _pill(Icons.hdr_auto_rounded, 'تلقائي', _autoCap, _toggleAutoCap),
+                    _pill(Icons.screen_rotation_alt_rounded, 'ميزان', _showLevel, _toggleLevel),
+                    _pill(Icons.crop_portrait_rounded, 'إطار A4', _a4Frame, _toggleA4Frame),
+                    if (_maxExp > _minExp)
+                      _pill(Icons.wb_sunny_rounded, 'إضاءة', _showExp || _exp.abs() > 0.05,
+                          () => setState(() => _showExp = !_showExp)),
+                  ],
+                ),
+                if (_aeAfLocked)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: GestureDetector(
+                      onTap: _unlockFocus,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.amber.withValues(alpha: 0.9),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.lock_rounded, size: 14, color: Colors.black),
+                          SizedBox(width: 4),
+                          Text('الفوكس والإضاءة مقفولين — اضغط للإلغاء',
+                              style: TextStyle(color: Colors.black, fontSize: 11, fontWeight: FontWeight.bold)),
+                        ]),
+                      ),
+                    ),
+                  ),
+                if (_camWarning != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: GestureDetector(
+                      onTap: widget.onUndoLast != null ? _undoLastShot : () => setState(() => _camWarning = null),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: Colors.redAccent.withValues(alpha: 0.92),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          const Icon(Icons.warning_amber_rounded, size: 15, color: Colors.white),
+                          const SizedBox(width: 5),
+                          Flexible(
+                            child: Text(
+                              widget.onUndoLast != null ? '$_camWarning — اضغط لمسح اللقطة' : _camWarning!,
+                              style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ]),
+                      ),
+                    ),
+                  ),
+                if (_lowLight && _camWarning == null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: GestureDetector(
+                      onTap: () async {
+                        if (_c == null) return;
+                        setState(() => _flash = 3); // تشغيل الكشاف مباشرة
+                        await _applyFlash(_c!);
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.withValues(alpha: 0.88),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.highlight_rounded, size: 14, color: Colors.black),
+                          SizedBox(width: 4),
+                          Text('إضاءة ضعيفة — اضغط لتشغيل الكشاف',
+                              style: TextStyle(color: Colors.black, fontSize: 11, fontWeight: FontWeight.bold)),
+                        ]),
+                      ),
+                    ),
+                  ),
+              ]),
+            ),
+          ),
+          // سلايدر الإضاءة الرأسي
+          if (_showExp && _maxExp > _minExp)
+            Positioned(
+              right: 8,
+              top: 76,
+              bottom: 56,
+              child: Container(
+                width: 40,
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Column(children: [
+                  const Icon(Icons.brightness_high_rounded, color: Colors.white, size: 16),
+                  Expanded(
+                    child: RotatedBox(
+                      quarterTurns: 3,
+                      child: Slider(
+                        value: _exp.clamp(_minExp, _maxExp).toDouble(),
+                        min: _minExp,
+                        max: _maxExp,
+                        activeColor: kAccent,
+                        onChanged: _setExposure,
+                      ),
+                    ),
+                  ),
+                  GestureDetector(
+                    onTap: () => _setExposure(0),
+                    child: const Text('0', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                  ),
+                ]),
+              ),
+            ),
+          // أزرار الزوم السريعة 1x / 1.5x / 2x
+          Positioned(
+            bottom: 10,
+            child: _zoomBar(),
+          ),
         ]),
       );
     });
@@ -6557,25 +8538,32 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
             Expanded(child: _preview()),
             Padding(
               padding: const EdgeInsets.only(top: 6),
-              child: Text(widget.title,
-                  style: TextStyle(color: kAccent, fontSize: 15, fontWeight: FontWeight.w600)),
+              child: Text(
+                _autoCap && _stableHits > 0 ? 'ثبّت إيدك... جاري الالتقاط' : widget.title,
+                style: TextStyle(
+                    color: _autoCap && _stableHits > 0 ? Colors.greenAccent : kAccent,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600),
+              ),
             ),
-            // صف الأيقونات: إغلاق، فلاش، جودة، معرض
+            // صف الأيقونات: إغلاق، فلاش، دقة، شبكة، معرض
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
               child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                _icon(Icons.close_rounded, 'إغلاق', () => Navigator.pop(context)),
+                _icon(Icons.close_rounded, 'إغلاق', _finish),
                 _icon(_flashIcons[_flash], 'فلاش', _cycleFlash, on: _flash != 0),
-                _icon(Icons.hd_rounded, _hd ? 'جودة عالية' : 'جودة عادية', _toggleHd, on: _hd),
+                _icon(Icons.high_quality_rounded, 'دقة: ${resShort(gResLevel)}', _pickRes, on: gResLevel > 0),
                 _icon(Icons.grid_3x3_rounded, 'شبكة', _toggleGrid, on: _grid),
                 if (widget.onGallery != null) _icon(Icons.photo_library_rounded, 'معرض', _gallery),
               ]),
             ),
-            // صف التصوير: المصغّرة بالعداد، الزر، تم
+            // صف التصوير: المصغّرة (+ مسح آخر لقطة)، الزر في المنتصف بالظبط، تم
             Padding(
-              padding: const EdgeInsets.fromLTRB(28, 14, 28, 18),
-              child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                _thumbBox(),
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 18),
+              child: Row(children: [
+                Expanded(
+                  child: Align(alignment: Alignment.centerLeft, child: _thumbBox()),
+                ),
                 GestureDetector(
                   onTap: _shot,
                   child: Container(
@@ -6584,7 +8572,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                     padding: const EdgeInsets.all(5),
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      border: Border.all(color: kAccent, width: 4),
+                      border: Border.all(
+                          color: _autoCap && _stableHits > 0 ? Colors.greenAccent : kAccent, width: 4),
                     ),
                     child: Container(
                       decoration: BoxDecoration(
@@ -6594,20 +8583,23 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                     ),
                   ),
                 ),
-                SizedBox(
-                  width: 64,
-                  child: (!widget.single && _count > 0)
-                      ? InkResponse(
-                          onTap: _shooting ? null : () => Navigator.pop(context),
-                          radius: 36,
-                          child: Container(
-                            height: 48,
-                            decoration: BoxDecoration(
-                                color: kAccent, borderRadius: BorderRadius.circular(10)),
-                            child: Icon(Icons.check_rounded, color: pal.onAccent, size: 30),
-                          ),
-                        )
-                      : const SizedBox(),
+                Expanded(
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: (!widget.single && (_count > 0 || _pendingCount > 0))
+                        ? InkResponse(
+                            onTap: _shooting ? null : _finish,
+                            radius: 36,
+                            child: Container(
+                              width: 64,
+                              height: 48,
+                              decoration: BoxDecoration(
+                                  color: kAccent, borderRadius: BorderRadius.circular(10)),
+                              child: Icon(Icons.check_rounded, color: pal.onAccent, size: 30),
+                            ),
+                          )
+                        : const SizedBox(width: 64),
+                  ),
                 ),
               ]),
             ),
@@ -6631,7 +8623,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   File? built;
   bool busy = false;
   bool loaded = false;
-  bool continuous = true;
   ScanFilter filter = ScanFilter.receipt;
   String? progress;
   final Set<String> noTags = {}; // إيصالات من غير ورقة
@@ -6654,7 +8645,16 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   @override
   void initState() {
     super.initState();
+    gMinSide = kSheetHdSide; // دقة عالية لصور الإيصالات المتعددة
+    gMinQuality = kSheetHdQuality;
     _load();
+  }
+
+  @override
+  void dispose() {
+    gMinSide = 0;
+    gMinQuality = 0;
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -6663,7 +8663,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final f = await Store.pdf();
     final used = await Store.pdfImgs();
     final fl = await Store.filter();
-    final co = await Store.continuous();
     final nts = <String>{};
     for (final x in d) {
       if (await Store.noTag(x)) nts.add(x);
@@ -6685,7 +8684,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       tag = t;
       built = b;
       filter = fl;
-      continuous = co;
       loaded = true;
     });
     final lost = await takeLostPick('receipts');
@@ -6698,8 +8696,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (d.isEmpty && mounted) await _chooseSource();
   }
 
-  /// أول ما تفتح إيصالات الدفع وهي فاضية: اختار كاميرا ولا معرض.
+  /// أول ما تفتح إيصالات الدفع وهي فاضية: اختار ماسح جوجل ولا كاميرا A2R ولا معرض.
   Future<void> _chooseSource() async {
+    if (!mounted) return;
     final c = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
@@ -6708,7 +8707,12 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
           ListTile(
             leading: const Icon(Icons.add_a_photo_rounded),
             title: const Text('كاميرا'),
-            onTap: () => Navigator.pop(ctx, 'camera'),
+            onTap: () => Navigator.pop(ctx, 'google'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.camera_rounded),
+            title: const Text('كاميرا A2R'),
+            onTap: () => Navigator.pop(ctx, 'a2r'),
           ),
           ListTile(
             leading: const Icon(Icons.photo_library_rounded),
@@ -6720,10 +8724,20 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       ),
     );
     if (!mounted) return;
-    if (c == 'camera') {
-      await _add();
-    } else if (c == 'gallery') {
-      await _addGallery();
+    switch (c) {
+      case 'google':
+        await Store.setScanEngineReceipts(1);
+        await _addGoogle();
+        // لو ماسح جوجل مش شغال على الموبايل ده، نكمل بكاميرا A2R تلقائياً
+        if (_scannerFailed && mounted && imgs.isEmpty) await _addA2R();
+        break;
+      case 'a2r':
+        await Store.setScanEngineReceipts(0);
+        await _addA2R();
+        break;
+      case 'gallery':
+        await _addGallery();
+        break;
     }
   }
 
@@ -6731,7 +8745,61 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       A2RCamState(count: imgs.length, thumb: imgs.isEmpty ? null : imgs.last, close: close);
 
   /// كاميرا التطبيق (شكل كام اسكنر): كل صورة بتتحفظ وتتفتح للتعديل، والكاميرا تفضل مفتوحة والعداد بيزيد.
+  /// زرار "تصوير": بيلتزم بمحرك التصوير المختار (ماسح جوجل أو كاميرا A2R) من الإعدادات
+  /// أو من اختيارك في أول مرة. ماسح جوجل بيصغّر الصورة الناتجة، فلو الأرقام الصغيرة بتضيع
+  /// اختار كاميرا A2R.
   Future<void> _add() async {
+    final engine = await Store.scanEngineReceipts();
+    final perf = await Store.perfMode();
+    if (!mounted) return;
+    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
+      await _addGoogle();
+      // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
+      if (_scannerFailed && mounted) await _addA2R();
+    } else {
+      await _addA2R();
+    }
+  }
+
+  /// لو الموظف خرج من شاشة التعديل بدون حفظ: بنطبّق الفلتر المختار على الصورة.
+  Future<void> _ensureReceiptFiltered(int idx, String savedPath) async {
+    if (!mounted || filter == ScanFilter.original || idx < 0 || idx >= imgs.length || imgs[idx] != savedPath) {
+      return;
+    }
+    try {
+      final f = File(savedPath);
+      await f.writeAsBytes(await applyFilter(await f.readAsBytes(), filter));
+      await FileImage(f).evict();
+      if (mounted) setState(() => built = null);
+    } catch (e, st) {
+      AppLog.e('receipts.lateFilter', e, st);
+    }
+  }
+
+  /// ماسح جوجل الذكي: صورة واحدة مقصوصة جاهزة، بعدها شاشة التعديل، وبعدها نرجع لشاشة الإيصالات
+  /// (لإنشاء الـ PDF أو إضافة صور تانية).
+  Future<void> _addGoogle() async {
+    final paths = await scanImages(context, 1, camFallback: true);
+    if (paths.isEmpty || !mounted) return;
+    final manual = _lastScanManual;
+    final start = imgs.length;
+    await _saveAll(paths, quick: true, keepOriginal: !manual);
+    _lastScanManual = manual;
+    for (var i = start; i < imgs.length; i++) {
+      if (!mounted) break;
+      final savedPath = imgs[i];
+      final retake = await _edit(i, tab: manual ? 0 : 2, fromCam: true);
+      if (retake && mounted) {
+        await _addGoogle(); // إعادة أخذ
+        break;
+      }
+      await _ensureReceiptFiltered(i, savedPath);
+    }
+  }
+
+  /// كاميرا A2R: صورة واحدة، بعدها التعديل، ولما يخلص تقفل الكاميرا وترجع لشاشة الإيصالات
+  /// (لإنشاء الـ PDF أو إضافة صور تانية).
+  Future<void> _addA2R() async {
     if (!await ensureCamera(context)) return;
     if (!mounted) return;
     await Navigator.push<void>(
@@ -6739,22 +8807,26 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       MaterialPageRoute(
         builder: (_) => A2RCameraScreen(
           title: 'إيصالات الدفع',
-          single: !continuous,
+          single: true,
           count: imgs.length,
           thumb: imgs.isEmpty ? null : imgs.last,
           onShot: (p) async {
             _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
             final before = imgs.length;
-            await _saveAll([p]);
+            await _saveAll([p], quick: true); // من غير فلتر على الصورة الكاملة: شاشة التعديل بتطبّقه
             if (mounted && imgs.length > before) {
-              final retake = await _edit(imgs.length - 1, tab: 2, fromCam: true);
+              final idx = imgs.length - 1;
+              final savedPath = imgs[idx];
+              final retake = await _edit(idx, tab: 2, fromCam: true);
               if (retake && mounted) return _camState(); // إعادة أخذ: الصفحة اتمسحت والكاميرا مفتوحة
+              await _ensureReceiptFiltered(idx, savedPath);
             }
-            return _camState(close: !continuous && imgs.length > before);
+            return _camState(close: imgs.length > before);
           },
           onGallery: () async {
+            final before = imgs.length;
             await _addGallery();
-            return _camState();
+            return _camState(close: imgs.length > before);
           },
         ),
       ),
@@ -6767,7 +8839,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     await markPickTarget('receipts');
     List<XFile> xs;
     try {
-      xs = await ImagePicker().pickMultiImage(maxWidth: 2000, imageQuality: 90);
+      xs = await ImagePicker().pickMultiImage(); // الأصل من غير تصغير أو إعادة ضغط
     } catch (e, st) {
       AppLog.e('_addGallery', e, st);
       if (mounted) snack(context, 'تعذر فتح المعرض');
@@ -6776,28 +8848,30 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (xs.isEmpty || !mounted) return;
     _lastScanManual = true; // صور من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
     final start = imgs.length;
-    await _saveAll(xs.map((e) => e.path).toList());
+    await _saveAll(xs.map((e) => e.path).toList(), quick: true);
     for (var i = start; i < imgs.length; i++) {
       if (!mounted) break;
+      final savedPath = imgs[i];
       await _edit(i, tab: 2);
+      await _ensureReceiptFiltered(i, savedPath);
     }
   }
 
-  Future<void> _saveAll(List<String> r) async {
+  Future<void> _saveAll(List<String> r, {bool quick = false, bool keepOriginal = false}) async {
     setState(() => busy = true);
     var added = 0;
     try {
       for (final p in r) {
         final saved = await persistImage(
             p, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
-            filter: filter);
+            filter: filter, applyNow: !quick, keepOriginal: keepOriginal);
         await Store.addToDraft(saved);
         imgs.add(saved);
         added++;
       }
       built = null;
       HapticFeedback.lightImpact();
-      if (imgs.isNotEmpty) {
+      if (!quick && imgs.isNotEmpty) {
         unawaited(qualityWarning(imgs.last).then((warn) {
           if (warn != null && mounted) snack(context, warn);
         }));
@@ -6880,14 +8954,18 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   /// ضغطة واحدة: يجهّز الـ PDF وبعدها يفتح شاشة المعاينة (مشاركة PDF / مشاركة صور).
   Future<void> _createAndSend() async {
+    if (!await preSendCheckReceipts(context, widget.session, imgs)) return;
+    if (!mounted) return;
     await _create();
     if (!mounted || built == null) return;
-    await _send();
+    await _send(check: false);
   }
 
-  Future<void> _send() async {
+  Future<void> _send({bool check = true}) async {
     final f = built;
     if (f == null) return;
+    if (check && !await preSendCheckReceipts(context, widget.session, imgs)) return;
+    if (!mounted) return;
     final done = await Navigator.push<bool>(
         context,
         MaterialPageRoute(
@@ -7134,18 +9212,22 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                         },
                 ),
               ),
-              Row(children: [
-                const SizedBox(width: 4),
-                const Expanded(
-                    child: Text('تصوير متتالي (يفتح الكاميرا تاني بعد كل إيصال)',
-                        style: TextStyle(fontSize: 12))),
-                Switch(
-                    value: continuous,
-                    onChanged: (v) {
-                      setState(() => continuous = v);
-                      Store.setContinuous(v);
-                    }),
-              ]),
+              if (imgs.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                SizedBox(
+                  width: double.infinity,
+                  height: 42,
+                  child: OutlinedButton.icon(
+                    onPressed: busy
+                        ? null
+                        : () => _applyToAll(EditParams(filter: filter), ''),
+                    icon: const Icon(Icons.auto_fix_high_rounded, size: 18),
+                    label: Text(
+                        'تطبيق فلتر "${kFilterLabels[filter] ?? filter.name}" على كل الصور (${imgs.length})'),
+                  ),
+                ),
+              ],
+              const SizedBox(height: 8),
               Row(children: [
                 Expanded(
                   child: FilledButton.tonalIcon(
@@ -7182,6 +9264,163 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
           ),
         ),
       ]),
+    );
+  }
+}
+
+
+// =====================================================================
+//  سجل الإرسال
+// =====================================================================
+
+class SendLogEntry {
+  final DateTime time;
+  final String kind; // batch | receipts
+  final String name, unit, detail;
+  final String? building;
+  const SendLogEntry({
+    required this.time,
+    required this.kind,
+    required this.name,
+    required this.unit,
+    required this.detail,
+    this.building,
+  });
+
+  Map<String, dynamic> toJson() => {
+        't': time.millisecondsSinceEpoch,
+        'k': kind,
+        'n': name,
+        'u': unit,
+        'b': building,
+        'd': detail,
+      };
+
+  factory SendLogEntry.fromJson(Map<String, dynamic> j) => SendLogEntry(
+        time: DateTime.fromMillisecondsSinceEpoch((j['t'] as num).toInt()),
+        kind: j['k'] as String,
+        name: j['n'] as String,
+        unit: j['u'] as String,
+        building: j['b'] as String?,
+        detail: (j['d'] as String?) ?? '',
+      );
+}
+
+class SendLogScreen extends StatefulWidget {
+  const SendLogScreen({super.key});
+  @override
+  State<SendLogScreen> createState() => _SendLogScreenState();
+}
+
+class _SendLogScreenState extends State<SendLogScreen> {
+  List<SendLogEntry>? log;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final l = await Store.readLog();
+    if (!mounted) return;
+    setState(() => log = l);
+  }
+
+  Future<void> _clear() async {
+    if (!await askYesNo(context, 'مسح السجل؟',
+        'سجل الإرسال كله هيتمسح (الملفات نفسها مش هتتأثر).',
+        yes: 'امسح', no: 'إلغاء')) {
+      return;
+    }
+    await Store.clearLog();
+    await _load();
+  }
+
+  String _time(DateTime t) {
+    final h = t.hour % 12 == 0 ? 12 : t.hour % 12;
+    return '$h:${t.minute.toString().padLeft(2, '0')} ${t.hour < 12 ? 'ص' : 'م'}';
+  }
+
+  String _day(DateTime t) {
+    final n = DateTime.now();
+    final diff = DateTime(n.year, n.month, n.day).difference(DateTime(t.year, t.month, t.day)).inDays;
+    if (diff == 0) return 'النهارده';
+    if (diff == 1) return 'امبارح';
+    return '${t.day.toString().padLeft(2, '0')}/${t.month.toString().padLeft(2, '0')}/${t.year}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l = log;
+    final cs = Theme.of(context).colorScheme;
+    Widget body;
+    if (l == null) {
+      body = const Center(child: CircularProgressIndicator());
+    } else if (l.isEmpty) {
+      body = const Center(child: Text('لسه مفيش حاجة اتبعتت', style: TextStyle(fontSize: 16)));
+    } else {
+      final counts = <String, List<int>>{};
+      for (final e in l) {
+        counts.putIfAbsent(_day(e.time), () => [0, 0])[e.kind == 'batch' ? 0 : 1]++;
+      }
+      final rows = <Object>[];
+      String? last;
+      for (final e in l) {
+        final d = _day(e.time);
+        if (d != last) {
+          last = d;
+          rows.add(d);
+        }
+        rows.add(e);
+      }
+      body = ListView.builder(
+        padding: const EdgeInsets.all(12),
+        itemCount: rows.length,
+        itemBuilder: (_, i) {
+          final r = rows[i];
+          if (r is String) {
+            final c = counts[r]!;
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(4, 12, 4, 6),
+              child: Text('$r  -  ${c[0]} باتش  -  ${c[1]} إرسال إيصالات',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+            );
+          }
+          final e = r as SendLogEntry;
+          final isBatch = e.kind == 'batch';
+          return Card(
+            shape: kCardShape,
+            margin: const EdgeInsets.symmetric(vertical: 4),
+            child: ListTile(
+              isThreeLine: true,
+              leading: CircleAvatar(
+                backgroundColor: cs.primary.withAlpha(40),
+                child: Icon(isBatch ? Icons.receipt_long_rounded : Icons.payments_rounded,
+                    color: cs.primary),
+              ),
+              title: Text(isBatch ? 'الباتش' : 'إيصالات الدفع',
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(
+                  '${e.unit}${e.building == null ? '' : ' - ${e.building}'}\n${e.name}${e.detail.isEmpty ? '' : '\n${e.detail}'}'),
+              trailing: Text(_time(e.time), style: const TextStyle(fontSize: 12, color: Colors.grey)),
+            ),
+          );
+        },
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('سجل الإرسال'),
+        actions: [
+          if (l != null && l.isNotEmpty)
+            IconButton(
+                tooltip: 'مسح السجل',
+                icon: const Icon(Icons.delete_sweep_rounded),
+                onPressed: _clear),
+        ],
+      ),
+      body: body,
     );
   }
 }
