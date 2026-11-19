@@ -7676,10 +7676,22 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
           onShot: (p) async {
             _lastScanManual = true; // من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
             final before = imgs.length;
-            await _saveAll([p]);
+            await _saveAll([p], quick: true); // من غير فلتر على الصورة الكاملة: شاشة التعديل بتطبّقه
             if (mounted && imgs.length > before) {
-              final retake = await _edit(imgs.length - 1, tab: 2, fromCam: true);
+              final idx = imgs.length - 1;
+              final savedPath = imgs[idx];
+              final retake = await _edit(idx, tab: 2, fromCam: true);
               if (retake && mounted) return _camState(); // إعادة أخذ: الصفحة اتمسحت والكاميرا مفتوحة
+              // خرج من التعديل من غير حفظ: الصورة لسه من غير فلتر، فنطبّقه عليها دلوقتي
+              if (mounted && filter != ScanFilter.original && idx < imgs.length && imgs[idx] == savedPath) {
+                try {
+                  final f = File(savedPath);
+                  await f.writeAsBytes(await applyFilter(await f.readAsBytes(), filter), flush: true);
+                  built = null;
+                } catch (e, st) {
+                  AppLog.e('receipts.lateFilter', e, st);
+                }
+              }
             }
             return _camState(close: !continuous && imgs.length > before);
           },
@@ -7714,14 +7726,14 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
-  Future<void> _saveAll(List<String> r) async {
+  Future<void> _saveAll(List<String> r, {bool quick = false}) async {
     setState(() => busy = true);
     var added = 0;
     try {
       for (final p in r) {
         final saved = await persistImage(
             p, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
-            filter: filter);
+            filter: filter, applyNow: !quick);
         await Store.addToDraft(saved);
         imgs.add(saved);
         added++;
