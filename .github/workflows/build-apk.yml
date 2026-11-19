@@ -152,9 +152,9 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
             /usr/local/lib/android/sdk/ndk
-          key: gradle-ndk-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
+          key: gradle-ndk-v2-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
           restore-keys: |
-            gradle-ndk-${{ runner.os }}-
+            gradle-ndk-v2-${{ runner.os }}-
 
       - name: Build APK
         run: >
