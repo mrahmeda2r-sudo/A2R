@@ -5106,9 +5106,9 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
     for (var i = 0; i < n; i++) {
       final int r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
       final int y = (r * 54 + g * 183 + b * 19) >> 8;
-      final int hi = r > g ? (r > b ? r : b) : (g > b ? g : b);
-      final int lo = r < g ? (r < b ? r : b) : (g < b ? g : b);
-      final int v = y - 2 * (hi - lo); // الخشب ملوّن فبيبقى أغمق، والورقة رمادية فبتفضل فاتحة
+      // نغمّق الألوان الدافية بس (الخشب/المكتب)، ومنلمسش الأزرق الفاتح بتاع الورق الحراري
+      final int warm = r > b ? (r - b) : 0;
+      final int v = y - ((warm * 6) >> 3);
       feat[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
     return _quadFromFeature(feat, w, h);
@@ -5163,22 +5163,18 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
   return b.score > a.score ? b.q : a.q;
 }
 
-({List<Offset> q, double score})? _quadFromOtsuScored(Uint8List feat, int w, int h) {
-  final n = w * h;
-  final hist = List<int>.filled(256, 0);
-  for (var i = 0; i < n; i++) {
-    hist[feat[i]]++;
-  }
+int _otsuOf(List<int> hist, int totalN, int from, int to) {
+  if (totalN <= 0) return (from + to) ~/ 2;
   var sum = 0.0;
-  for (var t = 0; t < 256; t++) {
+  for (var t = from; t <= to; t++) {
     sum += t * hist[t];
   }
   var sumB = 0.0, wB = 0.0, bestV = -1.0;
-  var thr = 128;
-  for (var t = 0; t < 256; t++) {
+  var thr = (from + to) ~/ 2;
+  for (var t = from; t <= to; t++) {
     wB += hist[t];
     if (wB == 0) continue;
-    final wF = n - wB;
+    final wF = totalN - wB;
     if (wF == 0) break;
     sumB += t * hist[t];
     final mB = sumB / wB, mF = (sum - sumB) / wF;
@@ -5188,93 +5184,134 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
       thr = t;
     }
   }
-  final sc = w / 160.0;
-  final levels = <int>{0, math.max(1, (2 * sc).round()), math.max(2, (4 * sc).round()), math.max(3, (7 * sc).round())}.toList()
-    ..sort();
+  return thr;
+}
+
+int _histPct(List<int> hist, int n, double p) {
+  final target = (n * p).floor();
+  var acc = 0;
+  for (var t = 0; t < 256; t++) {
+    acc += hist[t];
+    if (acc >= target) return t;
+  }
+  return 255;
+}
+
+({List<Offset> q, double score})? _quadFromOtsuScored(Uint8List feat, int w, int h) {
+  final n = w * h;
+  final hist = List<int>.filled(256, 0);
+  for (var i = 0; i < n; i++) {
+    hist[feat[i]]++;
+  }
+  final tOtsu = _otsuOf(hist, n, 0, 255);
+  var upperN = 0;
+  for (var t = tOtsu + 1; t < 256; t++) {
+    upperN += hist[t];
+  }
+  // عتبة تانية فوق Otsu عشان لو في جسم أسود على المكتب، تفصل الورقة عن المكتب الفاتح
+  final tUpper = upperN > n * 0.08 ? _otsuOf(hist, upperN, tOtsu + 1, 255) : tOtsu;
+  final med = _histPct(hist, n, 0.50);
+  final p75 = _histPct(hist, n, 0.75);
+  final p85 = _histPct(hist, n, 0.85);
+  final thresholds = <int>{tOtsu, tUpper, (tOtsu + tUpper) ~/ 2, p75, p85}.toList()..sort();
+
   final seen = List<bool>.filled(n, false);
   final queue = List<int>.filled(n, 0);
-
   List<Offset>? bestQ;
   var bestScore = 0.0;
 
-  for (final bright in [true, false]) {
-    var closed = List<bool>.generate(n, (i) => bright ? feat[i] > thr : feat[i] <= thr);
+  // الورقة دايماً أفتح من الخلفية (ممنوع نبحث في الغامق عشان ميختارش المكتب الخشب)
+  for (final thr in thresholds) {
+    var closed = List<bool>.generate(n, (i) => feat[i] > thr);
     closed = _dilate4(_dilate4(closed, w, h), w, h);
-    for (final k in levels) {
-      var er = closed;
-      for (var i = 0; i < k + 2; i++) {
-        er = _erode4(er, w, h);
+    final er = _erode4(_erode4(closed, w, h), w, h);
+    for (var i = 0; i < n; i++) {
+      seen[i] = false;
+    }
+    for (var s0 = 0; s0 < n; s0++) {
+      if (!er[s0] || seen[s0]) continue;
+      var head = 0, tail = 0;
+      queue[tail++] = s0;
+      seen[s0] = true;
+      var tl = s0, tr = s0, br = s0, bl = s0;
+      var sx = 0, sy = 0, sFeat = 0;
+      var minX = w, maxX = 0, minY = h, maxY = 0;
+      while (head < tail) {
+        final i = queue[head++];
+        final x = i % w, y = i ~/ w;
+        sx += x;
+        sy += y;
+        sFeat += feat[i];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (x + y < tl % w + tl ~/ w) tl = i;
+        if (x + y > br % w + br ~/ w) br = i;
+        if (x - y > tr % w - tr ~/ w) tr = i;
+        if (x - y < bl % w - bl ~/ w) bl = i;
+        if (x > 0 && er[i - 1] && !seen[i - 1]) {
+          seen[i - 1] = true;
+          queue[tail++] = i - 1;
+        }
+        if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
+          seen[i + 1] = true;
+          queue[tail++] = i + 1;
+        }
+        if (y > 0 && er[i - w] && !seen[i - w]) {
+          seen[i - w] = true;
+          queue[tail++] = i - w;
+        }
+        if (y < h - 1 && er[i + w] && !seen[i + w]) {
+          seen[i + w] = true;
+          queue[tail++] = i + w;
+        }
       }
-      for (var i = 0; i < n; i++) {
-        seen[i] = false;
+      if (tail < n * 0.04) continue;
+      final compMean = sFeat / tail;
+      if (compMean < med + 6) continue;
+      Offset raw(int i) => Offset((i % w).toDouble(), (i ~/ w).toDouble());
+      final rq = [raw(tl), raw(tr), raw(br), raw(bl)];
+      var a2 = 0.0;
+      for (var i = 0; i < 4; i++) {
+        final p = rq[i], q2 = rq[(i + 1) % 4];
+        a2 += p.dx * q2.dy - q2.dx * p.dy;
       }
-      for (var s0 = 0; s0 < n; s0++) {
-        if (!er[s0] || seen[s0]) continue;
-        var head = 0, tail = 0;
-        queue[tail++] = s0;
-        seen[s0] = true;
-        var tl = s0, tr = s0, br = s0, bl = s0;
-        var sx = 0, sy = 0;
-        while (head < tail) {
-          final i = queue[head++];
-          final x = i % w, y = i ~/ w;
-          sx += x;
-          sy += y;
-          if (x + y < tl % w + tl ~/ w) tl = i;
-          if (x + y > br % w + br ~/ w) br = i;
-          if (x - y > tr % w - tr ~/ w) tr = i;
-          if (x - y < bl % w - bl ~/ w) bl = i;
-          if (x > 0 && er[i - 1] && !seen[i - 1]) {
-            seen[i - 1] = true;
-            queue[tail++] = i - 1;
-          }
-          if (x < w - 1 && er[i + 1] && !seen[i + 1]) {
-            seen[i + 1] = true;
-            queue[tail++] = i + 1;
-          }
-          if (y > 0 && er[i - w] && !seen[i - w]) {
-            seen[i - w] = true;
-            queue[tail++] = i - w;
-          }
-          if (y < h - 1 && er[i + w] && !seen[i + w]) {
-            seen[i + w] = true;
-            queue[tail++] = i + w;
-          }
-        }
-        if (tail < n * 0.05) continue;
-        Offset raw(int i) => Offset((i % w).toDouble(), (i ~/ w).toDouble());
-        final rq = [raw(tl), raw(tr), raw(br), raw(bl)];
-        var a2 = 0.0;
-        for (var i = 0; i < 4; i++) {
-          final p = rq[i], q2 = rq[(i + 1) % 4];
-          a2 += p.dx * q2.dy - q2.dx * p.dy;
-        }
-        final qaPx = a2.abs() / 2;
-        if (qaPx < 4) continue;
-        final fill = math.min(1.0, tail / qaPx);
-        if (fill < 0.72) continue;
-        final d = k.toDouble();
-        Offset pt(int i, double ex, double ey) => Offset(
-              (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
-              (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
-            );
-        final q = [
-          pt(tl, -1.5 - d, -1.5 - d),
-          pt(tr, 1.5 + d, -1.5 - d),
-          pt(br, 1.5 + d, 1.5 + d),
-          pt(bl, -1.5 - d, 1.5 + d),
-        ];
-        if (!_quadConvex(q)) continue;
-        final area = _quadArea(q);
-        if (area < 0.08 || area > 0.94) continue;
-        final cx = sx / tail / w, cy = sy / tail / h;
-        final cen = (cx - 0.5).abs() + (cy - 0.5).abs();
-        final big = area > 0.8 ? math.max(0.0, 1.0 - (area - 0.8) * 5) : 1.0;
-        final score = math.sqrt(area) * math.pow(fill, 4) * (1.0 - cen) * big;
-        if (score > bestScore + 1e-9) {
-          bestScore = score;
-          bestQ = q;
-        }
+      final qaPx = a2.abs() / 2;
+      if (qaPx < 4) continue;
+      final fill = math.min(1.0, tail / qaPx);
+      if (fill < 0.72) continue;
+      Offset pt(int i, double ex, double ey) => Offset(
+            (((i % w) + 0.5 + ex) / w).clamp(0.0, 1.0).toDouble(),
+            (((i ~/ w) + 0.5 + ey) / h).clamp(0.0, 1.0).toDouble(),
+          );
+      final q = [
+        pt(tl, -1.0, -1.0),
+        pt(tr, 1.0, -1.0),
+        pt(br, 1.0, 1.0),
+        pt(bl, -1.0, 1.0),
+      ];
+      if (!_quadConvex(q)) continue;
+      final area = _quadArea(q);
+      if (area < 0.05 || area > 0.90) continue;
+      // عقوبة قوية لأي جسم لامس حواف الشاشة (لأن المكتب دايماً بيلمس حواف الكادر)
+      var touch = 0;
+      if (minX <= 3) touch++;
+      if (maxX >= w - 4) touch++;
+      if (minY <= 3) touch++;
+      if (maxY >= h - 4) touch++;
+      final borderPen = touch == 0 ? 1.0 : (touch == 1 ? 0.75 : (touch == 2 ? 0.20 : 0.05));
+      final cx = sx / tail / w, cy = sy / tail / h;
+      final cen = (cx - 0.5).abs() + (cy - 0.5).abs();
+      final contrastBoost = ((compMean - med) / 40.0 + 0.5).clamp(0.2, 1.5).toDouble();
+      final score = math.pow(area, 0.35) *
+          math.pow(fill, 3) *
+          math.max(0.1, 1.0 - cen * 0.8) *
+          borderPen *
+          contrastBoost;
+      if (score > bestScore + 1e-9) {
+        bestScore = score;
+        bestQ = q;
       }
     }
   }
@@ -5286,6 +5323,12 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
 ({List<Offset> q, double score})? _quadFromEdgesScored(Uint8List feat, int w, int h) {
   if (w < 16 || h < 16) return null;
   final n = w * h;
+  final hist = List<int>.filled(256, 0);
+  for (var i = 0; i < n; i++) {
+    hist[feat[i]]++;
+  }
+  final med = _histPct(hist, n, 0.50);
+
   final mag = Uint16List(n);
   var sumM = 0;
   var cnt = 0;
@@ -5314,10 +5357,8 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
       if (mag[row + x] >= thr) barrier[row + x] = true;
     }
   }
-  // توسيع بسيط 1px لسد الفجوات الرفيعة في خط حافة الورقة
   barrier = _dilate4(barrier, w, h);
 
-  // ملء الخلفية الخارجية من حواف الصورة الأربعة
   final outside = List<bool>.filled(n, false);
   final queue = List<int>.filled(n, 0);
   var head = 0, tail = 0;
@@ -5357,7 +5398,6 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
     }
   }
 
-  // أي بكسل مش خارجي هو داخل إطار الورقة (أو الحافة نفسها)
   final inside = List<bool>.generate(n, (i) => !outside[i]);
   final seen = List<bool>.filled(n, false);
   List<Offset>? bestQ;
@@ -5370,12 +5410,18 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
     queue[tail++] = s0;
     seen[s0] = true;
     var tl = s0, tr = s0, br = s0, bl = s0;
-    var sx = 0, sy = 0;
+    var sx = 0, sy = 0, sFeat = 0;
+    var minX = w, maxX = 0, minY = h, maxY = 0;
     while (head < tail) {
       final i = queue[head++];
       final x = i % w, y = i ~/ w;
       sx += x;
       sy += y;
+      sFeat += feat[i];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
       if (x + y < tl % w + tl ~/ w) tl = i;
       if (x + y > br % w + br ~/ w) br = i;
       if (x - y > tr % w - tr ~/ w) tr = i;
@@ -5397,7 +5443,9 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
         queue[tail++] = i + w;
       }
     }
-    if (tail < n * 0.08) continue;
+    if (tail < n * 0.06) continue;
+    final compMean = sFeat / tail;
+    if (compMean < med + 8) continue;
     Offset raw(int i) => Offset((i % w).toDouble(), (i ~/ w).toDouble());
     final rq = [raw(tl), raw(tr), raw(br), raw(bl)];
     var a2 = 0.0;
@@ -5416,11 +5464,22 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
     final q = [pt(tl), pt(tr), pt(br), pt(bl)];
     if (!_quadConvex(q)) continue;
     final area = _quadArea(q);
-    if (area < 0.09 || area > 0.92) continue;
+    if (area < 0.06 || area > 0.90) continue;
+    var touch = 0;
+    if (minX <= 2) touch++;
+    if (maxX >= w - 3) touch++;
+    if (minY <= 2) touch++;
+    if (maxY >= h - 3) touch++;
+    final borderPen = touch == 0 ? 1.0 : (touch == 1 ? 0.75 : (touch == 2 ? 0.20 : 0.05));
     final cx = sx / tail / w, cy = sy / tail / h;
     final cen = (cx - 0.5).abs() + (cy - 0.5).abs();
-    final big = area > 0.8 ? math.max(0.0, 1.0 - (area - 0.8) * 5) : 1.0;
-    final score = math.sqrt(area) * math.pow(fill, 4) * (1.0 - cen) * big * 0.96;
+    final contrastBoost = ((compMean - med) / 40.0 + 0.5).clamp(0.2, 1.5).toDouble();
+    final score = math.pow(area, 0.35) *
+        math.pow(fill, 3) *
+        math.max(0.1, 1.0 - cen * 0.8) *
+        borderPen *
+        contrastBoost *
+        0.92;
     if (score > bestScore + 1e-9) {
       bestScore = score;
       bestQ = q;
@@ -5468,11 +5527,13 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
       final cx = sx >> 1, cy = sy >> 1;
       final ci = cy * up.bytesPerRow + cx * ub;
       final vi = cy * vp.bytesPerRow + cx * vb;
-      var chroma = 0;
+      var warm = 0;
       if (ci < up.bytes.length && vi < vp.bytes.length) {
-        chroma = (up.bytes[ci] - 128).abs() + (vp.bytes[vi] - 128).abs();
+        // نغمّق الألوان الدافية بس (خشب/مكتب)، ومنأثرش على الأزرق الفاتح بتاع الإيصال الحراري
+        final diff = ((vp.bytes[vi] - 128) * 14 - (up.bytes[ci] - 128) * 14) ~/ 10;
+        if (diff > 0) warm = diff;
       }
-      final int v = y - (chroma * 1.5).round();
+      final int v = y - ((warm * 6) >> 3);
       feat[gy * gw + gx] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
   }
