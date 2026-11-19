@@ -952,7 +952,7 @@ Future<bool> _decodesOk(Uint8List b) async {
 /// نسخ الصورة من مكان الماسح المؤقت لمكان ثابت كـ JPEG واحد مضغوط (مرة واحدة بس).
 /// وبعدها بيتطبق الفلتر لو الموظف اختاره.
 Future<String> persistImage(String src, String name,
-    {ScanFilter filter = ScanFilter.original}) async {
+    {ScanFilter filter = ScanFilter.original, bool applyNow = true}) async {
   final swPersist = Stopwatch()..start();
   final mode = await Store.perfMode();
   final maxSide = getMaxSide(mode);
@@ -999,7 +999,8 @@ Future<String> persistImage(String src, String name,
     await Store.setEdit(f.path, EditParams(filter: filter));
   }
   final tFilter = swPersist.elapsedMilliseconds;
-  bytes = await applyFilter(bytes, filter);
+  // applyNow=false: بنحفظ الصورة من غير فلتر (شاشة التعديل بتطبّقه على المعاينة) عشان الانتقال يبقى سريع
+  if (applyNow) bytes = await applyFilter(bytes, filter);
   await f.writeAsBytes(bytes, flush: true);
   AppLog.i('t persist.filter ${swPersist.elapsedMilliseconds - tFilter}ms total ${swPersist.elapsedMilliseconds}ms');
   return f.path;
@@ -4477,7 +4478,7 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt);
+          filter: ScanFilter.receipt, applyNow: false);
       await Store.setBatchImg(path, fresh: true);
       await _show(path);
       unawaited(qualityWarning(path).then((warn) {
