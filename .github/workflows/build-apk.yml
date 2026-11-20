@@ -33,6 +33,10 @@ jobs:
         run: |
           flutter pub add google_mlkit_document_scanner:0.4.1 google_mlkit_text_recognition:^0.15.0 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 camera:^0.11.0
           flutter pub add flutter_localizations --sdk=flutter
+          flutter pub add "override:path_provider_android:2.2.23"
+          flutter pub add "override:shared_preferences_android:>=2.4.0 <2.5.0"
+          echo "--- JNI deps ---"
+          flutter pub deps --style=compact | grep -i "jni" || echo "no jni"
 
       - name: Add logo asset (shown in the app)
         run: |
@@ -73,10 +77,112 @@ jobs:
           else:
               s = s.replace('<application', '<queries>' + intent + '</queries>\n    <application', 1)
           s = s.replace('<application', perms + '<application', 1)
-          # رامات أكبر للتطبيق: ضغط الصور الكبيرة كان بيخلّص الذاكرة ويقفل التطبيق
           s = s.replace('<application', '<application android:largeHeap="true"', 1)
           open(p, 'w', encoding='utf-8').write(s)
           print(s)
+          PY
+
+      - name: Camera hardware controls (Volume shutter + Tilt level)
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+
+          files = glob.glob('android/app/src/main/**/MainActivity.kt', recursive=True)
+          if not files:
+              sys.exit('MainActivity.kt not found')
+          p = files[0]
+          old = open(p, encoding='utf-8').read()
+          m = re.search(r'^package\s+([\w.]+)', old, re.M)
+          pkg = m.group(1) if m else 'com.a2r.a2r'
+
+          code = f'''package {pkg}
+
+          import android.content.Context
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.view.KeyEvent
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.EventChannel
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {{
+              private var hwChannel: MethodChannel? = null
+              private var volumeCaptureEnabled = false
+              private var sensorManager: SensorManager? = null
+              private var tiltListener: SensorEventListener? = null
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {{
+                  super.configureFlutterEngine(flutterEngine)
+                  hwChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/cam_hw")
+                  hwChannel?.setMethodCallHandler {{ call, result ->
+                      if (call.method == "setVolumeCapture") {{
+                          volumeCaptureEnabled = (call.arguments as? Boolean) ?: false
+                          result.success(null)
+                      }} else {{
+                          result.notImplemented()
+                      }}
+                  }}
+
+                  EventChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/tilt")
+                      .setStreamHandler(object : EventChannel.StreamHandler {{
+                          override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {{
+                              stopTilt()
+                              val sm = getSystemService(Context.SENSOR_SERVICE) as? SensorManager ?: return
+                              val acc = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
+                              sensorManager = sm
+                              var lastTs = 0L
+                              val listener = object : SensorEventListener {{
+                                  override fun onSensorChanged(event: SensorEvent) {{
+                                      val now = System.currentTimeMillis()
+                                      if (now - lastTs < 50) return
+                                      lastTs = now
+                                      events?.success(listOf(
+                                          event.values[0].toDouble(),
+                                          event.values[1].toDouble(),
+                                          event.values[2].toDouble()
+                                      ))
+                                  }}
+                                  override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {{}}
+                              }}
+                              tiltListener = listener
+                              sm.registerListener(listener, acc, SensorManager.SENSOR_DELAY_UI)
+                          }}
+
+                          override fun onCancel(arguments: Any?) {{
+                              stopTilt()
+                          }}
+                      }})
+              }}
+
+              private fun stopTilt() {{
+                  tiltListener?.let {{ sensorManager?.unregisterListener(it) }}
+                  tiltListener = null
+              }}
+
+              override fun onPause() {{
+                  stopTilt()
+                  super.onPause()
+              }}
+
+              override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {{
+                  if (volumeCaptureEnabled &&
+                      (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)) {{
+                      if (event?.repeatCount == 0) {{
+                          hwChannel?.invokeMethod("volumeShot", null)
+                      }}
+                      return true
+                  }}
+                  return super.onKeyDown(keyCode, event)
+              }}
+          }}
+          '''
+          lines = code.splitlines()
+          cleaned = [lines[0]] + [l[10:] if l.startswith('          ') else l for l in lines[1:]]
+          open(p, 'w', encoding='utf-8').write('\n'.join(cleaned) + '\n')
+          print(f'Updated {p} (package {pkg})')
           PY
 
       - name: Support old Android (minSdk 21)
@@ -107,9 +213,9 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
             /usr/local/lib/android/sdk/ndk
-          key: gradle-ndk-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
+          key: gradle-ndk-v2-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
           restore-keys: |
-            gradle-ndk-${{ runner.os }}-
+            gradle-ndk-v2-${{ runner.os }}-
 
       - name: Build APK
         run: >
