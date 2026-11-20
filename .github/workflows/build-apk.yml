@@ -1,8 +1,8 @@
-name: Build APK
+name: Build APK (Shared)
 
 on:
   push:
-    branches: [main]
+    branches: [shared]
   workflow_dispatch:
 
 permissions:
@@ -120,24 +120,24 @@ jobs:
           --dart-define=APP_VERSION=1.${{ github.run_number }}
 
       - name: Rename APK
-        run: cp build/app/outputs/flutter-apk/app-release.apk A2R.apk
+        run: cp build/app/outputs/flutter-apk/app-release.apk A2R-Shared.apk
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.${{ github.run_number }}
-          name: A2R v1.${{ github.run_number }}
-          body: "Commit ${{ github.sha }}"
-          files: A2R.apk
+          tag_name: shared-v1.${{ github.run_number }}
+          name: A2R Shared v1.${{ github.run_number }}
+          body: "Shared branch commit ${{ github.sha }}"
+          files: A2R-Shared.apk
           fail_on_unmatched_files: true
-          make_latest: true
+          make_latest: false
 
-      - name: Keep only the latest 5 releases
+      - name: Keep only the latest 5 shared releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release list --limit 200 --json tagName,createdAt \
-            --jq 'sort_by(.createdAt) | reverse | .[5:][].tagName' |
+            --jq '[.[] | select(.tagName | startswith("shared-v"))] | sort_by(.createdAt) | reverse | .[5:][].tagName' |
           while read -r tag; do
             echo "Deleting old release $tag"
             gh release delete "$tag" --cleanup-tag --yes
