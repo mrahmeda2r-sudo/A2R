@@ -176,13 +176,90 @@ jobs:
           print(p, pkg)
           PY
 
-      - name: Configure stable release signing (required)
+      - name: Configure signing (stable secrets optional)
         env:
           A2R_KEYSTORE_BASE64: ${{ secrets.A2R_KEYSTORE_BASE64 }}
           A2R_STORE_PASSWORD: ${{ secrets.A2R_STORE_PASSWORD }}
           A2R_KEY_PASSWORD: ${{ secrets.A2R_KEY_PASSWORD }}
           A2R_KEY_ALIAS: ${{ secrets.A2R_KEY_ALIAS }}
-        run: python3 .github/scripts/configure_release_signing.py
+        run: |
+          python3 - <<'PYSIGN'
+          #!/usr/bin/env python3
+          """Use stable signing when configured; otherwise preserve generated debug signing."""
+          import base64
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          
+          required = ['A2R_KEYSTORE_BASE64', 'A2R_STORE_PASSWORD', 'A2R_KEY_PASSWORD', 'A2R_KEY_ALIAS']
+          # Apply compatibility settings independently of signing mode.
+          gradle = Path('android/app/build.gradle.kts')
+          source = gradle.read_text()
+          source, sdk_count = re.subn(r'(?m)^\s*minSdk\s*=.*$', '        minSdk = 21', source)
+          if sdk_count != 1:
+              sys.exit('Expected exactly one minSdk field. Refusing ambiguous compatibility settings.')
+          source, ndk_count = re.subn(r'(?m)^\s*ndkVersion\s*=.*$', '    ndkVersion = "27.0.12077973"', source)
+          if ndk_count != 1:
+              sys.exit('Expected exactly one ndkVersion field. Refusing ambiguous build settings.')
+          if source.count('signingConfigs.getByName("debug")') != 1:
+              sys.exit('Expected exactly one generated debug signing assignment. Refusing an unknown template.')
+          gradle.write_text(source)
+          
+          if not any(os.environ.get(name) for name in required):
+              print('::warning::No signing secrets configured. Using generated debug signing. Certificate may change between builds; updates may require uninstall/reinstall after preserving app data.')
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+                  env.write('A2R_SIGNING_MODE=generated-debug\n')
+              sys.exit(0)
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              sys.exit('Partial stable-signing configuration. Add all four secrets or remove all four to use debug signing. Missing: ' + ', '.join(missing))
+          try:
+              data = base64.b64decode(''.join(os.environ['A2R_KEYSTORE_BASE64'].split()), validate=True)
+          except Exception:
+              sys.exit('A2R_KEYSTORE_BASE64 is not valid base64. No APK will be published.')
+          if len(data) < 100:
+              sys.exit('Signing keystore is empty or invalid. No APK will be published.')
+          key = Path(os.environ['RUNNER_TEMP']) / 'a2r-release-signing.jks'
+          key.write_bytes(data)
+          key.chmod(0o600)
+          gradle = Path('android/app/build.gradle.kts')
+          source = gradle.read_text()
+          if 'signingConfigs.getByName("debug")' not in source:
+              sys.exit('Expected generated signing template not found. Refusing unsafe signing changes.')
+          config = '''    signingConfigs {
+                  create("a2rRelease") {
+                      storeFile = file(System.getenv("A2R_KEYSTORE_PATH") ?: error("Missing release keystore path"))
+                      storePassword = System.getenv("A2R_STORE_PASSWORD") ?: error("Missing store password")
+                      keyAlias = System.getenv("A2R_KEY_ALIAS") ?: error("Missing key alias")
+                      keyPassword = System.getenv("A2R_KEY_PASSWORD") ?: error("Missing key password")
+                      enableV1Signing = true
+                      enableV2Signing = true
+                  }
+              }
+          
+          '''
+          if source.count('    buildTypes {') != 1:
+              sys.exit('Unexpected Gradle buildTypes template. Refusing to continue.')
+          source = source.replace('    buildTypes {', config + '    buildTypes {')
+          source = source.replace('signingConfigs.getByName("debug")', 'signingConfigs.getByName("a2rRelease")')
+          # Use the actual supported minimum. Legacy Flutter 3.32.8 supports Android API 21+.
+          source, count = re.subn(r'(?m)^\s*minSdk\s*=.*$', '        minSdk = 21', source)
+          if count != 1:
+              sys.exit('Expected exactly one minSdk field. No build will proceed.')
+          if 'signingConfigs.getByName("debug")' in source:
+              sys.exit('Debug release signing remains. Refusing to continue.')
+          source, ndk_count = re.subn(r'(?m)^\s*ndkVersion\s*=.*$', '    ndkVersion = "27.0.12077973"', source)
+          if ndk_count != 1:
+              sys.exit('Expected exactly one ndkVersion field. Refusing ambiguous build configuration.')
+          gradle.write_text(source)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'A2R_KEYSTORE_PATH={key}\n')
+          print('Release signing configured from repository secrets. Android minimum: API 21.')
+          
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write('A2R_SIGNING_MODE=stable-release\n')
+          PYSIGN
 
       - name: Separate Legacy application identity
         run: |
@@ -256,6 +333,7 @@ jobs:
       - name: Verify signed APK and record compatibility
         run: |
           set -euo pipefail
+          echo "APK signing mode: $A2R_SIGNING_MODE"
           BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
           "$BUILD_TOOLS/apksigner" verify --verbose --print-certs A2R-Legacy.apk | tee legacy-signature-report.txt
           APK_ANALYZER=$(find "$ANDROID_HOME/cmdline-tools" -path '*/bin/apkanalyzer' | sort | tail -1)
