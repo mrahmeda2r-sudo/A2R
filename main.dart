@@ -188,20 +188,20 @@ enum ScanFilter {
   thermal,
   receiptBw,
   auto,
+  clean,
 }
 
 /// ترتيب وأسماء الفلاتر في الشاشة (الإيصالات الأول لأنها الأهم).
+// الفلاتر الظاهرة في شاشة التعديل. (enhance وmagic وgray وbw اتخفّوا من القايمة: مكررين أو ضعاف
+// للإيصالات، لكن لسه موجودين في الكود عشان الصور والإعدادات القديمة اللي اتخزنت بأرقامهم تفضل شغالة)
 const kFilterOrder = <ScanFilter>[
   ScanFilter.original,
   ScanFilter.receipt,
   ScanFilter.thermal,
   ScanFilter.receiptBw,
+  ScanFilter.clean,
   ScanFilter.auto,
-  ScanFilter.enhance,
-  ScanFilter.magic,
   ScanFilter.document,
-  ScanFilter.bw,
-  ScanFilter.gray,
   ScanFilter.lighten,
   ScanFilter.sharpen,
 ];
@@ -210,7 +210,7 @@ const kFilterLabels = <ScanFilter, String>{
   ScanFilter.original: 'أصلي',
   ScanFilter.receipt: 'إيصال',
   ScanFilter.thermal: 'حراري باهت',
-  ScanFilter.receiptBw: 'إيصال أ/س',
+  ScanFilter.receiptBw: 'فوتوكوبي',
   ScanFilter.auto: 'تلقائي',
   ScanFilter.enhance: 'تحسين',
   ScanFilter.magic: 'ألوان',
@@ -219,11 +219,15 @@ const kFilterLabels = <ScanFilter, String>{
   ScanFilter.gray: 'رمادي',
   ScanFilter.lighten: 'تفتيح',
   ScanFilter.sharpen: 'حدة',
+  ScanFilter.clean: 'تنضيف',
 };
 
 /// فلاتر الإيصال: بتعدي على _cleanJob (تقدير لون الورق وقسمة الصورة عليه) قبل أي مصفوفة ألوان.
 bool isCleanFilter(ScanFilter f) =>
-    f == ScanFilter.receipt || f == ScanFilter.thermal || f == ScanFilter.receiptBw;
+    f == ScanFilter.receipt ||
+    f == ScanFilter.thermal ||
+    f == ScanFilter.receiptBw ||
+    f == ScanFilter.clean;
 
 /// الحراري الباهت وإيصال الأبيض والأسود بيستخدموا منحنى أقوى عشان الكتابة الخفيفة متختفيش.
 bool usesThermalClean(ScanFilter f) => f == ScanFilter.thermal || f == ScanFilter.receiptBw;
@@ -469,6 +473,7 @@ List<double> editMatrix(ScanFilter f, double contrast, double brightness, [List<
     case ScanFilter.original:
     case ScanFilter.receipt: // المعالجة الحقيقية في _cleanJob، والمصفوفة هنا للتباين والسطوع بس
     case ScanFilter.thermal:
+    case ScanFilter.clean:
     case ScanFilter.sharpen: // الحدة بتتطبق في _sharpenJob
       w = [
         [1.0, 0.0, 0.0],
@@ -583,6 +588,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   final w = a['w'] as int, h = a['h'] as int;
   final gray = a['gray'] as bool;
   final th = (a['th'] as bool?) ?? false; // حراري باهت: منحنى أقوى وحدة أعلى
+  final plain = (a['plain'] as bool?) ?? false; // تنضيف بس: إزالة ظلال وإضاءة من غير منحنى ألوان
   final bs = math.max(th ? 12 : 16, (math.max(w, h) / (th ? 48 : 40)).round());
   final gw = (w + bs - 1) ~/ bs, gh = (h + bs - 1) ~/ bs;
   final bg = List.generate(3, (_) => List<double>.filled(gw * gh, 255.0));
@@ -652,7 +658,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   }
 
   // أي قيمة من 238 لفوق = أبيض صافي، وفي وضع الحراري الباهت بنطبّق تعزيز ذكي للحبر الخفيف مع إزالة الظلال
-  final wp = th ? 242.0 : 238.0, gam = th ? 2.35 : 1.25;
+  final wp = th ? 242.0 : (plain ? 255.0 : 238.0), gam = th ? 2.35 : (plain ? 1.0 : 1.25);
   final lut = List<int>.generate(256, (i) {
     if (th && i >= 238) return 255;
     var v = 255.0 * math.pow(math.min(1.0, i / wp), gam);
@@ -709,7 +715,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   }
 
   // حدة ذكية تحسّن النص وتمنع تشويش الورق الأبيض
-  final k = th ? 0.65 : 0.35;
+  final k = th ? 0.65 : (plain ? 0.15 : 0.35);
   final cp = Uint8List.fromList(out);
   final row = w * 4;
   for (var y = 1; y < h - 1; y++) {
@@ -727,12 +733,14 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
 }
 
 /// بتطبّق فلتر الإيصال على ui.Image وبترجّع صورة جديدة (الأصلية مبتتمسحش).
-Future<ui.Image> cleanUiImage(ui.Image img, {bool gray = false, bool thermal = false}) async {
+Future<ui.Image> cleanUiImage(ui.Image img,
+    {bool gray = false, bool thermal = false, bool plain = false}) async {
   final w = img.width, h = img.height;
   final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
   if (bd == null) throw Exception('تعذر قراءة الصورة');
   final rgba = await compute(_cleanJob, <String, dynamic>{
     'src': bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+    'plain': plain,
     'w': w,
     'h': h,
     'gray': gray,
@@ -750,7 +758,7 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
     final w = img.width, h = img.height;
     ui.Image out;
     if (isCleanFilter(f)) {
-      var c = await cleanUiImage(img, thermal: usesThermalClean(f));
+      var c = await cleanUiImage(img, thermal: usesThermalClean(f), plain: f == ScanFilter.clean);
       if (f == ScanFilter.receiptBw) {
         final raw = await c.toByteData(format: ui.ImageByteFormat.rawRgba);
         if (raw == null) throw Exception('تعذر قراءة الصورة');
@@ -1246,6 +1254,46 @@ Future<Uint8List> composeBatch(String path, Session s) async {
 
 /// صورة الإيصال النهائية للمشاركة: نفس صفحة الـ PDF (شريط أبيض فيه الورقة فوق الإيصال).
 /// من غير ورقة (إخفاء الورقة) بترجع الصورة زي ما هي.
+/// تركيب وش وضهر البطاقة على ورقة واحدة بيضا (فوق بعض بالطول، بنفس العرض).
+Future<Uint8List> composeIdCard(String frontPath, String backPath) async {
+  final f = await decodeImage(await File(frontPath).readAsBytes());
+  final b = await decodeImage(await File(backPath).readAsBytes());
+  try {
+    const w = 1240.0, m = 48.0, gap = 48.0;
+    const iw = w - m * 2;
+    final fh = iw * f.height / f.width, bh = iw * b.height / b.width;
+    final h = m + fh + gap + bh + m;
+    final rec = ui.PictureRecorder();
+    final c = Canvas(rec);
+    c.drawRect(Rect.fromLTWH(0, 0, w, h), Paint()..color = const Color(0xFFFFFFFF));
+    c.drawImageRect(
+        f,
+        Rect.fromLTWH(0, 0, f.width.toDouble(), f.height.toDouble()),
+        Rect.fromLTWH(m, m, iw, fh),
+        Paint());
+    c.drawImageRect(
+        b,
+        Rect.fromLTWH(0, 0, b.width.toDouble(), b.height.toDouble()),
+        Rect.fromLTWH(m, m + fh + gap, iw, bh),
+        Paint());
+    // خط فاصل خفيف بين الوش والضهر
+    c.drawLine(
+        Offset(m, m + fh + gap / 2),
+        Offset(w - m, m + fh + gap / 2),
+        Paint()
+          ..color = const Color(0xFFE0E0E0)
+          ..strokeWidth = 2);
+    final img = await rec.endRecording().toImage(w.round(), h.round());
+    final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+    img.dispose();
+    if (bd == null) throw Exception('تعذر تركيب صورة البطاقة');
+    return _bytesOf(bd);
+  } finally {
+    f.dispose();
+    b.dispose();
+  }
+}
+
 Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel}) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src;
@@ -1412,6 +1460,12 @@ class Store {
       await p.remove('pos:$path');
       await p.remove('edit:$path');
       await p.remove('notag:$path');
+      await p.remove('enh:$path');
+      await p.remove('ocr:$path');
+      final kept = p.getStringList('kept');
+      if (kept != null && kept.remove(path)) await p.setStringList('kept', kept);
+      final arch = p.getStringList('archive');
+      if (arch != null && arch.remove(path)) await p.setStringList('archive', arch);
     } catch (e, st) {
       AppLog.e('del', e, st);
     }
@@ -1698,6 +1752,53 @@ class Store {
     }
   }
 
+  /// صورة متحسّنة من ماسح جوجل الكامل: منطبّقش عليها فلتر الإيصال تاني (منع التحسين المزدوج).
+  static Future<bool> enhanced(String path) async => (await _p).getBool('enh:$path') ?? false;
+
+  static Future<void> setEnhanced(String path, bool v) async {
+    final p = await _p;
+    if (v) {
+      await p.setBool('enh:$path', true);
+    } else {
+      await p.remove('enh:$path');
+    }
+  }
+
+  /// نص الصورة المقروء بالـ OCR (بيتخزن أول مرة قراءة عشان البحث يبقى سريع).
+  static Future<String?> ocrText(String path) async => (await _p).getString('ocr:$path');
+
+  static Future<void> setOcrText(String path, String t) async =>
+      (await _p).setString('ocr:$path', t);
+
+  // --- الأرشيف: صور متعلّم عليها "احتفظ بيها" بتتنقل هنا بدل المسح بعد ١٢ ساعة من الإرسال ---
+  static Future<List<String>> archive() async {
+    final l = (await _p).getStringList('archive') ?? [];
+    return l.where((e) => File(e).existsSync()).toList();
+  }
+
+  static Future<bool> isKept(String path) async =>
+      ((await _p).getStringList('kept') ?? []).contains(path);
+
+  /// تعليم/إلغاء تعليم صورة "احتفظ بيها". بيتطبق لما تتبعت وتعدّي ١٢ ساعة.
+  static Future<void> setKept(String path, bool v) async {
+    final p = await _p;
+    final l = p.getStringList('kept') ?? [];
+    if (v && !l.contains(path)) {
+      l.add(path);
+      await p.setStringList('kept', l);
+    } else if (!v && l.remove(path)) {
+      await p.setStringList('kept', l);
+    }
+  }
+
+  /// مسح صورة من الأرشيف نهائياً.
+  static Future<void> unarchive(String path) async {
+    final p = await _p;
+    final l = p.getStringList('archive') ?? [];
+    if (l.remove(path)) await p.setStringList('archive', l);
+    await del(path);
+  }
+
   static Future<EditParams?> editOf(String path) async =>
       EditParams.decode((await _p).getString('edit:$path'));
 
@@ -1810,10 +1911,40 @@ class Store {
     final now = DateTime.now();
     final bt = p.getInt('batchSentAt');
     if (bt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(bt)) > sentLife) {
-      await clearBatchImg();
+      final bi = p.getString('batchImg');
+      if (bi != null && await isKept(bi)) {
+        // محفوظ: يروح للأرشيف بدل المسح (ميفضلش باتش حالي)
+        final arch = p.getStringList('archive') ?? [];
+        if (!arch.contains(bi)) arch.add(bi);
+        await p.setStringList('archive', arch);
+        await setKept(bi, false);
+        await p.remove('batchImg');
+        await _resetBatchMeta(p);
+      } else {
+        await clearBatchImg();
+      }
     }
     final rt = p.getInt('rcSentAt');
     if (rt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(rt)) > sentLife) {
+      // الإيصالات المحفوظة تروح للأرشيف الأول، والباقي يتمسح عادي
+      final sent = p.getStringList('rcSentImgs') ?? [];
+      final arch = p.getStringList('archive') ?? [];
+      final left = await draft();
+      var changed = false;
+      for (final u in List.of(sent)) {
+        if (await isKept(u)) {
+          if (!arch.contains(u)) arch.add(u);
+          changed = true;
+          await setKept(u, false);
+          sent.remove(u);
+          left.remove(u);
+        }
+      }
+      if (changed) {
+        await p.setStringList('archive', arch);
+        await p.setStringList('rcSentImgs', sent);
+        await p.setStringList('draft', left);
+      }
       await discardSentReceipts();
     }
   }
@@ -1883,7 +2014,7 @@ class Store {
   /// مسح أي ملفات مؤقتة مش تابعة لمسودة أو PDF شغّال. مبتشتغلش لو فيه عملية شغالة.
   static Future<void> cleanup() async {
     if (working > 0) return;
-    final keep = <String>{...await draft(), ...await pdfImgs()};
+    final keep = <String>{...await draft(), ...await pdfImgs(), ...await archive()};
     final bi = await batchImg();
     if (bi != null) keep.add(bi);
     final pdfPath = (await pdf())?.file.path;
@@ -2427,7 +2558,8 @@ BatchOcr parseBatchRows(List<String> rows) {
 
 /// قراءة صورة الباتش بـ ML Kit وتجميع النص في صفوف حسب الموقع الرأسي.
 /// لو في أكتر من ورقة باتش في الصورة (جنب بعض أو فوق بعض) بيقرا كل ورقة لوحدها ويجمعهم.
-Future<BatchOcr> readBatchInfo(String path) async {
+/// قراءة سطور النص الخام من صورة بـ ML Kit (المحرك بيقفل بعد كل قراءة).
+Future<List<mlt.TextLine>> _ocrLinesOf(String path) async {
   final rec = mlt.TextRecognizer(script: mlt.TextRecognitionScript.latin);
   try {
     final res = await rec.processImage(mlt.InputImage.fromFilePath(path));
@@ -2435,28 +2567,47 @@ Future<BatchOcr> readBatchInfo(String path) async {
     for (final b in res.blocks) {
       lines.addAll(b.lines);
     }
-    List<String> toRows(List<mlt.TextLine> ls) {
-      ls.sort((a, b) => a.boundingBox.center.dy.compareTo(b.boundingBox.center.dy));
-      final groups = <List<mlt.TextLine>>[];
-      double? cy, ch;
-      for (final l in ls) {
-        final c = l.boundingBox.center.dy, h = l.boundingBox.height;
-        if (cy != null && ch != null && (c - cy).abs() < math.max(ch, h) * 0.6) {
-          groups.last.add(l);
-          cy = (cy + c) / 2;
-        } else {
-          groups.add([l]);
-          cy = c;
-          ch = h;
-        }
-      }
-      final out = <String>[];
-      for (final g in groups) {
-        g.sort((a, b) => a.boundingBox.left.compareTo(b.boundingBox.left));
-        out.add(g.map((l) => l.text).join(' '));
-      }
-      return out;
+    return lines;
+  } finally {
+    await rec.close();
+  }
+}
+
+/// تجميع سطور ML Kit اللي على نفس المستوى في سطر نصي واحد (فوق لتحت، ومن الشمال لليمين).
+List<String> _ocrRowsOfLines(List<mlt.TextLine> ls) {
+  ls.sort((a, b) => a.boundingBox.center.dy.compareTo(b.boundingBox.center.dy));
+  final groups = <List<mlt.TextLine>>[];
+  double? cy, ch;
+  for (final l in ls) {
+    final c = l.boundingBox.center.dy, h = l.boundingBox.height;
+    if (cy != null && ch != null && (c - cy).abs() < math.max(ch, h) * 0.6) {
+      groups.last.add(l);
+      cy = (cy + c) / 2;
+    } else {
+      groups.add([l]);
+      cy = c;
+      ch = h;
     }
+  }
+  final out = <String>[];
+  for (final g in groups) {
+    g.sort((a, b) => a.boundingBox.left.compareTo(b.boundingBox.left));
+    out.add(g.map((l) => l.text).join(' '));
+  }
+  return out;
+}
+
+/// استخراج كل نص الصورة سطور مرتبة زي الورقة (للبحث في الإيصالات واستخراج النص).
+Future<List<String>> readAllTextRows(String path) async {
+  final lines = await _ocrLinesOf(path);
+  if (lines.isEmpty) return <String>[];
+  return _ocrRowsOfLines(lines);
+}
+
+Future<BatchOcr> readBatchInfo(String path) async {
+  final lines = await _ocrLinesOf(path);
+  {
+    List<String> toRows(List<mlt.TextLine> ls) => _ocrRowsOfLines(ls);
 
     // قراءة الصورة كلها (بتغطي الورقة الواحدة، والأوراق اللي فوق بعض)
     final allRows = toRows(List.of(lines));
@@ -2497,8 +2648,6 @@ Future<BatchOcr> readBatchInfo(String path) async {
       }
     }
     return _attachBatchMeta(whole, allRows);
-  } finally {
-    await rec.close();
   }
 }
 
@@ -3035,6 +3184,70 @@ class _TagDragState extends State<_TagDrag> {
         },
         child: widget.child,
       );
+}
+
+/// شاشة استخراج النص: تقرأ نص الصورة بالـ OCR (أول مرة بس، بعدين من الكاش) وتعرضه للنسخ أو المشاركة.
+Future<void> showOcrTextSheet(BuildContext context, String path,
+    {String title = 'النص المستخرج'}) async {
+  var text = await Store.ocrText(path);
+  if (text == null && context.mounted) {
+    text = await _runWithProgress(context, 'بنقرأ النص من الصورة…', () async {
+      final t = (await readAllTextRows(path)).join('\n');
+      await Store.setOcrText(path, t);
+      return t;
+    });
+  }
+  if (!context.mounted || text == null) return;
+  final display = text.trim().isEmpty ? 'مفيش نص مقروء في الصورة دي' : text;
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    builder: (ctx) => SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Flexible(
+            child: SingleChildScrollView(
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Theme.of(ctx).colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: SelectableText(display, textDirection: TextDirection.ltr),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(
+              child: FilledButton.tonalIcon(
+                icon: const Icon(Icons.copy_rounded),
+                label: const Text('نسخ'),
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: text!));
+                  if (ctx.mounted) Navigator.pop(ctx);
+                  if (context.mounted) snack(context, 'النص اتنسخ');
+                },
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: OutlinedButton.icon(
+                icon: const Icon(Icons.share_rounded),
+                label: const Text('مشاركة'),
+                onPressed: () => Share.share(text!),
+              ),
+            ),
+          ]),
+        ]),
+      ),
+    ),
+  );
 }
 
 class ZoomPage extends StatefulWidget {
@@ -4231,6 +4444,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         centerTitle: true,
         actions: [
           IconButton(
+              tooltip: 'الأرشيف',
+              icon: const Icon(Icons.archive_rounded),
+              onPressed: () => _open(const ArchiveScreen())),
+          IconButton(
               tooltip: 'سجل الإرسال',
               icon: const Icon(Icons.history_rounded),
               onPressed: () => _open(const SendLogScreen())),
@@ -4406,6 +4623,7 @@ class _BatchScreenState extends State<BatchScreen> {
   double? aspect;
   bool busy = false;
   bool noTag = false; // الصورة دي من غير ورقة بيانات
+  bool kept = false; // الصورة دي محفوظة للأرشيف بعد الإرسال
 
   @override
   void initState() {
@@ -4419,6 +4637,16 @@ class _BatchScreenState extends State<BatchScreen> {
     if (path == null) return;
     setState(() => noTag = hide);
     await Store.setNoTag(path, hide);
+  }
+
+  /// حفظ الباتش في الأرشيف بعد الإرسال (بدل المسح بعد ١٢ ساعة).
+  Future<void> _toggleKeep() async {
+    final path = img;
+    if (path == null) return;
+    final v = !kept;
+    setState(() => kept = v);
+    await Store.setKept(path, v);
+    if (mounted) snack(context, v ? 'هيتحفظ في الأرشيف بعد الإرسال' : 'اتشال من المحفوظات');
   }
 
   Future<void> _init() async {
@@ -4472,9 +4700,11 @@ class _BatchScreenState extends State<BatchScreen> {
       final p = fitTagPos(p0, t, a);
       if (p.cx != p0.cx || p.cy != p0.cy) await Store.setPosFor(path, p);
       final nt = await Store.noTag(path);
+      final kp = await Store.isKept(path);
       if (!mounted) return;
       setState(() {
         noTag = nt;
+        kept = kp;
         tag = t;
         img = path;
         aspect = a;
@@ -4757,7 +4987,20 @@ class _BatchScreenState extends State<BatchScreen> {
   Widget build(BuildContext context) {
     final ready = img != null && tag != null && pos != null && aspect != null;
     return Scaffold(
-      appBar: AppBar(title: const Text('الباتش')),
+      appBar: AppBar(title: const Text('الباتش'), actions: [
+        if (img != null) ...[
+          IconButton(
+              tooltip: kept ? 'محفوظ للأرشيف' : 'احتفظ بيه في الأرشيف',
+              icon: Icon(kept ? Icons.bookmark_rounded : Icons.bookmark_outline_rounded,
+                  color: kept ? Colors.teal : null),
+              onPressed: busy ? null : _toggleKeep),
+          IconButton(
+              tooltip: 'استخراج النص',
+              icon: const Icon(Icons.text_snippet_outlined),
+              onPressed:
+                  busy ? null : () => showOcrTextSheet(context, img!, title: 'نص الباتش')),
+        ],
+      ]),
       body: !ready
           ? const Center(child: CircularProgressIndicator())
           : Column(children: [
@@ -5727,6 +5970,7 @@ Map<String, dynamic> _renderPipelineJob(Map<String, dynamic> a) {
   final needWarp = a['needWarp'] as bool;
   final clean = a['clean'] as bool;
   final thermal = a['thermal'] as bool;
+  final plain = (a['plain'] as bool?) ?? false;
   final postMatrix = a['postMatrix'] as List<double>?;
   final sk = (a['sk'] as num).toDouble();
   final doTrim = a['doTrim'] as bool;
@@ -5755,7 +5999,14 @@ Map<String, dynamic> _renderPipelineJob(Map<String, dynamic> a) {
   }
 
   if (clean) {
-    rgba = _cleanJob(<String, dynamic>{'src': rgba, 'w': w, 'h': h, 'gray': false, 'th': thermal});
+    rgba = _cleanJob(<String, dynamic>{
+      'src': rgba,
+      'w': w,
+      'h': h,
+      'gray': false,
+      'th': thermal,
+      'plain': plain,
+    });
     if (postMatrix != null) {
       rgba = _matrixJob(<String, dynamic>{'src': rgba, 'm': postMatrix});
     }
@@ -5834,6 +6085,7 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
       'needWarp': needWarp,
       'clean': clean,
       'thermal': usesThermalClean(filter),
+      'plain': filter == ScanFilter.clean,
       'postMatrix': (clean && (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw))
           ? editMatrix(filter, contrast, brightness)
           : null,
@@ -5920,6 +6172,41 @@ class _GridPainter extends CustomPainter {
   bool shouldRepaint(_GridPainter o) => false;
 }
 
+bool _bytesEq(Uint8List a, Uint8List b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+/// هل الملفين ليهم نفس المحتوى؟ (حجم + عينات من الأول والآخر — بتميّز نسختين كُتبوا من نفس البايتس)
+Future<bool> _sameFileBytes(String a, String b) async {
+  try {
+    final fa = File(a), fb = File(b);
+    final la = await fa.length(), lb = await fb.length();
+    if (la != lb) return false;
+    if (la == 0) return true;
+    const n = 4096;
+    final ra = await fa.open();
+    final rb = await fb.open();
+    try {
+      if (!_bytesEq(await ra.read(n), await rb.read(n))) return false;
+      if (la > n) {
+        await ra.setPosition(math.max(0, la - n));
+        await rb.setPosition(math.max(0, lb - n));
+        if (!_bytesEq(await ra.read(n), await rb.read(n))) return false;
+      }
+      return true;
+    } finally {
+      await ra.close();
+      await rb.close();
+    }
+  } catch (_) {
+    return false;
+  }
+}
+
 class EditorPage extends StatefulWidget {
   final bool canRetake; // بيظهر زر إعادة الأخذ لما الشاشة تتفتح من الكاميرا
   final int pageIndex; // ترتيب الصفحة (من 0)
@@ -5975,12 +6262,16 @@ class _EditorPageState extends State<EditorPage> {
   static const _maxZoom = 6.0;
   bool _swipeOk = false;
   String _sig0 = '';
+  // إعدادات تعديل متسجلة على الصورة بس لسه مش متنفذة على الملف نفسه (persistImage بتحفظ الفلتر من غير ما ترسمه).
+  // لما تكون true: "تم" والتنقل لازم يرسموا حتى لو مفيش تغيير، وإلا الفلتر الظاهر في المعاينة مش بيتطبق.
+  bool _seedUnbaked = false;
   bool busy = false;
   bool _quadTouched = false; // الموظف حدد الإطار بنفسه: القص التلقائي المتأخر ميلمسوش
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
   int _viewGen = 0;
   ui.Image? cleaned; // نسخة منضّفة للمعاينة لما الفلتر من فلاتر الإيصال
-  bool _cleanedThermal = false; // النسخة المنضّفة دي بالمنحنى الحراري ولا العادي
+  // النسخة المنضّفة المعروضة اتعملت بأي وضع تنضيف: 0 إيصال، 1 حراري باهت، 2 تنضيف بس
+  int _cleanedMode = 0;
   int _cleanGen = 0;
   double sharp = 0; // حدة يدوية 0..1
   List<double>? levels; // مستويات التحسين التلقائي (بتتحسب مرة واحدة من نسخة مصغرة)
@@ -6092,8 +6383,11 @@ class _EditorPageState extends State<EditorPage> {
         ),
       );
 
+  /// وضع التنضيف بتاع الفلتر: 0 إيصال، 1 حراري باهت، 2 تنضيف بس (من غير منحنى)
+  static int _cleanModeOf(ScanFilter f) =>
+      f == ScanFilter.clean ? 2 : (usesThermalClean(f) ? 1 : 0);
   bool get _cleanReady =>
-      isCleanFilter(filter) && cleaned != null && _cleanedThermal == usesThermalClean(filter);
+      isCleanFilter(filter) && cleaned != null && _cleanedMode == _cleanModeOf(filter);
   ui.Image get _base => _cleanReady ? cleaned! : view!;
   ui.Image get _shownNow => _peek ? view! : _shown;
 
@@ -6124,7 +6418,7 @@ class _EditorPageState extends State<EditorPage> {
     final gen = ++_cleanGen;
     final th = usesThermalClean(filter);
     try {
-      final c = await cleanUiImage(v, thermal: th);
+      final c = await cleanUiImage(v, thermal: th, plain: filter == ScanFilter.clean);
       if (!mounted || gen != _cleanGen || view != v) {
         c.dispose();
         return;
@@ -6132,7 +6426,7 @@ class _EditorPageState extends State<EditorPage> {
       final old = cleaned;
       setState(() {
         cleaned = c;
-        _cleanedThermal = th;
+        _cleanedMode = _cleanModeOf(filter);
       });
       WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
       _resharp();
@@ -6214,7 +6508,7 @@ class _EditorPageState extends State<EditorPage> {
 
   void _afterFilter(ScanFilter f) {
     if (isCleanFilter(f)) {
-      if (cleaned == null || _cleanedThermal != usesThermalClean(f)) {
+      if (cleaned == null || _cleanedMode != _cleanModeOf(f)) {
         _makeClean();
       } else {
         _resharp();
@@ -6273,6 +6567,14 @@ class _EditorPageState extends State<EditorPage> {
       final s = (hot != null || await base.exists()) ? base.path : widget.path;
       final e = await Store.editOf(widget.path);
       if (!mounted) return;
+      if (e != null) {
+        // لو الصورة الحالية والنسخة الأصلية نفس البايتس: الفلتر متسجّل بس مش مرسوم على الملف لسه.
+        final bf = File(Store.baseOf(widget.path));
+        if (await bf.exists() && await _sameFileBytes(widget.path, bf.path)) {
+          _seedUnbaked = true;
+        }
+        if (!mounted) return;
+      }
       src = s;
       if (e != null) {
         turns = e.turns;
@@ -6327,7 +6629,7 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _nav(String dir) async {
     if (busy || widget.pageCount <= 0 || aspect == null) return;
     if (dir == 'prev' && widget.pageIndex <= 0) return;
-    if (_sig() == _sig0) {
+    if (_sig() == _sig0 && !_seedUnbaked) {
       Navigator.pop(context, '$kNavPrefix|$dir|${widget.path}');
       return;
     }
@@ -6609,6 +6911,17 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _apply({String? nav, bool all = false}) async {
     if (!_quadConvex(quad)) {
       snack(context, 'حدود القص متداخلة، عدّل الزوايا');
+      return;
+    }
+    // مفيش أي تغيير من فتح الصفحة والفلتر متنفذ على الملف أصلاً: نرجّع الملف زي ما هو (من غير إعادة رسم أو ضغط)
+    if (_sig() == _sig0 && !_seedUnbaked) {
+      if (all) {
+        final style =
+            EditParams(filter: filter, contrast: contrast, brightness: brightness, sharp: sharp);
+        Navigator.pop(context, '$kAllPrefix|${style.encode()}|${widget.path}');
+      } else {
+        Navigator.pop(context, nav == null ? widget.path : '$kNavPrefix|$nav|${widget.path}');
+      }
       return;
     }
     setState(() => busy = true);
@@ -8626,6 +8939,11 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   ScanFilter filter = ScanFilter.receipt;
   String? progress;
   final Set<String> noTags = {}; // إيصالات من غير ورقة
+  final Set<String> kept = {}; // إيصالات متعلّم عليها "احتفظ بيها" (بتروح الأرشيف بعد الإرسال)
+  final Map<String, String> _ocr = {}; // كاش نص الـ OCR في الجلسة (الدائم في Store)
+  final _searchCtrl = TextEditingController();
+  String _ocrProgress = '';
+  bool _ocrRunning = false;
 
   Future<void> _toggleTag(String path) async {
     final hide = !noTags.contains(path);
@@ -8642,6 +8960,109 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     });
   }
 
+  /// تعليم إيصال "احتفظ بيها": بعد الإرسال وعدّي ١٢ ساعة يروح للأرشيف بدل ما يتمسح.
+  Future<void> _toggleKeep(String path) async {
+    final v = !kept.contains(path);
+    await Store.setKept(path, v);
+    if (!mounted) return;
+    setState(() {
+      if (v) {
+        kept.add(path);
+      } else {
+        kept.remove(path);
+      }
+    });
+    snack(context, v ? 'هتتحفظ في الأرشيف بعد الإرسال' : 'اتشالت من المحفوظات');
+  }
+
+  /// البحث في نص الإيصالات: بيقرأ OCR لأي إيصال متقريش (أول مرة بس) والنتايج بتظهر أول بأول.
+  Future<void> _onSearchChanged() async {
+    setState(() {});
+    if (_searchCtrl.text.trim().isEmpty) {
+      if (mounted) setState(() => _ocrProgress = '');
+      return;
+    }
+    if (_ocrRunning) return;
+    _ocrRunning = true;
+    try {
+      final all = List.of(imgs);
+      var done = 0;
+      for (final p in all) {
+        if (!mounted || _searchCtrl.text.trim().isEmpty) return;
+        if (_ocr.containsKey(p)) continue;
+        final cached = await Store.ocrText(p);
+        if (cached != null) {
+          _ocr[p] = cached;
+        } else {
+          if (mounted) setState(() => _ocrProgress = 'بنقرأ نص الإيصالات… ${done + 1}/${all.length}');
+          try {
+            final t = (await readAllTextRows(p)).join('\n');
+            _ocr[p] = t;
+            await Store.setOcrText(p, t);
+          } catch (e, st) {
+            AppLog.e('receipts.ocr', e, st);
+            _ocr[p] = '';
+          }
+        }
+        done++;
+        if (mounted) setState(() {});
+      }
+    } finally {
+      _ocrRunning = false;
+      if (mounted) setState(() => _ocrProgress = '');
+    }
+  }
+
+  /// تصوير بطاقة: وش وضهر بالماسح، بيتركّبوا على ورقة واحدة وتتحفظ كإيصال عادي في القايمة.
+  Future<void> _addIdCard() async {
+    if (!await askYesNo(context, 'تصوير بطاقة',
+        'هتصوّر وش البطاقة الأول، وبعدين ضهرها، وهيتركبوا في صفحة واحدة تتحفظ هنا.',
+        yes: 'ابدأ', no: 'إلغاء')) {
+      return;
+    }
+    final engine = await Store.scanEngineReceipts();
+    final mode = engine == 2 ? ScannerMode.full : ScannerMode.base;
+    if (!mounted) return;
+    final front = await scanImages(context, 1, mode: mode, camFallback: true);
+    if (front.isEmpty || !mounted) return;
+    if (!await askYesNo(context, 'اتصوّر الوش ✓', 'دلوقتي صوّر ضهر البطاقة.',
+        yes: 'تصوير', no: 'إلغاء')) {
+      return;
+    }
+    if (!mounted) return;
+    final back = await scanImages(context, 1, mode: mode, camFallback: true);
+    if (back.isEmpty || !mounted) return;
+    setState(() => busy = true);
+    String? tmp;
+    try {
+      final bytes = await composeIdCard(front.first, back.first);
+      final d = await Store.dir();
+      tmp = '${d.path}/idcard_${DateTime.now().microsecondsSinceEpoch}.png';
+      await File(tmp).writeAsBytes(bytes, flush: true);
+      final saved = await persistImage(tmp, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
+          filter: ScanFilter.original, applyNow: false);
+      await Store.addToDraft(saved);
+      // صفحة البطاقة جاهزة بخلفية بيضا: مفيش فلتر إيصال تلقائي عليها
+      await Store.setEnhanced(saved, true);
+      if (!mounted) return;
+      setState(() {
+        imgs.add(saved);
+        built = null;
+      });
+      HapticFeedback.lightImpact();
+      final idx = imgs.length - 1;
+      final savedPath = imgs[idx];
+      await _edit(idx, tab: 2);
+      await _ensureReceiptFiltered(idx, savedPath); // هيتخطاها: البطاقة متعلّمة جاهزة
+    } catch (e, st) {
+      AppLog.e('receipts.idCard', e, st);
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    } finally {
+      if (tmp != null) await Store.del(tmp);
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -8652,6 +9073,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   @override
   void dispose() {
+    _searchCtrl.dispose();
     gMinSide = 0;
     gMinQuality = 0;
     super.dispose();
@@ -8664,8 +9086,10 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final used = await Store.pdfImgs();
     final fl = await Store.filter();
     final nts = <String>{};
+    final kp = <String>{};
     for (final x in d) {
       if (await Store.noTag(x)) nts.add(x);
+      if (await Store.isKept(x)) kp.add(x);
     }
     File? b;
     if (f != null && d.isNotEmpty && used.length == d.length) {
@@ -8680,6 +9104,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       noTags
         ..clear()
         ..addAll(nts);
+      kept
+        ..clear()
+        ..addAll(kp);
       imgs = d;
       tag = t;
       built = b;
@@ -9107,9 +9534,11 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     return false;
   }
 
-  Widget _item(int i) {
-    final path = imgs[i];
+  Widget _item(int i) => _card(imgs[i], i, false);
+
+  Widget _card(String path, int i, bool searching) {
     final cs = Theme.of(context).colorScheme;
+    final isKept = kept.contains(path);
     return Card(
       shape: kCardShape,
       key: ValueKey(path),
@@ -9123,52 +9552,79 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                     child: ReceiptPreview(
                         path: path, tag: tag!, showTag: !noTags.contains(path))))),
         child: Padding(
-          padding: const EdgeInsets.all(8),
-          child: Row(children: [
-            CircleAvatar(
-                radius: 14,
-                backgroundColor: cs.primary,
-                child: Text('${i + 1}', style: TextStyle(color: cs.onPrimary, fontSize: 13))),
-            const SizedBox(width: 10),
-            // المصغّرة = الناتج النهائي: شريط أبيض بعرض الصورة والورقة في منتصفه فوق الإيصال
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                width: 96,
-                height: 128,
-                decoration: BoxDecoration(border: Border.all(color: Colors.black12)),
-                child: FittedBox(
-                  fit: BoxFit.cover,
-                  alignment: Alignment.topCenter,
-                  clipBehavior: Clip.hardEdge,
-                  child: SizedBox(
-                      width: 300,
-                      child: ReceiptPreview(
-                          path: path,
-                          tag: tag!,
-                          cacheWidth: 300,
-                          showTag: !noTags.contains(path))),
+          padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+          child: Column(children: [
+            Row(children: [
+              CircleAvatar(
+                  radius: 14,
+                  backgroundColor: cs.primary,
+                  child: Text('${i + 1}', style: TextStyle(color: cs.onPrimary, fontSize: 13))),
+              const SizedBox(width: 10),
+              // المصغّرة = الناتج النهائي: شريط أبيض بعرض الصورة والورقة في منتصفه فوق الإيصال
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  width: 96,
+                  height: 128,
+                  decoration: BoxDecoration(border: Border.all(color: Colors.black12)),
+                  child: FittedBox(
+                    fit: BoxFit.cover,
+                    alignment: Alignment.topCenter,
+                    clipBehavior: Clip.hardEdge,
+                    child: SizedBox(
+                        width: 300,
+                        child: ReceiptPreview(
+                            path: path,
+                            tag: tag!,
+                            cacheWidth: 300,
+                            showTag: !noTags.contains(path))),
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(child: Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey))),
-            IconButton(
-                tooltip: noTags.contains(path) ? 'إظهار الورقة' : 'إخفاء الورقة',
-                icon: Icon(noTags.contains(path) ? Icons.label_off_rounded : Icons.label_outline_rounded),
-                onPressed: busy ? null : () => _toggleTag(path)),
-            IconButton(
-                tooltip: 'تعديل',
-                icon: const Icon(Icons.tune_rounded),
-                onPressed: busy ? null : () => _edit(i)),
-            IconButton(
-                tooltip: 'مسح',
-                icon: const Icon(Icons.delete_outline_rounded, color: Colors.red),
-                onPressed: busy ? null : () => _remove(i)),
-            ReorderableDragStartListener(
-                index: i,
-                child:
-                    const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle_rounded))),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey)),
+                  if (isKept)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 4),
+                      child: Text('🔖 محفوظة للأرشيف',
+                          style: TextStyle(fontSize: 11, color: Colors.teal)),
+                    ),
+                ]),
+              ),
+              if (!searching)
+                ReorderableDragStartListener(
+                    index: i,
+                    child: const Padding(
+                        padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle_rounded))),
+            ]),
+            Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+              IconButton(
+                  tooltip: isKept ? 'إلغاء الحفظ في الأرشيف' : 'احتفظ بيها في الأرشيف',
+                  icon: Icon(
+                      isKept ? Icons.bookmark_rounded : Icons.bookmark_outline_rounded,
+                      color: isKept ? Colors.teal : null),
+                  onPressed: busy ? null : () => _toggleKeep(path)),
+              IconButton(
+                  tooltip: 'استخراج النص',
+                  icon: const Icon(Icons.text_snippet_outlined),
+                  onPressed: busy ? null : () => showOcrTextSheet(context, path)),
+              IconButton(
+                  tooltip: noTags.contains(path) ? 'إظهار الورقة' : 'إخفاء الورقة',
+                  icon: Icon(noTags.contains(path)
+                      ? Icons.label_off_rounded
+                      : Icons.label_outline_rounded),
+                  onPressed: busy ? null : () => _toggleTag(path)),
+              IconButton(
+                  tooltip: 'تعديل',
+                  icon: const Icon(Icons.tune_rounded),
+                  onPressed: busy ? null : () => _edit(i)),
+              IconButton(
+                  tooltip: 'مسح',
+                  icon: const Icon(Icons.delete_outline_rounded, color: Colors.red),
+                  onPressed: busy ? null : () => _remove(i)),
+            ]),
           ]),
         ),
       ),
@@ -9188,13 +9644,72 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                       child: busy
                           ? const CircularProgressIndicator()
                           : const Text('لسه مفيش صور', style: TextStyle(fontSize: 16)))
-                  : ReorderableListView.builder(
-                      padding: const EdgeInsets.all(12),
-                      buildDefaultDragHandles: false,
-                      itemCount: imgs.length,
-                      onReorder: _reorder,
-                      itemBuilder: (_, i) => _item(i),
-                    ),
+                  : Column(children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                        child: TextField(
+                          controller: _searchCtrl,
+                          decoration: InputDecoration(
+                            isDense: true,
+                            prefixIcon: const Icon(Icons.search_rounded),
+                            hintText: 'ابحث في نص الإيصالات (رقم، اسم، مبلغ)',
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                            suffixIcon: _searchCtrl.text.isEmpty
+                                ? null
+                                : IconButton(
+                                    icon: const Icon(Icons.close_rounded),
+                                    onPressed: () {
+                                      _searchCtrl.clear();
+                                      setState(() => _ocrProgress = '');
+                                    }),
+                          ),
+                          onChanged: (_) => _onSearchChanged(),
+                        ),
+                      ),
+                      if (_ocrProgress.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+                          child: Row(children: [
+                            const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2)),
+                            const SizedBox(width: 8),
+                            Expanded(
+                                child:
+                                    Text(_ocrProgress, style: const TextStyle(fontSize: 12))),
+                          ]),
+                        ),
+                      Expanded(
+                        child: _searchCtrl.text.trim().isEmpty
+                            ? ReorderableListView.builder(
+                                padding: const EdgeInsets.all(12),
+                                buildDefaultDragHandles: false,
+                                itemCount: imgs.length,
+                                onReorder: _reorder,
+                                itemBuilder: (_, i) => _item(i),
+                              )
+                            : Builder(builder: (_) {
+                                final q = _searchCtrl.text.trim().toLowerCase();
+                                final shown = [
+                                  for (final p in imgs)
+                                    if ((_ocr[p] ?? '').toLowerCase().contains(q)) p
+                                ];
+                                if (shown.isEmpty) {
+                                  return const Center(
+                                      child: Text('مفيش إيصال فيه النص ده',
+                                          style:
+                                              TextStyle(fontSize: 15, color: Colors.grey)));
+                                }
+                                return ListView.builder(
+                                  padding: const EdgeInsets.all(12),
+                                  itemCount: shown.length,
+                                  itemBuilder: (_, i) =>
+                                      _card(shown[i], imgs.indexOf(shown[i]), true),
+                                );
+                              }),
+                      ),
+                    ]),
         ),
         SafeArea(
           child: Padding(
@@ -9248,6 +9763,16 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
               const SizedBox(height: 8),
               SizedBox(
                 width: double.infinity,
+                height: 42,
+                child: OutlinedButton.icon(
+                  onPressed: busy ? null : _addIdCard,
+                  icon: const Icon(Icons.badge_outlined, size: 18),
+                  label: const Text('تصوير بطاقة (وش وضهر في صفحة واحدة)'),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
                 height: 50,
                 child: FilledButton.icon(
                   onPressed: (busy || imgs.isEmpty) ? null : (built == null ? _createAndSend : _send),
@@ -9272,6 +9797,121 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 // =====================================================================
 //  سجل الإرسال
 // =====================================================================
+
+// =====================================================================
+//  الأرشيف (الصور المحفوظة من المسح التلقائي)
+// =====================================================================
+
+class ArchiveScreen extends StatefulWidget {
+  const ArchiveScreen({super.key});
+  @override
+  State<ArchiveScreen> createState() => _ArchiveScreenState();
+}
+
+class _ArchiveScreenState extends State<ArchiveScreen> {
+  List<String> imgs = [];
+  bool loaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final l = await Store.archive();
+    // الأحدث الأول (بتاريخ تعديل الملف)
+    l.sort((a, b) {
+      try {
+        return File(b).lastModifiedSync().compareTo(File(a).lastModifiedSync());
+      } catch (_) {
+        return 0;
+      }
+    });
+    if (!mounted) return;
+    setState(() {
+      imgs = l;
+      loaded = true;
+    });
+  }
+
+  Future<void> _remove(String path) async {
+    if (!await askYesNo(context, 'مسح من الأرشيف؟', 'الصورة هتتمسح نهائياً من التطبيق.',
+        yes: 'امسح', no: 'إلغاء')) {
+      return;
+    }
+    await Store.unarchive(path);
+    if (!mounted) return;
+    setState(() => imgs.remove(path));
+  }
+
+  String _dateOf(String path) {
+    try {
+      final t = File(path).lastModifiedSync();
+      final m = t.month.toString().padLeft(2, '0'), d = t.day.toString().padLeft(2, '0');
+      return '${t.year}-$m-$d';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('الأرشيف (${imgs.length})')),
+      body: !loaded
+          ? const Center(child: CircularProgressIndicator())
+          : imgs.isEmpty
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(24),
+                    child: Text(
+                        'مفيش حاجة محفوظة لسه.\nعلّم أي باتش أو إيصال بعلامة الحفظ قبل ما تبعته، وهيتحفظ هنا بدل ما يتمسح بعد ١٢ ساعة.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 15)),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: imgs.length,
+                  itemBuilder: (_, i) {
+                    final path = imgs[i];
+                    return Card(
+                      shape: kCardShape,
+                      margin: const EdgeInsets.symmetric(vertical: 4),
+                      child: ListTile(
+                        leading: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Image.file(File(path),
+                              width: 48, height: 64, fit: BoxFit.cover, cacheWidth: 150),
+                        ),
+                        title: Text('محفوظ ${_dateOf(path)}'),
+                        subtitle: const Text('اضغط للمعاينة'),
+                        onTap: () => Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                builder: (_) => ZoomPage(child: Image.file(File(path))))),
+                        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                          IconButton(
+                              tooltip: 'استخراج النص',
+                              icon: const Icon(Icons.text_snippet_outlined),
+                              onPressed: () => showOcrTextSheet(context, path)),
+                          IconButton(
+                              tooltip: 'مشاركة',
+                              icon: const Icon(Icons.share_rounded),
+                              onPressed: () => shareFiles(context, [path])),
+                          IconButton(
+                              tooltip: 'مسح',
+                              icon: const Icon(Icons.delete_outline_rounded, color: Colors.red),
+                              onPressed: () => _remove(path)),
+                        ]),
+                      ),
+                    );
+                  },
+                ),
+    );
+  }
+}
 
 class SendLogEntry {
   final DateTime time;
