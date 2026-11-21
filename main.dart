@@ -312,6 +312,7 @@ enum ScanFilter {
   auto,
   clean,
   adaptive, // Append only: existing saved filter indices stay valid.
+  gentle, // Fast color-preserving enhancement, append only.
 }
 
 /// ترتيب وأسماء الفلاتر في الشاشة (الإيصالات الأول لأنها الأهم).
@@ -320,6 +321,7 @@ enum ScanFilter {
 const kFilterOrder = <ScanFilter>[
   ScanFilter.adaptive,
   ScanFilter.original,
+  ScanFilter.gentle,
   ScanFilter.receipt,
   ScanFilter.thermal,
   ScanFilter.receiptBw,
@@ -332,6 +334,7 @@ const kFilterOrder = <ScanFilter>[
 
 const kFilterLabels = <ScanFilter, String>{
   ScanFilter.original: 'أصلي',
+  ScanFilter.gentle: 'تحسين خفيف',
   ScanFilter.receipt: 'إيصال',
   ScanFilter.thermal: 'حراري باهت',
   ScanFilter.receiptBw: 'فوتوكوبي',
@@ -364,7 +367,8 @@ double effSharpness(ScanFilter f, double s) => f == ScanFilter.sharpen ? math.ma
 class FilterBar extends StatelessWidget {
   final ScanFilter selected;
   final ValueChanged<ScanFilter>? onChanged;
-  const FilterBar({super.key, required this.selected, required this.onChanged});
+  final ScanFilter? automaticChoice;
+  const FilterBar({super.key, required this.selected, required this.onChanged, this.automaticChoice});
 
   @override
   Widget build(BuildContext context) {
@@ -377,7 +381,9 @@ class FilterBar extends StatelessWidget {
             Padding(
               padding: const EdgeInsetsDirectional.only(end: 6),
               child: ChoiceChip(
-                label: Text(kFilterLabels[f] ?? f.name),
+                label: Text(f == ScanFilter.adaptive && automaticChoice != null
+                    ? 'تلقائي: ${kFilterLabels[automaticChoice]}'
+                    : (kFilterLabels[f] ?? f.name)),
                 selected: f == selected,
                 onSelected: onChanged == null ? null : (_) => onChanged!(f),
               ),
@@ -441,9 +447,15 @@ Uint8List _sharpenJob(Map<String, dynamic> a) {
   return out;
 }
 
-/// Conservative per-image selection. At most 160 pixels on the longer side;
-/// center region limits desk/background influence. No OCR, network or model.
+/// Save only already-observed state. Never await on the capture path.
+void _rememberDiagnostic(String key, String value) {
+  unawaited(SharedPreferences.getInstance().then((p) async {
+    await p.setString(key, value);
+  }).catchError((Object e, StackTrace st) {AppLog.e('diagnostic', e, st);}));
+}
+
 final _adaptiveCache = <String, ScanFilter>{};
+/// Conservative per-image selection on a small preview. No OCR or network.
 ScanFilter chooseImageFilter(Uint8List rgba, int w, int h) {
   final hist = List<int>.filled(256, 0);
   var n = 0, colored = 0;
@@ -463,14 +475,16 @@ ScanFilter chooseImageFilter(Uint8List rgba, int w, int h) {
   if (n < 16) return ScanFilter.original;
   final low = _histPct(hist,n,0.08), mid = _histPct(hist,n,0.50);
   final high = _histPct(hist,n,0.92);
-  // Preserve colored content and stamps instead of whitening/desaturating it.
-  if (colored / n > 0.07) return ScanFilter.original;
+  // Color/stamps or warm lighting must not disable automatic selection.
+  // Use one mild RGB matrix, not whitening, desaturation or a local-clean pass.
+  if (colored / n > 0.07) return mid < 145 ? ScanFilter.lighten : ScanFilter.gentle;
   // Low contrast/faint text: gentle local cleanup without hard white clipping.
   if (high - low < 75) return ScanFilter.clean;
   // Uneven or dark paper needs local illumination correction.
-  if (mid < 155 || high < 210) return ScanFilter.clean;
-  // Crisp, bright neutral documents need no extra lossy enhancement.
-  if (mid > 218 && low < 135) return ScanFilter.original;
+  if (mid < 155 || high < 210) return ScanFilter.lighten;
+  // A bright page still gets a real, restrained filter. Original stays manual
+  // (or the error/empty-sample fallback), not the normal automatic outcome.
+  if (mid > 218 && low < 135) return ScanFilter.gentle;
   return ScanFilter.receipt;
 }
 
@@ -674,6 +688,10 @@ List<double> editMatrix(ScanFilter f, double contrast, double brightness, [List<
         [0.0, 0.0, 1.0],
       ];
       t0 = [0.0, 0.0, 0.0];
+      break;
+    case ScanFilter.gentle:
+      w = [[1.08, 0.0, 0.0], [0.0, 1.08, 0.0], [0.0, 0.0, 1.08]];
+      t0 = List<double>.filled(3, -7.0);
       break;
     case ScanFilter.enhance:
       {
@@ -1095,7 +1113,8 @@ Future<String> persistImage(String src, String name,
     bool applyNow = true,
     bool keepOriginal = false,
     ImageQualityProfile? profile}) async {
-  if (filter == ScanFilter.adaptive) filter = await resolveImageFilter(src);
+  final automaticFilter = filter == ScanFilter.adaptive;
+  if (automaticFilter) filter = await resolveImageFilter(src);
   final swPersist = Stopwatch()..start();
   final capturedProfile = _captureProfiles.remove(src);
   profile ??= capturedProfile;
@@ -1163,7 +1182,7 @@ Future<String> persistImage(String src, String name,
     // Receipt ingest keeps one source file until the first final render.
     // Standard/legacy images retain their existing base-file behavior.
     if (profile == null) await File(Store.baseOf(f.path)).writeAsBytes(bytes);
-    await Store.setEdit(f.path, EditParams(filter: filter));
+    await Store.setEdit(f.path, EditParams(filter: automaticFilter ? ScanFilter.adaptive : filter));
     if (profile != null && !applyNow) await Store.setEditPending(f.path, true);
   }
   final tFilter = swPersist.elapsedMilliseconds;
@@ -1829,7 +1848,6 @@ class Store {
   static Future<bool> continuous() async => (await _p).getBool('continuous') ?? true;
   static Future<void> setContinuous(bool v) async => (await _p).setBool('continuous', v);
 
-  /// فتح شاشة الفلاتر والقص بعد كل صورة (تصوير أو معرض)
   /// قص الهوامش البيضاء الفاضية بعد تعديل الإيصال (مقفول افتراضياً)
   static Future<bool> trimMargins() async => (await _p).getBool('trim') ?? false;
   static Future<void> setTrimMargins(bool v) async => (await _p).setBool('trim', v);
@@ -2456,7 +2474,7 @@ Future<List<String>> _manualPick(BuildContext context,
 }
 
 const _engineOpts = <(int, String, String)>[
-  (2, 'ماسح جوجل الكامل', 'قص وتحسين وإعادة تصوير من نفس الشاشة، زي CamScanner بالظبط (إيصالات الدفع)'),
+  (2, 'ماسح جوجل الكامل', 'قص وتحسين من جوجل، وإعادة تصوير من شاشة الماسح'),
   (1, 'ماسح جوجل', 'قص ذكي بالذكاء الاصطناعي، والتحسين بيتعمل من التطبيق'),
   (0, 'كاميرا A2R', 'كاميرا التطبيق المخصصة مع القص اليدوي/التلقائي'),
 ];
@@ -2509,10 +2527,12 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
     );
     try {
       final r = await scanner.scanDocument();
+      _rememberDiagnostic('lastScannerDiagnostic', 'آخر محاولة: اشتغل (${m.name})');
       return List<String>.from(r.images ?? const []);
     } catch (e) {
       if (e.toString().toLowerCase().contains('cancel')) return const <String>[];
       lastErr = e;
+      _rememberDiagnostic('lastScannerDiagnostic', 'آخر محاولة: غير متاح أو فشلت. بديل A2R أو المعرض موجود');
       AppLog.e('scanImages.$m', e, StackTrace.current);
       return null;
     } finally {
@@ -4062,8 +4082,10 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   PerfMode mode = PerfMode.balanced;
-  int scan = 0, qual = 1, pdfSz = 0, theme = 0, crop = 0, engine = 1, res = 0;
-  bool autoEdit = false, trim = false, slow = false;
+  int qual = 1, theme = 0, crop = 0, engine = 1, receiptEngine = 2, res = 0;
+  bool trim = false, slow = false;
+  String cameraDiagnostic = 'لم تُفتح كاميرا A2R بعد';
+  String scannerDiagnostic = 'لم يُجرّب ماسح جوجل بعد';
   AppPalette palSel = AppPalette.gold;
   bool loaded = false;
 
@@ -4073,11 +4095,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     (PerfMode.pro, 'احترافي (Pro)', 'أعلى جودة، للتليفونات القوية بس'),
   ];
 
-  // الإعدادات الجاهزة: (الأداء، وضع الماسح، الجودة، حجم الـ PDF)
-  static const _presets = <(PerfMode, int, int, int)>[
-    (PerfMode.lite, 1, 0, 1), // خفيف جداً
-    (PerfMode.balanced, 0, 1, 0), // متوازن
-    (PerfMode.pro, 0, 2, 0), // أعلى جودة
+  // Presets affect processing/JPEG settings, never disable receipt protection.
+  static const _presets = <(PerfMode, int)>[
+    (PerfMode.lite, 0), (PerfMode.balanced, 1), (PerfMode.pro, 2),
   ];
 
   @override
@@ -4088,30 +4108,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _load() async {
     final m = await Store.perfMode();
-    final sc = await Store.scanSetting();
     final en = await Store.scanEngine();
+    final re = await Store.scanEngineReceipts();
     final q = await Store.qualitySetting();
     final rs = await Store.resSetting();
-    final ae = await Store.autoEdit();
     final tr = await Store.trimMargins();
-    final pz = await Store.pdfSize();
     final th = await Store.themeSetting();
     final pl = await Store.paletteSetting();
     final cr = await Store.autoCropSetting();
     var sl = false;
     try {
-      sl = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
+      final prefs = await SharedPreferences.getInstance();
+      sl = prefs.getBool('camSlow') ?? false;
+      cameraDiagnostic = prefs.getString('lastCameraDiagnostic') ?? cameraDiagnostic;
+      scannerDiagnostic = prefs.getString('lastScannerDiagnostic') ?? scannerDiagnostic;
     } catch (_) {}
     if (!mounted) return;
     setState(() {
       mode = m;
-      scan = sc;
       engine = en;
+      receiptEngine = re;
       qual = q;
       res = rs;
-      autoEdit = ae;
       trim = tr;
-      pdfSz = pz;
       theme = th;
       palSel = AppPalette.values[pl];
       crop = cr;
@@ -4124,34 +4143,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int get _preset {
     for (var i = 0; i < _presets.length; i++) {
       final p = _presets[i];
-      if (mode == p.$1 && scan == p.$2 && qual == p.$3 && pdfSz == p.$4) return i;
+      if (mode == p.$1 && qual == p.$2 && res == 0) return i;
     }
     return -1;
   }
 
   Future<void> _setPreset(int i) async {
     final p = _presets[i];
-    final pdfChanged = pdfSz != p.$4;
-    setState(() {
-      mode = p.$1;
-      scan = p.$2;
-      qual = p.$3;
-      pdfSz = p.$4;
-      if (i == 0) {
-        autoEdit = false;
-        trim = false;
-      }
-    });
+    setState(() {mode = p.$1; qual = p.$2; res = 0; slow = false;});
     await Store.setPerfMode(p.$1);
-    await Store.setScanSetting(p.$2);
-    await Store.setQualitySetting(p.$3);
-    await Store.setPdfSize(p.$4);
-    if (i == 0) {
-      await Store.setAutoEdit(false);
-      await Store.setTrimMargins(false);
-    }
-    if (pdfChanged) await Store.clearPdf();
-    if (i == 0 && mounted) snack(context, 'اتفعّل وضع التليفون الضعيف: أخف وأسرع بجودة أقل');
+    await Store.setQualitySetting(p.$2);
+    await Store.setResSetting(0);
+    await (await SharedPreferences.getInstance()).remove('camSlow');
+    if (i == 0 && mounted) snack(context, 'وضع خفيف للمعاينة والمعالجة. جودة الإيصالات المحمية محفوظة');
   }
 
   Future<void> _setMode(PerfMode v) async {
@@ -4164,9 +4168,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await Store.setScanEngine(v);
   }
 
-  Future<void> _setScan(int v) async {
-    setState(() => scan = v);
-    await Store.setScanSetting(v);
+  Future<void> _setReceiptEngine(int v) async {
+    setState(() => receiptEngine = v);
+    await Store.setScanEngineReceipts(v);
   }
 
   Future<void> _setQual(int v) async {
@@ -4175,17 +4179,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _setRes(int v) async {
-    setState(() => res = v);
+    setState(() {res = v; slow = false;});
     await Store.setResSetting(v);
     try {
       (await SharedPreferences.getInstance()).remove('camSlow'); // اختيار الموظف بيلغي التنزيل التلقائي
     } catch (_) {}
-  }
-
-  Future<void> _setPdf(int v) async {
-    setState(() => pdfSz = v);
-    await Store.setPdfSize(v);
-    await Store.clearPdf();
   }
 
   Future<void> _setTheme(int v) async {
@@ -4207,17 +4205,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _reset() async {
-    if (!await askYesNo(context, 'إعادة الضبط؟', 'كل الإعدادات هترجع للوضع الافتراضي.',
+    if (!await askYesNo(context, 'إعادة الضبط؟', 'إعدادات الصفحة دي والفلتر الافتراضي هترجع للافتراضي. الصور والمسودات والحساب وسجل الإرسال مش هيتمسحوا.',
         yes: 'إعادة ضبط', no: 'إلغاء')) {
       return;
     }
     await _setPreset(1);
-    setState(() {
-      autoEdit = false;
-      trim = false;
-    });
-    await Store.setAutoEdit(false);
+    setState(() => trim = false);
     await Store.setTrimMargins(false);
+    await _setEngine(1);
+    await _setReceiptEngine(2);
+    await Store.setFilter(ScanFilter.adaptive);
+    await (await SharedPreferences.getInstance()).setBool('adaptiveFilterV1', true);
+    await Store.setAutoEdit(false);
+    await Store.setPdfSize(0);
     await _setTheme(0);
     await _setPalette(AppPalette.gold);
     await _setCrop(0);
@@ -4356,11 +4356,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ),
                   ),
-                _sec('نمط الاستخدام', sub: 'اختار اللي يناسب تليفونك'),
+                _sec('نمط الاستخدام', sub: 'للمعاينة والصور العادية. الإيصالات تحتفظ بجودتها المحمية'),
                 _presetCard(
                   icon: _weakIcon(),
                   title: 'تليفون ضعيف جداً',
-                  sub: 'أقل إعدادات: أخف وأسرع وملفات صغيرة، بجودة أقل',
+                  sub: 'معاينة أخف وبدون كشف حي. الإيصالات تفضل بجودتها المحمية',
                   on: cur == 0,
                   onTap: () => _setPreset(0),
                 ),
@@ -4414,7 +4414,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         const SizedBox(height: 2),
                         Text(
                             crop == 0
-                                ? 'ذكي: يعدّل الورقة لو شكلها مستطيل، ولو الكشف مش مظبوط يرجع لمستطيل مستقيم'
+                                ? 'يحافظ على منظور الورقة الصحيح. لو الحدود مش مؤكدة يسيب الصورة كاملة للتعديل اليدوي'
                                 : (crop == 1
                                     ? 'مستطيل مستقيم دايماً، من غير ميلان'
                                     : 'أربع أركان حرة مع تصحيح المنظور'),
@@ -4436,15 +4436,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ]),
                     ),
                     SwitchListTile(
-                      title: const Text('أوضاع الفلتر بعد كل صورة'),
-                      subtitle: const Text('تظهر شاشة الفلاتر والقص بعد كل صورة'),
-                      value: autoEdit,
-                      onChanged: (v) {
-                        setState(() => autoEdit = v);
-                        Store.setAutoEdit(v);
-                      },
-                    ),
-                    SwitchListTile(
                       title: const Text('قص الهوامش البيضاء تلقائياً'),
                       subtitle: const Text('في فلاتر الإيصال: بيشيل البياض الفاضي حوالين الإيصال'),
                       value: trim,
@@ -4464,35 +4455,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     collapsedShape: const Border(),
                     leading: const Icon(Icons.tune_rounded),
                     title: const Text('إعدادات متقدمة'),
-                    subtitle: const Text('الأداء ووضع الماسح وجودة الصورة وحجم الـ PDF'),
+                    subtitle: const Text('الأداء وكاميرا الباتش والإيصالات وجودة الصور العادية'),
                     children: [
                       _sub('الأداء'),
                       _radioGroup<PerfMode>(_perfOpts, mode, _setMode),
                       const Divider(),
-                      _sub('الكاميرا / الماسح'),
-                      _radioGroup<int>(_engineOpts, engine, _setEngine),
+                      _sub('كاميرا الباتش'),
+                      const Padding(padding: EdgeInsets.symmetric(horizontal: 16), child: Text('الوضع الاقتصادي يستخدم كاميرا A2R بدل جوجل. لو جوجل فشل، التطبيق يوفّر البديل.', style: TextStyle(fontSize: 12))),
+                      _radioGroup<int>(const [
+                        (1, 'ماسح جوجل الأساسي', 'قص من جوجل، والتحسين من التطبيق'),
+                        (0, 'كاميرا A2R', 'كاميرا التطبيق مع القص والفلاتر'),
+                      ], engine == 0 ? 0 : 1, _setEngine),
+                      const Divider(),
+                      _sub('كاميرا إيصالات الدفع'),
+                      _radioGroup<int>(_engineOpts, receiptEngine, _setReceiptEngine),
 
                       const Divider(),
-                      _sub('جودة الصورة'),
+                      _sub('جودة الصور العادية'),
+                      const Padding(padding: EdgeInsets.symmetric(horizontal: 16),
+                        child: Text('الإيصالات والصور عالية التفاصيل لها حد جودة محمي. الاختيار المنخفض هنا لا يقلل جودة أصل الإيصال.', style: TextStyle(fontSize: 12))),
                       _radioGroup<int>(_qualOpts, qual, _setQual),
                       const Divider(),
                       _sub('دقة الصورة'),
                       const Padding(
                         padding: EdgeInsets.fromLTRB(16, 0, 16, 4),
                         child: Text(
-                            'كاميرا A2R: بتصوّر بالدقة دي فعلاً. ماسح جوجل: شاشته من جوجل فبنصغّر الصورة الناتجة للدقة دي (مش بنكبّرها).',
+                            'للصور العادية: كاميرا A2R تطلب الدقة المختارة حسب دعم الجهاز. الإيصالات والجودة الأعلى تستخدم دقتها المحمية. ماسح جوجل يتحكم في دقة الالتقاط بنفسه.',
                             style: TextStyle(fontSize: 12)),
                       ),
                       _radioGroup<int>(_resOpts, res, _setRes),
-                      const Divider(),
-                      _sub('حجم ملف الـ PDF'),
-                      _radioGroup<int>(const [
-                        (0, 'كما هو (أعلى جودة)', 'من غير ضغط إضافي'),
-                        (1, 'مضغوط (حجم أصغر)', 'أنسب للنت الضعيف، والكتابة الصغيرة ممكن تقل وضوحها'),
-                      ], pdfSz, _setPdf),
                     ],
                   ),
                 ),
+                const SizedBox(height: 16),
+                Card(shape: kCardShape, child: ExpansionTile(
+                  leading: const Icon(Icons.info_outline_rounded),
+                  title: const Text('معلومات الجهاز والتصوير'),
+                  subtitle: const Text('آخر حالة مسجلة، من غير تشغيل الكاميرا أو فحص جديد'),
+                  children: [
+                    ListTile(title: const Text('النظام كما يبلّغه الجهاز'),
+                      subtitle: Text('${Platform.operatingSystem}: ${Platform.operatingSystemVersion}')),
+                    ListTile(title: const Text('كاميرا A2R'), subtitle: Text(cameraDiagnostic)),
+                    ListTile(title: const Text('ماسح جوجل'), subtitle: Text(scannerDiagnostic)),
+                    const Padding(padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
+                      child: Text('حالة جوجل دي آخر محاولة، مش ضمان إنه متاح دلوقتي. النسخة الأصغر للـ PDF بتتعمل من شاشة الملف، والأصل بيفضل محفوظ.', style: TextStyle(fontSize: 12))),
+                  ],
+                )),
                 const SizedBox(height: 16),
                 OutlinedButton.icon(
                   onPressed: () => AppLog.share(context),
@@ -4755,60 +4763,47 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await _reload();
   }
 
-  Widget _statusChip(IconData icon, String label, bool done, String doneText, String todoText) {
-    final color = done ? Colors.green : Colors.orange;
-    return Expanded(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-        decoration: BoxDecoration(
-          color: color.withAlpha(30),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: color.withAlpha(120)),
-        ),
-        child: Row(children: [
-          Icon(done ? Icons.check_circle_rounded : Icons.pending_rounded, color: color, size: 22),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-              Text(done ? doneText : todoText,
-                  style: TextStyle(fontSize: 12, color: color.withAlpha(255))),
+  Widget _big(IconData icon, String label, VoidCallback onTap, {required bool sent}) {
+    final cs = Theme.of(context).colorScheme;
+    return Material(
+      color: cs.surfaceContainerHigh,
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(22),
+        side: BorderSide(color: kAccent.withAlpha(110), width: 1.2),
+      ),
+      child: InkWell(
+        onTap: onTap,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 158),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 13),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Semantics(
+                label: '$label: ${sent ? "تم الإرسال" : "لم يُرسل"}',
+                child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  Icon(sent ? Icons.check_circle_rounded : Icons.radio_button_unchecked_rounded,
+                      color: sent ? Colors.green.shade400 : cs.onSurfaceVariant, size: 16),
+                  const SizedBox(width: 4),
+                  Flexible(child: Text(sent ? 'تم الإرسال' : 'لم يُرسل',
+                      style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant))),
+                ]),
+              ),
+              const SizedBox(height: 10),
+              Container(
+                width: 52, height: 52,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  color: kAccent.withAlpha(32),
+                  border: Border.all(color: kAccent.withAlpha(100)),
+                ),
+                child: Icon(icon, size: 29, color: kAccent),
+              ),
+              const SizedBox(height: 10),
+              Text(label, textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
             ]),
           ),
-        ]),
-      ),
-    );
-  }
-
-  Widget _big(IconData icon, String label, VoidCallback onTap) {
-    final cs = Theme.of(context).colorScheme;
-    return SizedBox(
-      height: 140,
-      child: Material(
-        color: cs.surfaceContainerHigh,
-        clipBehavior: Clip.antiAlias,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(24),
-          side: BorderSide(color: kAccent.withAlpha(110), width: 1.2),
-        ),
-        child: InkWell(
-          onTap: onTap,
-          child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Container(
-              width: 58,
-              height: 58,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: kAccent.withAlpha(32),
-                border: Border.all(color: kAccent.withAlpha(140)),
-              ),
-              child: Icon(icon, size: 30, color: kAccent),
-            ),
-            const SizedBox(height: 10),
-            Text(label,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          ]),
         ),
       ),
     );
@@ -4817,37 +4812,42 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final s = widget.session;
-    final cs = Theme.of(context).colorScheme;
     final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
     final pf = pdf;
     final bi = batchImg;
     return Scaffold(
       appBar: AppBar(
-        title: appLogo(height: 30),
+        automaticallyImplyLeading: false,
+        leadingWidth: 56,
+        leading: IconButton(
+          tooltip: 'الإعدادات',
+          icon: const Icon(Icons.settings_rounded),
+          onPressed: _showSettings,
+        ),
+        title: appLogo(height: 40),
         centerTitle: true,
+        toolbarHeight: 68,
         actions: [
-          IconButton(
-              tooltip: 'الأرشيف',
-              icon: const Icon(Icons.archive_rounded),
-              onPressed: () => _open(const ArchiveScreen())),
-          IconButton(
-              tooltip: 'سجل الإرسال',
-              icon: const Icon(Icons.history_rounded),
-              onPressed: () => _open(const SendLogScreen())),
-          IconButton(
-              tooltip: 'إعدادات الأداء',
-              icon: const Icon(Icons.settings_rounded),
-              onPressed: _showSettings),
-          IconButton(
-              tooltip: 'تغيير الحساب',
-              icon: const Icon(Icons.switch_account_rounded),
-              onPressed: () => Navigator.pop(context)),
+          SizedBox(width: 56, child: PopupMenuButton<String>(
+            tooltip: 'المزيد',
+            icon: const Icon(Icons.more_horiz_rounded),
+            onSelected: (value) {
+              if (value == 'archive') _open(const ArchiveScreen());
+              if (value == 'history') _open(const SendLogScreen());
+              if (value == 'account') Navigator.pop(context);
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'archive', child: Text('الأرشيف')),
+              PopupMenuItem(value: 'history', child: Text('سجل الإرسال')),
+              PopupMenuItem(value: 'account', child: Text('تغيير الحساب')),
+            ],
+          )),
         ],
       ),
-      body: ListView(padding: const EdgeInsets.all(16), children: [
+      body: ListView(padding: const EdgeInsets.all(14), children: [
         if (busy) const LinearProgressIndicator(),
         Container(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(22),
             gradient: LinearGradient(
@@ -4857,7 +4857,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             ),
             border: Border.all(color: kAccent.withAlpha(110), width: 1.2),
           ),
-          child: DefaultTextStyle(
+          child: DefaultTextStyle.merge(
             style: const TextStyle(color: Colors.white, fontSize: 16),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
@@ -4865,46 +4865,37 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 const SizedBox(width: 8),
                 Expanded(
                     child: Text(s.name,
-                        style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold))),
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
               ]),
-              const SizedBox(height: 8),
+              const SizedBox(height: 6),
               Row(children: [
                 Icon(Icons.location_on_rounded, color: kAccent),
                 const SizedBox(width: 8),
                 Expanded(child: Text(unitLine)),
               ]),
-              const SizedBox(height: 8),
-              Row(children: [
-                Icon(Icons.calendar_today_rounded, color: kAccent, size: 20),
-                const SizedBox(width: 8),
-                Text(s.date,
-                    textDirection: TextDirection.ltr,
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(width: 8),
-                Expanded(
-                    child: Text('(تاريخ التليفون - اتأكد إنه صح)',
-                        style: TextStyle(fontSize: 11, color: Colors.white.withAlpha(200)))),
-              ]),
+              const SizedBox(height: 6),
+              Wrap(spacing: 7, runSpacing: 3, crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Icon(Icons.calendar_today_rounded, color: kAccent, size: 18),
+                  Text(s.date, textDirection: TextDirection.ltr,
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  Text('تاريخ التليفون، اتأكد إنه صح',
+                    style: TextStyle(fontSize: 10, color: Colors.white.withAlpha(200))),
+                ],
+              ),
             ]),
           ),
         ),
         const SizedBox(height: 14),
-        Row(children: [
-          _statusChip(Icons.receipt_long_rounded, 'الباتش', batchSent, 'اتبعت', 'لسه'),
-          const SizedBox(width: 10),
-          _statusChip(Icons.payments_rounded, 'الإيصالات', receiptsSent, 'اتبعت',
-              draft.isEmpty ? 'لسه' : '${draft.length} صورة جاهزة'),
-        ]),
-        const SizedBox(height: 14),
-        Row(children: [
+        IntrinsicHeight(child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Expanded(
               child: _big(Icons.receipt_long_rounded, 'الباتش',
-                  _newBatch)),
+                  _newBatch, sent: batchSent)),
           const SizedBox(width: 12),
           Expanded(
               child: _big(
-                  Icons.payments_rounded, 'إيصالات الدفع', _openReceipts)),
-        ]),
+                  Icons.payments_rounded, 'إيصالات الدفع', _openReceipts, sent: receiptsSent)),
+        ])),
         if (draft.isNotEmpty || pf != null || bi != null) ...[
           const SizedBox(height: 24),
           const Text('ملفاتي',
@@ -7076,20 +7067,22 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
+  bool _automaticFilter = false;
   int _filterChoiceGen = 0;
-  void _onFilter(ScanFilter f) {
+  void _onFilter(ScanFilter f, {bool autoChosen = false}) {
     final gen = ++_filterChoiceGen;
     if (f == ScanFilter.adaptive) {
       final path = src;
       if (path == null) return;
       unawaited(resolveImageFilter(path).then((chosen) {
         if (!mounted || busy || gen != _filterChoiceGen) return;
-        _onFilter(chosen);
+        _onFilter(chosen, autoChosen: true);
         snack(context, 'اختيار تلقائي: ${kFilterLabels[chosen]}، تقدر تغيّره بإيدك');
       }));
       return;
     }
     setState(() {
+      _automaticFilter = autoChosen;
       filter = f;
       final fv = _favs[f]; // الإعداد المفضل للفلتر (لو محفوظ)
       if (fv != null) {
@@ -7195,10 +7188,17 @@ class _EditorPageState extends State<EditorPage> {
         if (!mounted) return;
       }
       src = s;
+      if (e == null && !await Store.enhanced(widget.path) &&
+          await Store.filter() == ScanFilter.adaptive) {
+        _automaticFilter = true;
+        filter = await resolveImageFilter(s);
+        if (!mounted) return;
+      }
       if (e != null) {
         turns = e.turns;
         angle = e.angle;
-        filter = e.filter == ScanFilter.adaptive ? await resolveImageFilter(s) : e.filter;
+        _automaticFilter = e.filter == ScanFilter.adaptive;
+        filter = _automaticFilter ? await resolveImageFilter(s) : e.filter;
         contrast = e.contrast;
         brightness = e.brightness;
         sharp = e.sharp;
@@ -7538,7 +7538,7 @@ class _EditorPageState extends State<EditorPage> {
     if (_sig() == _sig0 && !_seedUnbaked) {
       if (all) {
         final style =
-            EditParams(filter: filter, contrast: contrast, brightness: brightness, sharp: sharp);
+            EditParams(filter: _automaticFilter ? ScanFilter.adaptive : filter, contrast: contrast, brightness: brightness, sharp: sharp);
         Navigator.pop(context, '$kAllPrefix|${style.encode()}|${widget.path}');
       } else {
         Navigator.pop(context, nav == null ? widget.path : '$kNavPrefix|$nav|${widget.path}');
@@ -7569,7 +7569,7 @@ class _EditorPageState extends State<EditorPage> {
           allowSafeReceiptOutput: prefs.getBool('apply_safe') == true);
       if (mounted) {
         final style =
-            EditParams(filter: filter, contrast: contrast, brightness: brightness, sharp: sharp);
+            EditParams(filter: _automaticFilter ? ScanFilter.adaptive : filter, contrast: contrast, brightness: brightness, sharp: sharp);
         Navigator.pop(
             context,
             all
@@ -7692,7 +7692,7 @@ class _EditorPageState extends State<EditorPage> {
         return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
           Row(children: [
             _peekBtn(),
-            Expanded(child: FilterBar(selected: filter, onChanged: busy ? null : _onFilter)),
+            Expanded(child: FilterBar(selected: filter, automaticChoice: _automaticFilter ? filter : null, onChanged: busy ? null : _onFilter)),
           ]),
           Row(children: [
             const Icon(Icons.brightness_6_rounded, size: 20),
@@ -8660,6 +8660,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         AppLog.i('camera-adapt requested=${preset.name} actual=${actualPreset.name}');
         _showCamWarning('الموبايل مش قادر يشغّل الدقة المطلوبة. اشتغلنا بدقة أقل مدعومة، راجع الأرقام قبل الحفظ', canUndo: false);
       }
+      _rememberDiagnostic('lastCameraDiagnostic', 'آخر تشغيل ناجح: مطلوب ${preset.name}، المستخدم ${actualPreset.name}\nمعاينة ${c.value.previewSize} (مش دقة الصورة المحفوظة)');
       AppLog.i('cam name=${back.name} lens=${back.lensDirection} sensor=${back.sensorOrientation} preset=$actualPreset requested=$preset preview=${c.value.previewSize} receipt=${widget.receiptQuality} detail=$_detailedCapture');
       try {
         await c.lockCaptureOrientation(DeviceOrientation.portraitUp);
