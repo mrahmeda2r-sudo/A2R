@@ -28,6 +28,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// الأسماء والوحدات بتتبني جوه التطبيق من ملف data.xlsx وقت البناء (assets/data.json).
 const kVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
+const kImageQualityRevision = 'receipt-q4';
 
 const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
 const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
@@ -97,12 +98,23 @@ class AppLog {
 /// مستوى الدقة اللي الموظف اختاره: 0 تلقائي (حسب وضع الأداء)، 1..4 من kResLevels.
 int gResLevel = 0;
 
-/// إيصالات الدفع (١٥ إيصال في الصورة الواحدة): بيرفع أقصى ضلع وجودة الـ JPEG طول ما شاشة الإيصالات مفتوحة.
-/// 0 = متعطّل (الإعدادات العادية).
-int gMinSide = 0;
-int gMinQuality = 0;
-const int kSheetHdSide = 4096;
-const int kSheetHdQuality = 90;
+/// Receipt quality is independent of global performance/resolution preferences.
+/// Persisted per image and passed explicitly to capture and export.
+class ImageQualityProfile {
+  final String id;
+  final int maxSide;
+  final int jpegQuality;
+  const ImageQualityProfile(this.id, this.maxSide, this.jpegQuality);
+  static const receipts = ImageQualityProfile('receipts-v1', 4096, 90);
+  static const detailedCapture = ImageQualityProfile('camera-detail-v1', 3200, 92);
+}
+
+// Per-shot handoff only. Persisted on the image as soon as ingest consumes it.
+final _captureProfiles = <String, ImageQualityProfile>{};
+void _rememberCaptureProfile(String path, ImageQualityProfile profile) {
+  if (_captureProfiles.length >= 8) _captureProfiles.remove(_captureProfiles.keys.first);
+  _captureProfiles[path] = profile;
+}
 
 /// (رقم، الاسم، الرقم المختصر، أقصى ضلع بالبكسل)
 const kResLevels = <(int, String, String, int)>[
@@ -114,12 +126,8 @@ const kResLevels = <(int, String, String, int)>[
 
 String resShort(int l) => l <= 0 || l > kResLevels.length ? 'تلقائي' : kResLevels[l - 1].$3;
 
-int getMaxSide(PerfMode mode) {
-  final v = _getMaxSideBase(mode);
-  // لو الموظف اختار دقة بنفسه نلتزم باختياره، وإلا إيصالات الصور المتعددة بترفع الحد الأدنى
-  if (gResLevel > 0) return v;
-  return gMinSide > v ? gMinSide : v;
-}
+int getMaxSide(PerfMode mode, {ImageQualityProfile? profile}) =>
+    profile?.maxSide ?? _getMaxSideBase(mode);
 
 int _getMaxSideBase(PerfMode mode) {
   if (gResLevel > 0 && gResLevel <= kResLevels.length) {
@@ -303,12 +311,14 @@ enum ScanFilter {
   receiptBw,
   auto,
   clean,
+  adaptive, // Append only: existing saved filter indices stay valid.
 }
 
 /// ترتيب وأسماء الفلاتر في الشاشة (الإيصالات الأول لأنها الأهم).
 // الفلاتر الظاهرة في شاشة التعديل. (enhance وmagic وgray وbw اتخفّوا من القايمة: مكررين أو ضعاف
 // للإيصالات، لكن لسه موجودين في الكود عشان الصور والإعدادات القديمة اللي اتخزنت بأرقامهم تفضل شغالة)
 const kFilterOrder = <ScanFilter>[
+  ScanFilter.adaptive,
   ScanFilter.original,
   ScanFilter.receipt,
   ScanFilter.thermal,
@@ -325,7 +335,8 @@ const kFilterLabels = <ScanFilter, String>{
   ScanFilter.receipt: 'إيصال',
   ScanFilter.thermal: 'حراري باهت',
   ScanFilter.receiptBw: 'فوتوكوبي',
-  ScanFilter.auto: 'تلقائي',
+  ScanFilter.auto: 'ضبط مستويات',
+  ScanFilter.adaptive: 'تلقائي حسب الصورة',
   ScanFilter.enhance: 'تحسين',
   ScanFilter.magic: 'ألوان',
   ScanFilter.document: 'مستند',
@@ -428,6 +439,62 @@ Uint8List _sharpenJob(Map<String, dynamic> a) {
     }
   }
   return out;
+}
+
+/// Conservative per-image selection. At most 160 pixels on the longer side;
+/// center region limits desk/background influence. No OCR, network or model.
+final _adaptiveCache = <String, ScanFilter>{};
+ScanFilter chooseImageFilter(Uint8List rgba, int w, int h) {
+  final hist = List<int>.filled(256, 0);
+  var n = 0, colored = 0;
+  final x0 = (w * 0.12).floor(), x1 = (w * 0.88).ceil();
+  final y0 = (h * 0.12).floor(), y1 = (h * 0.88).ceil();
+  for (var y = y0; y < y1; y++) {
+    for (var x = x0; x < x1; x++) {
+      final i = (y * w + x) * 4;
+      if (i + 2 >= rgba.length) continue;
+      final r = rgba[i], g = rgba[i+1], b = rgba[i+2];
+      final lum = (r*54 + g*183 + b*19) >> 8;
+      hist[lum]++;
+      if (math.max(r, math.max(g,b)) - math.min(r, math.min(g,b)) > 38) colored++;
+      n++;
+    }
+  }
+  if (n < 16) return ScanFilter.original;
+  final low = _histPct(hist,n,0.08), mid = _histPct(hist,n,0.50);
+  final high = _histPct(hist,n,0.92);
+  // Preserve colored content and stamps instead of whitening/desaturating it.
+  if (colored / n > 0.07) return ScanFilter.original;
+  // Low contrast/faint text: gentle local cleanup without hard white clipping.
+  if (high - low < 75) return ScanFilter.clean;
+  // Uneven or dark paper needs local illumination correction.
+  if (mid < 155 || high < 210) return ScanFilter.clean;
+  // Crisp, bright neutral documents need no extra lossy enhancement.
+  if (mid > 218 && low < 135) return ScanFilter.original;
+  return ScanFilter.receipt;
+}
+
+Future<ScanFilter> resolveImageFilter(String path) async {
+  final cached = _adaptiveCache[path];
+  if (cached != null) return cached;
+  final sw = Stopwatch()..start();
+  try {
+    final bytes = (_hotImgPath == path ? _hotImgBytes : null) ?? await File(path).readAsBytes();
+    final sz = await imageSize(bytes);
+    final width = math.max(1, (sz.w * math.min(1.0, 160 / math.max(sz.w,sz.h))).round());
+    final img = await decodeImage(bytes, maxWidth: width);
+    final w = img.width, h = img.height;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    img.dispose();
+    final choice = bd == null ? ScanFilter.original : chooseImageFilter(_bytesOf(bd),w,h);
+    if (_adaptiveCache.length >= 32) _adaptiveCache.remove(_adaptiveCache.keys.first);
+    _adaptiveCache[path] = choice;
+    AppLog.i('filter-select choice=${choice.name} sample=${w}x$h ${sw.elapsedMilliseconds}ms');
+    return choice;
+  } catch (e,st) {
+    AppLog.e('filter-select',e,st);
+    return ScanFilter.original;
+  }
 }
 
 /// مستويات "التحسين التلقائي": أدنى قيمة للحبر، وأعلى قيمة لكل قناة (لون الورق) من نسخة مصغرة جداً (160px).
@@ -565,6 +632,17 @@ Future<({int w, int h})> imageSize(Uint8List bytes) async {
   }
 }
 
+Future<void> logImageQuality(String stage, Uint8List bytes,
+    {ImageQualityProfile? profile}) async {
+  try {
+    final sz = await imageSize(bytes);
+    AppLog.i('quality $kImageQualityRevision $stage ${sz.w}x${sz.h} '
+        '${bytes.lengthInBytes}B profile=${profile?.id ?? "standard"}');
+  } catch (e, st) {
+    AppLog.e('quality.$stage', e, st);
+  }
+}
+
 Future<double> imageAspect(String path) async {
   final s = await imageSize(await File(path).readAsBytes());
   return s.h / s.w;
@@ -584,6 +662,7 @@ List<double> editMatrix(ScanFilter f, double contrast, double brightness, [List<
       ];
 
   switch (f) {
+    case ScanFilter.adaptive: // Resolved before preview/render; identity is the safe fallback.
     case ScanFilter.original:
     case ScanFilter.receipt: // المعالجة الحقيقية في _cleanJob، والمصفوفة هنا للتباين والسطوع بس
     case ScanFilter.thermal:
@@ -865,7 +944,23 @@ Future<ui.Image> cleanUiImage(ui.Image img,
   return comp.future;
 }
 
-Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
+Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f,
+    {ImageQualityProfile? profile}) async {
+  if (f == ScanFilter.adaptive) {
+    try {
+    // Byte-based callers do not have a path. Select on a tiny decode first.
+    final sz = await imageSize(bytes);
+    final width = math.max(1, (sz.w * math.min(1.0, 160 / math.max(sz.w,sz.h))).round());
+    final sample = await decodeImage(bytes, maxWidth: width);
+    final bd = await sample.toByteData(format: ui.ImageByteFormat.rawRgba);
+    final choice = bd == null ? ScanFilter.original : chooseImageFilter(_bytesOf(bd),sample.width,sample.height);
+    sample.dispose();
+    return await applyFilter(bytes, choice, profile: profile);
+    } catch (e,st) {
+      AppLog.e('filter-select.bytes',e,st);
+      return bytes;
+    }
+  }
   if (f == ScanFilter.original) return bytes;
   try {
     final img = await decodeImage(bytes);
@@ -901,7 +996,7 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f) async {
       _bytesOf(bd!),
       minWidth: w,
       minHeight: h,
-      quality: await Store.jpegQuality(),
+      quality: await Store.jpegQuality(profile: profile),
       format: CompressFormat.jpeg,
     );
   } catch (e, st) {
@@ -998,19 +1093,25 @@ bool _isJpegHeader(Uint8List b) => b.length > 100 && b[0] == 0xFF && b[1] == 0xD
 Future<String> persistImage(String src, String name,
     {ScanFilter filter = ScanFilter.original,
     bool applyNow = true,
-    bool keepOriginal = false}) async {
+    bool keepOriginal = false,
+    ImageQualityProfile? profile}) async {
+  if (filter == ScanFilter.adaptive) filter = await resolveImageFilter(src);
   final swPersist = Stopwatch()..start();
+  final capturedProfile = _captureProfiles.remove(src);
+  profile ??= capturedProfile;
   final mode = await Store.perfMode();
-  final maxSide = getMaxSide(mode);
+  final maxSide = getMaxSide(mode, profile: profile);
   Uint8List? bytes;
-  if (keepOriginal) {
+  // Receipt input keeps its real source JPEG. Filtering/cropping encodes once later.
+  if (keepOriginal || profile != null) {
     // صور ماسح جوجل بتيجي مقصوصة ومعدولة جاهزة: نحفظها بأصلها بدون إعادة ضغط أو تصغير عشان متقلش جودتها
     try {
       final raw = await File(src).readAsBytes();
       if (_isJpegHeader(raw)) {
         final sz = await imageSize(raw);
-        if (sz.w > 0 && sz.h > 0 && math.max(sz.w, sz.h) <= 4096) {
+        if (sz.w > 0 && sz.h > 0 && (profile != null || math.max(sz.w, sz.h) <= 4096)) {
           bytes = raw;
+          await logImageQuality('source-preserved', raw, profile: profile);
         }
       }
     } catch (e, st) {
@@ -1023,7 +1124,7 @@ Future<String> persistImage(String src, String name,
         src,
         minWidth: maxSide,
         minHeight: maxSide,
-        quality: await Store.jpegQuality(),
+        quality: await Store.jpegQuality(profile: profile),
         format: CompressFormat.jpeg,
         keepExif: false,
       );
@@ -1044,7 +1145,7 @@ Future<String> persistImage(String src, String name,
         _bytesOf(bd!),
         minWidth: w,
         minHeight: h,
-        quality: await Store.jpegQuality(),
+        quality: await Store.jpegQuality(profile: profile),
         format: CompressFormat.jpeg,
       );
     } catch (e, st) {
@@ -1054,17 +1155,32 @@ Future<String> persistImage(String src, String name,
   if (bytes == null || !_isJpegHeader(bytes)) {
     throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
   }
+  await logImageQuality('ingest', bytes, profile: profile);
   final f = File('${(await Store.dir()).path}/$name');
+  if (profile != null) await Store.setQualityProfile(f.path, profile);
   if (filter != ScanFilter.original) {
     // نسخة من غير فلتر عشان التعديل بعد كده يبقى ممكن يرجّع الأصلي (بدون flush لعدم تعطيل الواجهة)
-    await File(Store.baseOf(f.path)).writeAsBytes(bytes);
+    // Receipt ingest keeps one source file until the first final render.
+    // Standard/legacy images retain their existing base-file behavior.
+    if (profile == null) await File(Store.baseOf(f.path)).writeAsBytes(bytes);
     await Store.setEdit(f.path, EditParams(filter: filter));
+    if (profile != null && !applyNow) await Store.setEditPending(f.path, true);
   }
   final tFilter = swPersist.elapsedMilliseconds;
   // applyNow=false: بنحفظ الصورة من غير فلتر (شاشة التعديل بتطبّقه على المعاينة) عشان الانتقال يبقى فوري
   if (applyNow) {
-    bytes = await applyFilter(bytes, filter);
-    await f.writeAsBytes(bytes);
+    // Receipt sources remain untouched until the final crop/filter render.
+    if (profile != null && filter != ScanFilter.original) {
+      await f.writeAsBytes(bytes);
+      final rendered = await renderEditedPage(f.path, 'ingest_', EditParams(filter: filter));
+      final renderedBase = File(Store.baseOf(rendered));
+      if (await renderedBase.exists()) await renderedBase.rename(Store.baseOf(f.path));
+      await File(rendered).rename(f.path);
+      await Store.del(rendered);
+    } else {
+      bytes = await applyFilter(bytes, filter, profile: profile);
+      await f.writeAsBytes(bytes);
+    }
   } else {
     _hotImgPath = f.path;
     _hotImgBytes = bytes;
@@ -1294,7 +1410,8 @@ Future<Uint8List> composeBatch(String path, Session s) async {
   if (await Store.noTag(path)) return src; // من غير ورقة
   final layout = await Store.batchLayout();
   final sz = await imageSize(src);
-  final maxSide = getMaxSide(await Store.perfMode());
+  final profile = await Store.qualityProfile(path);
+  final maxSide = getMaxSide(await Store.perfMode(), profile: profile);
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final iw = img.width, ih = img.height;
   final w = iw.toDouble(), h = ih.toDouble();
@@ -1348,7 +1465,7 @@ Future<Uint8List> composeBatch(String path, Session s) async {
   outImg.dispose();
   if (pngBd == null) throw Exception('تعذر حفظ الصورة');
   final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
-  final q = await Store.jpegQuality();
+  final q = await Store.jpegQuality(profile: profile);
   final want = _meanLum(rgba, ow, oh);
   // أول محاولة بالأبعاد الكاملة، ولو الناتج مشوّه نجرّب أبعاد أصغر، ولو برضه مشوّه منبعتش صورة بايظة
   for (final k in const [1.0, 0.75]) {
@@ -1413,7 +1530,7 @@ Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src;
   final sz = await imageSize(src);
-  final maxSide = getMaxSide(await Store.perfMode());
+  final maxSide = getMaxSide(await Store.perfMode(), profile: ImageQualityProfile.receipts);
   final img = await decodeImage(src, maxWidth: sz.w > maxSide ? maxSide : null);
   final iw = img.width, ih = img.height;
   final tag = await receiptTag(iw.toDouble(), s, pageLabel: pageLabel);
@@ -1448,7 +1565,7 @@ Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel
   outImg.dispose();
   if (pngBd == null) throw Exception('تعذر حفظ الصورة');
   final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
-  final q = await Store.jpegQuality();
+  final q = await Store.jpegQuality(profile: ImageQualityProfile.receipts);
   final want = _meanLum(rgba, iw, oh);
   for (final k in const [1.0, 0.75]) {
     final jpg = await FlutterImageCompress.compressWithList(
@@ -1459,7 +1576,10 @@ Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel
       format: CompressFormat.jpeg,
     );
     final got = await _jpegMeanLum(jpg);
-    if (got != null && (got - want).abs() < 25) return jpg;
+    if (got != null && (got - want).abs() < 25) {
+      await logImageQuality('share-photo', jpg, profile: ImageQualityProfile.receipts);
+      return jpg;
+    }
   }
   throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
 }
@@ -1473,7 +1593,8 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     final doc = pw.Document();
     const pageW = 595.0;
     final pad = pageW * kBandPad;
-    final compact = forceCompact ?? ((await Store.pdfSize()) == 1);
+    final compact = forceCompact ?? false;
+    final swPdf = Stopwatch()..start();
     final multi = receipts.length > 1;
     Tag? sharedTag;
     pw.MemoryImage? sharedTagImg;
@@ -1488,17 +1609,18 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
         // PDF مضغوط: نسخة أصغر (عرض ~720 وجودة 70) لو طلعت أخف وسليمة، وإلا بنستخدم الأصلية
         try {
           // صورة فيها ١٥ إيصال: الضغط لـ 720 هيمسح الأرقام، فبنخلّي دقة أعلى بكتير
-          final hd = gMinSide > 0;
           final c = await FlutterImageCompress.compressWithList(bytes,
-              minWidth: hd ? 2200 : 720,
-              minHeight: hd ? 2200 : 720,
-              quality: hd ? 78 : 70,
+              minWidth: 2200,
+              minHeight: 2200,
+              quality: 78,
               format: CompressFormat.jpeg);
           if (c.isNotEmpty && c.length < bytes.length && await _decodesOk(c)) bytes = c;
         } catch (e, st) {
           AppLog.e('pdf.compact', e, st);
         }
       }
+      await logImageQuality(compact ? 'pdf-compact' : 'pdf-original', bytes,
+          profile: ImageQualityProfile.receipts);
       final sz = await imageSize(bytes);
       final imgH = pageW * sz.h / sz.w;
       final hide = await Store.noTag(receipts[i]);
@@ -1532,8 +1654,10 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     }
     onProgress?.call(receipts.length, receipts.length);
     final dir = await Store.dir();
-    final file = File('${dir.path}/${s.pdfName}.pdf');
+    final suffix = compact ? '_compact' : '';
+    final file = File('${dir.path}/${s.pdfName}$suffix.pdf');
     await file.writeAsBytes(await doc.save(), flush: true);
+    AppLog.i('t pdf compact=$compact ${swPdf.elapsedMilliseconds}ms ${await file.length()}B');
     return file;
   } finally {
     Store.working--;
@@ -1566,6 +1690,11 @@ class Store {
   }
 
   static Future<void> del(String path) async {
+    _adaptiveCache.remove(path);
+    if (_hotImgPath == path) {
+      _hotImgPath = null;
+      _hotImgBytes = null;
+    }
     try {
       final f = File(path);
       if (await f.exists()) await f.delete();
@@ -1577,6 +1706,8 @@ class Store {
       await p.remove('notag:$path');
       await p.remove('enh:$path');
       await p.remove('ocr:$path');
+      await p.remove('quality:$path');
+      await p.remove('pendingEdit:$path');
       final kept = p.getStringList('kept');
       if (kept != null && kept.remove(path)) await p.setStringList('kept', kept);
       final arch = p.getStringList('archive');
@@ -1638,9 +1769,9 @@ class Store {
     await (await _p).setInt('resLevel', gResLevel);
   }
 
-  static Future<int> jpegQuality() async {
+  static Future<int> jpegQuality({ImageQualityProfile? profile}) async {
     final b = await _jpegQualityBase();
-    return gMinQuality > b ? gMinQuality : b;
+    return profile == null ? b : math.max(b, profile.jpegQuality);
   }
 
   static Future<int> _jpegQualityBase() async {
@@ -1669,7 +1800,13 @@ class Store {
   }
 
   static Future<ScanFilter> filter() async {
-    final i = (await _p).getInt('filter') ?? ScanFilter.receipt.index;
+    final p = await _p;
+    // New automatic policy is the default once, then explicit manual choices persist.
+    if (p.getBool('adaptiveFilterV1') != true) {
+      await p.setInt('filter', ScanFilter.adaptive.index);
+      await p.setBool('adaptiveFilterV1', true);
+    }
+    final i = p.getInt('filter') ?? ScanFilter.adaptive.index;
     return ScanFilter.values[i.clamp(0, ScanFilter.values.length - 1)];
   }
 
@@ -1888,6 +2025,33 @@ class Store {
     }
   }
 
+  static Future<bool> editPending(String path) async =>
+      (await _p).getBool('pendingEdit:$path') ?? false;
+
+  static Future<void> setEditPending(String path, bool value) async =>
+      (await _p).setBool('pendingEdit:$path', value);
+
+  static Future<ImageQualityProfile?> qualityProfile(String path) async {
+    final p = await _p;
+    if (p.getString('quality:$path') == ImageQualityProfile.detailedCapture.id) {
+      return ImageQualityProfile.detailedCapture;
+    }
+    if (p.getString('quality:$path') == ImageQualityProfile.receipts.id) {
+      return ImageQualityProfile.receipts;
+    }
+    // Existing receipt drafts and PDFs get the receipt profile on first use.
+    if ((p.getStringList('draft') ?? []).contains(path) ||
+        (p.getStringList('pdfImgs') ?? []).contains(path) ||
+        (p.getStringList('rcSentImgs') ?? []).contains(path)) {
+      await p.setString('quality:$path', ImageQualityProfile.receipts.id);
+      return ImageQualityProfile.receipts;
+    }
+    return null;
+  }
+
+  static Future<void> setQualityProfile(String path, ImageQualityProfile profile) async =>
+      (await _p).setString('quality:$path', profile.id);
+
   /// نص الصورة المقروء بالـ OCR (بيتخزن أول مرة قراءة عشان البحث يبقى سريع).
   static Future<String?> ocrText(String path) async => (await _p).getString('ocr:$path');
 
@@ -1942,6 +2106,8 @@ class Store {
     await p.setStringList('draft', l);
     if (await noTag(old)) await setNoTag(neu, true); // الاختيار يفضل بعد التعديل
     if (await enhanced(old)) await setEnhanced(neu, true);
+    final profile = await qualityProfile(old);
+    if (profile != null) await setQualityProfile(neu, profile);
     // لو الصورة كانت من اللي اتبعتوا: الصورة المعدّلة تاخد مكانها في قايمة "اتبعت"
     final sent = p.getStringList('rcSentImgs');
     if (sent != null && sent.contains(old)) {
@@ -2206,7 +2372,8 @@ Future<bool> ensureCamera(BuildContext context) async {
   return false;
 }
 
-Future<List<String>> simplePick(BuildContext context, {bool multi = false}) async {
+Future<List<String>> simplePick(BuildContext context,
+    {bool multi = false, ImageQualityProfile? profile}) async {
   final src = await showModalBottomSheet<ImageSource>(
     context: context,
     builder: (c) => SafeArea(
@@ -2226,10 +2393,10 @@ Future<List<String>> simplePick(BuildContext context, {bool multi = false}) asyn
   try {
     final picker = ImagePicker();
     if (src == ImageSource.gallery && multi) {
-      final xs = await picker.pickMultiImage(maxWidth: 2000, imageQuality: 85);
+      final xs = await picker.pickMultiImage(maxWidth: profile == null ? 2000 : null, imageQuality: profile == null ? 85 : null);
       return xs.map((e) => e.path).toList();
     }
-    final x = await picker.pickImage(source: src, maxWidth: 2000, imageQuality: 85);
+    final x = await picker.pickImage(source: src, maxWidth: profile == null ? 2000 : null, imageQuality: profile == null ? 85 : null);
     return x == null ? [] : [x.path];
   } catch (e, st) {
     AppLog.e('simplePick', e, st);
@@ -2281,8 +2448,9 @@ List<Offset>? _shotQuad; // آخر تحديد حي وقت الضغط على زر
 bool _lastScanManual = false; // آخر تصوير اتعمل بالكاميرا العادية (من غير ماسح ML Kit) فمحتاج شاشة القص
 bool _scannerFailed = false; // فشل الماسح في الجلسة دي (بيتصفّر لما التطبيق يتقفل)
 
-Future<List<String>> _manualPick(BuildContext context, {bool multi = false}) async {
-  final r = await simplePick(context, multi: multi);
+Future<List<String>> _manualPick(BuildContext context,
+    {bool multi = false, ImageQualityProfile? profile}) async {
+  final r = await simplePick(context, multi: multi, profile: profile);
   _lastScanManual = r.isNotEmpty;
   return r;
 }
@@ -2312,24 +2480,24 @@ bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط �
 bool _lastScanEnhanced = false;
 
 Future<List<String>> scanImages(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.base, bool camFallback = false}) async {
+    {ScannerMode mode = ScannerMode.base, bool camFallback = false, ImageQualityProfile? profile}) async {
   if (_scanBusy) return [];
   _scanBusy = true;
   try {
-    return await _scanImagesImpl(context, limit, mode: mode, camFallback: camFallback);
+    return await _scanImagesImpl(context, limit, mode: mode, camFallback: camFallback, profile: profile);
   } finally {
     _scanBusy = false;
   }
 }
 
 Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.base, bool camFallback = false}) async {
+    {ScannerMode mode = ScannerMode.base, bool camFallback = false, ImageQualityProfile? profile}) async {
   _lastScanManual = false;
   _lastScanEnhanced = false;
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
   final perf = await Store.perfMode();
-  if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1);
+  if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1, profile: profile);
   Object? lastErr;
 
   // بيرجّع قائمة الصور، أو قائمة فاضية لو المستخدم لغى، أو null لو الماسح فشل.
@@ -2352,13 +2520,18 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
     }
   }
 
+  var usedMode = mode;
   var imgs = await tryScan(mode);
   if (imgs == null && mode != ScannerMode.base) {
     // الوضع الكامل ممكن يكون مش مدعوم على الموبايل ده (خدمات جوجل قديمة أو رامات قليلة): نرجع للأساسي
-    imgs = await tryScan(ScannerMode.base);
+    usedMode = ScannerMode.base;
+    imgs = await tryScan(usedMode);
   }
-  if (imgs != null && imgs.isNotEmpty && mode != ScannerMode.base) _lastScanEnhanced = true;
-  if (imgs != null) return imgs;
+  if (imgs != null && imgs.isNotEmpty && usedMode != ScannerMode.base) _lastScanEnhanced = true;
+  if (imgs != null) {
+    AppLog.i('scanner requested=$mode used=$usedMode pages=${imgs.length}');
+    return imgs;
+  }
   if (!context.mounted) return [];
   _scannerFailed = true;
   try {
@@ -2391,7 +2564,7 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
     ),
   );
   if (!context.mounted) return [];
-  return _manualPick(context, multi: limit > 1);
+  return _manualPick(context, multi: limit > 1, profile: profile);
 }
 
 /// قايمة المشاركة العادية: الموظف يختار واتساب أو أي تطبيق.
@@ -4865,7 +5038,7 @@ class _BatchScreenState extends State<BatchScreen> {
       try {
         final path = await persistImage(
             lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-            filter: ScanFilter.receipt);
+            filter: ScanFilter.adaptive);
         await Store.setBatchImg(path, fresh: true);
         await _show(path);
         _lastScanManual = true;
@@ -4934,7 +5107,7 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt, applyNow: false);
+          filter: ScanFilter.adaptive, applyNow: false);
       await Store.setBatchImg(path, fresh: true);
       await _show(path);
       unawaited(qualityWarning(path).then((warn) {
@@ -4955,7 +5128,7 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt, applyNow: false, keepOriginal: keepOriginal);
+          filter: ScanFilter.adaptive, applyNow: false, keepOriginal: keepOriginal);
       await Store.setBatchImg(path, fresh: true);
       return path;
     } catch (e) {
@@ -4969,7 +5142,9 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final f = File(path);
       if (await f.exists()) {
-        await f.writeAsBytes(await applyFilter(await f.readAsBytes(), ScanFilter.receipt));
+        await f.writeAsBytes(await applyFilter(await f.readAsBytes(),
+          await resolveImageFilter(path),
+          profile: await Store.qualityProfile(path)));
         await FileImage(f).evict();
       }
     } catch (e, st) {
@@ -5129,7 +5304,7 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.receipt, applyNow: false);
+          filter: ScanFilter.adaptive, applyNow: false);
       await Store.setBatchImg(path, fresh: true);
       await _show(path);
     } catch (e) {
@@ -5444,12 +5619,18 @@ Future<ui.Image> _rotateUi(ui.Image src, int turns) async {
 }
 
 /// الصورة بعد التدوير بدقة محدودة (kMaxSide) عشان الذاكرة.
-Future<ui.Image> _rotatedImage(String path, int turns) async {
+Future<ui.Image> _rotatedImage(String path, int turns,
+    {ImageQualityProfile? profile, int? maxDecodeSide}) async {
   final mode = await Store.perfMode();
-  final maxSide = getMaxSide(mode);
-  final bytes = await File(path).readAsBytes();
+  final maxSide = maxDecodeSide ?? getMaxSide(mode, profile: profile);
+  final bytes = _takeHotBytes(path) ?? await File(path).readAsBytes();
   final sz = await imageSize(bytes);
-  final src = await decodeImage(bytes, maxWidth: sz.w > maxSide ? maxSide : null);
+  // Bound the decode by the longer side, including portrait sources.
+  final longest = math.max(sz.w, sz.h);
+  final decodeWidth = profile == null && maxDecodeSide == null
+      ? (sz.w > maxSide ? maxSide : null)
+      : (longest > maxSide ? math.max(1, (sz.w * maxSide / longest).round()) : null);
+  final src = await decodeImage(bytes, maxWidth: decodeWidth);
   return _rotateUi(src, turns);
 }
 
@@ -5548,12 +5729,6 @@ List<Offset> _rectOf(List<Offset> q) {
 /// شكل القص التلقائي: 0 ذكي (الافتراضي)، 1 مستطيل دايماً، 2 منظور (4 أركان) دايماً.
 int autoCropMode = 0;
 
-/// الفرق بين اتجاهين (بالدرجات) كخطوط، من 0 لـ 90.
-double _angDiff(double a, double b) {
-  final d = (a - b).abs() % 180;
-  return d > 90 ? 180 - d : d;
-}
-
 /// بيقرر شكل الإطار التلقائي. aspect = ارتفاع/عرض الصورة.
 /// الذكي: لو الأركان الأربعة شكلها مستطيل فعلاً (حتى لو ملفوف) بنحتفظ بيها عشان تتعدّل الورقة،
 /// ولو الشكل مائل أو مشوّه (غالباً الكشف غلط أو منظور قوي) بنرجع لمستطيل مستقيم.
@@ -5561,18 +5736,9 @@ List<Offset> _shapeQuad(List<Offset> q, double aspect, [int? mode]) {
   final m = mode ?? autoCropMode;
   if (m == 2) return q;
   if (m == 1) return _rectOf(q);
-  final p = [for (final o in q) Offset(o.dx, o.dy * aspect)];
-  double dir(Offset a, Offset b) => math.atan2(b.dy - a.dy, b.dx - a.dx) * 180 / math.pi;
-  final top = dir(p[0], p[1]), right = dir(p[3], p[2]);
-  final left = dir(p[0], p[3]), rightSide = dir(p[1], p[2]);
-  final par = math.max(_angDiff(top, right), _angDiff(left, rightSide));
-  var dev = 0.0;
-  for (final a in [top, right]) {
-    for (final b in [left, rightSide]) {
-      dev = math.max(dev, 90 - _angDiff(a, b));
-    }
-  }
-  return (par <= 12 && dev <= 14) ? q : _rectOf(q);
+  // A valid perspective quad is not made more accurate by its bounding box.
+  // Only the explicit rectangle preference may expand it to background.
+  return q;
 }
 
 Future<bool> _nativeDetectorAllowed() async {
@@ -5613,7 +5779,7 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
       final int v = y - ((warm * 6) >> 3);
       feat[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
-    return _quadFromFeature(feat, w, h);
+    return await compute(_stillQuadJob, <String, dynamic>{'feat': feat, 'w': w, 'h': h});
   } catch (e, st) {
     AppLog.e('_detectDocQuadSimple', e, st);
     return null;
@@ -5622,6 +5788,51 @@ Future<List<Offset>?> _detectDocQuadSimple(String path) async {
 
 /// الجزء المشترك بين كشف الصورة المصوّرة والكشف الحي من الكاميرا.
 /// feat: قيمة 0..255 لكل بكسل (الورقة غالباً أعلى من الخلفية). بيرجّع TL,TR,BR,BL كنسب.
+List<Offset>? _stillQuadJob(Map<String, dynamic> a) =>
+    _quadFromFeature(a['feat'] as Uint8List, a['w'] as int, a['h'] as int);
+
+/// A crop needs a visible, continuous edge on every side. A frame edge is
+/// not evidence of the paper edge. Return no crop rather than guess/cut text.
+bool _supportedQuad(Uint16List mag, List<Offset> q, int w, int h) {
+  for (var i = 0; i < 4; i++) {
+    final a = q[i], b = q[(i + 1) % 4];
+    if ((a.dx < 0.018 && b.dx < 0.018) ||
+        (a.dx > 0.982 && b.dx > 0.982) ||
+        (a.dy < 0.018 && b.dy < 0.018) ||
+        (a.dy > 0.982 && b.dy > 0.982)) return false;
+    var supported = 0;
+    const steps = 28;
+    for (var k = 0; k < steps; k++) {
+      final t = 0.08 + 0.84 * k / (steps - 1);
+      final x = ((a.dx + (b.dx - a.dx) * t) * w).round();
+      final y = ((a.dy + (b.dy - a.dy) * t) * h).round();
+      var best = 0;
+      for (var yy = math.max(1, y - 1); yy <= math.min(h - 2, y + 1); yy++) {
+        for (var xx = math.max(1, x - 1); xx <= math.min(w - 2, x + 1); xx++) {
+          best = math.max(best, mag[yy * w + xx]);
+        }
+      }
+      if (best >= 48) supported++;
+    }
+    if (supported < steps * 0.55) return false;
+  }
+  return true;
+}
+
+/// Low-cost focus proxy for automatic capture, not proof of hardware AF lock.
+/// Measures sharp edge transitions on the already-sampled luminance feature.
+bool _frameHasDetail(Uint8List feat, int w, int h) {
+  var edgeCount = 0;
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final i = y * w + x;
+      final lap = (4 * feat[i] - feat[i-1] - feat[i+1] - feat[i-w] - feat[i+w]).abs();
+      if (lap >= 32) edgeCount++;
+    }
+  }
+  return edgeCount >= w * h * 0.012;
+}
+
 List<bool> _dilate4(List<bool> m, int w, int h) {
   final o = List<bool>.filled(w * h, false);
   for (var y = 0; y < h; y++) {
@@ -5843,7 +6054,7 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
         Offset(((rq[2].dx + 0.5) / w).clamp(0.0, 1.0), ((rq[2].dy + 0.5) / h).clamp(0.0, 1.0)),
         Offset(((rq[3].dx + 0.5) / w).clamp(0.0, 1.0), ((rq[3].dy + 0.5) / h).clamp(0.0, 1.0)),
       ];
-      if (!_quadConvex(q)) continue;
+      if (!_quadConvex(q) || !_supportedQuad(mag, q, w, h)) continue;
       final area = _quadArea(q);
       if (area < 0.05 || area > 0.90) continue;
       var touch = 0;
@@ -5876,7 +6087,9 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
   // والركن هو تقاطع الخطوط (أدق بكتير من نقاط الحواف الخام خصوصاً مع الدوران والميل)
   final refined = _refineQuadLines(feat, w, h, bestThr, bestSeed, bestQ);
   // تحسين نهائي (Edge Snapping): تحريك كل ضلع ±2 بكسل نحو أقوى حافة فعلية (Sobel) ليلتصق بحدود الورقة بدقة
-  return _snapQuadToSobel(mag, refined ?? bestQ, w, h);
+  final snapped = _snapQuadToSobel(mag, refined ?? bestQ, w, h);
+  if (_supportedQuad(mag, snapped, w, h)) return snapped;
+  return _supportedQuad(mag, bestQ, w, h) ? bestQ : null;
 }
 
 /// تركيب خط مستقيم على كل ضلع من أضلاع الرباعي الأولي باستخدام بكسلات حدود المكوّن الفائز،
@@ -6042,7 +6255,8 @@ List<Offset> _snapQuadToSobel(Uint16List mag, List<Offset> q, int w, int h) {
     final nx = -dy / len, ny = dx / len;
     var bestShift = 0.0;
     var bestVal = sideAvg(p0, p1);
-    for (final sh in const [-2.0, -1.0, 1.0, 2.0]) {
+    final step = math.min(1.0, math.min(w, h) * 0.01);
+    for (final sh in [-2 * step, -step, step, 2 * step]) {
       final a = Offset(p0.dx + nx * sh, p0.dy + ny * sh);
       final b = Offset(p1.dx + nx * sh, p1.dy + ny * sh);
       final v = sideAvg(a, b);
@@ -6385,7 +6599,8 @@ Map<String, dynamic> _renderPipelineJob(Map<String, dynamic> a) {
 
 /// بيرسم صفحة بعد التعديل (قص + تدوير + فلتر) من نسختها الأصلية وبيرجّع مسار الصورة الجديدة.
 /// بيستخدمه المحرر (زر ✓) و"طبّق على كل الصفحات".
-Future<String> renderEditedPage(String path, String prefix, EditParams e) async {
+Future<String> renderEditedPage(String path, String prefix, EditParams e,
+    {bool allowSafeReceiptOutput = false}) async {
   final sp = await SharedPreferences.getInstance();
   Store.working++;
   try {
@@ -6393,7 +6608,8 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
     await sp.setBool('apply_guard', true);
     final baseF = File(Store.baseOf(path));
     final src = await baseF.exists() ? baseF.path : path;
-    final turns = e.turns, angle = e.angle, filter = e.filter;
+    final turns = e.turns, angle = e.angle;
+    final filter = e.filter == ScanFilter.adaptive ? await resolveImageFilter(src) : e.filter;
     final contrast = e.contrast, brightness = e.brightness, sharp = e.sharp;
     var levels = e.levels;
     final quad = (e.quad != null && _quadConvex(e.quad!))
@@ -6403,7 +6619,14 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
     if (filter == ScanFilter.auto && levels == null) {
       levels = await autoLevelsOf(await File(src).readAsBytes());
     }
-    final r = await _rotatedImage(src, turns);
+    final profile = await Store.qualityProfile(path);
+    final safe = sp.getBool('apply_safe') ?? false;
+    if (profile != null && safe && !allowSafeReceiptOutput) {
+      throw Exception('حماية الذاكرة شغالة. افتح التعديل واختر الحفظ الآمن، أو أعد تشغيل التطبيق للمحاولة بالدقة العالية');
+    }
+    final decodeLimit = safe ? math.min(1400, getMaxSide(await Store.perfMode(), profile: profile)) : null;
+    final swRender = Stopwatch()..start();
+    final r = await _rotatedImage(src, turns, profile: profile, maxDecodeSide: decodeLimit);
     final rw = r.width, rh = r.height;
     AppLog.i('apply decoded ${rw}x$rh');
     final bd = await r.toByteData(format: ui.ImageByteFormat.rawRgba);
@@ -6414,8 +6637,7 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
     final leftH = (pts[3] - pts[0]).distance, rightH = (pts[2] - pts[1]).distance;
     var ow = math.max(topW, botW), oh = math.max(leftH, rightH);
     final mode = await Store.perfMode();
-    final safe = sp.getBool('apply_safe') ?? false;
-    final maxSide = safe ? math.min(1400, getMaxSide(mode)) : getMaxSide(mode);
+    final maxSide = safe ? math.min(1400, getMaxSide(mode, profile: profile)) : getMaxSide(mode, profile: profile);
     final k = math.min(1.0, maxSide / math.max(ow, oh));
     ow *= k;
     oh *= k;
@@ -6462,13 +6684,15 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e) async 
       png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
       minWidth: fw,
       minHeight: fh,
-      quality: await Store.jpegQuality(),
+      quality: await Store.jpegQuality(profile: profile),
       format: CompressFormat.jpeg,
     );
     final dir = (await Store.dir()).path;
     final nf = File('$dir/$prefix${DateTime.now().microsecondsSinceEpoch}.jpg');
     await nf.writeAsBytes(jpg);
-    AppLog.i('apply jpg ${jpg.length ~/ 1024}KB saved');
+    await logImageQuality('edited', jpg, profile: profile);
+    AppLog.i('t render ${swRender.elapsedMilliseconds}ms');
+    if (profile != null) await Store.setQualityProfile(nf.path, profile);
     // النسخة الأصلية بتنتقل للصورة الجديدة (أو بتتعمل أول مرة من الصورة الحالية)
     final oldBase = File(Store.baseOf(path));
     final newBase = Store.baseOf(nf.path);
@@ -6626,6 +6850,9 @@ class _EditorPageState extends State<EditorPage> {
   bool _quadTouched = false; // الموظف حدد الإطار بنفسه: القص التلقائي المتأخر ميلمسوش
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
   int _viewGen = 0;
+  bool _receiptQuality = false;
+  bool _detailPreview = false;
+  Timer? _detailTimer;
   ui.Image? cleaned; // نسخة منضّفة للمعاينة لما الفلتر من فلاتر الإيصال
   // النسخة المنضّفة المعروضة اتعملت بأي وضع تنضيف: 0 إيصال، 1 حراري باهت، 2 تنضيف بس
   int _cleanedMode = 0;
@@ -6763,6 +6990,7 @@ class _EditorPageState extends State<EditorPage> {
 
   @override
   void dispose() {
+    _detailTimer?.cancel();
     view?.dispose();
     cleaned?.dispose();
     sharpImg?.dispose();
@@ -6848,7 +7076,19 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
+  int _filterChoiceGen = 0;
   void _onFilter(ScanFilter f) {
+    final gen = ++_filterChoiceGen;
+    if (f == ScanFilter.adaptive) {
+      final path = src;
+      if (path == null) return;
+      unawaited(resolveImageFilter(path).then((chosen) {
+        if (!mounted || busy || gen != _filterChoiceGen) return;
+        _onFilter(chosen);
+        snack(context, 'اختيار تلقائي: ${kFilterLabels[chosen]}، تقدر تغيّره بإيدك');
+      }));
+      return;
+    }
     setState(() {
       filter = f;
       final fv = _favs[f]; // الإعداد المفضل للفلتر (لو محفوظ)
@@ -6876,12 +7116,32 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
+  // Do not decode a large preview on entry or on every pinch frame.
+  // Upgrade only after a receipt zoom gesture finishes, at most once per editor.
+  void _requestDetailPreview() {
+    if (!_receiptQuality || _detailPreview || _zm < 1.4 || busy) return;
+    _detailTimer?.cancel();
+    _detailTimer = Timer(const Duration(milliseconds: 250), () {
+      if (!mounted || busy || _zm < 1.4 || _detailPreview) return;
+      _detailPreview = true;
+      unawaited(_loadView());
+    });
+  }
+
   Future<void> _loadView({Uint8List? preloadedBytes}) async {
     final gen = ++_viewGen;
     try {
       final lite = await Store.perfMode() == PerfMode.lite;
       final raw = preloadedBytes ?? await File(src!).readAsBytes();
-      final img = await decodeImage(raw, maxWidth: lite ? 700 : 1200);
+      int? previewWidth = lite ? 700 : 1200;
+      if (_detailPreview && _receiptQuality) {
+        final sz = await imageSize(raw);
+        final limit = lite ? 1800 : 3200;
+        final longest = math.max(sz.w, sz.h);
+        previewWidth = longest > limit ? math.max(1, (sz.w * limit / longest).round()) : null;
+      }
+      final img = await decodeImage(raw, maxWidth: previewWidth);
+      AppLog.i('preview detail=$_detailPreview ${img.width}x${img.height}');
       final baseAspect = img.height / img.width;
       final r = await _rotateUi(img, turns);
       if (!mounted || gen != _viewGen) {
@@ -6921,13 +7181,15 @@ class _EditorPageState extends State<EditorPage> {
       unawaited(_loadFavs()); // متوقفش فتح الصورة عشان قراءة المفضلة
       final hot = _takeHotBytes(widget.path);
       final base = File(Store.baseOf(widget.path));
-      final s = (hot != null || await base.exists()) ? base.path : widget.path;
+      final s = await base.exists() ? base.path : widget.path;
       final e = await Store.editOf(widget.path);
+      _receiptQuality = await Store.qualityProfile(widget.path) != null;
       if (!mounted) return;
       if (e != null) {
         // لو الصورة الحالية والنسخة الأصلية نفس البايتس: الفلتر متسجّل بس مش مرسوم على الملف لسه.
         final bf = File(Store.baseOf(widget.path));
-        if (await bf.exists() && await _sameFileBytes(widget.path, bf.path)) {
+        if (await Store.editPending(widget.path) ||
+            (await bf.exists() && await _sameFileBytes(widget.path, bf.path))) {
           _seedUnbaked = true;
         }
         if (!mounted) return;
@@ -6936,7 +7198,7 @@ class _EditorPageState extends State<EditorPage> {
       if (e != null) {
         turns = e.turns;
         angle = e.angle;
-        filter = e.filter;
+        filter = e.filter == ScanFilter.adaptive ? await resolveImageFilter(s) : e.filter;
         contrast = e.contrast;
         brightness = e.brightness;
         sharp = e.sharp;
@@ -7137,6 +7399,7 @@ class _EditorPageState extends State<EditorPage> {
     final wasDrag = drag;
     if (drag != -1) setState(() => drag = -1);
     if (wasDrag != -1 && !cancel) _mark();
+    if (!cancel) _requestDetailPreview();
     if (cancel || _pinched) return;
     if (_swipeOk) {
       // سويب أفقي: يمين = الصفحة اللي بعدها (أو إضافة صورة)، شمال = اللي قبلها
@@ -7172,6 +7435,7 @@ class _EditorPageState extends State<EditorPage> {
       _lastTapAt = now;
       _lastTapPos = pos;
     }
+    _requestDetailPreview();
   }
 
   Offset? _focus(Size s) {
@@ -7242,13 +7506,13 @@ class _EditorPageState extends State<EditorPage> {
 
   Future<void> _auto({bool silent = false}) async {
     if (!silent) _quadTouched = false;
-    setState(() => busy = true);
+    if (!silent) setState(() => busy = true);
     try {
       final q = await detectDocQuad(src!);
       if (!mounted) return;
       if (silent && _quadTouched) return;
       if (q == null) {
-        if (!silent) snack(context, 'مقدرتش أحدد حدود الورقة تلقائياً، حددها بإيدك');
+        snack(context, 'حدود الإيصال مش واضحة. قرّب الورقة وخلي خلفيتها مختلفة، أو حدد الأركان بإيدك');
       } else {
         var r = q;
         for (var i = 0; i < turns; i++) {
@@ -7261,7 +7525,7 @@ class _EditorPageState extends State<EditorPage> {
         _mark();
       }
     } finally {
-      if (mounted) setState(() => busy = false);
+      if (mounted && !silent) setState(() => busy = false);
     }
   }
 
@@ -7283,6 +7547,15 @@ class _EditorPageState extends State<EditorPage> {
     }
     setState(() => busy = true);
     try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool('apply_safe') == true &&
+          await Store.qualityProfile(widget.path) != null) {
+        if (!mounted) return;
+        final proceed = await askYesNo(context, 'حماية الذاكرة',
+            'آخر تعديل اتوقف. الحفظ الآمن هيقلل دقة النسخة إلى 1400 بكسل، والأصل هيفضل محفوظ. نكمل؟',
+            yes: 'حفظ آمن', no: 'إلغاء');
+        if (!proceed || !mounted) return;
+      }
       final ep = EditParams(
           quad: quad,
           turns: turns,
@@ -7292,7 +7565,8 @@ class _EditorPageState extends State<EditorPage> {
           brightness: brightness,
           sharp: sharp,
           levels: levels);
-      final np = await renderEditedPage(widget.path, widget.prefix, ep);
+      final np = await renderEditedPage(widget.path, widget.prefix, ep,
+          allowSafeReceiptOutput: prefs.getBool('apply_safe') == true);
       if (mounted) {
         final style =
             EditParams(filter: filter, contrast: contrast, brightness: brightness, sharp: sharp);
@@ -7607,7 +7881,9 @@ class _EditorPageState extends State<EditorPage> {
                           onPointerCancel: (e) => _ptrUp(e, size, cancel: true),
                           child: Padding(
                             padding: const EdgeInsets.all(pad),
-                            child: Stack(clipBehavior: zoomed ? Clip.hardEdge : Clip.none, children: [
+                            child: ClipRect(
+                              clipBehavior: zoomed ? Clip.hardEdge : Clip.none,
+                              child: Stack(children: [
                               Transform(
                                 transform: Matrix4.translationValues(pan.dx, pan.dy, 0) *
                                     Matrix4.diagonal3Values(_zm, _zm, 1),
@@ -7637,7 +7913,7 @@ class _EditorPageState extends State<EditorPage> {
                                     ),
                                   ),
                                 ),
-                            ]),
+                            ])),
                           ),
                         ),
                       ),
@@ -7828,7 +8104,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
         if (await Store.noTag(x)) nts.add(x);
       }
       final sz = await _pdf.exists() ? await _pdf.length() : null;
-      final isComp = (await Store.pdfSize()) == 1;
+      final isComp = false;
       if (!mounted) return;
       setState(() {
         tag = t;
@@ -7846,6 +8122,10 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
 
   Future<void> _compressNow() async {
     if (busy) return;
+    if (!await askYesNo(context, 'إنشاء نسخة أصغر؟',
+        'الأصل العالي الجودة هيفضل محفوظ. النسخة الأصغر ممكن تقلل وضوح الأرقام الصغيرة.',
+        yes: 'نسخة أصغر', no: 'إلغاء')) return;
+    if (!mounted) return;
     final before = _pdfBytes ?? 0;
     setState(() {
       busy = true;
@@ -7856,7 +8136,6 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
           onProgress: (d, t) {
         if (mounted) setState(() => progress = '$d/$t');
       });
-      await Store.setPdf(f, List.of(widget.imgs));
       final after = await f.length();
       if (!mounted) return;
       setState(() {
@@ -7865,7 +8144,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
         _compressed = true;
       });
       snack(context,
-          before > 0 ? 'اتضغط الملف من ${_fmtBytes(before)} إلى ${_fmtBytes(after)}' : 'تم ضغط الملف');
+          before > 0 ? 'اتضغط الملف من ${_fmtBytes(before)} إلى ${_fmtBytes(after)}' : 'اتعملت نسخة أصغر والأصل محفوظ');
     } catch (e) {
       if (mounted) snack(context, 'تعذر الضغط: ${errText(e)}');
     } finally {
@@ -7876,6 +8155,17 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
         });
       }
     }
+  }
+
+  Future<void> _useOriginalPdf() async {
+    if (busy) return;
+    final bytes = await widget.pdf.length();
+    if (!mounted) return;
+    setState(() {
+      _pdf = widget.pdf;
+      _pdfBytes = bytes;
+      _compressed = false;
+    });
   }
 
   void _markShared(String how) {
@@ -7993,11 +8283,14 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
                   style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
                 ),
               ),
+              if (_compressed)
+                TextButton(onPressed: busy ? null : _useOriginalPdf,
+                    child: const Text('رجوع للأصل')),
               if (!_compressed && sz > 500 * 1024)
                 TextButton.icon(
                   onPressed: busy ? null : _compressNow,
                   icon: const Icon(Icons.compress_rounded, size: 17),
-                  label: const Text('ضغط'),
+                  label: const Text('نسخة أصغر'),
                 ),
             ]),
           ),
@@ -8059,6 +8352,7 @@ class A2RCamState {
 
 class A2RCameraScreen extends StatefulWidget {
   final String title; // مكتوب تحت المعاينة (إيصالات / باتش)
+  final bool receiptQuality;
   final bool single; // true: تقفل بعد أول صورة (الباتش)
   final int count;
   final String? thumb;
@@ -8075,12 +8369,26 @@ class A2RCameraScreen extends StatefulWidget {
     this.onFastShot,
     this.onUndoLast,
     this.onGallery,
+    this.receiptQuality = false,
     this.single = false,
     this.count = 0,
     this.thumb,
   });
   @override
   State<A2RCameraScreen> createState() => _A2RCameraScreenState();
+}
+
+List<cam.ResolutionPreset> cameraFallbackPresets(cam.ResolutionPreset requested) {
+  const order = [cam.ResolutionPreset.max, cam.ResolutionPreset.ultraHigh,
+      cam.ResolutionPreset.veryHigh, cam.ResolutionPreset.high];
+  final index = order.indexOf(requested);
+  return index < 0 ? [requested] : order.sublist(index);
+}
+
+int nextDetectionInterval(int current, int processingMs) {
+  // Reduce preview analysis work, never saved-photo quality, on busy phones.
+  if (processingMs > current) return math.min(300, math.max(current + 20, processingMs));
+  return current;
 }
 
 class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingObserver {
@@ -8092,6 +8400,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   bool _shutterFlash = false; // وميض أبيض سريع عند الالتقاط في الوضع السريع
   String? _lastShot; // أبعاد آخر صورة اتصوّرت فعلاً (للتأكد من الدقة)
   bool _hd = true;
+  bool _detailedCapture = false; // Explicit per-session opt-in, never a slower default.
   int _flash = 0; // 0 مقفول، 1 تلقائي، 2 فلاش، 3 كشاف
   bool _grid = false; // شبكة الأثلاث للمحاذاة
   bool _a4Frame = false; // إطار إرشادي A4 لتصوير شيت الإيصالات
@@ -8099,6 +8408,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   bool _autoCap = false; // التصوير التلقائي عند ثبات الورقة
   bool _lowLight = false; // تنبيه الإضاءة الضعيفة الحي
   bool _aeAfLocked = false; // قفل الفوكس والإضاءة بالضغط المطوّل
+  bool _warningCanUndo = true;
   String? _camWarning; // تنبيه الاهتزاز/الإضاءة الفوري بعد اللقطة السريعة
   Timer? _warnTimer;
   bool _showLevel = true; // ميزان الاستقامة (التوازي مع المكتب)
@@ -8117,9 +8427,15 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   List<Offset>? _stableRef; // مرجع الثبات للتصوير التلقائي
   int _stableHits = 0;
   int _lastAutoShot = 0;
+  int _stableSince = 0;
+  int _focusChangedAt = 0;
+  int _liveEpoch = 0;
   bool _live = false, _liveBusy = false;
   final _LiveDetWorker _detWorker = _LiveDetWorker();
   int _lastLive = 0, _liveMiss = 0;
+  int _liveIntervalMs = 85;
+  bool _supportsFocusPoint = true;
+  bool _supportsExposurePoint = true;
   Future<void> _saveQueue = Future.value();
   int _pendingCount = 0;
 
@@ -8212,6 +8528,16 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     } catch (_) {}
   }
 
+  Future<void> _toggleDetailedCapture() async {
+    if (_shooting || _starting) return;
+    if (!_detailedCapture && !await askYesNo(context, 'جودة أعلى لكاميرا A2R',
+        'تصوير بأقصى دقة وحفظ حتى 3200 بكسل بجودة 92. ممكن يكون أبطأ أو يحتاج ذاكرة أكتر. الوضع السريع يفضل زي ما هو لو مش مفعّله.',
+        yes: 'تفعيل الجودة الأعلى', no: 'إلغاء')) return;
+    if (!mounted) return;
+    setState(() => _detailedCapture = !_detailedCapture);
+    await _start();
+  }
+
   Future<void> _toggleA4Frame() async {
     HapticFeedback.selectionClick();
     setState(() => _a4Frame = !_a4Frame);
@@ -8220,11 +8546,14 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     } catch (_) {}
   }
 
-  void _showCamWarning(String msg) {
+  void _showCamWarning(String msg, {bool canUndo = true}) {
     _warnTimer?.cancel();
     HapticFeedback.vibrate();
     if (!mounted) return;
-    setState(() => _camWarning = msg);
+    setState(() {
+      _camWarning = msg;
+      _warningCanUndo = canUndo;
+    });
     _warnTimer = Timer(const Duration(seconds: 4), () {
       if (mounted) setState(() => _camWarning = null);
     });
@@ -8285,7 +8614,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final perf = await Store.perfMode();
       final slow = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
       late final cam.ResolutionPreset preset;
-      if (gMinSide > 0 && gResLevel == 0) {
+      if (widget.receiptQuality || _detailedCapture) {
         preset = cam.ResolutionPreset.max;
       } else if (gResLevel > 0) {
         preset = const [
@@ -8301,23 +8630,63 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       } else {
         preset = cam.ResolutionPreset.high;
       }
-      final c = cam.CameraController(back, preset,
-          enableAudio: false,
-          imageFormatGroup:
-              Platform.isAndroid ? cam.ImageFormatGroup.yuv420 : cam.ImageFormatGroup.bgra8888);
-      await c.initialize();
-      AppLog.i('cam preset=$preset preview=${c.value.previewSize}');
+      cam.CameraController? initialized;
+      var actualPreset = preset;
+      Object? lastStartError;
+      for (final candidate in cameraFallbackPresets(preset)) {
+        final trial = cam.CameraController(back, candidate,
+            enableAudio: false,
+            imageFormatGroup:
+                Platform.isAndroid ? cam.ImageFormatGroup.yuv420 : cam.ImageFormatGroup.bgra8888);
+        try {
+          await trial.initialize();
+          initialized = trial;
+          actualPreset = candidate;
+          break;
+        } catch (e, st) {
+          lastStartError = e;
+          AppLog.e('cam.initialize.${candidate.name}', e, st);
+          try { await trial.dispose(); } catch (_) {}
+          // Permission failures cannot be fixed by trying another resolution.
+          if (e is cam.CameraException && e.code.toLowerCase().contains('access')) rethrow;
+        }
+      }
+      if (initialized == null) throw lastStartError ?? Exception('تعذر تشغيل الكاميرا');
+      final c = initialized;
+      _supportsFocusPoint = c.value.focusPointSupported;
+      _supportsExposurePoint = c.value.exposurePointSupported;
+      _liveIntervalMs = 85;
+      if (actualPreset != preset) {
+        AppLog.i('camera-adapt requested=${preset.name} actual=${actualPreset.name}');
+        _showCamWarning('الموبايل مش قادر يشغّل الدقة المطلوبة. اشتغلنا بدقة أقل مدعومة، راجع الأرقام قبل الحفظ', canUndo: false);
+      }
+      AppLog.i('cam name=${back.name} lens=${back.lensDirection} sensor=${back.sensorOrientation} preset=$actualPreset requested=$preset preview=${c.value.previewSize} receipt=${widget.receiptQuality} detail=$_detailedCapture');
       try {
         await c.lockCaptureOrientation(DeviceOrientation.portraitUp);
       } catch (_) {}
       await _applyFlash(c);
+      // A missing focus-point feature must not skip exposure or camera startup.
+      try { await c.setFocusMode(cam.FocusMode.auto); } catch (_) {}
+      try { await c.setExposureMode(cam.ExposureMode.auto); } catch (_) {}
+      if (_supportsFocusPoint) {
+        try { await c.setFocusPoint(const Offset(0.5, 0.5)); } catch (_) { _supportsFocusPoint = false; }
+      }
+      if (_supportsExposurePoint) {
+        try { await c.setExposurePoint(const Offset(0.5, 0.5)); } catch (_) { _supportsExposurePoint = false; }
+      }
+      AppLog.i('camera-cap focusPoint=$_supportsFocusPoint exposurePoint=$_supportsExposurePoint');
+      _focusChangedAt = DateTime.now().millisecondsSinceEpoch;
       try {
-        await c.setFocusMode(cam.FocusMode.auto);
-        await c.setExposureMode(cam.ExposureMode.auto);
+        _minZoom = await c.getMinZoomLevel();
+        _maxZoom = math.max(_minZoom, math.min(await c.getMaxZoomLevel(), 6.0));
+      } catch (_) {
+        _minZoom = 1;
+        _maxZoom = 1;
+      }
+      _zoom = 1.0.clamp(_minZoom, _maxZoom).toDouble();
+      try {
+        await c.setZoomLevel(_zoom);
       } catch (_) {}
-      _minZoom = await c.getMinZoomLevel();
-      _maxZoom = math.min(await c.getMaxZoomLevel(), 6.0);
-      _zoom = _minZoom;
       try {
         _minExp = await c.getMinExposureOffset();
         _maxExp = await c.getMaxExposureOffset();
@@ -8363,7 +8732,9 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   Future<void> _stopLive() async {
     final c = _c;
     _live = false;
+    _liveEpoch++;
     _liveQuad = null;
+    _stableSince = 0;
     _stableHits = 0;
     _stableRef = null;
     if (c == null) return;
@@ -8383,7 +8754,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
 
   void _onFrame(cam.CameraImage f) {
     final now = DateTime.now().millisecondsSinceEpoch;
-    if (!_live || _liveBusy || _shooting || now - _lastLive < 85 || !mounted) return;
+    if (!_live || _liveBusy || _shooting || now - _lastLive < _liveIntervalMs || !mounted) return;
     _liveBusy = true;
     _lastLive = now;
     final ex = _liveExtract(f, _c?.description.sensorOrientation ?? 90);
@@ -8392,8 +8763,11 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       return;
     }
     final isLow = ex.meanY < 72 && _flash == 0;
+    final hasDetail = _frameHasDetail(ex.feat, ex.w, ex.h);
+    final epoch = _liveEpoch;
+    final swLive = Stopwatch()..start();
     _detWorker.detect(ex.feat, ex.w, ex.h, autoCropMode).then((raw) {
-      if (!mounted || !_live) return;
+      if (!mounted || !_live || epoch != _liveEpoch) return;
       List<Offset>? q;
       if (raw != null && raw.length == 8) {
         q = [for (var i = 0; i < 8; i += 2) Offset(raw[i], raw[i + 1])];
@@ -8405,35 +8779,37 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
           _stableHits = 0;
           _stableRef = null;
         }
-        if (_liveMiss <= 3) {
-          if (_lowLight != isLow) setState(() => _lowLight = isLow);
-          return;
-        }
+        _stableSince = 0;
       } else {
         _liveMiss = 0;
-        if (prev != null) {
-          q = [for (var i = 0; i < 4; i++) Offset.lerp(prev[i], q[i], 0.65)!];
-        }
-        if (_autoCap && !_shooting) {
+        // Test stability on raw corners, not a smoothed overlay that hides motion.
+        final rawQ = List<Offset>.of(q);
+        if (_autoCap && !_shooting && hasDetail && !isLow &&
+            now - _focusChangedAt >= 700) {
           final ts = DateTime.now().millisecondsSinceEpoch;
           if (ts - _lastAutoShot > 1100) {
-            if (_stableRef != null && _maxQuadDelta(_stableRef!, q) < 0.035) {
+            if (_stableRef != null && _maxQuadDelta(_stableRef!, rawQ) < 0.018) {
               _stableHits++;
-              if (_stableHits >= 3) {
+              if (_stableHits >= 4 && ts - _stableSince >= 450) {
                 _stableHits = 0;
                 _stableRef = null;
                 _lastAutoShot = ts;
                 shouldAutoShoot = true;
               }
             } else {
-              _stableRef = q;
+              _stableRef = rawQ;
+              _stableSince = ts;
               _stableHits = 1;
             }
           }
         } else {
           _stableHits = 0;
+          _stableSince = 0;
           _stableRef = null;
         }
+      }
+      if (q != null && prev != null) {
+        q = [for (var i = 0; i < 4; i++) Offset.lerp(prev[i], q[i], 0.65)!];
       }
       setState(() {
         _liveQuad = q;
@@ -8445,6 +8821,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     }).catchError((Object e, StackTrace st) {
       AppLog.e('cam.liveFrame', e, st);
     }).whenComplete(() {
+      _liveIntervalMs = nextDetectionInterval(_liveIntervalMs, swLive.elapsedMilliseconds);
       _liveBusy = false;
     });
   }
@@ -8505,6 +8882,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     if (c == null || !c.value.isInitialized) return;
     final clamped = z.clamp(_minZoom, _maxZoom).toDouble();
     HapticFeedback.selectionClick();
+    _focusChangedAt = DateTime.now().millisecondsSinceEpoch;
     setState(() => _zoom = clamped);
     try {
       await c.setZoomLevel(clamped);
@@ -8535,6 +8913,10 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
 
   Future<void> _pickRes() async {
     HapticFeedback.selectionClick();
+    if (widget.receiptQuality) {
+      snack(context, 'إيصالات الدفع: تصوير بأقصى دقة وحفظ بجودة عالية. تصغير الملف من نسخة PDF أصغر فقط');
+      return;
+    }
     final cur = gResLevel;
     final v = await showModalBottomSheet<int>(
       context: context,
@@ -8569,6 +8951,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     );
     if (v == null || v == cur) return;
     await Store.setResSetting(v);
+    _detailedCapture = false; // Explicit resolution replaces the session detail mode.
     try {
       (await SharedPreferences.getInstance()).remove('camSlow');
     } catch (_) {}
@@ -8636,10 +9019,13 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       HapticFeedback.mediumImpact();
       final lq = _liveQuad;
       final quadCopy = lq == null ? null : List<Offset>.of(lq);
-      _shotQuad = quadCopy;
+      _shotQuad = null; // Live preview/stream and JPEG can have different sensor crops.
       final swShot = Stopwatch()..start();
       await _stopLive();
       final x = await c.takePicture();
+      if (_detailedCapture && !widget.receiptQuality) {
+        _rememberCaptureProfile(x.path, ImageQualityProfile.detailedCapture);
+      }
       final shotMs = swShot.elapsedMilliseconds;
       AppLog.i('t takePicture ${shotMs}ms');
       if (shotMs > 2500) {
@@ -8699,9 +9085,12 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     try {
       final x = await ImagePicker().pickImage(
           source: ImageSource.camera,
-          maxWidth: gMinSide > 0 ? null : 2000,
-          imageQuality: gMinSide > 0 ? null : 90);
+          maxWidth: widget.receiptQuality || _detailedCapture ? null : 2000,
+          imageQuality: widget.receiptQuality || _detailedCapture ? null : 90);
       if (x == null || !mounted) return;
+      if (_detailedCapture && !widget.receiptQuality) {
+        _rememberCaptureProfile(x.path, ImageQualityProfile.detailedCapture);
+      }
       _apply(await widget.onShot(x.path));
     } catch (e, st) {
       AppLog.e('cam.system', e, st);
@@ -8739,8 +9128,13 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _aeAfLocked = true;
     });
     try {
-      await c.setFocusPoint(Offset(dx, dy));
-      await c.setExposurePoint(Offset(dx, dy));
+      _focusChangedAt = DateTime.now().millisecondsSinceEpoch;
+      final stamp = _focusChangedAt;
+      await c.setFocusMode(cam.FocusMode.auto);
+      if (_supportsFocusPoint) await c.setFocusPoint(Offset(dx, dy));
+      if (_supportsExposurePoint) await c.setExposurePoint(Offset(dx, dy));
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+      if (!mounted || !_aeAfLocked || _focusChangedAt != stamp || !identical(_c, c)) return;
       await c.setFocusMode(cam.FocusMode.locked);
       await c.setExposureMode(cam.ExposureMode.locked);
     } catch (_) {}
@@ -8767,6 +9161,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     if (!pvRect.contains(d.localPosition)) return;
     final dx = ((d.localPosition.dx - pvRect.left) / pvRect.width).clamp(0.0, 1.0).toDouble();
     final dy = ((d.localPosition.dy - pvRect.top) / pvRect.height).clamp(0.0, 1.0).toDouble();
+    _focusChangedAt = DateTime.now().millisecondsSinceEpoch;
     final wasLocked = _aeAfLocked;
     setState(() {
       _focusAt = d.localPosition;
@@ -8777,8 +9172,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         await c.setFocusMode(cam.FocusMode.auto);
         await c.setExposureMode(cam.ExposureMode.auto);
       }
-      await c.setFocusPoint(Offset(dx, dy));
-      await c.setExposurePoint(Offset(dx, dy));
+      if (_supportsFocusPoint) await c.setFocusPoint(Offset(dx, dy));
+      if (_supportsExposurePoint) await c.setExposurePoint(Offset(dx, dy));
     } catch (_) {}
     Future.delayed(const Duration(milliseconds: 900), () {
       if (mounted && !_aeAfLocked) setState(() => _focusAt = null);
@@ -8942,6 +9337,30 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     ]);
   }
 
+  Widget _warningBanner() => Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: GestureDetector(
+                      onTap: _warningCanUndo && widget.onUndoLast != null ? _undoLastShot : () => setState(() => _camWarning = null),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: Colors.redAccent.withValues(alpha: 0.92),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          const Icon(Icons.warning_amber_rounded, size: 15, color: Colors.white),
+                          const SizedBox(width: 5),
+                          Flexible(
+                            child: Text(
+                              _warningCanUndo && widget.onUndoLast != null ? '$_camWarning — اضغط لمسح اللقطة' : _camWarning!,
+                              style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ]),
+                      ),
+                    ),
+                  );
+
   Widget _preview() {
     if (_err != null) {
       return Center(
@@ -8979,6 +9398,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
           if (d.pointerCount < 2) return;
           final z = (_zoom0 * d.scale).clamp(_minZoom, _maxZoom).toDouble();
           if ((z - _zoom).abs() < 0.02) return;
+          _focusChangedAt = DateTime.now().millisecondsSinceEpoch;
           setState(() => _zoom = z);
           try {
             await c.setZoomLevel(z);
@@ -9031,7 +9451,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
               height: pvH,
               child: IgnorePointer(
                 child: CustomPaint(
-                  painter: _LiveQuadPainter(_liveQuad!, lockProgress: _autoCap ? _stableHits / 3.0 : 0),
+                  painter: _LiveQuadPainter(_liveQuad!, lockProgress: _autoCap ? (_stableHits / 4.0).clamp(0.0, 1.0) : 0),
                 ),
               ),
             ),
@@ -9072,6 +9492,10 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                   runSpacing: 6,
                   alignment: WrapAlignment.center,
                   children: [
+                    if (!widget.receiptQuality)
+                      _pill(Icons.high_quality_rounded,
+                          _detailedCapture ? 'جودة أعلى ✓' : 'جودة أعلى (ممكن أبطأ)',
+                          _detailedCapture, _toggleDetailedCapture),
                     if (_canFast)
                       _pill(Icons.bolt_rounded, _fastMode ? 'تصوير سريع' : 'تعديل فوري', _fastMode, _toggleFastMode),
                     _pill(Icons.hdr_auto_rounded, 'تلقائي', _autoCap, _toggleAutoCap),
@@ -9103,29 +9527,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                     ),
                   ),
                 if (_camWarning != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: GestureDetector(
-                      onTap: widget.onUndoLast != null ? _undoLastShot : () => setState(() => _camWarning = null),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                        decoration: BoxDecoration(
-                          color: Colors.redAccent.withValues(alpha: 0.92),
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          const Icon(Icons.warning_amber_rounded, size: 15, color: Colors.white),
-                          const SizedBox(width: 5),
-                          Flexible(
-                            child: Text(
-                              widget.onUndoLast != null ? '$_camWarning — اضغط لمسح اللقطة' : _camWarning!,
-                              style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ]),
-                      ),
-                    ),
-                  ),
+                  _warningBanner(),
                 if (_lowLight && _camWarning == null)
                   Padding(
                     padding: const EdgeInsets.only(top: 6),
@@ -9222,7 +9624,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
               child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
                 _icon(Icons.close_rounded, 'إغلاق', _finish),
                 _icon(_flashIcons[_flash], 'فلاش', _cycleFlash, on: _flash != 0),
-                _icon(Icons.high_quality_rounded, 'دقة: ${resShort(gResLevel)}', _pickRes, on: gResLevel > 0),
+                _icon(Icons.high_quality_rounded, widget.receiptQuality ? 'دقة: إيصالات عالية' : (_detailedCapture ? 'دقة: أعلى' : 'دقة: ${resShort(gResLevel)}'), _pickRes, on: widget.receiptQuality || gResLevel > 0),
                 _icon(Icons.grid_3x3_rounded, 'شبكة', _toggleGrid, on: _grid),
                 if (widget.onGallery != null) _icon(Icons.photo_library_rounded, 'معرض', _gallery),
               ]),
@@ -9380,14 +9782,14 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final engine = await Store.scanEngineReceipts();
     final mode = engine == 2 ? ScannerMode.full : ScannerMode.base;
     if (!mounted) return;
-    final front = await scanImages(context, 1, mode: mode, camFallback: true);
+    final front = await scanImages(context, 1, mode: mode, camFallback: true, profile: ImageQualityProfile.receipts);
     if (front.isEmpty || !mounted) return;
     if (!await askYesNo(context, 'اتصوّر الوش ✓', 'دلوقتي صوّر ضهر البطاقة.',
         yes: 'تصوير', no: 'إلغاء')) {
       return;
     }
     if (!mounted) return;
-    final back = await scanImages(context, 1, mode: mode, camFallback: true);
+    final back = await scanImages(context, 1, mode: mode, camFallback: true, profile: ImageQualityProfile.receipts);
     if (back.isEmpty || !mounted) return;
     setState(() => busy = true);
     String? tmp;
@@ -9397,7 +9799,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       tmp = '${d.path}/idcard_${DateTime.now().microsecondsSinceEpoch}.png';
       await File(tmp).writeAsBytes(bytes, flush: true);
       final saved = await persistImage(tmp, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.original, applyNow: false);
+          filter: ScanFilter.original, applyNow: false, profile: ImageQualityProfile.receipts);
       await Store.addToDraft(saved);
       // صفحة البطاقة جاهزة بخلفية بيضا: مفيش فلتر إيصال تلقائي عليها
       await Store.setEnhanced(saved, true);
@@ -9423,16 +9825,12 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   @override
   void initState() {
     super.initState();
-    gMinSide = kSheetHdSide; // دقة عالية لصور الإيصالات المتعددة
-    gMinQuality = kSheetHdQuality;
     _load();
   }
 
   @override
   void dispose() {
     _searchCtrl.dispose();
-    gMinSide = 0;
-    gMinQuality = 0;
     super.dispose();
   }
 
@@ -9552,10 +9950,15 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
     if (await Store.enhanced(savedPath)) return; // متحسّنة من ماسح جوجل الكامل: مفيش فلتر تاني
     try {
-      final f = File(savedPath);
-      await f.writeAsBytes(await applyFilter(await f.readAsBytes(), filter));
-      await FileImage(f).evict();
-      if (mounted) setState(() => built = null);
+      final next = await renderEditedPage(savedPath, 'r_',
+          await Store.editOf(savedPath) ?? EditParams(filter: filter));
+      await Store.replaceInDraft(savedPath, next);
+      if (mounted && idx < imgs.length && imgs[idx] == savedPath) {
+        setState(() {
+          imgs[idx] = next;
+          built = null;
+        });
+      }
     } catch (e, st) {
       AppLog.e('receipts.lateFilter', e, st);
     }
@@ -9565,7 +9968,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   /// (لإنشاء الـ PDF أو إضافة صور تانية).
   Future<void> _addGoogle({bool full = false}) async {
     final paths = await scanImages(context, 1,
-        mode: full ? ScannerMode.full : ScannerMode.base, camFallback: true);
+        mode: full ? ScannerMode.full : ScannerMode.base, camFallback: true, profile: ImageQualityProfile.receipts);
     if (paths.isEmpty || !mounted) return;
     final manual = _lastScanManual;
     final enhanced = _lastScanEnhanced && !manual; // متحسّنة من جوجل: منطبّقش فلتر الإيصال عليها
@@ -9594,6 +9997,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       MaterialPageRoute(
         builder: (_) => A2RCameraScreen(
           title: 'إيصالات الدفع',
+          receiptQuality: true,
           single: false,
           count: imgs.length,
           thumb: imgs.isEmpty ? null : imgs.last,
@@ -9628,10 +10032,11 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     String? saved;
     try {
       saved = await persistImage(src, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.original, applyNow: false);
+          filter: ScanFilter.original, applyNow: false, profile: ImageQualityProfile.receipts);
       var path = saved;
-      if (quad != null || filter != ScanFilter.original) {
-        path = await renderEditedPage(saved, 'r_', EditParams(quad: quad, filter: filter));
+      final stillQuad = await detectDocQuad(saved);
+      if (stillQuad != null || filter != ScanFilter.original) {
+        path = await renderEditedPage(saved, 'r_', EditParams(quad: stillQuad, filter: filter));
         await Store.del(saved);
         saved = null;
       }
@@ -9642,7 +10047,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
           built = null;
         });
       }
-      final warn = await qualityWarning(path);
+      final warn = stillQuad == null
+          ? 'حدود الإيصال مش واضحة. الصورة كاملة محفوظة، افتح القص وحدد الأركان بإيدك'
+          : await qualityWarning(path);
       return A2RCamState(count: imgs.length, thumb: path, warning: warn);
     } catch (e, st) {
       AppLog.e('receipts.fastSave', e, st);
@@ -9701,7 +10108,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             p, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
             filter: preEnhanced ? ScanFilter.original : filter,
             applyNow: !quick,
-            keepOriginal: keepOriginal);
+            keepOriginal: keepOriginal, profile: ImageQualityProfile.receipts);
         await Store.addToDraft(saved);
         if (preEnhanced) await Store.setEnhanced(saved, true);
         imgs.add(saved);
