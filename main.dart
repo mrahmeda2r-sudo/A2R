@@ -2509,7 +2509,7 @@ Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
     );
     try {
       final r = await scanner.scanDocument();
-      return List<String>.from(r.images ?? const []);
+      return List<String>.from(r.images);
     } catch (e) {
       if (e.toString().toLowerCase().contains('cancel')) return const <String>[];
       lastErr = e;
