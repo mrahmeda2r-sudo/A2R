@@ -185,10 +185,84 @@ jobs:
           print(f'Updated {p} (package {pkg})')
           PY
 
-      - name: Support old Android (minSdk 21)
+      - name: Configure signing (stable secrets optional)
+        env:
+          A2R_KEYSTORE_BASE64: ${{ secrets.A2R_KEYSTORE_BASE64 }}
+          A2R_STORE_PASSWORD: ${{ secrets.A2R_STORE_PASSWORD }}
+          A2R_KEY_PASSWORD: ${{ secrets.A2R_KEY_PASSWORD }}
+          A2R_KEY_ALIAS: ${{ secrets.A2R_KEY_ALIAS }}
         run: |
-          sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*.*/minSdk = 21/' android/app/build.gradle.kts
-          grep -n "minSdk" android/app/build.gradle.kts
+          python3 - <<'PYSIGN'
+          #!/usr/bin/env python3
+          """Use stable signing when configured; otherwise preserve generated debug signing."""
+          import base64
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          required = ['A2R_KEYSTORE_BASE64', 'A2R_STORE_PASSWORD', 'A2R_KEY_PASSWORD', 'A2R_KEY_ALIAS']
+          # Apply compatibility settings independently of signing mode.
+          gradle = Path('android/app/build.gradle.kts')
+          source = gradle.read_text()
+          source, sdk_count = re.subn(r'(?m)^\s*minSdk\s*=.*$', '        minSdk = 24', source)
+          if sdk_count != 1:
+              sys.exit('Expected exactly one minSdk field. Refusing ambiguous compatibility settings.')
+          if source.count('signingConfigs.getByName("debug")') != 1:
+              sys.exit('Expected exactly one generated debug signing assignment. Refusing an unknown template.')
+          gradle.write_text(source)
+
+          if not any(os.environ.get(name) for name in required):
+              print('::warning::No signing secrets configured. Using generated debug signing. Certificate may change between builds; updates may require uninstall/reinstall after preserving app data.')
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+                  env.write('A2R_SIGNING_MODE=generated-debug\n')
+              sys.exit(0)
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              sys.exit('Partial stable-signing configuration. Add all four secrets or remove all four to use debug signing. Missing: ' + ', '.join(missing))
+          try:
+              data = base64.b64decode(''.join(os.environ['A2R_KEYSTORE_BASE64'].split()), validate=True)
+          except Exception:
+              sys.exit('A2R_KEYSTORE_BASE64 is not valid base64. No APK will be published.')
+          if len(data) < 100:
+              sys.exit('Signing keystore is empty or invalid. No APK will be published.')
+          key = Path(os.environ['RUNNER_TEMP']) / 'a2r-release-signing.jks'
+          key.write_bytes(data)
+          key.chmod(0o600)
+          gradle = Path('android/app/build.gradle.kts')
+          source = gradle.read_text()
+          if 'signingConfigs.getByName("debug")' not in source:
+              sys.exit('Expected generated signing template not found. Refusing unsafe signing changes.')
+          config = '''    signingConfigs {
+                  create("a2rRelease") {
+                      storeFile = file(System.getenv("A2R_KEYSTORE_PATH") ?: error("Missing release keystore path"))
+                      storePassword = System.getenv("A2R_STORE_PASSWORD") ?: error("Missing store password")
+                      keyAlias = System.getenv("A2R_KEY_ALIAS") ?: error("Missing key alias")
+                      keyPassword = System.getenv("A2R_KEY_PASSWORD") ?: error("Missing key password")
+                      enableV1Signing = true
+                      enableV2Signing = true
+                  }
+              }
+
+          '''
+          if source.count('    buildTypes {') != 1:
+              sys.exit('Unexpected Gradle buildTypes template. Refusing to continue.')
+          source = source.replace('    buildTypes {', config + '    buildTypes {')
+          source = source.replace('signingConfigs.getByName("debug")', 'signingConfigs.getByName("a2rRelease")')
+          # Use the actual supported minimum. Flutter 3.50 does not support Android 5/6.
+          source, count = re.subn(r'(?m)^\s*minSdk\s*=.*$', '        minSdk = 24', source)
+          if count != 1:
+              sys.exit('Expected exactly one minSdk field. No build will proceed.')
+          if 'signingConfigs.getByName("debug")' in source:
+              sys.exit('Debug release signing remains. Refusing to continue.')
+          gradle.write_text(source)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'A2R_KEYSTORE_PATH={key}\n')
+          print('Release signing configured from repository secrets. Android minimum: API 24.')
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write('A2R_SIGNING_MODE=stable-release\n')
+          PYSIGN
 
       - name: App icon and splash screen
         run: |
@@ -197,7 +271,7 @@ jobs:
 
       - name: Disable R8 minify (ML Kit crashes with NullPointerException when minified)
         run: |
-          sed -i -E 's/(signingConfig = signingConfigs.getByName\("[a-z]+"\))/\1\n            isMinifyEnabled = false\n            isShrinkResources = false/' android/app/build.gradle.kts
+          sed -i -E 's/(signingConfig = signingConfigs.getByName\("[A-Za-z0-9_]+"\))/\1\n            isMinifyEnabled = false\n            isShrinkResources = false/' android/app/build.gradle.kts
           sed -n '/buildTypes/,/^    }/p' android/app/build.gradle.kts
 
       - name: Skip lint tasks (lint crashes on image_picker)
@@ -218,6 +292,10 @@ jobs:
             gradle-ndk-v2-${{ runner.os }}-
 
       - name: Build APK
+        env:
+          A2R_STORE_PASSWORD: ${{ secrets.A2R_STORE_PASSWORD }}
+          A2R_KEY_PASSWORD: ${{ secrets.A2R_KEY_PASSWORD }}
+          A2R_KEY_ALIAS: ${{ secrets.A2R_KEY_ALIAS }}
         run: >
           flutter build apk --release
           --target-platform android-arm,android-arm64
@@ -228,13 +306,34 @@ jobs:
       - name: Rename APK
         run: cp build/app/outputs/flutter-apk/app-release.apk A2R-Shared.apk
 
+      - name: Verify signed APK and record compatibility
+        run: |
+          set -euo pipefail
+          echo "APK signing mode: $A2R_SIGNING_MODE"
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs A2R-Shared.apk | tee apk-signature-report.txt
+          APK_ANALYZER=$(find "$ANDROID_HOME/cmdline-tools" -path '*/bin/apkanalyzer' | sort | tail -1)
+          test -n "$APK_ANALYZER"
+          "$APK_ANALYZER" manifest min-sdk A2R-Shared.apk | tee apk-min-sdk.txt
+          test "$(tr -d '[:space:]' < apk-min-sdk.txt)" = 24
+          "$APK_ANALYZER" manifest application-id A2R-Shared.apk
+          "$APK_ANALYZER" manifest version-code A2R-Shared.apk
+          unzip -l A2R-Shared.apk | grep -E 'lib/(armeabi-v7a|arm64-v8a)/(libapp|libflutter)\.so'
+
+      - name: Remove temporary signing keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/a2r-release-signing.jks"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: shared-v1.${{ github.run_number }}
           name: A2R Shared v1.${{ github.run_number }}
           body: "Shared branch commit ${{ github.sha }}"
-          files: A2R-Shared.apk
+          files: |
+            A2R-Shared.apk
+            apk-signature-report.txt
+            apk-min-sdk.txt
           fail_on_unmatched_files: true
           make_latest: false
 
