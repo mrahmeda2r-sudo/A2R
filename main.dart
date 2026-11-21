@@ -1527,6 +1527,7 @@ class Store {
       await p.remove('pos:$path');
       await p.remove('edit:$path');
       await p.remove('notag:$path');
+      await p.remove('enh:$path');
     } catch (e, st) {
       AppLog.e('del', e, st);
     }
@@ -1554,14 +1555,23 @@ class Store {
       await p.setInt('scanEngine', 1);
       await p.setBool('engMig1', true);
     }
-    return (p.getInt('scanEngine') ?? 1).clamp(0, 1);
+    return (p.getInt('scanEngine') ?? 1).clamp(0, 2);
   }
 
   static Future<void> setScanEngine(int v) async => (await _p).setInt('scanEngine', v);
 
   /// محرك التصوير بتاع إيصالات الدفع بس (اختيارك في أول الملف). مبيأثرش على الباتش ولا على باقي التطبيق.
-  static Future<int> scanEngineReceipts() async =>
-      ((await _p).getInt('scanEngineR') ?? await scanEngine()).clamp(0, 1);
+  /// 2 = ماسح جوجل الكامل (قص + تحسين زي CamScanner)، 1 = ماسح جوجل قص بس، 0 = كاميرا A2R.
+  static Future<int> scanEngineReceipts() async {
+    final p = await _p;
+    // مرة واحدة: الوضع الكامل بقى الافتراضي لإيصالات الدفع (اللي اختار كاميرا A2R بيفضل زي ما هو)
+    if (p.getBool('engMig2') != true) {
+      if ((p.getInt('scanEngineR') ?? 1) == 1) await p.setInt('scanEngineR', 2);
+      await p.setBool('engMig2', true);
+    }
+    return (p.getInt('scanEngineR') ?? 2).clamp(0, 2);
+  }
+
   static Future<void> setScanEngineReceipts(int v) async => (await _p).setInt('scanEngineR', v);
 
   /// جودة الصورة: 0 صغيرة، 1 عادية، 2 عالية
@@ -1813,6 +1823,18 @@ class Store {
     }
   }
 
+  /// صورة متحسّنة من ماسح جوجل الكامل: منطبّقش عليها فلتر الإيصال تاني (منع التحسين المزدوج).
+  static Future<bool> enhanced(String path) async => (await _p).getBool('enh:$path') ?? false;
+
+  static Future<void> setEnhanced(String path, bool v) async {
+    final p = await _p;
+    if (v) {
+      await p.setBool('enh:$path', true);
+    } else {
+      await p.remove('enh:$path');
+    }
+  }
+
   static Future<EditParams?> editOf(String path) async =>
       EditParams.decode((await _p).getString('edit:$path'));
 
@@ -1831,6 +1853,7 @@ class Store {
     final p = await _p;
     await p.setStringList('draft', l);
     if (await noTag(old)) await setNoTag(neu, true); // الاختيار يفضل بعد التعديل
+    if (await enhanced(old)) await setEnhanced(neu, true);
     // لو الصورة كانت من اللي اتبعتوا: الصورة المعدّلة تاخد مكانها في قايمة "اتبعت"
     final sent = p.getStringList('rcSentImgs');
     if (sent != null && sent.contains(old)) {
@@ -2147,7 +2170,8 @@ Future<List<String>> _manualPick(BuildContext context, {bool multi = false}) asy
 }
 
 const _engineOpts = <(int, String, String)>[
-  (1, 'ماسح جوجل', 'قص ذكي بالذكاء الاصطناعي زي CamScanner (الافتراضي)'),
+  (2, 'ماسح جوجل الكامل', 'قص وتحسين وإعادة تصوير من نفس الشاشة، زي CamScanner بالظبط (إيصالات الدفع)'),
+  (1, 'ماسح جوجل', 'قص ذكي بالذكاء الاصطناعي، والتحسين بيتعمل من التطبيق'),
   (0, 'كاميرا A2R', 'كاميرا التطبيق المخصصة مع القص اليدوي/التلقائي'),
 ];
 
@@ -2166,6 +2190,8 @@ const _resOpts = <(int, String, String)>[
 ];
 
 bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط المزدوج كان بيقفل التطبيق)
+/// آخر صور رجعت من ماسح جوجل: هل اتعملها تحسين الوضع الكامل؟ (متحسّمة = ميتحطش عليها فلتر تاني)
+bool _lastScanEnhanced = false;
 
 Future<List<String>> scanImages(BuildContext context, int limit,
     {ScannerMode mode = ScannerMode.base, bool camFallback = false}) async {
@@ -2181,56 +2207,73 @@ Future<List<String>> scanImages(BuildContext context, int limit,
 Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
     {ScannerMode mode = ScannerMode.base, bool camFallback = false}) async {
   _lastScanManual = false;
+  _lastScanEnhanced = false;
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
   final perf = await Store.perfMode();
   if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1);
-  // ماسح جوجل للقص فقط (ScannerMode.base) عشان يرجّع الصورة الأصلية بدون أي فلتر مزدوج
-  final scanner = DocumentScanner(
-    options: DocumentScannerOptions(mode: ScannerMode.base, pageLimit: limit, isGalleryImport: true),
-  );
-  try {
-    final r = await scanner.scanDocument();
-    return List<String>.from(r.images ?? const []);
-  } catch (e) {
-    if (e.toString().toLowerCase().contains('cancel')) return [];
-    if (!context.mounted) return [];
-    _scannerFailed = true;
-    try {
-      (await SharedPreferences.getInstance())
-          .setInt('scannerFailedAt', DateTime.now().millisecondsSinceEpoch);
-    } catch (e, st) {
-      AppLog.e('scanImages.prefs', e, st);
-    }
-    if (!context.mounted) return [];
-    if (camFallback) {
-      // الطالب بيحول لكاميرا A2R بنفسه: نرجّع فاضي من غير ما نفتح المعرض
-      AppLog.e('scanImages.unavailable', e, StackTrace.current);
-      snack(context, 'ماسح جوجل مش متاح على الموبايل ده، هنستخدم كاميرا A2R');
-      return [];
-    }
-    await showDialog<void>(
-      context: context,
-      builder: (c) => Directionality(
-        textDirection: TextDirection.rtl,
-        child: AlertDialog(
-          title: const Text('الماسح مش شغال على الموبايل ده'),
-          content: SingleChildScrollView(
-            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('هنفتح الكاميرا العادية وبعدها شاشة القص. سبب المشكلة:'),
-              const SizedBox(height: 8),
-              SelectableText(e.toString(), textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12)),
-            ]),
-          ),
-          actions: [FilledButton(onPressed: () => Navigator.pop(c), child: const Text('تمام'))],
-        ),
-      ),
+  Object? lastErr;
+
+  // بيرجّع قائمة الصور، أو قائمة فاضية لو المستخدم لغى، أو null لو الماسح فشل.
+  Future<List<String>?> tryScan(ScannerMode m) async {
+    // ماسح جوجل: الوضع الأساسي (base) قص بس عشان يرجّع الصورة الأصلية من غير فلتر مزدوج،
+    // والوضع الكامل (full) قص + تحسين من جوجل نفسها زي CamScanner.
+    final scanner = DocumentScanner(
+      options: DocumentScannerOptions(mode: m, pageLimit: limit, isGalleryImport: true),
     );
-    if (!context.mounted) return [];
-    return _manualPick(context, multi: limit > 1);
-  } finally {
-    scanner.close();
+    try {
+      final r = await scanner.scanDocument();
+      return List<String>.from(r.images ?? const []);
+    } catch (e) {
+      if (e.toString().toLowerCase().contains('cancel')) return const <String>[];
+      lastErr = e;
+      AppLog.e('scanImages.$m', e, StackTrace.current);
+      return null;
+    } finally {
+      scanner.close();
+    }
   }
+
+  var imgs = await tryScan(mode);
+  if (imgs == null && mode != ScannerMode.base) {
+    // الوضع الكامل ممكن يكون مش مدعوم على الموبايل ده (خدمات جوجل قديمة أو رامات قليلة): نرجع للأساسي
+    imgs = await tryScan(ScannerMode.base);
+  }
+  if (imgs != null && imgs.isNotEmpty && mode != ScannerMode.base) _lastScanEnhanced = true;
+  if (imgs != null) return imgs;
+  if (!context.mounted) return [];
+  _scannerFailed = true;
+  try {
+    (await SharedPreferences.getInstance())
+        .setInt('scannerFailedAt', DateTime.now().millisecondsSinceEpoch);
+  } catch (e, st) {
+    AppLog.e('scanImages.prefs', e, st);
+  }
+  if (!context.mounted) return [];
+  if (camFallback) {
+    // الطالب بيحول لكاميرا A2R بنفسه: نرجّع فاضي من غير ما نفتح المعرض
+    snack(context, 'ماسح جوجل مش متاح على الموبايل ده، هنستخدم كاميرا A2R');
+    return [];
+  }
+  await showDialog<void>(
+    context: context,
+    builder: (c) => Directionality(
+      textDirection: TextDirection.rtl,
+      child: AlertDialog(
+        title: const Text('الماسح مش شغال على الموبايل ده'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('هنفتح الكاميرا العادية وبعدها شاشة القص. سبب المشكلة:'),
+            const SizedBox(height: 8),
+            SelectableText('$lastErr', textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12)),
+          ]),
+        ),
+        actions: [FilledButton(onPressed: () => Navigator.pop(c), child: const Text('تمام'))],
+      ),
+    ),
+  );
+  if (!context.mounted) return [];
+  return _manualPick(context, multi: limit > 1);
 }
 
 /// قايمة المشاركة العادية: الموظف يختار واتساب أو أي تطبيق.
@@ -4722,7 +4765,8 @@ class _BatchScreenState extends State<BatchScreen> {
     final engine = await Store.scanEngine();
     final perf = await Store.perfMode();
     if (!mounted) return;
-    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
+    // الباتش يفضل على ماسح جوجل الأساسي (قص بس) حتى لو الإيصالات على الوضع الكامل: صورة خام أنضف للـ OCR
+    if (engine >= 1 && !_scannerFailed && perf != PerfMode.lite) {
       await _captureGoogle();
       // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
       if (_scannerFailed && mounted) await _captureA2R();
@@ -5323,7 +5367,7 @@ Future<File?> _smallCopy(String path) async {
 /// كشف تقريبي بسيط: الورقة أفتح وأقل تشبعاً بالألوان من الخلفية (خشب/مكتب).
 Future<List<Offset>?> _detectDocQuadSimple(String path) async {
   try {
-    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 160);
+    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 320);
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
     img.dispose();
@@ -5501,6 +5545,8 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
   final queue = List<int>.filled(n, 0);
   List<Offset>? bestQ;
   var bestScore = 0.0;
+  var bestThr = -1;
+  var bestSeed = -1;
 
   for (final thr in thresholds) {
     final rawMask = List<bool>.generate(n, (i) => feat[i] > thr);
@@ -5590,12 +5636,156 @@ List<Offset>? _quadFromFeature(Uint8List feat, int w, int h) {
       if (score > bestScore + 1e-9) {
         bestScore = score;
         bestQ = q;
+        bestThr = thr;
+        bestSeed = s0;
       }
     }
   }
   if (bestQ == null) return null;
+  // تحسين الأركان: تركيب خط مستقيم على كل ضلع من بكسلات حدود المكوّن الفائز،
+  // والركن هو تقاطع الخطوط (أدق بكتير من نقاط الحواف الخام خصوصاً مع الدوران والميل)
+  final refined = _refineQuadLines(feat, w, h, bestThr, bestSeed, bestQ);
   // تحسين نهائي (Edge Snapping): تحريك كل ضلع ±2 بكسل نحو أقوى حافة فعلية (Sobel) ليلتصق بحدود الورقة بدقة
-  return _snapQuadToSobel(mag, bestQ, w, h);
+  return _snapQuadToSobel(mag, refined ?? bestQ, w, h);
+}
+
+/// تركيب خط مستقيم على كل ضلع من أضلاع الرباعي الأولي باستخدام بكسلات حدود المكوّن الفائز،
+/// وإرجاع الأركان الأربعة كتقاطعات الخطوط المتجاورة. بيرجّع null لو التحسين مش واثق (نرجع للرباعي الأصلي).
+List<Offset>? _refineQuadLines(
+    Uint8List feat, int w, int h, int thr, int seed, List<Offset> q0) {
+  try {
+    final n = w * h;
+    if (seed < 0 || seed >= n) return null;
+    final rawMask = List<bool>.generate(n, (i) => feat[i] > thr);
+    final er = _erode4(_dilate4(rawMask, w, h), w, h);
+    if (!er[seed]) return null;
+    // تجميع المكوّن الفائز من البذرة
+    final inComp = List<bool>.filled(n, false);
+    final queue = List<int>.filled(n, 0);
+    var head = 0, tail = 0, count = 0;
+    queue[tail++] = seed;
+    inComp[seed] = true;
+    while (head < tail) {
+      final i = queue[head++];
+      count++;
+      final x = i % w, y = i ~/ w;
+      if (x > 0 && er[i - 1] && !inComp[i - 1]) {
+        inComp[i - 1] = true;
+        queue[tail++] = i - 1;
+      }
+      if (x < w - 1 && er[i + 1] && !inComp[i + 1]) {
+        inComp[i + 1] = true;
+        queue[tail++] = i + 1;
+      }
+      if (y > 0 && er[i - w] && !inComp[i - w]) {
+        inComp[i - w] = true;
+        queue[tail++] = i - w;
+      }
+      if (y < h - 1 && er[i + w] && !inComp[i + w]) {
+        inComp[i + w] = true;
+        queue[tail++] = i + w;
+      }
+    }
+    if (count < n * 0.04) return null;
+    // بكسلات الحدود: بكسل من المكوّن له جار خارجه (أو على حرف الصورة)
+    final bx = <int>[], by = <int>[];
+    for (var i = 0; i < n; i++) {
+      if (!inComp[i]) continue;
+      final x = i % w, y = i ~/ w;
+      if (x == 0 ||
+          y == 0 ||
+          x == w - 1 ||
+          y == h - 1 ||
+          !inComp[i - 1] ||
+          !inComp[i + 1] ||
+          !inComp[i - w] ||
+          !inComp[i + w]) {
+        bx.add(x);
+        by.add(y);
+      }
+    }
+    if (bx.length < 16) return null;
+    // نقاط الرباعي الأولي بالبكسل
+    final pts = [for (final o in q0) Offset(o.dx * w - 0.5, o.dy * h - 0.5)];
+    // خط ax + by = c لكل ضلع
+    final lines = <List<double>>[];
+    for (var e = 0; e < 4; e++) {
+      final a = pts[e], b = pts[(e + 1) % 4];
+      final dx = b.dx - a.dx, dy = b.dy - a.dy;
+      final len = math.sqrt(dx * dx + dy * dy);
+      if (len < 8) return null;
+      final ux = dx / len, uy = dy / len; // اتجاه الضلع
+      final nx = -uy, ny = ux; // العمودي عليه
+      final margin = math.max(3.0, len * 0.06);
+      final xs = <double>[], ys = <double>[];
+      for (var i = 0; i < bx.length; i++) {
+        final rx = bx[i] - a.dx, ry = by[i] - a.dy;
+        final t = rx * ux + ry * uy;
+        if (t < len * 0.08 || t > len * 0.92) continue; // نتجنب منطقة الأركان
+        if ((rx * nx + ry * ny).abs() > margin) continue;
+        xs.add(bx[i].toDouble());
+        ys.add(by[i].toDouble());
+      }
+      final m = xs.length;
+      if (m < 6) return null;
+      // مربعات صغرى: الضلع الأفقي نركّب y على x، والرأسي x على y
+      if (dx.abs() >= dy.abs()) {
+        var sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+        for (var i = 0; i < m; i++) {
+          sx += xs[i];
+          sy += ys[i];
+          sxx += xs[i] * xs[i];
+          sxy += xs[i] * ys[i];
+        }
+        final den = m * sxx - sx * sx;
+        if (den.abs() < 1e-6) return null;
+        final k = (m * sxy - sx * sy) / den;
+        final c0 = (sy - k * sx) / m;
+        // k*x - y + c0 = 0
+        lines.add([k, -1.0, -c0]);
+      } else {
+        var sx = 0.0, sy = 0.0, syy = 0.0, sxy = 0.0;
+        for (var i = 0; i < m; i++) {
+          sx += xs[i];
+          sy += ys[i];
+          syy += ys[i] * ys[i];
+          sxy += xs[i] * ys[i];
+        }
+        final den = m * syy - sy * sy;
+        if (den.abs() < 1e-6) return null;
+        final k = (m * sxy - sx * sy) / den;
+        final c0 = (sx - k * sy) / m;
+        // -x + k*y + c0 = 0
+        lines.add([-1.0, k, -c0]);
+      }
+    }
+    // الأركان = تقاطعات الخطوط المتجاورة
+    final out = <Offset>[];
+    for (var i = 0; i < 4; i++) {
+      final l1 = lines[(i + 3) % 4], l2 = lines[i];
+      final det = l1[0] * l2[1] - l2[0] * l1[1];
+      if (det.abs() < 1e-9) return null;
+      // حل النظام a1*x+b1*y=c1 ، a2*x+b2*y=c2
+      final x = (l1[2] * l2[1] - l2[2] * l1[1]) / det;
+      final y = (l1[0] * l2[2] - l2[0] * l1[2]) / det;
+      out.add(Offset(x, y));
+    }
+    final norm = [
+      for (final p in out)
+        Offset(((p.dx + 0.5) / w).clamp(0.0, 1.0), ((p.dy + 0.5) / h).clamp(0.0, 1.0))
+    ];
+    if (!_quadConvex(norm)) return null;
+    final ar = _quadArea(norm);
+    if (ar < 0.04 || ar > 0.93) return null;
+    // لو أي ركن اتحرك أكتر من 12% من أبعاد الصورة نعتبر التحسين غلط ونرجع للأصلي
+    for (var i = 0; i < 4; i++) {
+      if ((norm[i] - q0[i]).distance > 0.12) return null;
+    }
+    return norm;
+  } catch (e, st) {
+    AppLog.e('refineQuad', e, st);
+    return null;
+  }
 }
 
 List<Offset> _snapQuadToSobel(Uint16List mag, List<Offset> q, int w, int h) {
@@ -8906,7 +9096,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (!mounted) return;
     switch (c) {
       case 'google':
-        await Store.setScanEngineReceipts(1);
+        await Store.setScanEngineReceipts(2);
         await _addGoogle();
         // لو ماسح جوجل مش شغال على الموبايل ده، نكمل بكاميرا A2R تلقائياً
         if (_scannerFailed && mounted && imgs.isEmpty) await _addA2R();
@@ -8932,8 +9122,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final engine = await Store.scanEngineReceipts();
     final perf = await Store.perfMode();
     if (!mounted) return;
-    if (engine == 1 && !_scannerFailed && perf != PerfMode.lite) {
-      await _addGoogle();
+    if (engine >= 1 && !_scannerFailed && perf != PerfMode.lite) {
+      await _addGoogle(full: engine == 2);
       // لو الماسح فشل دلوقتي (مش متاح) نكمل بكاميرا A2R تلقائياً
       if (_scannerFailed && mounted) await _addA2R();
     } else {
@@ -8946,6 +9136,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     if (!mounted || filter == ScanFilter.original || idx < 0 || idx >= imgs.length || imgs[idx] != savedPath) {
       return;
     }
+    if (await Store.enhanced(savedPath)) return; // متحسّنة من ماسح جوجل الكامل: مفيش فلتر تاني
     try {
       final f = File(savedPath);
       await f.writeAsBytes(await applyFilter(await f.readAsBytes(), filter));
@@ -8958,19 +9149,21 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   /// ماسح جوجل الذكي: صورة واحدة مقصوصة جاهزة، بعدها شاشة التعديل، وبعدها نرجع لشاشة الإيصالات
   /// (لإنشاء الـ PDF أو إضافة صور تانية).
-  Future<void> _addGoogle() async {
-    final paths = await scanImages(context, 1, camFallback: true);
+  Future<void> _addGoogle({bool full = false}) async {
+    final paths = await scanImages(context, 1,
+        mode: full ? ScannerMode.full : ScannerMode.base, camFallback: true);
     if (paths.isEmpty || !mounted) return;
     final manual = _lastScanManual;
+    final enhanced = _lastScanEnhanced && !manual; // متحسّنة من جوجل: منطبّقش فلتر الإيصال عليها
     final start = imgs.length;
-    await _saveAll(paths, quick: true, keepOriginal: !manual);
+    await _saveAll(paths, quick: true, keepOriginal: !manual, preEnhanced: enhanced);
     _lastScanManual = manual;
     for (var i = start; i < imgs.length; i++) {
       if (!mounted) break;
       final savedPath = imgs[i];
       final retake = await _edit(i, tab: manual ? 0 : 2, fromCam: true);
       if (retake && mounted) {
-        await _addGoogle(); // إعادة أخذ
+        await _addGoogle(full: full); // إعادة أخذ
         break;
       }
       await _ensureReceiptFiltered(i, savedPath);
@@ -8987,7 +9180,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       MaterialPageRoute(
         builder: (_) => A2RCameraScreen(
           title: 'إيصالات الدفع',
-          single: true,
+          single: false,
           count: imgs.length,
           thumb: imgs.isEmpty ? null : imgs.last,
           onShot: (p) async {
@@ -9003,6 +9196,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
             }
             return _camState(close: imgs.length > before);
           },
+          // التصوير السريع المتتالي: قص تلقائي بالإطار المكتشف + فلتر الإيصال في الخلفية من غير فتح المحرر
+          onFastShot: (p, quad) => _fastSave(p, quad),
+          onUndoLast: _undoLastShot,
           onGallery: () async {
             final before = imgs.length;
             await _addGallery();
@@ -9011,6 +9207,50 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
         ),
       ),
     );
+  }
+
+  /// لقطة سريعة: بتحفظ الصورة مقصوصة ومفلترة جاهزة على طول. الموظف يقدر يفتحها في المحرر بعدين لو عايز يظبطها.
+  Future<A2RCamState?> _fastSave(String src, List<Offset>? quad) async {
+    String? saved;
+    try {
+      saved = await persistImage(src, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
+          filter: ScanFilter.original, applyNow: false);
+      var path = saved;
+      if (quad != null || filter != ScanFilter.original) {
+        path = await renderEditedPage(saved, 'r_', EditParams(quad: quad, filter: filter));
+        await Store.del(saved);
+        saved = null;
+      }
+      await Store.addToDraft(path);
+      if (mounted) {
+        setState(() {
+          imgs.add(path);
+          built = null;
+        });
+      }
+      final warn = await qualityWarning(path);
+      return A2RCamState(count: imgs.length, thumb: path, warning: warn);
+    } catch (e, st) {
+      AppLog.e('receipts.fastSave', e, st);
+      if (saved != null) await Store.del(saved);
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+      return null;
+    }
+  }
+
+  /// مسح آخر لقطة من جوه الكاميرا (في وضع التصوير السريع).
+  Future<A2RCamState?> _undoLastShot() async {
+    if (imgs.isEmpty) return _camState();
+    final p = imgs.last;
+    if (mounted) {
+      setState(() {
+        imgs.removeLast();
+        built = null;
+      });
+    }
+    await Store.unlistFromDraft(p);
+    await Store.del(p);
+    return _camState();
   }
 
   /// من المعرض: منتقي الصور بتاع النظام مباشرة وتقدر تحدد أكتر من صورة.
@@ -9037,15 +9277,19 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     }
   }
 
-  Future<void> _saveAll(List<String> r, {bool quick = false, bool keepOriginal = false}) async {
+  Future<void> _saveAll(List<String> r,
+      {bool quick = false, bool keepOriginal = false, bool preEnhanced = false}) async {
     setState(() => busy = true);
     var added = 0;
     try {
       for (final p in r) {
         final saved = await persistImage(
             p, 'r_${DateTime.now().microsecondsSinceEpoch}.jpg',
-            filter: filter, applyNow: !quick, keepOriginal: keepOriginal);
+            filter: preEnhanced ? ScanFilter.original : filter,
+            applyNow: !quick,
+            keepOriginal: keepOriginal);
         await Store.addToDraft(saved);
+        if (preEnhanced) await Store.setEnhanced(saved, true);
         imgs.add(saved);
         added++;
       }
