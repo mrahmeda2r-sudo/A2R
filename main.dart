@@ -6529,6 +6529,41 @@ class _GridPainter extends CustomPainter {
   bool shouldRepaint(_GridPainter o) => false;
 }
 
+bool _bytesEq(Uint8List a, Uint8List b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+/// هل الملفين ليهم نفس المحتوى؟ (حجم + عينات من الأول والآخر — بتميّز نسختين كُتبوا من نفس البايتس)
+Future<bool> _sameFileBytes(String a, String b) async {
+  try {
+    final fa = File(a), fb = File(b);
+    final la = await fa.length(), lb = await fb.length();
+    if (la != lb) return false;
+    if (la == 0) return true;
+    const n = 4096;
+    final ra = await fa.open();
+    final rb = await fb.open();
+    try {
+      if (!_bytesEq(await ra.read(n), await rb.read(n))) return false;
+      if (la > n) {
+        await ra.setPosition(math.max(0, la - n));
+        await rb.setPosition(math.max(0, lb - n));
+        if (!_bytesEq(await ra.read(n), await rb.read(n))) return false;
+      }
+      return true;
+    } finally {
+      await ra.close();
+      await rb.close();
+    }
+  } catch (_) {
+    return false;
+  }
+}
+
 class EditorPage extends StatefulWidget {
   final bool canRetake; // بيظهر زر إعادة الأخذ لما الشاشة تتفتح من الكاميرا
   final int pageIndex; // ترتيب الصفحة (من 0)
@@ -6584,6 +6619,9 @@ class _EditorPageState extends State<EditorPage> {
   static const _maxZoom = 6.0;
   bool _swipeOk = false;
   String _sig0 = '';
+  // إعدادات تعديل متسجلة على الصورة بس لسه مش متنفذة على الملف نفسه (persistImage بتحفظ الفلتر من غير ما ترسمه).
+  // لما تكون true: "تم" والتنقل لازم يرسموا حتى لو مفيش تغيير، وإلا الفلتر الظاهر في المعاينة مش بيتطبق.
+  bool _seedUnbaked = false;
   bool busy = false;
   bool _quadTouched = false; // الموظف حدد الإطار بنفسه: القص التلقائي المتأخر ميلمسوش
   ui.Image? view; // نسخة خفيفة للعرض بس (بعد التدوير 90)
@@ -6886,6 +6924,14 @@ class _EditorPageState extends State<EditorPage> {
       final s = (hot != null || await base.exists()) ? base.path : widget.path;
       final e = await Store.editOf(widget.path);
       if (!mounted) return;
+      if (e != null) {
+        // لو الصورة الحالية والنسخة الأصلية نفس البايتس: الفلتر متسجّل بس مش مرسوم على الملف لسه.
+        final bf = File(Store.baseOf(widget.path));
+        if (await bf.exists() && await _sameFileBytes(widget.path, bf.path)) {
+          _seedUnbaked = true;
+        }
+        if (!mounted) return;
+      }
       src = s;
       if (e != null) {
         turns = e.turns;
@@ -6940,7 +6986,7 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _nav(String dir) async {
     if (busy || widget.pageCount <= 0 || aspect == null) return;
     if (dir == 'prev' && widget.pageIndex <= 0) return;
-    if (_sig() == _sig0) {
+    if (_sig() == _sig0 && !_seedUnbaked) {
       Navigator.pop(context, '$kNavPrefix|$dir|${widget.path}');
       return;
     }
@@ -7224,8 +7270,8 @@ class _EditorPageState extends State<EditorPage> {
       snack(context, 'حدود القص متداخلة، عدّل الزوايا');
       return;
     }
-    // مفيش أي تغيير من فتح الصفحة: نرجّع الملف الأصلي زي ما هو (من غير إعادة رسم أو ضغط)
-    if (_sig() == _sig0) {
+    // مفيش أي تغيير من فتح الصفحة والفلتر متنفذ على الملف أصلاً: نرجّع الملف زي ما هو (من غير إعادة رسم أو ضغط)
+    if (_sig() == _sig0 && !_seedUnbaked) {
       if (all) {
         final style =
             EditParams(filter: filter, contrast: contrast, brightness: brightness, sharp: sharp);
