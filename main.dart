@@ -1941,6 +1941,8 @@ class Store {
     final old = p.getString('batchImg');
     if (old != null && old != path) await del(old);
     await p.setString('batchImg', path);
+    // باتش جديد من الكاميرا/المعرض: صورة السيستم القديمة متتعادلش معاه
+    if (fresh && old != null && old != path) await _clearSystemPhoto(p);
     if (fresh && p.getInt('batchSentAt') != null) await _resetBatchMeta(p);
   }
 
@@ -1949,6 +1951,31 @@ class Store {
     for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
       await p.remove(k);
     }
+    await _clearSystemPhoto(p);
+  }
+
+  /// صورة السيستم المرفقة بالباتش الحالي (بتتبعت معاه كصورة مستقلة بنفس الوصف).
+  static Future<String?> systemPhoto() async {
+    final p = await _p;
+    final s = p.getString('systemImg');
+    if (s != null && !File(s).existsSync()) {
+      await p.remove('systemImg');
+      return null;
+    }
+    return s;
+  }
+
+  static Future<void> setSystemPhoto(String path) async {
+    final p = await _p;
+    final old = p.getString('systemImg');
+    if (old != null && old != path) await del(old);
+    await p.setString('systemImg', path);
+  }
+
+  static Future<void> _clearSystemPhoto(SharedPreferences p) async {
+    final old = p.getString('systemImg');
+    if (old != null) await del(old);
+    await p.remove('systemImg');
   }
 
   static Future<void> clearBatchImg() async {
@@ -3123,11 +3150,44 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
   bool reading = true, d1 = false, d4 = false;
   String? note;
   List<String> alerts = const [];
+  String? sysImg; // صورة السيستم المرفقة بالباتش (إجباري قبل الإرسال)
+  bool sysBusy = false;
 
   @override
   void initState() {
     super.initState();
     _ocr();
+    Store.systemPhoto().then((s) {
+      if (mounted && s != null) setState(() => sysImg = s);
+    });
+  }
+
+  /// تصوير أو اختيار صورة السيستم: بتتحفظ زي ما هي من غير فلاتر ولا دمج.
+  /// الضغطة التانية على نفس الزرار بتبدّل الصورة (إعادة التصوير).
+  Future<void> _pickSystem(ImageSource src) async {
+    if (sysBusy) return;
+    setState(() => sysBusy = true);
+    try {
+      final x = await ImagePicker()
+          .pickImage(source: src, maxWidth: 2000, imageQuality: 90);
+      if (x == null || !mounted) return;
+      final dest =
+          '${(await Store.dir()).path}/system_${DateTime.now().microsecondsSinceEpoch}.jpg';
+      await File(x.path).copy(dest);
+      await Store.setSystemPhoto(dest);
+      if (mounted) setState(() => sysImg = dest);
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    } finally {
+      if (mounted) setState(() => sysBusy = false);
+    }
+  }
+
+  void _previewSystem() {
+    final s = sysImg;
+    if (s == null) return;
+    Navigator.push(context,
+        MaterialPageRoute(builder: (_) => ZoomPage(child: Image.file(File(s)))));
   }
 
   Future<void> _ocr() async {
@@ -3169,6 +3229,9 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
   }
 
   Future<void> _ok() async {
+    if (sysImg == null) {
+      return setState(() => err = 'صوّر أو اختار صورة السيستم الأول');
+    }
     final count = _digits(c1.text), pi = _digits(c2.text);
     final col = _digits(c3.text), tot = _digits(c4.text);
     bool isInt(String s) => RegExp(r'^\d+$').hasMatch(s);
@@ -3271,6 +3334,29 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
                       const SizedBox(width: 10),
                       Expanded(child: _f(c3, 'المعاملات المجمعة', selectAll: true)),
                     ]),
+                    Row(children: [
+                      Expanded(
+                          child: OutlinedButton.icon(
+                        onPressed: sysBusy ? null : () => _pickSystem(ImageSource.camera),
+                        icon: const Icon(Icons.add_a_photo_rounded, size: 18),
+                        label: const Text('تصوير'),
+                      )),
+                      const SizedBox(width: 8),
+                      Expanded(
+                          child: OutlinedButton.icon(
+                        onPressed: sysBusy ? null : () => _pickSystem(ImageSource.gallery),
+                        icon: const Icon(Icons.photo_library_rounded, size: 18),
+                        label: const Text('معرض'),
+                      )),
+                      const SizedBox(width: 8),
+                      Expanded(
+                          child: OutlinedButton.icon(
+                        onPressed: sysImg == null || sysBusy ? null : _previewSystem,
+                        icon: const Icon(Icons.visibility_rounded, size: 18),
+                        label: Text(sysImg == null ? 'معاينة' : '✓ معاينة'),
+                      )),
+                    ]),
+                    const SizedBox(height: 10),
                     if (err != null)
                       Padding(
                         padding: const EdgeInsets.only(bottom: 8),
@@ -3279,7 +3365,9 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
                     SizedBox(
                       width: double.infinity,
                       height: 50,
-                      child: FilledButton(onPressed: _ok, child: const Text('متابعة للإرسال')),
+                      child: FilledButton(
+                          onPressed: sysImg == null ? null : _ok,
+                          child: const Text('متابعة للإرسال')),
                     ),
                   ]),
                 ),
@@ -3427,7 +3515,9 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
     Store.working--;
   }
   if (!context.mounted) return false;
-  final ok = await shareFiles(context, [out.path], text: caption);
+  final sys = await Store.systemPhoto();
+  final ok =
+      await shareFiles(context, [out.path, if (sys != null) sys], text: caption);
   if (ok) {
     await Store.afterBatchSent();
     await Store.addLog(s, 'batch', 'عدد المعاملات ${info.count} - الإجمالي ${info.total}');
@@ -10881,3 +10971,4 @@ class _SendLogScreenState extends State<SendLogScreen> {
     );
   }
 }
+
