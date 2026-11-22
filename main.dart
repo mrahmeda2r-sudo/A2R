@@ -3339,7 +3339,8 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
                           child: OutlinedButton.icon(
                         onPressed: sysBusy ? null : () => _pickSystem(ImageSource.camera),
                         icon: const Icon(Icons.add_a_photo_rounded, size: 18),
-                        label: const Text('تصوير'),
+                        label: const Text('صوّر السيستم',
+                            style: TextStyle(fontSize: 12.5)),
                       )),
                       const SizedBox(width: 8),
                       Expanded(
