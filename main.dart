@@ -339,7 +339,7 @@ const kFilterLabels = <ScanFilter, String>{
   ScanFilter.thermal: 'حراري باهت',
   ScanFilter.receiptBw: 'فوتوكوبي',
   ScanFilter.auto: 'ضبط مستويات',
-  ScanFilter.adaptive: 'تلقائي حسب الصورة',
+  ScanFilter.adaptive: 'تلقائي · إيصال / حراري / فوتوكوبي',
   ScanFilter.enhance: 'تحسين',
   ScanFilter.magic: 'ألوان',
   ScanFilter.document: 'مستند',
@@ -456,35 +456,31 @@ void _rememberDiagnostic(String key, String value) {
 
 final _adaptiveCache = <String, ScanFilter>{};
 /// Conservative per-image selection on a small preview. No OCR or network.
+ScannerMode receiptScannerMode(ScanFilter filter,bool full) =>
+    filter == ScanFilter.adaptive ? ScannerMode.base : (full ? ScannerMode.full : ScannerMode.base);
+
+const automaticReceiptFilters = <ScanFilter>{ScanFilter.receipt, ScanFilter.thermal, ScanFilter.receiptBw};
+/// One tiny-sample histogram. Select only the three receipt treatments requested.
 ScanFilter chooseImageFilter(Uint8List rgba, int w, int h) {
-  final hist = List<int>.filled(256, 0);
-  var n = 0, colored = 0;
-  final x0 = (w * 0.12).floor(), x1 = (w * 0.88).ceil();
-  final y0 = (h * 0.12).floor(), y1 = (h * 0.88).ceil();
-  for (var y = y0; y < y1; y++) {
-    for (var x = x0; x < x1; x++) {
-      final i = (y * w + x) * 4;
-      if (i + 2 >= rgba.length) continue;
-      final r = rgba[i], g = rgba[i+1], b = rgba[i+2];
-      final lum = (r*54 + g*183 + b*19) >> 8;
-      hist[lum]++;
-      if (math.max(r, math.max(g,b)) - math.min(r, math.min(g,b)) > 38) colored++;
-      n++;
-    }
+  final hist=List<int>.filled(256,0);
+  var n=0,colored=0,dark=0,ink=0;
+  final x0=(w*.12).floor(),x1=(w*.88).ceil();
+  final y0=(h*.12).floor(),y1=(h*.88).ceil();
+  for(var y=y0;y<y1;y++)for(var x=x0;x<x1;x++) {
+    final i=(y*w+x)*4;if(i+2>=rgba.length)continue;
+    final r=rgba[i],g=rgba[i+1],b=rgba[i+2];
+    final lum=(r*54+g*183+b*19)>>8;hist[lum]++;
+    if(math.max(r,math.max(g,b))-math.min(r,math.min(g,b))>38)colored++;
+    if(lum<120)dark++;if(lum<210)ink++;n++;
   }
-  if (n < 16) return ScanFilter.original;
-  final low = _histPct(hist,n,0.08), mid = _histPct(hist,n,0.50);
-  final high = _histPct(hist,n,0.92);
-  // Color/stamps or warm lighting must not disable automatic selection.
-  // Use one mild RGB matrix, not whitening, desaturation or a local-clean pass.
-  if (colored / n > 0.07) return mid < 145 ? ScanFilter.lighten : ScanFilter.gentle;
-  // Low contrast/faint text: gentle local cleanup without hard white clipping.
-  if (high - low < 75) return ScanFilter.clean;
-  // Uneven or dark paper needs local illumination correction.
-  if (mid < 155 || high < 210) return ScanFilter.lighten;
-  // A bright page still gets a real, restrained filter. Original stays manual
-  // (or the error/empty-sample fallback), not the normal automatic outcome.
-  if (mid > 218 && low < 135) return ScanFilter.gentle;
+  if(n<16)return ScanFilter.receipt;
+  final low=_histPct(hist,n,.08),mid=_histPct(hist,n,.50),high=_histPct(hist,n,.92);
+  // Warm/shadowed receipts need local paper normalization, not a mild RGB tint.
+  if(colored/n>.07 || mid<170 || high<205)return ScanFilter.receipt;
+  // Faint ink: use the thermal curve, without the harder photocopy threshold.
+  if(high-low<65 || (dark/n<.015 && ink/n>.015))return ScanFilter.thermal;
+  // Neutral bright paper with genuinely dark strokes suits photocopy.
+  if(mid>218 && dark/n>=.015)return ScanFilter.receiptBw;
   return ScanFilter.receipt;
 }
 
@@ -500,14 +496,14 @@ Future<ScanFilter> resolveImageFilter(String path) async {
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
     img.dispose();
-    final choice = bd == null ? ScanFilter.original : chooseImageFilter(_bytesOf(bd),w,h);
+    final choice = bd == null ? ScanFilter.receipt : chooseImageFilter(_bytesOf(bd),w,h);
     if (_adaptiveCache.length >= 32) _adaptiveCache.remove(_adaptiveCache.keys.first);
     _adaptiveCache[path] = choice;
     AppLog.i('filter-select choice=${choice.name} sample=${w}x$h ${sw.elapsedMilliseconds}ms');
     return choice;
   } catch (e,st) {
     AppLog.e('filter-select',e,st);
-    return ScanFilter.original;
+    return ScanFilter.receipt;
   }
 }
 
@@ -971,7 +967,7 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f,
     final width = math.max(1, (sz.w * math.min(1.0, 160 / math.max(sz.w,sz.h))).round());
     final sample = await decodeImage(bytes, maxWidth: width);
     final bd = await sample.toByteData(format: ui.ImageByteFormat.rawRgba);
-    final choice = bd == null ? ScanFilter.original : chooseImageFilter(_bytesOf(bd),sample.width,sample.height);
+    final choice = bd == null ? ScanFilter.receipt : chooseImageFilter(_bytesOf(bd),sample.width,sample.height);
     sample.dispose();
     return await applyFilter(bytes, choice, profile: profile);
     } catch (e,st) {
@@ -1821,9 +1817,10 @@ class Store {
   static Future<ScanFilter> filter() async {
     final p = await _p;
     // New automatic policy is the default once, then explicit manual choices persist.
-    if (p.getBool('adaptiveFilterV1') != true) {
+    if (p.getBool('adaptiveReceiptV2') != true) {
       await p.setInt('filter', ScanFilter.adaptive.index);
       await p.setBool('adaptiveFilterV1', true);
+      await p.setBool('adaptiveReceiptV2', true);
     }
     final i = p.getInt('filter') ?? ScanFilter.adaptive.index;
     return ScanFilter.values[i.clamp(0, ScanFilter.values.length - 1)];
@@ -7191,6 +7188,7 @@ class _EditorPageState extends State<EditorPage> {
       if (e == null && !await Store.enhanced(widget.path) &&
           await Store.filter() == ScanFilter.adaptive) {
         _automaticFilter = true;
+        _seedUnbaked = true; // automatic preview must be baked even with no touch
         filter = await resolveImageFilter(s);
         if (!mounted) return;
       }
@@ -9969,7 +9967,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   /// (لإنشاء الـ PDF أو إضافة صور تانية).
   Future<void> _addGoogle({bool full = false}) async {
     final paths = await scanImages(context, 1,
-        mode: full ? ScannerMode.full : ScannerMode.base, camFallback: true, profile: ImageQualityProfile.receipts);
+        mode: receiptScannerMode(filter,full), camFallback: true, profile: ImageQualityProfile.receipts);
     if (paths.isEmpty || !mounted) return;
     final manual = _lastScanManual;
     final enhanced = _lastScanEnhanced && !manual; // متحسّنة من جوجل: منطبّقش فلتر الإيصال عليها
