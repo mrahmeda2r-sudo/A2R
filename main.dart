@@ -1750,11 +1750,9 @@ int _waSeq = 0;
 Future<String> waShareCopy(String path, {required bool enhance}) async {
   try {
     final dir = (await Store.dir()).path;
-    try {
-      await for (final e in Directory(dir).list()) {
-        if (e.path.contains('/wa_') && e.path.endsWith('.jpg')) await e.delete();
-      }
-    } catch (_) {}
+    // Keep every prepared attachment alive until the share operation has
+    // consumed the entire group. Preparing the system photo must not delete
+    // the batch copy created by the preceding call.
     final raw = await File(path).readAsBytes();
     final sz = await imageSize(raw);
     // من غير تحسين ومن غير تصغير: نبعت الأصل زي ما هو (مفيش أي إعادة ضغط تقلل الجودة)
