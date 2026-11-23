@@ -1020,6 +1020,11 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f,
   }
 }
 
+/// فحص جودة الصورة (Isolate). اتعاير على صور باتش حقيقية مع اهتزاز/ضبابية صناعية:
+/// - الحدة: لكل مربع فيه كتابة في نص الصورة (70%) بنقيس نسبة طاقة المشتقة التانية للأولى
+///   (مش متأثرة بالتباين ولا الإضاءة)، والضبابية بتنزّلها. بناخد ربيع المربعات الأحدّ.
+/// - الاهتزاز في اتجاه واحد: طاقة الحواف الأفقية مقابل الرأسية بتختل جامد.
+/// - اللمعة: بقعة محروقة (≥250) جوه ورقة مش محروقة كلها.
 Map<String, dynamic> _qualityJob(Map<String, dynamic> a) {
   final px = a['px'] as Uint8List;
   final w = a['w'] as int, h = a['h'] as int;
@@ -1038,24 +1043,113 @@ Map<String, dynamic> _qualityJob(Map<String, dynamic> a) {
       break;
     }
   }
-  var s = 0.0, s2 = 0.0, n = 0;
-  for (var y = 1; y < h - 1; y++) {
-    for (var x = 1; x < w - 1; x++) {
-      final i = y * w + x;
-      final v = 4 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
-      s += v;
-      s2 += v * v;
-      n++;
+  final x0 = (w * 0.15).floor(), y0 = (h * 0.15).floor();
+  final x1 = (w * 0.85).floor(), y1 = (h * 0.85).floor();
+  const tile = 48;
+  final ratios = <double>[];
+  var ex = 0.0, ey = 0.0;
+  for (var ty = y0; ty + tile <= y1; ty += tile) {
+    for (var tx = x0; tx + tile <= x1; tx += tile) {
+      var s = 0.0, s2 = 0.0;
+      for (var y = ty; y < ty + tile; y++) {
+        for (var x = tx; x < tx + tile; x++) {
+          final v = lum[y * w + x];
+          s += v;
+          s2 += v * v;
+        }
+      }
+      const n = tile * tile;
+      final sd = math.sqrt(math.max(0.0, s2 / n - (s / n) * (s / n)));
+      if (sd < 14) continue; // مربع فاضي (ورق أبيض أو خلفية سادة)
+      var dx2 = 0.0, dy2 = 0.0, dxx2 = 0.0, dyy2 = 0.0;
+      var ndx = 0, ndy = 0, ndxx = 0, ndyy = 0;
+      for (var y = ty; y < ty + tile; y++) {
+        final r = y * w;
+        for (var x = tx; x < tx + tile; x++) {
+          final c = lum[r + x];
+          if (x + 1 < tx + tile) { final d = lum[r + x + 1] - c; dx2 += d * d; ndx++; }
+          if (y + 1 < ty + tile) { final d = lum[r + w + x] - c; dy2 += d * d; ndy++; }
+          if (x > tx && x + 1 < tx + tile) {
+            final d = 2 * c - lum[r + x - 1] - lum[r + x + 1]; dxx2 += d * d; ndxx++;
+          }
+          if (y > ty && y + 1 < ty + tile) {
+            final d = 2 * c - lum[r - w + x] - lum[r + w + x]; dyy2 += d * d; ndyy++;
+          }
+        }
+      }
+      final mdx = dx2 / ndx, mdy = dy2 / ndy;
+      ex += mdx;
+      ey += mdy;
+      final rx = (dxx2 / ndxx) / math.max(1e-6, mdx);
+      final ry = (dyy2 / ndyy) / math.max(1e-6, mdy);
+      ratios.add(math.min(rx, ry));
     }
   }
-  final varL = n == 0 ? 999.0 : s2 / n - (s / n) * (s / n);
-  return <String, dynamic>{'varL': varL, 'p90': p90};
+  double? sharp;
+  double? aniso;
+  if (ratios.length >= 4) {
+    ratios.sort();
+    sharp = ratios[(ratios.length * 0.75).floor()];
+    aniso = math.min(ex, ey) / math.max(1e-6, math.max(ex, ey));
+  }
+  // اللمعة: نسبة البكسلات المحروقة في نص الصورة، بشرط إن الورقة نفسها مش بيضا محروقة كلها
+  final rh = List<int>.filled(256, 0);
+  var rn = 0, sat = 0;
+  for (var y = y0; y < y1; y++) {
+    for (var x = x0; x < x1; x++) {
+      final v = lum[y * w + x].toInt();
+      rh[v]++;
+      rn++;
+      if (v >= 250) sat++;
+    }
+  }
+  var p75 = 255;
+  acc = 0;
+  for (var t = 0; t < 256; t++) {
+    acc += rh[t];
+    if (acc >= rn * 0.75) {
+      p75 = t;
+      break;
+    }
+  }
+  final satFrac = rn == 0 ? 0.0 : sat / rn;
+  return <String, dynamic>{
+    'p90': p90,
+    'sharp': sharp,
+    'aniso': aniso,
+    'tiles': ratios.length,
+    'sat': satFrac,
+    'p75': p75,
+  };
+}
+
+/// قرار التحذير من نتيجة الفحص (منفصل عشان يتجرّب لوحده).
+String? qualityVerdict(Map<String, dynamic> r) {
+  final p90 = r['p90'] as int;
+  final sharp = (r['sharp'] as num?)?.toDouble();
+  final aniso = (r['aniso'] as num?)?.toDouble();
+  final sat = (r['sat'] as num).toDouble();
+  final p75 = r['p75'] as int;
+  if (p90 < 130) return 'الإضاءة ضعيفة، صوّر في مكان أنور';
+  if (sharp != null && sharp < 0.42) {
+    return 'الصورة مش حادة (مهزوزة أو الفوكس مش مظبوط). ثبّت إيدك واضغط على الورقة للفوكس وصوّر تاني';
+  }
+  if (aniso != null && aniso < 0.26) {
+    return 'الصورة مهزوزة (الإيد اتحركت وقت التصوير). ثبّت الموبايل وصوّر تاني';
+  }
+  if (sat >= 0.01 && sat < 0.6 && p75 < 240) {
+    return 'في لمعة على الورقة ممكن تمسح أرقام. ميّل الموبايل شوية أو اطفي الكشاف وصوّر تاني';
+  }
+  return null;
 }
 
 /// فحص سريع بعد التصوير داخل Isolate (بدون تجميد الواجهة): بيرجّع رسالة تحذير أو null لو الصورة تمام.
+/// بيتعمل على نسخة لحد 1200 بكسل (مش 400) عشان الكلام الصغير في الإيصال يبان لو مهزوز.
 Future<String?> qualityWarning(String path) async {
   try {
-    final img = await decodeImage(await File(path).readAsBytes(), maxWidth: 400);
+    final raw = await File(path).readAsBytes();
+    final sz = await imageSize(raw);
+    final img = await decodeImage(raw, maxWidth: sz.w > 1200 ? 1200 : null);
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
     img.dispose();
@@ -1065,12 +1159,10 @@ Future<String?> qualityWarning(String path) async {
       'w': w,
       'h': h,
     });
-    final varL = (r['varL'] as num).toDouble();
-    final p90 = r['p90'] as int;
-    AppLog.i('quality var=${varL.toStringAsFixed(1)} p90=$p90');
-    if (p90 < 130) return 'الإضاءة ضعيفة، صوّر في مكان أنور';
-    if (varL < 25) return 'الصورة شكلها مهزوزة، ثبّت إيدك وصوّر تاني لو الكلام مش واضح';
-    return null;
+    AppLog.i('quality ${w}x$h p90=${r['p90']} sharp=${(r['sharp'] as num?)?.toStringAsFixed(2)} '
+        'aniso=${(r['aniso'] as num?)?.toStringAsFixed(2)} tiles=${r['tiles']} '
+        'sat=${((r['sat'] as num) * 100).toStringAsFixed(1)}% p75=${r['p75']}');
+    return qualityVerdict(r);
   } catch (e, st) {
     AppLog.e('qualityWarning', e, st);
     return null;
@@ -1542,13 +1634,17 @@ Future<Uint8List> composeIdCard(String frontPath, String backPath) async {
   }
 }
 
-/// نسخة إرسال واتساب في Isolate: تصغير بمتوسط المساحة لـ 1600 (مقاس واتساب) + اختياريًا
-/// مستويات تلقائية (سحق الحبر وقص الورق) وحدة معتدلة للمستند. الأصل لا يُمس.
+/// أقصى ضلع لنسخة الواتساب: 1600 (مقاس واتساب العادي) — التطبيق يصغّر بمرشح جيد ويطبّق
+/// المستويات والحدة على النسخة، فتوصل واضحة حتى من غير ما الموظف يختار HD.
+const kWaMaxSide = 1600;
+
+/// نسخة إرسال واتساب في Isolate: تصغير بمتوسط المساحة (لو أكبر من kWaMaxSide بس) + اختياريًا
+/// مستويات تلقائية (سحق الحبر وقص الورق)، والحدة بس لو حصل تصغير. الأصل لا يُمس.
 Map<String, dynamic> _waCopyJob(Map<String, dynamic> a) {
   final src = a['src'] as Uint8List;
   final sw = a['sw'] as int, sh = a['sh'] as int;
   final enhance = a['enhance'] as bool;
-  final k = math.min(1.0, 1600 / math.max(sw, sh));
+  final k = math.min(1.0, kWaMaxSide / math.max(sw, sh));
   final ow = math.max(8, (sw * k).round()), oh = math.max(8, (sh * k).round());
   final out = Uint8List(ow * oh * 4);
   for (var y = 0; y < oh; y++) {
@@ -1607,7 +1703,9 @@ Map<String, dynamic> _waCopyJob(Map<String, dynamic> a) {
       out[p + c] = v < 0 ? 0 : (v > 255 ? 255 : v.round());
     }
   }
-  // حدة معتدلة: قناع عدم حدة بضبابية 3x3
+  // حدة معتدلة بس لو الصورة اتصغرت (تعويض التصغير). من غير تصغير الحدة التانية بتعمل هالات حوالين الأرقام
+  // فوق فلتر التعديل اللي اتطبق قبل كده.
+  if (k >= 1.0) return {'rgba': out, 'w': ow, 'h': oh};
   final blur = Uint8List(ow * oh * 3);
   for (var y = 0; y < oh; y++) {
     for (var x = 0; x < ow; x++) {
@@ -1658,6 +1756,9 @@ Future<String> waShareCopy(String path, {required bool enhance}) async {
       }
     } catch (_) {}
     final raw = await File(path).readAsBytes();
+    final sz = await imageSize(raw);
+    // من غير تحسين ومن غير تصغير: نبعت الأصل زي ما هو (مفيش أي إعادة ضغط تقلل الجودة)
+    if (!enhance && math.max(sz.w, sz.h) <= kWaMaxSide) return path;
     final img = await decodeImage(raw);
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
@@ -1671,11 +1772,18 @@ Future<String> waShareCopy(String path, {required bool enhance}) async {
     });
     final rgba = res['rgba'] as Uint8List;
     final ow = res['w'] as int, oh = res['h'] as int;
+    // الضاغط محتاج صورة مشفّرة (PNG)، مش بكسلات خام: قبل كده كان بيفشل وبيرجع الأصل من غير التحسين
+    final comp = Completer<ui.Image>();
+    ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
+    final outImg = await comp.future;
+    final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
+    outImg.dispose();
+    if (pngBd == null) return path;
     final jpg = await FlutterImageCompress.compressWithList(
-      rgba,
+      pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes),
       minWidth: ow,
       minHeight: oh,
-      quality: 90,
+      quality: 95,
       format: CompressFormat.jpeg,
     );
     if (!_isJpegHeader(jpg)) return path;
@@ -6068,6 +6176,31 @@ bool _frameHasDetail(Uint8List feat, int w, int h) {
   return edgeCount >= w * h * 0.012;
 }
 
+/// نسبة البكسلات المحروقة (≥250) جوه الورقة في المعاينة الحية (شبكة صغيرة ~72 بكسل).
+/// q: أركان الورقة كنسب. بنصغّر المستطيل 10% عشان حواف الورقة/الخلفية متتحسبش.
+double _liveGlareFrac(Uint8List feat, int w, int h, List<Offset> q) {
+  var l = 1.0, t = 1.0, r = 0.0, b = 0.0;
+  for (final p in q) {
+    l = math.min(l, p.dx);
+    t = math.min(t, p.dy);
+    r = math.max(r, p.dx);
+    b = math.max(b, p.dy);
+  }
+  final iw = (r - l) * 0.1, ih = (b - t) * 0.1;
+  final x0 = ((l + iw) * w).floor().clamp(0, w - 1), x1 = ((r - iw) * w).ceil().clamp(1, w);
+  final y0 = ((t + ih) * h).floor().clamp(0, h - 1), y1 = ((b - ih) * h).ceil().clamp(1, h);
+  var n = 0, sat = 0;
+  for (var y = y0; y < y1; y++) {
+    for (var x = x0; x < x1; x++) {
+      n++;
+      if (feat[y * w + x] >= 250) sat++;
+    }
+  }
+  if (n < 20) return 0;
+  final f = sat / n;
+  return f > 0.6 ? 0 : f; // الورقة كلها بيضا محروقة = تعريض عالي، مش بقعة لمعة
+}
+
 List<bool> _dilate4(List<bool> m, int w, int h) {
   final o = List<bool>.filled(w * h, false);
   for (var y = 0; y < h; y++) {
@@ -8651,6 +8784,10 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   bool _fastMode = false; // وضع التصوير السريع المتتالي (للإيصالات)
   bool _autoCap = false; // التصوير التلقائي عند ثبات الورقة
   bool _lowLight = false; // تنبيه الإضاءة الضعيفة الحي
+  bool _glare = false; // تنبيه اللمعة الحي (بقعة محروقة جوه الورقة)
+  int _glareHits = 0;
+  Offset? _meterAt; // آخر نقطة قياس إضاءة اتحطت على الورقة
+  int _meterTs = 0;
   bool _aeAfLocked = false; // قفل الفوكس والإضاءة بالضغط المطوّل
   bool _warningCanUndo = true;
   String? _camWarning; // تنبيه الاهتزاز/الإضاءة الفوري بعد اللقطة السريعة
@@ -8703,7 +8840,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _grid = p.getBool('camGrid') ?? false;
       _a4Frame = p.getBool('camA4Frame') ?? false;
       _fastMode = _canFast && (p.getBool('camFastMode') ?? true);
-      _autoCap = p.getBool('camAutoCap') ?? false;
+      // التصوير التلقائي شغال افتراضيًا في كاميرا الباتش (لو الموظف قفله قبل كده بيفضل مقفول)
+      _autoCap = p.getBool('camAutoCap') ?? widget.single;
       _showLevel = p.getBool('camLevel') ?? true;
       _setVolumeCapture(true);
       if (_showLevel) _startTilt();
@@ -8891,6 +9029,10 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       if (initialized == null) throw lastStartError ?? Exception('تعذر تشغيل الكاميرا');
       final c = initialized;
       _supportsFocusPoint = c.value.focusPointSupported;
+      _meterAt = null;
+      _meterTs = 0;
+      _glare = false;
+      _glareHits = 0;
       _supportsExposurePoint = c.value.exposurePointSupported;
       _liveIntervalMs = 85;
       if (actualPreset != preset) {
@@ -9012,7 +9154,9 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       }
       final prev = _liveQuad;
       var shouldAutoShoot = false;
+      var glareNow = false;
       if (q == null) {
+        _glareHits = 0;
         if (++_liveMiss >= 2) {
           _stableHits = 0;
           _stableRef = null;
@@ -9022,7 +9166,12 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         _liveMiss = 0;
         // Test stability on raw corners, not a smoothed overlay that hides motion.
         final rawQ = List<Offset>.of(q);
-        if (_autoCap && !_shooting && hasDetail && !isLow &&
+        // لمعة: لازم تظهر في كذا فريم ورا بعض عشان التنبيه ميرعشش
+        final g = _liveGlareFrac(ex.feat, ex.w, ex.h, rawQ) >= 0.015;
+        _glareHits = g ? math.min(_glareHits + 1, 6) : math.max(_glareHits - 1, 0);
+        glareNow = _glareHits >= 3 || (_glare && _glareHits > 0);
+        _meterOnPaper(rawQ, now);
+        if (_autoCap && !_shooting && hasDetail && !isLow && !glareNow &&
             now - _focusChangedAt >= 700) {
           final ts = DateTime.now().millisecondsSinceEpoch;
           if (ts - _lastAutoShot > 1100) {
@@ -9052,6 +9201,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       setState(() {
         _liveQuad = q;
         _lowLight = isLow;
+        _glare = glareNow;
       });
       if (shouldAutoShoot) {
         unawaited(_shot());
@@ -9062,6 +9212,25 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _liveIntervalMs = nextDetectionInterval(_liveIntervalMs, swLive.elapsedMilliseconds);
       _liveBusy = false;
     });
+  }
+
+  /// قياس الإضاءة على الورقة نفسها مش نص الشاشة: الإيصال الأبيض على مكتب غامق كان بيتحرق
+  /// والطباعة الحرارية الباهتة بتختفي. بنحرّك نقطة القياس لنص الورقة (مش الفوكس) بهدوء.
+  void _meterOnPaper(List<Offset> q, int now) {
+    final c = _c;
+    if (c == null || _aeAfLocked || !_supportsExposurePoint || _shooting) return;
+    if (now - _meterTs < 1500) return;
+    var cx = 0.0, cy = 0.0;
+    for (final o in q) {
+      cx += o.dx / 4;
+      cy += o.dy / 4;
+    }
+    final at = Offset(cx.clamp(0.05, 0.95).toDouble(), cy.clamp(0.05, 0.95).toDouble());
+    final last = _meterAt ?? const Offset(0.5, 0.5);
+    if ((at - last).distance < 0.08) return;
+    _meterAt = at;
+    _meterTs = now;
+    unawaited(c.setExposurePoint(at).catchError((_) {}));
   }
 
   Future<void> _applyFlash(cam.CameraController c) async {
@@ -9259,6 +9428,23 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       final quadCopy = lq == null ? null : List<Offset>.of(lq);
       _shotQuad = null; // Live preview/stream and JPEG can have different sensor crops.
       final swShot = Stopwatch()..start();
+      // فوكس على نص الورقة قبل اللقطة (مش في التصوير السريع عشان السرعة، ومش لو الموظف قافل الفوكس
+      // أو لسه عامل فوكس بإيده). ده بيمنع إن الصورة تتاخد والفوكس على المكتب.
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      if (quadCopy != null && !(_fastMode && _canFast) && !_aeAfLocked && _supportsFocusPoint &&
+          nowMs - _focusChangedAt > 2500) {
+        var cx = 0.0, cy = 0.0;
+        for (final o in quadCopy) {
+          cx += o.dx / 4;
+          cy += o.dy / 4;
+        }
+        try {
+          _focusChangedAt = nowMs;
+          await c.setFocusPoint(Offset(cx.clamp(0.05, 0.95).toDouble(), cy.clamp(0.05, 0.95).toDouble()));
+          await Future<void>.delayed(const Duration(milliseconds: 550));
+        } catch (_) {}
+        if (!mounted || !identical(_c, c)) return;
+      }
       await _stopLive();
       final x = await c.takePicture();
       if (_detailedCapture && !widget.receiptQuality) {
@@ -9398,6 +9584,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     final dx = ((d.localPosition.dx - pvRect.left) / pvRect.width).clamp(0.0, 1.0).toDouble();
     final dy = ((d.localPosition.dy - pvRect.top) / pvRect.height).clamp(0.0, 1.0).toDouble();
     _focusChangedAt = DateTime.now().millisecondsSinceEpoch;
+    _meterAt = Offset(dx, dy); // الموظف اختار نقطة بإيده: منحرّكهاش لوحدنا لفترة
+    _meterTs = _focusChangedAt + 3500;
     final wasLocked = _aeAfLocked;
     setState(() {
       _focusAt = d.localPosition;
@@ -9764,6 +9952,30 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
                   ),
                 if (_camWarning != null)
                   _warningBanner(),
+                if (_glare && !_lowLight && _camWarning == null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: GestureDetector(
+                      onTap: () async {
+                        if (_c == null || _flash == 0) return;
+                        setState(() => _flash = 0); // الكشاف/الفلاش أكتر سبب للمعة على الورق الحراري
+                        await _applyFlash(_c!);
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.withValues(alpha: 0.88),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          const Icon(Icons.wb_sunny_rounded, size: 14, color: Colors.black),
+                          const SizedBox(width: 4),
+                          Text(_flash == 0 ? 'في لمعة على الورقة — ميّل الموبايل شوية' : 'في لمعة على الورقة — اضغط لقفل الكشاف',
+                              style: const TextStyle(color: Colors.black, fontSize: 11, fontWeight: FontWeight.bold)),
+                        ]),
+                      ),
+                    ),
+                  ),
                 if (_lowLight && _camWarning == null)
                   Padding(
                     padding: const EdgeInsets.only(top: 6),
