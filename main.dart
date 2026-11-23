@@ -28,7 +28,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// الأسماء والوحدات بتتبني جوه التطبيق من ملف data.xlsx وقت البناء (assets/data.json).
 const kVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
-const kImageQualityRevision = 'receipt-q4';
+const kImageQualityRevision = 'receipt-q5-smooth';
 
 const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
 const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
@@ -320,12 +320,12 @@ enum ScanFilter {
 // الفلاتر الظاهرة في شاشة التعديل. (enhance وmagic وgray وbw اتخفّوا من القايمة: مكررين أو ضعاف
 // للإيصالات، لكن لسه موجودين في الكود عشان الصور والإعدادات القديمة اللي اتخزنت بأرقامهم تفضل شغالة)
 const kFilterOrder = <ScanFilter>[
-  ScanFilter.adaptive,
-  ScanFilter.original,
-  ScanFilter.gentle,
   ScanFilter.receipt,
   ScanFilter.thermal,
   ScanFilter.receiptBw,
+  ScanFilter.adaptive,
+  ScanFilter.original,
+  ScanFilter.gentle,
   ScanFilter.clean,
   ScanFilter.auto,
   ScanFilter.document,
@@ -750,17 +750,10 @@ List<double> editMatrix(ScanFilter f, double contrast, double brightness, [List<
         break;
       }
     case ScanFilter.receiptBw:
-      {
-        // بعد تنضيف الإيصال: أبيض وأسود بانتقال ناعم (مش قطع حاد) عشان الأرقام الصغيرة متتقطعش
-        const lo = 150.0, hi = 215.0, s = 255 / (hi - lo);
-        w = [
-          [lr * s, lg * s, lb * s],
-          [lr * s, lg * s, lb * s],
-          [lr * s, lg * s, lb * s],
-        ];
-        t0 = List<double>.filled(3, -lo * s);
-        break;
-      }
+      // Photocopy tone and grayscale are applied once inside _cleanJob.
+      w = sat(1.0, 1.0);
+      t0 = List<double>.filled(3, 0.0);
+      break;
     case ScanFilter.auto:
       {
         final l = (lv != null && lv.length == 4) ? lv : const <double>[0.0, 255.0, 255.0, 255.0];
@@ -795,7 +788,8 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   final src = a['src'] as Uint8List;
   final w = a['w'] as int, h = a['h'] as int;
   final gray = a['gray'] as bool;
-  final th = (a['th'] as bool?) ?? false; // حراري باهت: منحنى أقوى وحدة أعلى
+  final photocopy = (a['photocopy'] as bool?) ?? false;
+  final th = (a['th'] as bool?) ?? false; // Thermal paper: finer background grid and its own smooth curve.
   final plain = (a['plain'] as bool?) ?? false; // تنضيف بس: إزالة ظلال وإضاءة من غير منحنى ألوان
   final bs = math.max(th ? 12 : 16, (math.max(w, h) / (th ? 48 : 40)).round());
   final gw = (w + bs - 1) ~/ bs, gh = (h + bs - 1) ~/ bs;
@@ -865,16 +859,14 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
     bg[c] = blur(blur(bg[c]));
   }
 
-  // أي قيمة من 238 لفوق = أبيض صافي، وفي وضع الحراري الباهت بنطبّق تعزيز ذكي للحبر الخفيف مع إزالة الظلال
-  final wp = th ? 242.0 : (plain ? 255.0 : 238.0), gam = th ? 2.35 : (plain ? 1.0 : 1.25);
+  // One smooth tone curve after local paper normalization. No stacked
+  // thermal + threshold curve, and no discontinuity around pale strokes.
+  final wp = th ? 242.0 : (plain ? 255.0 : 238.0);
+  final gam = photocopy ? 1.25 : (th ? 1.65 : (plain ? 1.0 : 1.25));
+  final black = photocopy ? 45.0 : 0.0;
   final lut = List<int>.generate(256, (i) {
-    if (th && i >= 238) return 255;
-    var v = 255.0 * math.pow(math.min(1.0, i / wp), gam);
-    if (th && v < 195) {
-      // تغميق تدريجي للحبر الباهت بدون تقطيع الأرقام الصغيرة
-      v = (v - 18.0) * 0.92;
-    }
-    return v.round().clamp(0, 255).toInt();
+    final t = ((i - black) / (wp - black)).clamp(0.0, 1.0);
+    return (255.0 * math.pow(t, gam)).round().clamp(0, 255).toInt();
   });
 
   final cx0 = List<int>.filled(w, 0), cx1 = List<int>.filled(w, 0);
@@ -910,10 +902,16 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
       if (vr > 255) vr = 255;
       if (vg > 255) vg = 255;
       if (vb > 255) vb = 255;
-      var r = lut[vr.round()], g = lut[vg.round()], b = lut[vb.round()];
-      if (gray) {
-        final l = (r * 54 + g * 183 + b * 19) >> 8;
-        r = g = b = l;
+      int r, g, b;
+      if (photocopy) {
+        final lum = ((vr * 54 + vg * 183 + vb * 19) / 256).round().clamp(0, 255);
+        r = g = b = lut[lum];
+      } else {
+        r = lut[vr.round()]; g = lut[vg.round()]; b = lut[vb.round()];
+        if (gray) {
+          final l = (r * 54 + g * 183 + b * 19) >> 8;
+          r = g = b = l;
+        }
       }
       out[i] = r;
       out[i + 1] = g;
@@ -923,7 +921,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
   }
 
   // حدة ذكية تحسّن النص وتمنع تشويش الورق الأبيض
-  final k = th ? 0.65 : (plain ? 0.15 : 0.35);
+  final k = th ? 0.30 : (plain ? 0.15 : 0.35);
   final cp = Uint8List.fromList(out);
   final row = w * 4;
   for (var y = 1; y < h - 1; y++) {
@@ -942,7 +940,7 @@ Uint8List _cleanJob(Map<String, dynamic> a) {
 
 /// بتطبّق فلتر الإيصال على ui.Image وبترجّع صورة جديدة (الأصلية مبتتمسحش).
 Future<ui.Image> cleanUiImage(ui.Image img,
-    {bool gray = false, bool thermal = false, bool plain = false}) async {
+    {bool gray = false, bool thermal = false, bool plain = false, bool photocopy = false}) async {
   final w = img.width, h = img.height;
   final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
   if (bd == null) throw Exception('تعذر قراءة الصورة');
@@ -953,6 +951,7 @@ Future<ui.Image> cleanUiImage(ui.Image img,
     'h': h,
     'gray': gray,
     'th': thermal,
+    'photocopy': photocopy,
   });
   final comp = Completer<ui.Image>();
   ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, comp.complete);
@@ -982,15 +981,8 @@ Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter f,
     final w = img.width, h = img.height;
     ui.Image out;
     if (isCleanFilter(f)) {
-      var c = await cleanUiImage(img, thermal: usesThermalClean(f), plain: f == ScanFilter.clean);
-      if (f == ScanFilter.receiptBw) {
-        final raw = await c.toByteData(format: ui.ImageByteFormat.rawRgba);
-        if (raw == null) throw Exception('تعذر قراءة الصورة');
-        final bwRgba =
-            await compute(_matrixJob, <String, dynamic>{'src': _bytesOf(raw), 'm': editMatrix(f, 0, 0)});
-        c.dispose();
-        c = await _imageFromRgba(bwRgba, w, h);
-      }
+      final c = await cleanUiImage(img, thermal: usesThermalClean(f),
+          plain: f == ScanFilter.clean, photocopy: f == ScanFilter.receiptBw);
       out = c;
     } else {
       final raw = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
@@ -3288,28 +3280,33 @@ BatchOcr _parseGeneric(List<String> rowsRaw) {
 
   // --- العدد
   String? count;
+  var sawCountLabel = false;
   String? firstInt(String r) {
     final cleaned = r.replaceAll(_ocrDec, ' ');
-    final m = _ocrInt.firstMatch(cleaned);
-    return m?.group(0);
+    final matches = _ocrInt.allMatches(cleaned).toList();
+    if (matches.length != 1) return null; // Split digits or several counts: ask, do not guess.
+    final m = matches.single;
+    if ((m.start > 0 && RegExp(r'[A-Za-z0-9]').hasMatch(cleaned[m.start - 1])) ||
+        (m.end < cleaned.length && RegExp(r'[A-Za-z0-9]').hasMatch(cleaned[m.end]))) return null;
+    return m.group(0);
   }
 
   for (var i = 0; i < rs.length && count == null; i++) {
     if (!_ocrCountKw.hasMatch(rs[i])) continue;
+    sawCountLabel = true;
     count = firstInt(rs[i]);
     // القيمة ممكن تكون في السطر اللي بعده
-    if (count == null && i + 1 < rs.length) {
+    if (count == null && !RegExp(r'\d').hasMatch(rs[i]) && i + 1 < rs.length) {
       final nx = rs[i + 1];
       if (!_ocrCountKw.hasMatch(nx) && !_ocrTotalKw.hasMatch(nx)) count = firstInt(nx);
     }
   }
   // لو مفيش كلمة عدد: رقم صحيح قبل الإجمالي في نفس الصف
-  if (count == null && bestRow != null) {
+  if (count == null && !sawCountLabel && bestRow != null) {
     final r = rs[bestRow!];
     final dm = _ocrDec.firstMatch(r);
     if (dm != null) {
-      final ints = _ocrInt.allMatches(r.substring(0, dm.start)).toList();
-      if (ints.isNotEmpty) count = ints.last.group(0);
+      count = firstInt(r.substring(0, dm.start));
     }
   }
 
@@ -3319,30 +3316,38 @@ BatchOcr _parseGeneric(List<String> rowsRaw) {
   );
 }
 
-final RegExp _ocrParen = RegExp(r'[(\[{]\s*([0-9OoIl]{1,6})\s*[)\]}]?');
+final RegExp _ocrParen = RegExp(r'[(\[{]([^)\]}\r\n]*)[)\]}]');
+final RegExp _ocrWholeCount = RegExp(r'^[0-9OoIl]{1,6}$');
 final RegExp _ocrGrand = RegExp(r'grand', caseSensitive: false);
 final RegExp _ocrEnd = RegExp(r'thank|hotline|nbe', caseSensitive: false);
 
 /// ورقة NBE واحدة: من سطر GRAND TOTALS لحد سطر THANK. العدد بين أقواس (015) والمبلغ جنبه.
 /// أي قيمة متقرتش بترجع null.
 BatchOcr _parseGrandBlock(List<String> rows, int from, int to) {
-  String? count;
+  final counts = <String>{};
+  var uncertainCount = false;
   double? best;
   for (var i = from; i < to; i++) {
     final r = rows[i];
-    if (count == null) {
-      final m = _ocrParen.firstMatch(r);
-      if (m != null) {
-        final d = m.group(1)!.replaceAll(RegExp(r'[Oo]'), '0').replaceAll(RegExp(r'[Il]'), '1');
-        count = '${int.parse(d)}';
-      }
-    }
     if (_ocrEnd.hasMatch(r)) break;
+    final matches = _ocrParen.allMatches(r).toList();
+    if (RegExp(r'[(\[{]').hasMatch(r) && matches.isEmpty) uncertainCount = true;
+    for (final m in matches) {
+      final token = m.group(1)!.trim();
+      if (!_ocrWholeCount.hasMatch(token)) {
+        uncertainCount = true; // Never accept 11 from (11B) or (11 8).
+        continue;
+      }
+      final d = token.replaceAll(RegExp(r'[Oo]'), '0').replaceAll(RegExp(r'[Il]'), '1');
+      counts.add('${int.parse(d)}');
+    }
     for (final m in _ocrDec.allMatches(r)) {
       final v = _ocrNum(m.group(0)!);
       if (v != null && (best == null || v > best)) best = v;
     }
   }
+  // Repeated Sale/Total counts must agree. A missing/ambiguous count stays empty.
+  final count = !uncertainCount && counts.length == 1 ? counts.single : null;
   return BatchOcr(count, best?.toStringAsFixed(2));
 }
 
@@ -3385,7 +3390,8 @@ BatchOcr parseBatchRows(List<String> rows) {
   final sheets = parseBatchSheets(rows);
   if (sheets.length > 1) return sumBatchSheets(sheets);
   final a = sheets.isEmpty ? const BatchOcr(null, null) : sheets.first;
-  if (a.count != null && a.total != null) return a;
+  // Do not revive a rejected GRAND TOTALS count via the generic fallback.
+  if (sheets.isNotEmpty) return a;
   final g = _parseGeneric(rows);
   return BatchOcr(a.count ?? g.count, a.total ?? g.total);
 }
@@ -3595,12 +3601,12 @@ class _BatchInfoSheet extends StatefulWidget {
 }
 
 class _BatchInfoSheetState extends State<_BatchInfoSheet> {
-  late final c1 = TextEditingController(text: widget.init.count);
+  late final c1 = TextEditingController(); // New photo: never prefill an old count.
   late final c2 =
       TextEditingController(text: widget.init.piasters.isEmpty ? '0' : widget.init.piasters);
   late final c3 =
       TextEditingController(text: widget.init.collected.isEmpty ? '0' : widget.init.collected);
-  late final c4 = TextEditingController(text: widget.init.total);
+  late final c4 = TextEditingController(); // New photo: never prefill an old total.
   String? err;
   bool reading = true, d1 = false, d4 = false;
   String? note;
@@ -3682,8 +3688,8 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     setState(() {
       reading = false;
       alerts = ws;
-      if (r?.count != null && !d1) c1.text = r!.count!;
-      if (r?.total != null && !d4) c4.text = r!.total!;
+      if (!d1) c1.text = r?.count ?? ''; // Failed/ambiguous read must stay empty.
+      if (!d4) c4.text = r?.total ?? '';
       if (r?.count == null && r?.total == null) {
         note = 'معرفتش أقرا الأرقام من الصورة، اكتبها بإيدك';
       } else if (r?.count == null || r?.total == null) {
@@ -7151,6 +7157,7 @@ Map<String, dynamic> _renderPipelineJob(Map<String, dynamic> a) {
   final thermal = a['thermal'] as bool;
   final plain = (a['plain'] as bool?) ?? false;
   final postMatrix = a['postMatrix'] as List<double>?;
+  final photocopy = (a['photocopy'] as bool?) ?? false;
   final sk = (a['sk'] as num).toDouble();
   final doTrim = a['doTrim'] as bool;
 
@@ -7185,6 +7192,7 @@ Map<String, dynamic> _renderPipelineJob(Map<String, dynamic> a) {
       'gray': false,
       'th': thermal,
       'plain': plain,
+      'photocopy': photocopy,
     });
     if (postMatrix != null) {
       rgba = _matrixJob(<String, dynamic>{'src': rgba, 'm': postMatrix});
@@ -7272,8 +7280,9 @@ Future<String> renderEditedPage(String path, String prefix, EditParams e,
       'needWarp': needWarp,
       'clean': clean,
       'thermal': usesThermalClean(filter),
+      'photocopy': filter == ScanFilter.receiptBw,
       'plain': filter == ScanFilter.clean,
-      'postMatrix': (clean && (contrast != 0 || brightness != 0 || filter == ScanFilter.receiptBw))
+      'postMatrix': (clean && (contrast != 0 || brightness != 0))
           ? editMatrix(filter, contrast, brightness)
           : null,
       'sk': effSharpness(filter, sharp),
@@ -7575,9 +7584,9 @@ class _EditorPageState extends State<EditorPage> {
         ),
       );
 
-  /// وضع التنضيف بتاع الفلتر: 0 إيصال، 1 حراري باهت، 2 تنضيف بس (من غير منحنى)
+  /// وضع التنضيف: 0 إيصال، 1 حراري، 2 تنضيف، 3 فوتوكوبي مستقل.
   static int _cleanModeOf(ScanFilter f) =>
-      f == ScanFilter.clean ? 2 : (usesThermalClean(f) ? 1 : 0);
+      f == ScanFilter.clean ? 2 : (f == ScanFilter.receiptBw ? 3 : (usesThermalClean(f) ? 1 : 0));
   bool get _cleanReady =>
       isCleanFilter(filter) && cleaned != null && _cleanedMode == _cleanModeOf(filter);
   ui.Image get _base => _cleanReady ? cleaned! : view!;
@@ -7611,7 +7620,8 @@ class _EditorPageState extends State<EditorPage> {
     final gen = ++_cleanGen;
     final th = usesThermalClean(filter);
     try {
-      final c = await cleanUiImage(v, thermal: th, plain: filter == ScanFilter.clean);
+      final c = await cleanUiImage(v, thermal: th, plain: filter == ScanFilter.clean,
+          photocopy: filter == ScanFilter.receiptBw);
       if (!mounted || gen != _cleanGen || view != v) {
         c.dispose();
         return;
