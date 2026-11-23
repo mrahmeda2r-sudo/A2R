@@ -1795,6 +1795,204 @@ Future<String> waShareCopy(String path, {required bool enhance}) async {
   }
 }
 
+// ───── شريط صورة السيستم (A2R SYS) ─────
+// كود الوحدة بالإنجليزي بالترمنل (نفس جدول الكونسول v96 و POS2). بيتكتب في شريط أبيض تحت صورة السيستم
+// علشان POS2 يعرف الماكينة من غير ما يعتمد على قراءة رقم الترمنل من صورة الشاشة (رقم واحد غلط = ماكينة تانية).
+const Map<String, String> kUnitCodeByTid = {
+  '50335710': 'ABIS-1',
+  '50335993': 'ABIS-2',
+  '50335987': 'ABIS-3',
+  '50325716': 'BORG-1',
+  '50335998': 'BORG-2',
+  '50335994': 'BORG-3',
+  '50335711': 'BORG-4',
+  '50382298': 'MONTAZA-1',
+  '50382315': 'MONTAZA-2',
+  '50383712': 'MONTAZA-3',
+  '50382306': 'MOHARRAM-1',
+  '50382316': 'MOHARRAM-2',
+  '50382308': 'AGAMY-1',
+  '50383706': 'AGAMY-2',
+  '50382300': 'QABBARY',
+  '50383702': 'MKAMEL',
+  '50382312': 'AMN',
+  '50383699': 'PORT',
+  '50383700': 'KHADAMAT',
+  '50325765': 'ABIS-S',
+  '50322364': 'BORG-S1',
+  '50322361': 'BORG-S2',
+  '50382150': 'MONTAZA-S',
+  '50381092': 'MOHARRAM-S',
+  '50381077': 'AGAMY-S',
+};
+
+// احتياطي لو الترمنل اتغير في data.xlsx: بالاسم بعد التوحيد (أ/ا، ة/ه، ى/ي، المسافات والأقواس)
+const Map<String, String> _kUnitCodeByName = {
+  'ابيس1': 'ABIS-1',
+  'ابيس2': 'ABIS-2',
+  'ابيس3': 'ABIS-3',
+  'برجالعرب1': 'BORG-1',
+  'برجالعرب2': 'BORG-2',
+  'برجالعرب3': 'BORG-3',
+  'برجالعرب4': 'BORG-4',
+  'المنتزه1': 'MONTAZA-1',
+  'المنتزه2': 'MONTAZA-2',
+  'المنتزه3': 'MONTAZA-3',
+  'محرمبك1': 'MOHARRAM-1',
+  'محرمبك2': 'MOHARRAM-2',
+  'العجمي1': 'AGAMY-1',
+  'العجمي2': 'AGAMY-2',
+  'القباري': 'QABBARY',
+  'مصطفيكامل': 'MKAMEL',
+  'مديريهالامن': 'AMN',
+  'ميناءالاسكندريه': 'PORT',
+  'خدماتمصر': 'KHADAMAT',
+  'مجمعخدماتمصر': 'KHADAMAT',
+  'ابيساحتياطي': 'ABIS-S',
+  'برجالعرباحتياطي1': 'BORG-S1',
+  'برجالعرباحتياطي2': 'BORG-S2',
+  'المنتزهاحتياطي': 'MONTAZA-S',
+  'محرمبكاحتياطي': 'MOHARRAM-S',
+  'العجمياحتياطي': 'AGAMY-S',
+};
+
+String _unitNameKey(String n) => n
+    .replaceAll(RegExp('[أإآ]'), 'ا')
+    .replaceAll('ة', 'ه')
+    .replaceAll('ى', 'ي')
+    .replaceAll(RegExp(r'[\s()\-_.]+'), '');
+
+String unitLatinCode(Unit u) => kUnitCodeByTid[u.tid] ?? _kUnitCodeByName[_unitNameKey(u.name)] ?? '';
+
+/// نص الشريط: A2R SYS 50383702 MKAMEL 23.11.2026
+String sysStripText(Unit u, DateTime d) {
+  final code = unitLatinCode(u);
+  final dt = '${d.day.toString().padLeft(2, '0')}.${d.month.toString().padLeft(2, '0')}.${d.year}';
+  return ['A2R', 'SYS', u.tid, if (code.isNotEmpty) code, dt].join(' ');
+}
+
+int _tidDigitDiff(String a, String b) {
+  if (a.length != b.length) return 99;
+  var d = 0;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) d++;
+  }
+  return d;
+}
+
+/// أرقام الترمنل (50xxxxxx) في نص صورة السيستم، متساهل مع غلطات الـ OCR (O/0 ، I/l/1 ، S/5).
+List<String> sysPhotoTids(String text) {
+  final out = <String>[];
+  final re = RegExp(r'(?<![0-9A-Za-z])([5S][0Oo][0-9OoIlS|]{6})(?![0-9A-Za-z])');
+  for (final m in re.allMatches(text)) {
+    final t = m
+        .group(1)!
+        .replaceAll(RegExp('[Oo]'), '0')
+        .replaceAll(RegExp('[Il|]'), '1')
+        .replaceAll('S', '5');
+    if (RegExp(r'^50\d{6}$').hasMatch(t) && !out.contains(t)) out.add(t);
+  }
+  return out;
+}
+
+/// تنبيه بس (عمره ما يمنع الإرسال): الترمنل المقروء من صورة السيستم مختلف عن الوحدة المختارة.
+/// لو الفرق رقم واحد بس بنعتبره غلطة قراءة (زي 50383702 تتقرا 50383700) ومش بننبّه.
+String? sysTidWarning(List<String> read, Unit sel, List<Unit> units) {
+  if (read.isEmpty) return null;
+  if (read.any((t) => _tidDigitDiff(t, sel.tid) <= 1)) return null;
+  final t = read.first;
+  Unit? other;
+  for (final u in units) {
+    if (u.tid == t) other = u;
+  }
+  final what = other == null ? t : '${other.name} · $t';
+  return 'رقم الترمنل في صورة السيستم ($what) مختلف عن الوحدة المختارة (${sel.name} · ${sel.tid}). '
+      'اتأكد إنك مختار الوحدة الصح وصورت سيستم نفس الماكينة — لو كله صح كمّل عادي';
+}
+
+/// نسخة واتساب لصورة السيستم + شريط أبيض تحتها فيه A2R SYS والترمنل والكود والتاريخ.
+/// الشريط بيتضاف تحت الصورة (مش فوقها)، والصورة نفسها بنفس بكسلاتها (أو نفس تصغير واتساب القديم لو أكبر
+/// من kWaMaxSide). عند أي فشل بنرجع للنسخة القديمة من غير شريط (الإرسال لا يتعطل أبدًا).
+Future<String> sysShareCopy(String path, Session s) async {
+  try {
+    final dir = (await Store.dir()).path;
+    final raw = await File(path).readAsBytes();
+    final sz = await imageSize(raw);
+    ui.Image src;
+    if (math.max(sz.w, sz.h) > kWaMaxSide) {
+      final img = await decodeImage(raw);
+      final w0 = img.width, h0 = img.height;
+      final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+      img.dispose();
+      if (bd == null) return await waShareCopy(path, enhance: false);
+      final res = await compute(_waCopyJob, <String, dynamic>{
+        'src': _bytesOf(bd),
+        'sw': w0,
+        'sh': h0,
+        'enhance': false,
+      });
+      src = await _imageFromRgba(res['rgba'] as Uint8List, res['w'] as int, res['h'] as int);
+    } else {
+      src = await decodeImage(raw);
+    }
+    final w = src.width, h = src.height;
+    final text = sysStripText(s.unit, DateTime.now());
+    TextPainter mk(double f) => TextPainter(
+          text: TextSpan(
+            text: text,
+            style: TextStyle(
+              color: const Color(0xFF000000),
+              fontSize: f,
+              fontWeight: FontWeight.w700,
+              fontFamily: 'monospace',
+              letterSpacing: f * 0.08,
+              height: 1.0,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+    // الخط كبير على قد عرض الصورة (حوالي 92%) علشان يتقري حتى بعد ضغط واتساب العادي
+    var fs = math.max(18.0, w / 16.0);
+    var tp = mk(fs);
+    if (tp.width > w * 0.92) {
+      fs = fs * (w * 0.92) / tp.width;
+      tp = mk(fs);
+    }
+    final pad = math.max(8.0, fs * 0.5);
+    final band = (tp.height + pad * 2).ceil();
+    final oh = h + band;
+    final rec = ui.PictureRecorder();
+    final c = Canvas(rec);
+    c.drawRect(Rect.fromLTWH(0, 0, w.toDouble(), oh.toDouble()), Paint()..color = const Color(0xFFFFFFFF));
+    c.drawImage(src, Offset.zero, Paint()..filterQuality = FilterQuality.none);
+    c.drawRect(Rect.fromLTWH(0, h.toDouble(), w.toDouble(), math.max(1.0, fs * 0.06)),
+        Paint()..color = const Color(0xFF000000));
+    tp.paint(c, Offset((w - tp.width) / 2, h + pad));
+    final pic = rec.endRecording();
+    final out = await pic.toImage(w, oh);
+    pic.dispose();
+    src.dispose();
+    final png = await out.toByteData(format: ui.ImageByteFormat.png);
+    out.dispose();
+    if (png == null) return await waShareCopy(path, enhance: false);
+    final jpg = await FlutterImageCompress.compressWithList(
+      _bytesOf(png),
+      minWidth: w,
+      minHeight: oh,
+      quality: 97,
+      format: CompressFormat.jpeg,
+    );
+    if (!_isJpegHeader(jpg)) return await waShareCopy(path, enhance: false);
+    final f = File('$dir/wa_sys_${DateTime.now().microsecondsSinceEpoch}_${_waSeq++}.jpg');
+    await f.writeAsBytes(jpg, flush: true);
+    AppLog.i('sysCopy ${sz.w}x${sz.h} -> ${w}x$oh strip="$text" ${jpg.length ~/ 1024}KB');
+    return f.path;
+  } catch (e, st) {
+    AppLog.e('sysCopy', e, st);
+    return await waShareCopy(path, enhance: false);
+  }
+}
+
 Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel}) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src;
@@ -3409,13 +3607,17 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
   List<String> alerts = const [];
   String? sysImg; // صورة السيستم المرفقة بالباتش (إجباري قبل الإرسال)
   bool sysBusy = false;
+  String? sysWarn; // تنبيه بس: الترمنل في صورة السيستم مختلف عن الوحدة المختارة (مبيمنعش الإرسال)
 
   @override
   void initState() {
     super.initState();
     _ocr();
     Store.systemPhoto().then((s) {
-      if (mounted && s != null) setState(() => sysImg = s);
+      if (mounted && s != null) {
+        setState(() => sysImg = s);
+        _checkSysTid(s);
+      }
     });
   }
 
@@ -3431,11 +3633,32 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
           '${(await Store.dir()).path}/system_${DateTime.now().microsecondsSinceEpoch}.jpg';
       await File(x.path).copy(dest);
       await Store.setSystemPhoto(dest);
-      if (mounted) setState(() => sysImg = dest);
+      if (mounted) {
+        setState(() {
+          sysImg = dest;
+          sysWarn = null;
+        });
+        _checkSysTid(dest); // في الخلفية: مبيأخرش التصوير
+      }
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
       if (mounted) setState(() => sysBusy = false);
+    }
+  }
+
+  /// قراءة رقم الترمنل من صورة السيستم في الخلفية ومقارنته بالوحدة المختارة. تنبيه بس.
+  Future<void> _checkSysTid(String path) async {
+    try {
+      final lines = await _ocrLinesOf(path).timeout(const Duration(seconds: 20));
+      final tids = sysPhotoTids(lines.map((l) => l.text).join('\n'));
+      if (!mounted || sysImg != path) return;
+      final w = sysTidWarning(tids, widget.session.unit, AppData.units);
+      AppLog.i('sys tid read=${tids.join(',')} unit=${widget.session.unit.tid} warn=${w != null}');
+      if (w != null) HapticFeedback.vibrate();
+      setState(() => sysWarn = w);
+    } catch (e) {
+      AppLog.i('sys tid ocr failed: $e');
     }
   }
 
@@ -3613,6 +3836,24 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
                         label: Text(sysImg == null ? 'معاينة' : '✓ معاينة'),
                       )),
                     ]),
+                    if (sysWarn != null)
+                      Container(
+                        width: double.infinity,
+                        margin: const EdgeInsets.only(top: 8),
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.withAlpha(30),
+                          border: Border.all(color: Colors.orange.withAlpha(190)),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 18),
+                          const SizedBox(width: 6),
+                          Expanded(
+                              child: Text(sysWarn!,
+                                  style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600))),
+                        ]),
+                      ),
                     const SizedBox(height: 10),
                     if (err != null)
                       Padding(
@@ -3773,9 +4014,10 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
   }
   if (!context.mounted) return false;
   final sys = await Store.systemPhoto();
-  // نسخ مضبوطة لواتساب: الباتش بتحسين مستند، وصورة السيستم تصغير جيد فقط (زي ما اتصورت)
+  // نسخ مضبوطة لواتساب: الباتش بتحسين مستند، وصورة السيستم تصغير جيد فقط (زي ما اتصورت) + شريط تحتها
   final outShare = await waShareCopy(out.path, enhance: true);
-  final sysShare = sys == null ? null : await waShareCopy(sys, enhance: false);
+  // صورة السيستم + شريط A2R SYS تحتها (الترمنل وكود الوحدة) علشان POS2 يعرف الماكينة صح
+  final sysShare = sys == null ? null : await sysShareCopy(sys, s);
   final ok = await shareFiles(context, [outShare, if (sysShare != null) sysShare],
       text: caption);
   if (ok) {
