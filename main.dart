@@ -105,8 +105,9 @@ class ImageQualityProfile {
   final int maxSide;
   final int jpegQuality;
   const ImageQualityProfile(this.id, this.maxSide, this.jpegQuality);
-  static const receipts = ImageQualityProfile('receipts-v1', 4096, 90);
+  static const receipts = ImageQualityProfile('receipts-v1', 4096, 100);
   static const detailedCapture = ImageQualityProfile('camera-detail-v1', 3200, 92);
+  static const batch = ImageQualityProfile('batch-v1', 4096, 100);
 }
 
 // Per-shot handoff only. Persisted on the image as soon as ingest consumes it.
@@ -1541,6 +1542,153 @@ Future<Uint8List> composeIdCard(String frontPath, String backPath) async {
   }
 }
 
+/// نسخة إرسال واتساب في Isolate: تصغير بمتوسط المساحة لـ 1600 (مقاس واتساب) + اختياريًا
+/// مستويات تلقائية (سحق الحبر وقص الورق) وحدة معتدلة للمستند. الأصل لا يُمس.
+Map<String, dynamic> _waCopyJob(Map<String, dynamic> a) {
+  final src = a['src'] as Uint8List;
+  final sw = a['sw'] as int, sh = a['sh'] as int;
+  final enhance = a['enhance'] as bool;
+  final k = math.min(1.0, 1600 / math.max(sw, sh));
+  final ow = math.max(8, (sw * k).round()), oh = math.max(8, (sh * k).round());
+  final out = Uint8List(ow * oh * 4);
+  for (var y = 0; y < oh; y++) {
+    final sy0 = y / k, sy1 = (y + 1) / k;
+    final iy0 = sy0.floor(), iy1 = math.min(sh, sy1.ceil());
+    for (var x = 0; x < ow; x++) {
+      final sx0 = x / k, sx1 = (x + 1) / k;
+      final ix0 = sx0.floor(), ix1 = math.min(sw, sx1.ceil());
+      double r = 0, g = 0, b = 0, al = 0, acc = 0;
+      for (var yy = iy0; yy < iy1; yy++) {
+        final wy = math.min(sy1, yy + 1.0) - math.max(sy0, yy.toDouble());
+        if (wy <= 0) continue;
+        for (var xx = ix0; xx < ix1; xx++) {
+          final wx = math.min(sx1, xx + 1.0) - math.max(sx0, xx.toDouble());
+          if (wx <= 0) continue;
+          final wgt = wx * wy;
+          final si = (yy * sw + xx) * 4;
+          r += src[si] * wgt;
+          g += src[si + 1] * wgt;
+          b += src[si + 2] * wgt;
+          al += src[si + 3] * wgt;
+          acc += wgt;
+        }
+      }
+      final di = (y * ow + x) * 4;
+      out[di] = (r / acc).round();
+      out[di + 1] = (g / acc).round();
+      out[di + 2] = (b / acc).round();
+      out[di + 3] = (al / acc).round();
+    }
+  }
+  if (!enhance) return {'rgba': out, 'w': ow, 'h': oh};
+  // مستويات تلقائية من هيستوجرام اللمعان: سحق الحبر وقص الورق
+  final hist = List<int>.filled(256, 0);
+  for (var i = 0; i < ow * oh; i++) {
+    final p = i * 4;
+    hist[(out[p] * 77 + out[p + 1] * 150 + out[p + 2] * 29) >> 8]++;
+  }
+  int pctl(double q) {
+    var acc = 0;
+    final t = (ow * oh * q).round();
+    for (var i = 0; i < 256; i++) {
+      acc += hist[i];
+      if (acc >= t) return i;
+    }
+    return 255;
+  }
+
+  final lo = math.max(0, pctl(0.02) - 30);
+  final hi = math.min(255, math.max(lo + 30, pctl(0.90) + 25));
+  final scale = 255.0 / (hi - lo);
+  for (var i = 0; i < ow * oh; i++) {
+    final p = i * 4;
+    for (var c = 0; c < 3; c++) {
+      final v = (out[p + c] - lo) * scale;
+      out[p + c] = v < 0 ? 0 : (v > 255 ? 255 : v.round());
+    }
+  }
+  // حدة معتدلة: قناع عدم حدة بضبابية 3x3
+  final blur = Uint8List(ow * oh * 3);
+  for (var y = 0; y < oh; y++) {
+    for (var x = 0; x < ow; x++) {
+      var r = 0, g = 0, b = 0, n = 0;
+      for (var dy = -1; dy <= 1; dy++) {
+        final yy = y + dy;
+        if (yy < 0 || yy >= oh) continue;
+        for (var dx = -1; dx <= 1; dx++) {
+          final xx = x + dx;
+          if (xx < 0 || xx >= ow) continue;
+          final si = (yy * ow + xx) * 4;
+          r += out[si];
+          g += out[si + 1];
+          b += out[si + 2];
+          n++;
+        }
+      }
+      final di = (y * ow + x) * 3;
+      blur[di] = r ~/ n;
+      blur[di + 1] = g ~/ n;
+      blur[di + 2] = b ~/ n;
+    }
+  }
+  const amt = 0.9, thr = 2;
+  for (var i = 0; i < ow * oh; i++) {
+    final p = i * 4, q = i * 3;
+    for (var c = 0; c < 3; c++) {
+      final diff = out[p + c] - blur[q + c];
+      if (diff.abs() > thr) {
+        final v = out[p + c] + (amt * diff).round();
+        out[p + c] = v < 0 ? 0 : (v > 255 ? 255 : v);
+      }
+    }
+  }
+  return {'rgba': out, 'w': ow, 'h': oh};
+}
+
+int _waSeq = 0;
+
+/// نسخة الإرسال للواتساب: نفس الصورة بمقاس واتساب وجودة جيدة، ولو enhance بتحسين مستند.
+/// عند أي فشل نرجع مسار الأصل كما هو (الإرسال لا يتعطل أبدًا بسبب النسخة).
+Future<String> waShareCopy(String path, {required bool enhance}) async {
+  try {
+    final dir = (await Store.dir()).path;
+    try {
+      await for (final e in Directory(dir).list()) {
+        if (e.path.contains('/wa_') && e.path.endsWith('.jpg')) await e.delete();
+      }
+    } catch (_) {}
+    final raw = await File(path).readAsBytes();
+    final img = await decodeImage(raw);
+    final w = img.width, h = img.height;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    img.dispose();
+    if (bd == null) return path;
+    final res = await compute(_waCopyJob, <String, dynamic>{
+      'src': _bytesOf(bd),
+      'sw': w,
+      'sh': h,
+      'enhance': enhance,
+    });
+    final rgba = res['rgba'] as Uint8List;
+    final ow = res['w'] as int, oh = res['h'] as int;
+    final jpg = await FlutterImageCompress.compressWithList(
+      rgba,
+      minWidth: ow,
+      minHeight: oh,
+      quality: 90,
+      format: CompressFormat.jpeg,
+    );
+    if (!_isJpegHeader(jpg)) return path;
+    final f = File('${dir}/wa_${DateTime.now().microsecondsSinceEpoch}_${_waSeq++}.jpg');
+    await f.writeAsBytes(jpg, flush: true);
+    AppLog.i('waCopy ${w}x$h -> ${ow}x$oh ${jpg.length ~/ 1024}KB enhance=$enhance');
+    return f.path;
+  } catch (e, st) {
+    AppLog.e('waCopy', e, st);
+    return path;
+  }
+}
+
 Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel}) async {
   final src = await File(path).readAsBytes();
   if (await Store.noTag(path)) return src;
@@ -2081,6 +2229,9 @@ class Store {
     if (p.getString('quality:$path') == ImageQualityProfile.receipts.id) {
       return ImageQualityProfile.receipts;
     }
+    if (p.getString('quality:$path') == ImageQualityProfile.batch.id) {
+      return ImageQualityProfile.batch;
+    }
     // Existing receipt drafts and PDFs get the receipt profile on first use.
     if ((p.getStringList('draft') ?? []).contains(path) ||
         (p.getStringList('pdfImgs') ?? []).contains(path) ||
@@ -2435,10 +2586,10 @@ Future<List<String>> simplePick(BuildContext context,
   try {
     final picker = ImagePicker();
     if (src == ImageSource.gallery && multi) {
-      final xs = await picker.pickMultiImage(maxWidth: profile == null ? 2000 : null, imageQuality: profile == null ? 85 : null);
+      final xs = await picker.pickMultiImage(); // الأصل من غير تصغير أو إعادة ضغط
       return xs.map((e) => e.path).toList();
     }
-    final x = await picker.pickImage(source: src, maxWidth: profile == null ? 2000 : null, imageQuality: profile == null ? 85 : null);
+    final x = await picker.pickImage(source: src); // الأصل من غير تصغير أو إعادة ضغط
     return x == null ? [] : [x.path];
   } catch (e, st) {
     AppLog.e('simplePick', e, st);
@@ -3168,8 +3319,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     if (sysBusy) return;
     setState(() => sysBusy = true);
     try {
-      final x = await ImagePicker()
-          .pickImage(source: src, maxWidth: 2000, imageQuality: 90);
+      final x = await ImagePicker().pickImage(source: src); // الأصل زي ما اتصور
       if (x == null || !mounted) return;
       final dest =
           '${(await Store.dir()).path}/system_${DateTime.now().microsecondsSinceEpoch}.jpg';
@@ -3517,8 +3667,11 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
   }
   if (!context.mounted) return false;
   final sys = await Store.systemPhoto();
-  final ok =
-      await shareFiles(context, [out.path, if (sys != null) sys], text: caption);
+  // نسخ مضبوطة لواتساب: الباتش بتحسين مستند، وصورة السيستم تصغير جيد فقط (زي ما اتصورت)
+  final outShare = await waShareCopy(out.path, enhance: true);
+  final sysShare = sys == null ? null : await waShareCopy(sys, enhance: false);
+  final ok = await shareFiles(context, [outShare, if (sysShare != null) sysShare],
+      text: caption);
   if (ok) {
     await Store.afterBatchSent();
     await Store.addLog(s, 'batch', 'عدد المعاملات ${info.count} - الإجمالي ${info.total}');
@@ -5117,7 +5270,7 @@ class _BatchScreenState extends State<BatchScreen> {
       try {
         final path = await persistImage(
             lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-            filter: ScanFilter.adaptive);
+            filter: ScanFilter.adaptive, profile: ImageQualityProfile.batch);
         await Store.setBatchImg(path, fresh: true);
         await _show(path);
         _lastScanManual = true;
@@ -5186,7 +5339,8 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.adaptive, applyNow: false);
+          filter: ScanFilter.adaptive, applyNow: false,
+          profile: ImageQualityProfile.batch);
       await Store.setBatchImg(path, fresh: true);
       await _show(path);
       unawaited(qualityWarning(path).then((warn) {
@@ -5207,7 +5361,8 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.adaptive, applyNow: false, keepOriginal: keepOriginal);
+          filter: ScanFilter.adaptive, applyNow: false, keepOriginal: keepOriginal,
+          profile: ImageQualityProfile.batch);
       await Store.setBatchImg(path, fresh: true);
       return path;
     } catch (e) {
@@ -5372,7 +5527,7 @@ class _BatchScreenState extends State<BatchScreen> {
     await markPickTarget('batch');
     try {
       x = await ImagePicker()
-          .pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 90);
+          .pickImage(source: ImageSource.gallery); // الأصل من غير تصغير
     } catch (e, st) {
       AppLog.e('_gallery', e, st);
       if (mounted) snack(context, 'تعذر فتح المعرض');
@@ -5383,7 +5538,8 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final path = await persistImage(
           x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
-          filter: ScanFilter.adaptive, applyNow: false);
+          filter: ScanFilter.adaptive, applyNow: false,
+          profile: ImageQualityProfile.batch);
       await Store.setBatchImg(path, fresh: true);
       await _show(path);
     } catch (e) {
@@ -8488,7 +8644,6 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   bool _shooting = false;
   bool _shutterFlash = false; // وميض أبيض سريع عند الالتقاط في الوضع السريع
   String? _lastShot; // أبعاد آخر صورة اتصوّرت فعلاً (للتأكد من الدقة)
-  bool _hd = true;
   bool _detailedCapture = false; // Explicit per-session opt-in, never a slower default.
   int _flash = 0; // 0 مقفول، 1 تلقائي، 2 فلاش، 3 كشاف
   bool _grid = false; // شبكة الأثلاث للمحاذاة
@@ -8544,7 +8699,6 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     _thumb = widget.thumb;
     WidgetsBinding.instance.addObserver(this);
     SharedPreferences.getInstance().then((p) {
-      _hd = p.getBool('camHd') ?? true;
       _flash = p.getInt('camFlash') ?? 0;
       _grid = p.getBool('camGrid') ?? false;
       _a4Frame = p.getBool('camA4Frame') ?? false;
@@ -8700,24 +8854,18 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       if (cams.isEmpty) throw Exception('مفيش كاميرا على الجهاز');
       final back = cams.firstWhere((x) => x.lensDirection == cam.CameraLensDirection.back,
           orElse: () => cams.first);
-      final perf = await Store.perfMode();
-      final slow = (await SharedPreferences.getInstance()).getBool('camSlow') ?? false;
       late final cam.ResolutionPreset preset;
-      if (widget.receiptQuality || _detailedCapture) {
-        preset = cam.ResolutionPreset.max;
-      } else if (gResLevel > 0) {
+      // أقصى دقة التقاط افتراضيًا لكل الكاميرات (إيصالات وباتش)؛ اختيار «دقة» من شاشة الكاميرا يكسب على الافتراضي.
+      // الاسكنر والقص التلقائي شغالين على نفس الدقة دي في مسار الإيصالات أصلًا.
+      if (gResLevel > 0) {
         preset = const [
           cam.ResolutionPreset.high,
           cam.ResolutionPreset.veryHigh,
           cam.ResolutionPreset.ultraHigh,
           cam.ResolutionPreset.max,
         ][(gResLevel - 1).clamp(0, 3)];
-      } else if (perf == PerfMode.pro) {
-        preset = _hd && !slow ? cam.ResolutionPreset.ultraHigh : cam.ResolutionPreset.veryHigh;
-      } else if (perf == PerfMode.balanced) {
-        preset = cam.ResolutionPreset.veryHigh;
       } else {
-        preset = cam.ResolutionPreset.high;
+        preset = cam.ResolutionPreset.max;
       }
       cam.CameraController? initialized;
       var actualPreset = preset;
@@ -9173,10 +9321,8 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   /// لو كاميرا التطبيق مش شغالة على الموبايل ده: كاميرا النظام بدالها.
   Future<void> _systemCamera() async {
     try {
-      final x = await ImagePicker().pickImage(
-          source: ImageSource.camera,
-          maxWidth: widget.receiptQuality || _detailedCapture ? null : 2000,
-          imageQuality: widget.receiptQuality || _detailedCapture ? null : 90);
+      final x = await ImagePicker()
+          .pickImage(source: ImageSource.camera); // الأصل من غير تصغير
       if (x == null || !mounted) return;
       if (_detailedCapture && !widget.receiptQuality) {
         _rememberCaptureProfile(x.path, ImageQualityProfile.detailedCapture);
