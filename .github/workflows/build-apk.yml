@@ -130,44 +130,110 @@ jobs:
           print(s)
           PY
 
-      - name: Volume keys take photos (native MainActivity)
+      - name: Volume keys take photos + tilt level (native MainActivity)
         run: |
           python3 - <<'PY'
-          import glob, re, os
+          import glob, re
           cands = glob.glob('android/app/src/main/**/MainActivity.kt', recursive=True)
           assert cands, 'MainActivity.kt not found'
           p = cands[0]
           pkg = re.search(r'(?m)^package\s+([\w.]+)', open(p, encoding='utf-8').read()).group(1)
           code = """package PKG
 
+          import android.content.Context
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
           import android.view.KeyEvent
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.EventChannel
           import io.flutter.plugin.common.MethodChannel
 
           class MainActivity : FlutterActivity() {
-              private var channel: MethodChannel? = null
-              private var enabled = false
+              private var keysChannel: MethodChannel? = null
+              private var camChannel: MethodChannel? = null
+              private var keysEnabled = false
+              private var camEnabled = false
+              private var sensorManager: SensorManager? = null
+              private var tiltListener: SensorEventListener? = null
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
-                  val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/keys")
-                  ch.setMethodCallHandler { call, result ->
+                  val messenger = flutterEngine.dartExecutor.binaryMessenger
+
+                  // القناة القديمة (متسابة للتوافق)
+                  val keys = MethodChannel(messenger, "a2r/keys")
+                  keys.setMethodCallHandler { call, result ->
                       if (call.method == "enable") {
-                          enabled = (call.arguments as? Boolean) ?: false
+                          keysEnabled = (call.arguments as? Boolean) ?: false
                           result.success(null)
                       } else {
                           result.notImplemented()
                       }
                   }
-                  channel = ch
+                  keysChannel = keys
+
+                  // زرار الصوت للتصوير: نفس الاسم اللي كاميرا A2R في main.dart بتكلمه
+                  val cam = MethodChannel(messenger, "a2r/cam_hw")
+                  cam.setMethodCallHandler { call, result ->
+                      if (call.method == "setVolumeCapture") {
+                          camEnabled = (call.arguments as? Boolean) ?: false
+                          result.success(null)
+                      } else {
+                          result.notImplemented()
+                      }
+                  }
+                  camChannel = cam
+
+                  // ميزان الاستقامة: قراءات الحساس [x, y, z] لـ main.dart
+                  EventChannel(messenger, "a2r/tilt").setStreamHandler(object : EventChannel.StreamHandler {
+                      override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                          stopTilt()
+                          val sm = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+                          val acc = sm?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+                          if (sm == null || acc == null) {
+                              events.error("no_sensor", "No accelerometer", null)
+                              return
+                          }
+                          val listener = object : SensorEventListener {
+                              override fun onSensorChanged(e: SensorEvent) {
+                                  events.success(listOf(e.values[0].toDouble(), e.values[1].toDouble(), e.values[2].toDouble()))
+                              }
+                              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+                          }
+                          sm.registerListener(listener, acc, SensorManager.SENSOR_DELAY_UI)
+                          sensorManager = sm
+                          tiltListener = listener
+                      }
+
+                      override fun onCancel(arguments: Any?) {
+                          stopTilt()
+                      }
+                  })
+              }
+
+              private fun stopTilt() {
+                  val l = tiltListener
+                  if (l != null) sensorManager?.unregisterListener(l)
+                  tiltListener = null
+              }
+
+              override fun onDestroy() {
+                  stopTilt()
+                  super.onDestroy()
               }
 
               override fun dispatchKeyEvent(event: KeyEvent): Boolean {
                   val k = event.keyCode
-                  if (enabled && (k == KeyEvent.KEYCODE_VOLUME_UP || k == KeyEvent.KEYCODE_VOLUME_DOWN)) {
+                  if ((camEnabled || keysEnabled) && (k == KeyEvent.KEYCODE_VOLUME_UP || k == KeyEvent.KEYCODE_VOLUME_DOWN)) {
                       if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                          channel?.invokeMethod("vol", null)
+                          if (camEnabled) {
+                              camChannel?.invokeMethod("volumeShot", null)
+                          } else {
+                              keysChannel?.invokeMethod("vol", null)
+                          }
                       }
                       return true
                   }
@@ -176,6 +242,7 @@ jobs:
           }
           """.replace('PKG', pkg)
           open(p, 'w', encoding='utf-8').write(code)
+          assert '"a2r/cam_hw"' in code and '"a2r/tilt"' in code
           print(p, pkg)
           PY
 
