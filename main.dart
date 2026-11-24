@@ -34,6 +34,7 @@ const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الص�
 const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
 /// تصغير ورقة بيانات إيصالات الدفع (الباتش مش متأثر): الخط والهوامش بالنسبة دي.
 const kReceiptTagScale = 1.0;
+const kTagMinScale = 0.05; // أصغر حجم لورقة الباتش (نسبة من عرض الصورة)
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
 const kBatchTagW = 0.7; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
@@ -1359,7 +1360,7 @@ class TagPos {
     if (a == null || b == null || c == null) return null;
     if (!a.isFinite || !b.isFinite || !c.isFinite) return null;
     return TagPos(a.clamp(0.0, 1.0).toDouble(), b.clamp(0.0, 10.0).toDouble(),
-        c.clamp(0.1, 1.0).toDouble());
+        c.clamp(kTagMinScale, 1.0).toDouble());
   }
 }
 
@@ -1540,6 +1541,145 @@ Future<double?> _jpegMeanLum(Uint8List jpg) async {
   }
 }
 
+/// تركيب مباشر بصيغة BMP 24 بت (من غير نسخة RGBA كاملة تانية ولا ضغط PNG): الصورة + الورقة، صف صف.
+/// بيرجّع BMP جاهز للضغط JPEG ومتوسط السطوع بنفس عينات _meanLum.
+Map<String, dynamic> _composeBmpJob(Map<String, dynamic> a) {
+  final img = a['img'] as Uint8List;
+  final iw = a['iw'] as int, ih = a['ih'] as int;
+  final tag = a['tag'] as Uint8List;
+  final tw = a['tw'] as int, th = a['th'] as int;
+  final ow = a['ow'] as int, oh = a['oh'] as int;
+  final ix = a['ix'] as int, iy = a['iy'] as int;
+  final tx = a['tx'] as int, ty = a['ty'] as int;
+  final rowBytes = ((ow * 3 + 3) ~/ 4) * 4;
+  final dataSize = rowBytes * oh;
+  final bmp = Uint8List(54 + dataSize);
+  final hd = ByteData.view(bmp.buffer);
+  bmp[0] = 0x42;
+  bmp[1] = 0x4D;
+  hd.setUint32(2, 54 + dataSize, Endian.little);
+  hd.setUint32(10, 54, Endian.little);
+  hd.setUint32(14, 40, Endian.little);
+  hd.setInt32(18, ow, Endian.little);
+  hd.setInt32(22, oh, Endian.little); // موجب = الصفوف من تحت لفوق
+  hd.setUint16(26, 1, Endian.little);
+  hd.setUint16(28, 24, Endian.little);
+  hd.setUint32(34, dataSize, Endian.little);
+  final row = Uint8List(ow * 4);
+  final sx0 = math.max(0, -ix), sx1 = math.min(iw, ow - ix);
+  final n = ow * oh;
+  final step = math.max(1, n ~/ 20000) | 1;
+  var lumSum = 0.0, lumCnt = 0;
+  for (var y = 0; y < oh; y++) {
+    row.fillRange(0, row.length, 255);
+    final sy = y - iy;
+    if (sy >= 0 && sy < ih && sx1 > sx0) {
+      row.setRange((ix + sx0) * 4, (ix + sx1) * 4, img, (sy * iw + sx0) * 4);
+    }
+    final ty0 = y - ty;
+    if (ty0 >= 0 && ty0 < th) {
+      for (var x = 0; x < tw; x++) {
+        final dx = x + tx;
+        if (dx < 0 || dx >= ow) continue;
+        final si = (ty0 * tw + x) * 4, di = dx * 4;
+        final al = tag[si + 3];
+        if (al == 0) continue;
+        if (al == 255) {
+          row[di] = tag[si];
+          row[di + 1] = tag[si + 1];
+          row[di + 2] = tag[si + 2];
+        } else {
+          final k = 1 - al / 255;
+          for (var c = 0; c < 3; c++) {
+            final v = tag[si + c] + row[di + c] * k;
+            row[di + c] = v > 255 ? 255 : v.round();
+          }
+        }
+      }
+    }
+    var o = 54 + (oh - 1 - y) * rowBytes;
+    for (var x = 0, j = 0; x < ow; x++, j += 4) {
+      bmp[o++] = row[j + 2];
+      bmp[o++] = row[j + 1];
+      bmp[o++] = row[j];
+    }
+    // عينات السطوع: نفس الفهارس i = y*ow + x اللي بتقبل القسمة على step
+    final base = y * ow;
+    var x0 = (step - base % step) % step;
+    for (var x = x0; x < ow; x += step) {
+      final j = x * 4;
+      lumSum += (row[j] * 54 + row[j + 1] * 183 + row[j + 2] * 19) >> 8;
+      lumCnt++;
+    }
+  }
+  return {'bmp': bmp, 'lum': lumCnt == 0 ? 0.0 : lumSum / lumCnt};
+}
+
+/// بيركّب الصورة والورقة ويطلّع JPEG بنفس الأبعاد من غير أي تصغير. المسار الأساسي BMP (أقل ذاكرة)،
+/// ولو فشل ضغطه بيرجع للمسار القديم (PNG) بنفس الأبعاد. لو الناتج مشوّه بنفشل بدل ما نصغّر أو نبعت صورة بايظة.
+Future<Uint8List> _composeEncode(ui.Image img, Tag tag,
+    {required int ow, required int oh, required int ix, required int iy, required int tx, required int ty,
+    required int q, required String label}) async {
+  final iw = img.width, ih = img.height;
+  final tImg = await decodeImage(tag.png);
+  final tw = tImg.width, th = tImg.height;
+  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
+  img.dispose();
+  tImg.dispose();
+  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
+  final args = <String, dynamic>{
+    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
+    'iw': iw,
+    'ih': ih,
+    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
+    'tw': tw,
+    'th': th,
+    'ow': ow,
+    'oh': oh,
+    'ix': ix,
+    'iy': iy,
+    'tx': tx,
+    'ty': ty,
+  };
+  try {
+    final r = await compute(_composeBmpJob, args);
+    final jpg = await FlutterImageCompress.compressWithList(
+      r['bmp'] as Uint8List,
+      minWidth: ow,
+      minHeight: oh,
+      quality: q,
+      format: CompressFormat.jpeg,
+    );
+    final got = await _jpegMeanLum(jpg);
+    final want = r['lum'] as double;
+    AppLog.i('$label bmp ${ow}x$oh ${jpg.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} got=${got?.toStringAsFixed(0)}');
+    if (_isJpegHeader(jpg) && got != null && (got - want).abs() < 25) return jpg;
+  } catch (e, st) {
+    AppLog.e('$label.bmp', e, st);
+  }
+  // المسار القديم (PNG) بنفس الأبعاد الكاملة، من غير تصغير
+  final rgba = await compute(_composeJob, args);
+  final comp = Completer<ui.Image>();
+  ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
+  final outImg = await comp.future;
+  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
+  outImg.dispose();
+  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
+  final want = _meanLum(rgba, ow, oh);
+  final jpg = await FlutterImageCompress.compressWithList(
+    pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes),
+    minWidth: ow,
+    minHeight: oh,
+    quality: q,
+    format: CompressFormat.jpeg,
+  );
+  final got = await _jpegMeanLum(jpg);
+  if (_isJpegHeader(jpg) && got != null && (got - want).abs() < 25) return jpg;
+  throw Exception('الصورة النهائية طلعت مشوّهة، الأصل محفوظ. جرّب تاني أو وضع الأداء Lite');
+}
+
+
 /// صورة الباتش + الورقة. layout 1: شريط أبيض تحت الصورة (الصورة كاملة من غير تغطية)،
 /// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
 Future<Uint8List> composeBatch(String path, Session s) async {
@@ -1574,51 +1714,9 @@ Future<Uint8List> composeBatch(String path, Session s) async {
     imgY = 0;
     oh = ih + band.ceil();
   }
-  final tImg = await decodeImage(tag.png);
-  final tw = tImg.width, th = tImg.height;
-  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
-  img.dispose();
-  tImg.dispose();
-  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
-  final rgba = await compute(_composeJob, <String, dynamic>{
-    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
-    'iw': iw,
-    'ih': ih,
-    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
-    'tw': tw,
-    'th': th,
-    'ow': ow,
-    'oh': oh,
-    'ix': imgX,
-    'iy': imgY,
-    'tx': tagAt.dx.round(),
-    'ty': tagAt.dy.round(),
-  });
-  final comp = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
-  final outImg = await comp.future;
-  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
-  outImg.dispose();
-  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
-  final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
   final q = await Store.jpegQuality(profile: profile);
-  final want = _meanLum(rgba, ow, oh);
-  // أول محاولة بالأبعاد الكاملة، ولو الناتج مشوّه نجرّب أبعاد أصغر، ولو برضه مشوّه منبعتش صورة بايظة
-  for (final k in const [1.0, 0.75]) {
-    final jpg = await FlutterImageCompress.compressWithList(
-      png,
-      minWidth: (ow * k).round(),
-      minHeight: (oh * k).round(),
-      quality: q,
-      format: CompressFormat.jpeg,
-    );
-    final got = await _jpegMeanLum(jpg);
-    AppLog.i('compose ${ow}x$oh k=$k ${jpg.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} '
-        'got=${got?.toStringAsFixed(0)}');
-    if (got != null && (got - want).abs() < 25) return jpg;
-  }
-  throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
+  return _composeEncode(img, tag,
+      ow: ow, oh: oh, ix: imgX, iy: imgY, tx: tagAt.dx.round(), ty: tagAt.dy.round(), q: q, label: 'batchImg');
 }
 
 /// صورة الإيصال النهائية للمشاركة: نفس صفحة الـ PDF (شريط أبيض فيه الورقة فوق الإيصال).
@@ -1979,28 +2077,21 @@ Future<String> sysShareCopy(String path, Session s) async {
     final pad = math.max(8.0, fs * 0.5);
     final band = (tp.height + pad * 2).ceil();
     final oh = h + band;
+    // الشريط بس بيترسم (صغير)، والصورة الكاملة بتتركّب صف صف من غير نسخ RGBA/PNG كاملة زيادة
     final rec = ui.PictureRecorder();
     final c = Canvas(rec);
-    c.drawRect(Rect.fromLTWH(0, 0, w.toDouble(), oh.toDouble()), Paint()..color = const Color(0xFFFFFFFF));
-    c.drawImage(src, Offset.zero, Paint()..filterQuality = FilterQuality.none);
-    c.drawRect(Rect.fromLTWH(0, h.toDouble(), w.toDouble(), math.max(1.0, fs * 0.06)),
+    c.drawRect(Rect.fromLTWH(0, 0, w.toDouble(), band.toDouble()), Paint()..color = const Color(0xFFFFFFFF));
+    c.drawRect(Rect.fromLTWH(0, 0, w.toDouble(), math.max(1.0, fs * 0.06)),
         Paint()..color = const Color(0xFF000000));
-    tp.paint(c, Offset((w - tp.width) / 2, h + pad));
+    tp.paint(c, Offset((w - tp.width) / 2, pad));
     final pic = rec.endRecording();
-    final out = await pic.toImage(w, oh);
+    final stripImg = await pic.toImage(w, band);
     pic.dispose();
-    src.dispose();
-    final png = await out.toByteData(format: ui.ImageByteFormat.png);
-    out.dispose();
-    if (png == null) throw Exception('تعذر تجهيز صورة السيستم بالجودة الكاملة');
-    final jpg = await FlutterImageCompress.compressWithList(
-      _bytesOf(png),
-      minWidth: w,
-      minHeight: oh,
-      quality: 100,
-      format: CompressFormat.jpeg,
-    );
-    if (!_isJpegHeader(jpg)) throw Exception('تعذر تجهيز صورة السيستم بالجودة الكاملة');
+    final stripPng = await stripImg.toByteData(format: ui.ImageByteFormat.png);
+    stripImg.dispose();
+    if (stripPng == null) throw Exception('تعذر تجهيز صورة السيستم بالجودة الكاملة');
+    final jpg = await _composeEncode(src, Tag(_bytesOf(stripPng), w.toDouble(), band.toDouble()),
+        ow: w, oh: oh, ix: 0, iy: 0, tx: 0, ty: h, q: 100, label: 'sysCopy');
     final f = File('$dir/wa_sys_${DateTime.now().microsecondsSinceEpoch}_${_waSeq++}.jpg');
     await f.writeAsBytes(jpg, flush: true);
     AppLog.i('sysCopy ${sz.w}x${sz.h} -> ${w}x$oh strip="$text" ${jpg.length ~/ 1024}KB');
@@ -2022,53 +2113,12 @@ Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel
   final pad = iw * kBandPad;
   final band = (tag.h + pad * 2).ceil();
   final oh = ih + band;
-  final tImg = await decodeImage(tag.png);
-  final tw = tImg.width, th = tImg.height;
-  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
-  img.dispose();
-  tImg.dispose();
-  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
-  final rgba = await compute(_composeJob, <String, dynamic>{
-    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
-    'iw': iw,
-    'ih': ih,
-    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
-    'tw': tw,
-    'th': th,
-    'ow': iw,
-    'oh': oh,
-    'ix': 0,
-    'iy': band,
-    'tx': ((iw - tag.w) / 2).round(),
-    'ty': pad.round(),
-  });
-  final comp = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, iw, oh, ui.PixelFormat.rgba8888, comp.complete);
-  final outImg = await comp.future;
-  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
-  outImg.dispose();
-  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
-  final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
   final q = await Store.jpegQuality(profile: ImageQualityProfile.receipts);
-  final want = _meanLum(rgba, iw, oh);
-  for (final k in const [1.0, 0.75]) {
-    final jpg = await FlutterImageCompress.compressWithList(
-      png,
-      minWidth: (iw * k).round(),
-      minHeight: (oh * k).round(),
-      quality: q,
-      format: CompressFormat.jpeg,
-    );
-    final got = await _jpegMeanLum(jpg);
-    if (got != null && (got - want).abs() < 25) {
-      await logImageQuality('share-photo', jpg, profile: ImageQualityProfile.receipts);
-      return jpg;
-    }
-  }
-  throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
+  final jpg = await _composeEncode(img, tag,
+      ow: iw, oh: oh, ix: 0, iy: band, tx: ((iw - tag.w) / 2).round(), ty: pad.round(), q: q, label: 'receiptImg');
+  await logImageQuality('share-photo', jpg, profile: ImageQualityProfile.receipts);
+  return jpg;
 }
-
 /// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال الأصلية (JPEG بيتحط في الـ PDF زي ما هو
 /// من غير إعادة رسم ولا إعادة ضغط، فالجودة أحسن والذاكرة أقل بكتير).
 Future<File> buildReceiptsPdf(Session s, List<String> receipts,
@@ -2393,7 +2443,7 @@ class Store {
     if (v == null || v.length != 3) return null;
     final a = double.tryParse(v[0]), b = double.tryParse(v[1]), c = double.tryParse(v[2]);
     if (a == null || b == null || c == null || !a.isFinite || !b.isFinite || !c.isFinite) return null;
-    return TagPos(a.clamp(0.0, 1.0).toDouble(), aspect - b, c.clamp(0.1, 1.0).toDouble());
+    return TagPos(a.clamp(0.0, 1.0).toDouble(), aspect - b, c.clamp(kTagMinScale, 1.0).toDouble());
   }
 
   /// بيحفظ مكان الورقة لصورة واحدة بس من غير ما يغيّر المكان الافتراضي المحفوظ للباتشات الجاية.
@@ -3613,13 +3663,16 @@ Future<BatchInfo?> askBatchInfo(BuildContext context, String img, Session s) asy
           textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img, session: s)),
     ),
   );
-  if (r != null) {
-    await p.setString('bi_count', r.count);
-    await p.setString('bi_pi', r.piasters);
-    await p.setString('bi_col', r.collected);
-    await p.setString('bi_total', r.total);
-  }
+  if (r != null) await rememberBatchInfo(r);
   return r;
+}
+
+Future<void> rememberBatchInfo(BatchInfo r) async {
+  final p = await SharedPreferences.getInstance();
+  await p.setString('bi_count', r.count);
+  await p.setString('bi_pi', r.piasters);
+  await p.setString('bi_col', r.collected);
+  await p.setString('bi_total', r.total);
 }
 
 /// صورة بتتكبّر وتتصغّر بإصبعين، ونقرتين بتكبّر عند مكان النقر (ونقرتين تاني بترجّع).
@@ -4105,8 +4158,12 @@ Future<bool> preSendCheckReceipts(BuildContext context, Session s, List<String> 
   return confirmWarnings(context, w);
 }
 
-Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
-  final info = await askBatchInfo(context, img, s);
+Future<bool> sendBatchFile(BuildContext context, Session s, String img, {BatchInfo? info}) async {
+  if (info != null) {
+    await rememberBatchInfo(info);
+  } else {
+    info = await askBatchInfo(context, img, s);
+  }
   if (info == null || !context.mounted) return false;
   final caption = batchCaption(s, info);
   Store.working++;
@@ -4154,6 +4211,7 @@ class TaggedImage extends StatelessWidget {
   final double? aspect;
   final ValueChanged<TagPos>? onChanged;
   final bool showTag;
+  final double zoom;
   const TaggedImage(
       {super.key,
       required this.path,
@@ -4161,7 +4219,8 @@ class TaggedImage extends StatelessWidget {
       required this.pos,
       this.aspect,
       this.onChanged,
-      this.showTag = true});
+      this.showTag = true,
+      this.zoom = 1});
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
@@ -4183,6 +4242,7 @@ class TaggedImage extends StatelessWidget {
             pos: pos,
             cw: cw,
             maxCy: aspect ?? 3,
+            zoom: zoom,
             onChanged: onChanged!,
             child: DecoratedBox(
                 decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
@@ -4216,6 +4276,7 @@ class TaggedImage extends StatelessWidget {
 class _TagDrag extends StatefulWidget {
   final TagPos pos;
   final double cw, maxCy;
+  final double zoom; // تكبير العرض (محفوظ للتوافق: فلتر الحركة بيتحول لإحداثيات الورقة تلقائياً)
   final ValueChanged<TagPos> onChanged;
   final Widget child;
   const _TagDrag(
@@ -4223,7 +4284,8 @@ class _TagDrag extends StatefulWidget {
       required this.cw,
       required this.maxCy,
       required this.onChanged,
-      required this.child});
+      required this.child,
+      this.zoom = 1});
   @override
   State<_TagDrag> createState() => _TagDragState();
 }
@@ -4237,7 +4299,7 @@ class _TagDragState extends State<_TagDrag> {
         onScaleStart: (_) => startS = widget.pos.s,
         onScaleUpdate: (d) {
           final p = widget.pos;
-          final s = (startS * d.scale).clamp(0.1, 1.0).toDouble();
+          final s = (startS * d.scale).clamp(kTagMinScale, 1.0).toDouble();
           final cx = (p.cx + d.focalPointDelta.dx / widget.cw).clamp(0.0, 1.0).toDouble();
           final cy =
               (p.cy + d.focalPointDelta.dy / widget.cw).clamp(0.0, widget.maxCy).toDouble();
@@ -5830,6 +5892,295 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 //  شاشة الباتش
 // =====================================================================
 
+/// نموذج بيانات الباتش جوه شاشة الباتش نفسها (بدل شاشة منفصلة). نفس القراءة والتحقق القديمين.
+class _BatchInfoPanel extends StatefulWidget {
+  final BatchInfo init;
+  final String img;
+  final Session session;
+  final ValueNotifier<bool> sysReady;
+  const _BatchInfoPanel(
+      {super.key, required this.init, required this.img, required this.session, required this.sysReady});
+  @override
+  State<_BatchInfoPanel> createState() => _BatchInfoPanelState();
+}
+
+final ButtonStyle kSysBtn = OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8));
+
+class _BatchInfoPanelState extends State<_BatchInfoPanel> {
+  late final c1 = TextEditingController(); // صورة جديدة: عمرنا ما نملّا عدد قديم
+  late final c2 =
+      TextEditingController(text: widget.init.piasters.isEmpty ? '0' : widget.init.piasters);
+  late final c3 =
+      TextEditingController(text: widget.init.collected.isEmpty ? '0' : widget.init.collected);
+  late final c4 = TextEditingController(); // صورة جديدة: عمرنا ما نملّا إجمالي قديم
+  String? err;
+  bool reading = true, d1 = false, d4 = false, alertsOpen = false;
+  String? note;
+  List<String> alerts = const [];
+  String? sysImg;
+  bool sysBusy = false;
+  String? sysWarn;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.sysReady.value = false;
+    _ocr();
+    Store.systemPhoto().then((s) {
+      if (mounted && s != null) {
+        setState(() => sysImg = s);
+        widget.sysReady.value = true;
+        _checkSysTid(s);
+      }
+    });
+  }
+
+  Future<void> _pickSystem(ImageSource src) async {
+    if (sysBusy) return;
+    setState(() => sysBusy = true);
+    try {
+      final x = await ImagePicker().pickImage(source: src); // الأصل زي ما اتصور
+      if (x == null || !mounted) return;
+      final dest =
+          '${(await Store.dir()).path}/system_${DateTime.now().microsecondsSinceEpoch}.jpg';
+      await File(x.path).copy(dest);
+      await Store.setSystemPhoto(dest);
+      if (mounted) {
+        setState(() {
+          sysImg = dest;
+          sysWarn = null;
+          err = null;
+        });
+        widget.sysReady.value = true;
+        _checkSysTid(dest);
+      }
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    } finally {
+      if (mounted) setState(() => sysBusy = false);
+    }
+  }
+
+  Future<void> _checkSysTid(String path) async {
+    try {
+      final lines = await _ocrLinesOf(path).timeout(const Duration(seconds: 20));
+      final tids = sysPhotoTids(lines.map((l) => l.text).join('\n'));
+      if (!mounted || sysImg != path) return;
+      final w = sysTidWarning(tids, widget.session.unit, AppData.units);
+      AppLog.i('sys tid read=${tids.join(',')} unit=${widget.session.unit.tid} warn=${w != null}');
+      if (w != null) HapticFeedback.vibrate();
+      setState(() => sysWarn = w);
+    } catch (e) {
+      AppLog.i('sys tid ocr failed: $e');
+    }
+  }
+
+  void _previewSystem() {
+    final s = sysImg;
+    if (s == null) return;
+    Navigator.push(context,
+        MaterialPageRoute(builder: (_) => ZoomPage(child: Image.file(File(s)))));
+  }
+
+  Future<void> _ocr() async {
+    BatchOcr? r;
+    try {
+      r = await readBatchInfo(widget.img).timeout(const Duration(seconds: 25));
+    } catch (e) {
+      AppLog.i('batch ocr failed: $e');
+    }
+    if (!mounted) return;
+    final ws = r == null ? const <String>[] : batchOcrWarnings(r, widget.session);
+    if (ws.isNotEmpty) HapticFeedback.vibrate();
+    setState(() {
+      reading = false;
+      alerts = ws;
+      if (!d1) c1.text = r?.count ?? ''; // قراءة فاشلة/ملتبسة تفضل فاضية
+      if (!d4) c4.text = r?.total ?? '';
+      if (r?.count == null && r?.total == null) {
+        note = 'معرفتش أقرا الأرقام من الصورة، اكتبها بإيدك';
+      } else if (r?.count == null || r?.total == null) {
+        note = 'اتقرا جزء بس من الصورة، كمّل الباقي وراجع القيم';
+      } else if ((r?.missing ?? 0) > 0) {
+        note = 'في ورقة باتش مش واضحة في الصورة، الإجمالي والعدد ممكن يكونوا ناقصين. راجعهم من الصورة';
+      } else if ((r?.parts ?? 1) > 1) {
+        note = 'اتقرا ${r!.parts} أوراق باتش في الصورة واتجمعوا (${r!.detail}). راجع القيم قبل الإرسال';
+      } else {
+        note = 'اتقرا من الصورة، راجع القيم قبل الإرسال';
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    c1.dispose();
+    c2.dispose();
+    c3.dispose();
+    c4.dispose();
+    super.dispose();
+  }
+
+  /// نفس تحققات الشاشة القديمة بالظبط. بيرجّع null لو في خطأ (والرسالة بتظهر) أو المستخدم ما كملش.
+  Future<BatchInfo?> submit() async {
+    if (sysImg == null) {
+      setState(() => err = 'صوّر أو اختار صورة السيستم الأول');
+      return null;
+    }
+    final count = _digits(c1.text), pi = _digits(c2.text);
+    final col = _digits(c3.text), tot = _digits(c4.text);
+    bool isInt(String s) => RegExp(r'^\d+$').hasMatch(s);
+    String? e;
+    if (!isInt(count)) {
+      e = 'اكتب عدد المعاملات (أرقام بس)';
+    } else if (pi.isNotEmpty && !isInt(pi)) {
+      e = 'عدد القروش الفاصلة لازم يكون رقم';
+    } else if (col.isNotEmpty && !isInt(col)) {
+      e = 'عدد المعاملات المجمعة لازم يكون رقم';
+    }
+    final t = double.tryParse(tot);
+    if (e == null && (t == null || t < 0)) e = 'اكتب الإجمالي صح (مثال 28107.19)';
+    if (e != null) {
+      setState(() => err = e);
+      snack(context, e);
+      return null;
+    }
+    setState(() => err = null);
+    if (alerts.isNotEmpty) {
+      final go = await confirmWarnings(context, alerts, title: 'تنبيه في ورقة الباتش', go: 'متابعة برضه');
+      if (!go || !mounted) return null;
+    }
+    return BatchInfo('${int.parse(count)}', pi.isEmpty ? '0' : '${int.parse(pi)}',
+        col.isEmpty ? '0' : '${int.parse(col)}', t!.toStringAsFixed(2));
+  }
+
+  Widget _f(TextEditingController c, String label,
+          {bool dec = false, bool selectAll = false, VoidCallback? onEdit}) =>
+      Expanded(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: TextField(
+            controller: c,
+            onChanged: onEdit == null ? null : (_) => onEdit(),
+            onTap: selectAll
+                ? () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length)
+                : null,
+            keyboardType: TextInputType.numberWithOptions(decimal: dec),
+            decoration: InputDecoration(labelText: label, isDense: true, border: kFieldBorder),
+          ),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          if (reading)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: Row(children: [
+                SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 10),
+                Expanded(child: Text('جاري قراءة الأرقام من صورة الباتش...')),
+              ]),
+            )
+          else if (note != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(note!, style: const TextStyle(color: Colors.grey, fontSize: 12.5)),
+            ),
+          if (alerts.isNotEmpty)
+            InkWell(
+              onTap: () => setState(() => alertsOpen = !alertsOpen),
+              child: Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.red.withAlpha(28),
+                  border: Border.all(color: Colors.redAccent.withAlpha(170)),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 17),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      for (final a in (alertsOpen ? alerts : alerts.take(1)))
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 3),
+                          child: Text(a,
+                              maxLines: alertsOpen ? null : 2,
+                              overflow: alertsOpen ? null : TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                        ),
+                    ]),
+                  ),
+                  if (alerts.length > 1) Text(alertsOpen ? '▴' : '${alerts.length} ▾', style: const TextStyle(fontSize: 12)),
+                ]),
+              ),
+            ),
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            _f(c1, 'عدد المعاملات', onEdit: () => d1 = true),
+            _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true),
+          ]),
+          const SizedBox(height: 10),
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            _f(c2, 'القروش الفاصلة', selectAll: true),
+            _f(c3, 'المعاملات المجمعة', selectAll: true),
+          ]),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(
+                child: OutlinedButton.icon(
+              onPressed: sysBusy ? null : () => _pickSystem(ImageSource.camera),
+              icon: const Icon(Icons.add_a_photo_rounded, size: 18),
+              label: const FittedBox(fit: BoxFit.scaleDown, child: Text('صوّر السيستم', maxLines: 1, style: TextStyle(fontSize: 12.5))),
+              style: kSysBtn,
+            )),
+            const SizedBox(width: 6),
+            Expanded(
+                child: OutlinedButton.icon(
+              onPressed: sysBusy ? null : () => _pickSystem(ImageSource.gallery),
+              icon: const Icon(Icons.photo_library_rounded, size: 18),
+              label: const FittedBox(fit: BoxFit.scaleDown, child: Text('معرض', maxLines: 1, style: TextStyle(fontSize: 12.5))),
+              style: kSysBtn,
+            )),
+            const SizedBox(width: 6),
+            Expanded(
+                child: OutlinedButton.icon(
+              onPressed: sysImg == null || sysBusy ? null : _previewSystem,
+              icon: const Icon(Icons.visibility_rounded, size: 18),
+              label: FittedBox(fit: BoxFit.scaleDown, child: Text(sysImg == null ? 'معاينة' : '✓ معاينة', maxLines: 1, style: const TextStyle(fontSize: 12.5))),
+              style: kSysBtn,
+            )),
+          ]),
+          if (sysWarn != null)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(top: 8),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.orange.withAlpha(30),
+                border: Border.all(color: Colors.orange.withAlpha(190)),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 18),
+                const SizedBox(width: 6),
+                Expanded(
+                    child: Text(sysWarn!,
+                        style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600))),
+              ]),
+            ),
+          if (err != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(err!, style: const TextStyle(color: Colors.red)),
+            ),
+        ]),
+      );
+}
+
 class BatchScreen extends StatefulWidget {
   final Session session;
   final bool fresh; // true = تصوير باتش جديد (من غير ما نفتح القديم)
@@ -5846,12 +6197,24 @@ class _BatchScreenState extends State<BatchScreen> {
   bool busy = false;
   bool noTag = false; // الصورة دي من غير ورقة بيانات
   bool kept = false; // الصورة دي محفوظة للأرشيف بعد الإرسال
+  final _panelKey = GlobalKey<_BatchInfoPanelState>();
+  final _sysReady = ValueNotifier<bool>(false);
+  final _viewTc = TransformationController(); // تكبير عرض الصورة بس (مش بيأثر على الملف المبعوت)
+  BatchInfo? _binit;
 
   @override
   void initState() {
     super.initState();
     unawaited(_warmTags());
+    unawaited(_loadBatchInit());
     _init();
+  }
+
+  Future<void> _loadBatchInit() async {
+    final p = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() => _binit = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
+        p.getString('bi_col') ?? '', p.getString('bi_total') ?? ''));
   }
 
   Future<void> _toggleTag(bool hide) async {
@@ -5924,6 +6287,7 @@ class _BatchScreenState extends State<BatchScreen> {
       final nt = await Store.noTag(path);
       final kp = await Store.isKept(path);
       if (!mounted) return;
+      _viewTc.value = Matrix4.identity();
       setState(() {
         noTag = nt;
         kept = kp;
@@ -6125,6 +6489,8 @@ class _BatchScreenState extends State<BatchScreen> {
       final path = img, p = pos, a = aspect;
       if (path != null && p != null && a != null) Store.saveBatchPos(path, p, a);
     }
+    _viewTc.dispose();
+    _sysReady.dispose();
     super.dispose();
   }
 
@@ -6199,9 +6565,11 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       await _flushPos();
       if (!mounted) return;
+      final info = await _panelKey.currentState?.submit();
+      if (info == null || !mounted) return;
       if (!await preSendCheckBatch(context, widget.session, img!)) return;
       if (!mounted) return;
-      final ok = await sendBatchFile(context, widget.session, img!);
+      final ok = await sendBatchFile(context, widget.session, img!, info: info);
       if (ok) HapticFeedback.mediumImpact();
       if (ok && mounted) Navigator.pop(context);
     } catch (e) {
@@ -6211,129 +6579,192 @@ class _BatchScreenState extends State<BatchScreen> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final ready = img != null && tag != null && pos != null && aspect != null;
-    return Scaffold(
-      appBar: AppBar(title: const Text('الباتش'), actions: [
-        if (img != null) ...[
-          IconButton(
-              tooltip: 'استخراج النص',
-              icon: const Icon(Icons.text_snippet_outlined),
-              onPressed:
-                  busy ? null : () => showOcrTextSheet(context, img!, title: 'نص الباتش')),
-        ],
-      ]),
-      body: !ready
-          ? const Center(child: CircularProgressIndicator())
-          : Column(children: [
-              Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.all(8),
-                  child: TaggedImage(
-                      path: img!,
-                      tag: tag!,
-                      pos: pos!,
-                      aspect: aspect,
-                      showTag: !noTag,
-                      onChanged: noTag ? null : _set),
+  /// شيت «الورقة»: إظهار/إخفاء + حجم + رجوع لأسفل الصورة. السحب والتكبير بإصبعين شغالين على الورقة نفسها.
+  Future<void> _paperSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: StatefulBuilder(builder: (ctx, setSheet) {
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('الورقة', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  title: const Text('ورقة البيانات على الصورة دي'),
+                  subtitle: const Text('اقفلها لو الصورة مش محتاجة ورقة (الصورة الجاية بتبدأ بالورقة)',
+                      style: TextStyle(fontSize: 11)),
+                  value: !noTag,
+                  onChanged: busy
+                      ? null
+                      : (v) async {
+                          await _toggleTag(!v);
+                          setSheet(() {});
+                        },
                 ),
-              ),
-              if (!noTag)
-                Container(
-                  margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: Colors.orange.withAlpha(28),
-                    border: Border.all(color: Colors.orange.withAlpha(150)),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 22),
-                    SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                          'تنبيه: حرّك الورقة لمكان فاضي من الصورة، وماتغطيش أي بيانات (خصوصًا العدد والإجمالي). '
-                          'اسحب بإصبع للتحريك، وبإصبعين للتكبير والتصغير.',
-                          style: TextStyle(fontSize: 12.5)),
-                    ),
-                  ]),
-                ),
-              SwitchListTile(
-                dense: true,
-                title: const Text('ورقة البيانات على الصورة دي'),
-                subtitle: const Text('اقفلها لو الصورة مش محتاجة ورقة (الصورة الجاية بتبدأ بالورقة)',
-                    style: TextStyle(fontSize: 11)),
-                value: !noTag,
-                onChanged: busy ? null : (v) => _toggleTag(!v),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Row(children: [
+                const Text('حجم الورقة: من 5% إلى 100% من عرض الصورة', style: TextStyle(fontSize: 12)),
+                Row(children: [
                   const Icon(Icons.format_size_rounded),
                   Expanded(
                     child: Slider(
-                      value: pos!.s.clamp(0.1, 1.0).toDouble(),
-                      min: 0.1,
+                      value: pos!.s.clamp(kTagMinScale, 1.0).toDouble(),
+                      min: kTagMinScale,
                       max: 1.0,
-                      onChanged: noTag ? null : (v) => _set(pos!.copyWith(s: v)),
+                      onChanged: noTag
+                          ? null
+                          : (v) {
+                              _set(fitTagPos(pos!.copyWith(s: v), tag!, aspect!));
+                              setSheet(() {});
+                            },
                     ),
                   ),
                   IconButton(
                     tooltip: 'أسفل الصورة بعرضها كله',
                     icon: const Icon(Icons.restart_alt_rounded),
-                    onPressed: noTag ? null : () => _set(bottomTagPos(tag!, aspect!)),
+                    onPressed: noTag
+                        ? null
+                        : () {
+                            _set(bottomTagPos(tag!, aspect!));
+                            setSheet(() {});
+                          },
                   ),
                 ]),
-              ),
-              SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    Row(children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _capture,
-                          icon: const Icon(Icons.add_a_photo_rounded),
-                          label: const Text('تصوير'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _gallery,
-                          icon: const Icon(Icons.photo_library_rounded),
-                          label: const Text('معرض'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _edit,
-                          icon: const Icon(Icons.crop_rounded),
-                          label: const Text('تعديل'),
-                        ),
-                      ),
-                    ]),
-                    const SizedBox(height: 8),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 50,
-                      child: FilledButton.icon(
-                        onPressed: busy ? null : _send,
-                        icon: busy
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.send_rounded),
-                        label: const Text('إرسال'),
-                      ),
-                    ),
-                  ]),
+                const Text(
+                    'حرّك الورقة لمكان فاضي من الصورة وماتغطيش أي بيانات (خصوصًا العدد والإجمالي). '
+                    'تقدر تسحب الورقة نفسها وتكبّرها وتصغّرها بإصبعين.',
+                    style: TextStyle(fontSize: 11.5, color: Colors.orange)),
+              ]),
+            ),
+          );
+        }),
+      ),
+    );
+  }
+
+  Widget _pill(IconData i, String t, VoidCallback? f) => OutlinedButton.icon(
+        onPressed: f,
+        icon: Icon(i, size: 16),
+        label: Text(t, style: const TextStyle(fontSize: 12)),
+        style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 10), visualDensity: VisualDensity.compact),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final ready = img != null && tag != null && pos != null && aspect != null && _binit != null;
+    return Scaffold(
+      appBar: AppBar(title: const Text('الباتش'), toolbarHeight: 52, actions: [
+        IconButton(
+            tooltip: 'تصوير',
+            icon: const Icon(Icons.add_a_photo_rounded),
+            onPressed: busy ? null : _capture),
+        IconButton(
+            tooltip: 'معرض',
+            icon: const Icon(Icons.photo_library_rounded),
+            onPressed: busy ? null : _gallery),
+        if (img != null)
+          IconButton(
+              tooltip: 'استخراج النص',
+              icon: const Icon(Icons.text_snippet_outlined),
+              onPressed: busy ? null : () => showOcrTextSheet(context, img!, title: 'نص الباتش')),
+      ]),
+      // الزر في bottomNavigationBar عشان رسائل الخطأ (snackbar) تظهر فوقه مش عليه
+      bottomNavigationBar: !ready
+          ? null
+          : SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+            child: ValueListenableBuilder<bool>(
+              valueListenable: _sysReady,
+              builder: (_, sysOk, __) => SizedBox(
+                width: double.infinity,
+                height: 50,
+                child: FilledButton.icon(
+                  onPressed: busy || !sysOk ? null : _send,
+                  icon: busy
+                      ? const SizedBox(
+                          width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.send_rounded),
+                  label: const Text('إرسال'),
                 ),
               ),
-            ]),
+            ),
+          ),
+        ),
+      body: !ready
+          ? const Center(child: CircularProgressIndicator())
+          : LayoutBuilder(builder: (ctx, cons) {
+              // الصورة ثابتة فوق (سحب الورقة مش بيتحوّل لتمرير)، والتمرير للي تحتها بس. الزر ثابت تحت.
+              const fixedBelow = 0.0, toolbarH = 46.0, minPanel = 96.0;
+              final total = cons.maxHeight;
+              final ih = (total * 0.45).clamp(110.0, 420.0).clamp(0.0, math.max(70.0, total - fixedBelow - toolbarH - minPanel)).toDouble();
+              return Column(children: [
+                SizedBox(
+                  height: toolbarH,
+                  child: ListView(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    children: [
+                      _pill(Icons.crop_rounded, 'تعديل', busy ? null : _edit),
+                      const SizedBox(width: 6),
+                      ListenableBuilder(
+                        listenable: _viewTc,
+                        builder: (_, __) {
+                          final z = _viewTc.value.getMaxScaleOnAxis();
+                          return _pill(Icons.zoom_in_rounded, 'عرض ×${z.toStringAsFixed(1)}  ↺',
+                              z > 1.01 ? () => _viewTc.value = Matrix4.identity() : null);
+                        },
+                      ),
+                      const SizedBox(width: 6),
+                      _pill(Icons.badge_outlined, 'الورقة', busy ? null : _paperSheet),
+                    ],
+                  ),
+                ),
+                SizedBox(
+                  height: ih,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
+                    child: ClipRect(
+                      child: InteractiveViewer(
+                        transformationController: _viewTc,
+                        minScale: 1,
+                        maxScale: 6,
+                        child: AnimatedBuilder(
+                          animation: _viewTc,
+                          builder: (_, __) => TaggedImage(
+                              path: img!,
+                              tag: tag!,
+                              pos: pos!,
+                              aspect: aspect,
+                              showTag: !noTag,
+                              zoom: _viewTc.value.getMaxScaleOnAxis(),
+                              onChanged: noTag ? null : _set),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: SingleChildScrollView(
+                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                    child: KeyedSubtree(
+                      key: ValueKey(img),
+                      child: _BatchInfoPanel(
+                          key: _panelKey,
+                          init: _binit!,
+                          img: img!,
+                          session: widget.session,
+                          sysReady: _sysReady),
+                    ),
+                  ),
+                ),
+              ]);
+            }),
     );
   }
 }
