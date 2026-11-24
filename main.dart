@@ -32,6 +32,8 @@ const kImageQualityRevision = 'receipt-q5-smooth';
 
 const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
 const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
+/// تصغير ورقة بيانات إيصالات الدفع (الباتش مش متأثر): الخط والهوامش بالنسبة دي.
+const kReceiptTagScale = 1.0;
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
 const kBatchTagW = 0.7; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
@@ -100,14 +102,17 @@ int gResLevel = 0;
 
 /// Receipt quality is independent of global performance/resolution preferences.
 /// Persisted per image and passed explicitly to capture and export.
+/// بدون تصغير تلقائي: الباتش والإيصالات بتتحفظ وتتعدّل وتتبعت بدقة الأصل.
+const kNoResizeSide = 100000;
+
 class ImageQualityProfile {
   final String id;
   final int maxSide;
   final int jpegQuality;
   const ImageQualityProfile(this.id, this.maxSide, this.jpegQuality);
-  static const receipts = ImageQualityProfile('receipts-v1', 4096, 100);
+  static const receipts = ImageQualityProfile('receipts-v1', kNoResizeSide, 100);
   static const detailedCapture = ImageQualityProfile('camera-detail-v1', 3200, 92);
-  static const batch = ImageQualityProfile('batch-v1', 4096, 100);
+  static const batch = ImageQualityProfile('batch-v1', kNoResizeSide, 100);
 }
 
 // Per-shot handoff only. Persisted on the image as soon as ingest consumes it.
@@ -1185,6 +1190,26 @@ Uint8List? _takeHotBytes(String path) {
   return null;
 }
 
+/// بينسخ المصدر لمجلد التطبيق الدائم ويضيفه للمحفوظات (مسح يدوي بس) لما التحويل يفشل.
+Future<void> _retainFailedCapture(String src) async {
+  try {
+    final dir = (await Store.dir()).path;
+    var keep = src;
+    if (!src.startsWith(dir)) {
+      final dot = src.lastIndexOf('.');
+      final ext = dot > src.lastIndexOf('/') ? src.substring(dot) : '.jpg';
+      keep = '$dir/capture_${DateTime.now().microsecondsSinceEpoch}$ext';
+      await File(src).copy(keep);
+    }
+    final p = await SharedPreferences.getInstance();
+    final a = p.getStringList('archive') ?? [];
+    if (!a.contains(keep)) a.add(keep);
+    await p.setStringList('archive', a);
+  } catch (e, st) {
+    AppLog.e('retainFailedCapture', e, st);
+  }
+}
+
 bool _isJpegHeader(Uint8List b) => b.length > 100 && b[0] == 0xFF && b[1] == 0xD8;
 
 /// نسخ الصورة من مكان الماسح المؤقت لمكان ثابت كـ JPEG واحد مضغوط (مرة واحدة بس).
@@ -1253,7 +1278,9 @@ Future<String> persistImage(String src, String name,
     }
   }
   if (bytes == null || !_isJpegHeader(bytes)) {
-    throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
+    // اللقطة متضيعش: بنحفظ المصدر في مجلد التطبيق (ويظهر تحت «ملفاتي») قبل ما نبلّغ بالفشل
+    await _retainFailedCapture(src);
+    throw Exception('الصورة دي ماتحوّلتش لـ JPEG، الأصل اتحفظ تحت «ملفاتي». جرّب تاني أو افتحه من هناك');
   }
   await logImageQuality('ingest', bytes, profile: profile);
   final f = File('${(await Store.dir()).path}/$name');
@@ -1391,15 +1418,19 @@ Future<Tag> receiptTag(double w, Session s, {bool batch = false, String? pageLab
 }
 
 Future<Tag> _renderTag(double w, Session s, {bool batch = false, String? pageLabel}) async {
-  final fs = w * kTagFont;
+  final fs = w * kTagFont * (batch ? 1.0 : kReceiptTagScale);
   final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
   final l1 = _tp('${s.name}  |  $unitLine', fs, TextDirection.rtl);
   final baseL2 = batch ? _isoLtr(s.date) : '${_isoLtr('TID: ${s.unit.tid}')}  |  ${_isoLtr(s.date)}';
-  final l2 = _tp(pageLabel == null ? baseL2 : '$baseL2  |  ${_isoLtr(pageLabel)}', fs, TextDirection.rtl);
-  final pad = fs * 0.6;
-  final gap = fs * 0.25;
-  final textW = l1.width > l2.width ? l1.width : l2.width;
-  final cw = (textW + pad * 2).clamp(0.0, w * 0.96).toDouble();
+  final l2 = _tp(baseL2, fs, TextDirection.rtl);
+  // رقم الصفحة بترتيبها: سطر لوحده بخط متوسط (أكبر من سطور البيانات) جوه ورقة البيانات
+  final l3 = pageLabel == null ? null : _tp(_isoLtr(pageLabel), fs * 1.5, TextDirection.ltr);
+  final pad = fs * (batch ? 0.6 : 0.3);
+  final gap = fs * (batch ? 0.25 : 0.12);
+  final textW = math.max(l1.width, l2.width);
+  // رقم الصفحة في جنب الورقة (شمال) بدل سطر زيادة، فارتفاع الورقة زي ما هو
+  final numW = l3 == null ? 0.0 : l3.width + pad * 2;
+  final cw = batch ? (textW + pad * 2 + numW).clamp(0.0, w * 0.96).toDouble() : w * 0.96;
   final ch = l1.height + l2.height + gap + pad * 2;
   final rec = ui.PictureRecorder();
   final c = Canvas(rec, Rect.fromLTWH(0, 0, cw, ch));
@@ -1415,8 +1446,14 @@ Future<Tag> _renderTag(double w, Session s, {bool batch = false, String? pageLab
         ..style = PaintingStyle.stroke
         ..strokeWidth = sw
         ..color = Colors.black);
-  l1.paint(c, Offset((cw - l1.width) / 2, pad));
-  l2.paint(c, Offset((cw - l2.width) / 2, pad + l1.height + gap));
+  final tx0 = numW; // البيانات في باقي العرض
+  l1.paint(c, Offset(tx0 + (cw - tx0 - l1.width) / 2, pad));
+  l2.paint(c, Offset(tx0 + (cw - tx0 - l2.width) / 2, pad + l1.height + gap));
+  if (l3 != null) {
+    l3.paint(c, Offset((numW - l3.width) / 2, (ch - l3.height) / 2));
+    c.drawLine(Offset(numW, ch * 0.18), Offset(numW, ch * 0.82),
+        Paint()..color = Colors.black..strokeWidth = math.max(1.0, sw * 0.6));
+  }
   final img = await rec.endRecording().toImage(cw.ceil(), ch.ceil());
   final bd = await img.toByteData(format: ui.ImageByteFormat.png);
   img.dispose();
@@ -1591,30 +1628,21 @@ Future<Uint8List> composeIdCard(String frontPath, String backPath) async {
   final f = await decodeImage(await File(frontPath).readAsBytes());
   final b = await decodeImage(await File(backPath).readAsBytes());
   try {
-    const w = 1240.0, m = 48.0, gap = 48.0;
-    const iw = w - m * 2;
-    final fh = iw * f.height / f.width, bh = iw * b.height / b.width;
-    final h = m + fh + gap + bh + m;
+    // بدقة الأصل من غير تصغير: العرض = أعرض وش + هوامش، والطول = الاتنين + فاصل صغير
+    final inner = math.max(f.width, b.width).toDouble();
+    final m = (inner * 0.03).roundToDouble(), gap = (inner * 0.03).roundToDouble();
+    final w = inner + 2 * m;
+    final h = m + f.height + gap + b.height + m;
     final rec = ui.PictureRecorder();
     final c = Canvas(rec);
     c.drawRect(Rect.fromLTWH(0, 0, w, h), Paint()..color = const Color(0xFFFFFFFF));
-    c.drawImageRect(
-        f,
-        Rect.fromLTWH(0, 0, f.width.toDouble(), f.height.toDouble()),
-        Rect.fromLTWH(m, m, iw, fh),
-        Paint());
-    c.drawImageRect(
-        b,
-        Rect.fromLTWH(0, 0, b.width.toDouble(), b.height.toDouble()),
-        Rect.fromLTWH(m, m + fh + gap, iw, bh),
-        Paint());
+    c.drawImage(f, Offset((w - f.width) / 2, m), Paint());
+    c.drawImage(b, Offset((w - b.width) / 2, m + f.height + gap), Paint());
     // خط فاصل خفيف بين الوش والضهر
-    c.drawLine(
-        Offset(m, m + fh + gap / 2),
-        Offset(w - m, m + fh + gap / 2),
-        Paint()
-          ..color = const Color(0xFFE0E0E0)
-          ..strokeWidth = 2);
+    final ly = m + f.height + gap / 2;
+    c.drawLine(Offset(m, ly), Offset(w - m, ly), Paint()
+      ..color = const Color(0xFFE0E0E0)
+      ..strokeWidth = math.max(2.0, inner / 600));
     final img = await rec.endRecording().toImage(w.round(), h.round());
     final bd = await img.toByteData(format: ui.ImageByteFormat.png);
     img.dispose();
@@ -1636,7 +1664,8 @@ Map<String, dynamic> _waCopyJob(Map<String, dynamic> a) {
   final src = a['src'] as Uint8List;
   final sw = a['sw'] as int, sh = a['sh'] as int;
   final enhance = a['enhance'] as bool;
-  final k = math.min(1.0, kWaMaxSide / math.max(sw, sh));
+  final cap = (a['max'] as int?) ?? kWaMaxSide;
+  final k = math.min(1.0, cap / math.max(sw, sh));
   final ow = math.max(8, (sw * k).round()), oh = math.max(8, (sh * k).round());
   final out = Uint8List(ow * oh * 4);
   for (var y = 0; y < oh; y++) {
@@ -1739,7 +1768,8 @@ int _waSeq = 0;
 
 /// نسخة الإرسال للواتساب: نفس الصورة بمقاس واتساب وجودة جيدة، ولو enhance بتحسين مستند.
 /// عند أي فشل نرجع مسار الأصل كما هو (الإرسال لا يتعطل أبدًا بسبب النسخة).
-Future<String> waShareCopy(String path, {required bool enhance}) async {
+/// fullRes: من غير تصغير وجودة 100، وأي فشل بيرمي استثناء (مبنرجعش ملف تاني بدل المطلوب).
+Future<String> waShareCopy(String path, {required bool enhance, bool fullRes = false}) async {
   try {
     final dir = (await Store.dir()).path;
     // Keep every prepared attachment alive until the share operation has
@@ -1748,17 +1778,21 @@ Future<String> waShareCopy(String path, {required bool enhance}) async {
     final raw = await File(path).readAsBytes();
     final sz = await imageSize(raw);
     // من غير تحسين ومن غير تصغير: نبعت الأصل زي ما هو (مفيش أي إعادة ضغط تقلل الجودة)
-    if (!enhance && math.max(sz.w, sz.h) <= kWaMaxSide) return path;
+    if (!enhance && (fullRes || math.max(sz.w, sz.h) <= kWaMaxSide)) return path;
     final img = await decodeImage(raw);
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
     img.dispose();
-    if (bd == null) return path;
+    if (bd == null) {
+      if (fullRes) throw Exception('تعذر قراءة الصورة');
+      return path;
+    }
     final res = await compute(_waCopyJob, <String, dynamic>{
       'src': _bytesOf(bd),
       'sw': w,
       'sh': h,
       'enhance': enhance,
+      'max': fullRes ? kNoResizeSide : kWaMaxSide,
     });
     final rgba = res['rgba'] as Uint8List;
     final ow = res['w'] as int, oh = res['h'] as int;
@@ -1768,21 +1802,28 @@ Future<String> waShareCopy(String path, {required bool enhance}) async {
     final outImg = await comp.future;
     final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
     outImg.dispose();
-    if (pngBd == null) return path;
+    if (pngBd == null) {
+      if (fullRes) throw Exception('تعذر تجهيز نسخة الإرسال');
+      return path;
+    }
     final jpg = await FlutterImageCompress.compressWithList(
       pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes),
       minWidth: ow,
       minHeight: oh,
-      quality: 95,
+      quality: fullRes ? 100 : 95,
       format: CompressFormat.jpeg,
     );
-    if (!_isJpegHeader(jpg)) return path;
+    if (!_isJpegHeader(jpg)) {
+      if (fullRes) throw Exception('نسخة الإرسال طلعت غير سليمة');
+      return path;
+    }
     final f = File('${dir}/wa_${DateTime.now().microsecondsSinceEpoch}_${_waSeq++}.jpg');
     await f.writeAsBytes(jpg, flush: true);
     AppLog.i('waCopy ${w}x$h -> ${ow}x$oh ${jpg.length ~/ 1024}KB enhance=$enhance');
     return f.path;
   } catch (e, st) {
     AppLog.e('waCopy', e, st);
+    if (fullRes) rethrow;
     return path;
   }
 }
@@ -1910,23 +1951,8 @@ Future<String> sysShareCopy(String path, Session s) async {
     final dir = (await Store.dir()).path;
     final raw = await File(path).readAsBytes();
     final sz = await imageSize(raw);
-    ui.Image src;
-    if (math.max(sz.w, sz.h) > kWaMaxSide) {
-      final img = await decodeImage(raw);
-      final w0 = img.width, h0 = img.height;
-      final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-      img.dispose();
-      if (bd == null) return await waShareCopy(path, enhance: false);
-      final res = await compute(_waCopyJob, <String, dynamic>{
-        'src': _bytesOf(bd),
-        'sw': w0,
-        'sh': h0,
-        'enhance': false,
-      });
-      src = await _imageFromRgba(res['rgba'] as Uint8List, res['w'] as int, res['h'] as int);
-    } else {
-      src = await decodeImage(raw);
-    }
+    // من غير تصغير: صورة السيستم بتتبعت بمقاسها المخزّن
+    final src = await decodeImage(raw);
     final w = src.width, h = src.height;
     final text = sysStripText(s.unit, DateTime.now());
     TextPainter mk(double f) => TextPainter(
@@ -1966,22 +1992,22 @@ Future<String> sysShareCopy(String path, Session s) async {
     src.dispose();
     final png = await out.toByteData(format: ui.ImageByteFormat.png);
     out.dispose();
-    if (png == null) return await waShareCopy(path, enhance: false);
+    if (png == null) throw Exception('تعذر تجهيز صورة السيستم بالجودة الكاملة');
     final jpg = await FlutterImageCompress.compressWithList(
       _bytesOf(png),
       minWidth: w,
       minHeight: oh,
-      quality: 97,
+      quality: 100,
       format: CompressFormat.jpeg,
     );
-    if (!_isJpegHeader(jpg)) return await waShareCopy(path, enhance: false);
+    if (!_isJpegHeader(jpg)) throw Exception('تعذر تجهيز صورة السيستم بالجودة الكاملة');
     final f = File('$dir/wa_sys_${DateTime.now().microsecondsSinceEpoch}_${_waSeq++}.jpg');
     await f.writeAsBytes(jpg, flush: true);
     AppLog.i('sysCopy ${sz.w}x${sz.h} -> ${w}x$oh strip="$text" ${jpg.length ~/ 1024}KB');
     return f.path;
   } catch (e, st) {
     AppLog.e('sysCopy', e, st);
-    return await waShareCopy(path, enhance: false);
+    rethrow;
   }
 }
 
@@ -2054,13 +2080,6 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     final pad = pageW * kBandPad;
     final compact = forceCompact ?? false;
     final swPdf = Stopwatch()..start();
-    final multi = receipts.length > 1;
-    Tag? sharedTag;
-    pw.MemoryImage? sharedTagImg;
-    if (!multi) {
-      sharedTag = await receiptTag(1000, s);
-      sharedTagImg = pw.MemoryImage(sharedTag.png);
-    }
     for (var i = 0; i < receipts.length; i++) {
       onProgress?.call(i, receipts.length);
       var bytes = await File(receipts[i]).readAsBytes();
@@ -2087,8 +2106,8 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
       pw.MemoryImage? pTagImg;
       var tw = 0.0, th = 0.0, bandH = 0.0;
       if (!hide) {
-        pTag = multi ? await receiptTag(1000, s, pageLabel: '${i + 1} / ${receipts.length}') : sharedTag!;
-        pTagImg = multi ? pw.MemoryImage(pTag.png) : sharedTagImg!;
+        pTag = await receiptTag(1000, s, pageLabel: '${i + 1} / ${receipts.length}');
+        pTagImg = pw.MemoryImage(pTag.png);
         tw = pageW * pTag.w / 1000;
         th = pageW * pTag.h / 1000;
         bandH = th + pad * 2;
@@ -2115,6 +2134,10 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     final dir = await Store.dir();
     final suffix = compact ? '_compact' : '';
     final file = File('${dir.path}/${s.pdfName}$suffix.pdf');
+    final sp = await SharedPreferences.getInstance();
+    if (sp.getString('pdfPath') == file.path) {
+      await Store._archiveSentPdf(sp, file.path); // cam: PDF بنفس الاسم: ميتكتبش فوقه
+    }
     await file.writeAsBytes(await doc.save(), flush: true);
     AppLog.i('t pdf compact=$compact ${swPdf.elapsedMilliseconds}ms ${await file.length()}B');
     return file;
@@ -2245,13 +2268,25 @@ class Store {
   }
 
   /// شيل الصورة من المسودة من غير ما نمسح الملف (عشان "تراجع").
-  static Future<void> unlistFromDraft(String path) async {
+  // cam: تعديلات قايمة المسودة بتتنفّذ واحدة ورا التانية، عشان حفظ لقطة ومسح لقطة في نفس الوقت ميضيّعوش تعديل بعض
+  static Future<void> _draftTail = Future<void>.value();
+  static Future<void> _draftLocked(Future<void> Function() f) {
+    final r = _draftTail.then((_) => f());
+    _draftTail = r.then((_) {}, onError: (_) {});
+    return r;
+  }
+
+  static Future<void> unlistFromDraft(String path) => _draftLocked(() => _unlistFromDraftRaw(path));
+
+  static Future<void> _unlistFromDraftRaw(String path) async {
     final l = await draft();
     l.remove(path);
     await (await _p).setStringList('draft', l);
   }
 
-  static Future<void> relistInDraft(String path, int index) async {
+  static Future<void> relistInDraft(String path, int index) => _draftLocked(() => _relistInDraftRaw(path, index));
+
+  static Future<void> _relistInDraftRaw(String path, int index) async {
     if (!File(path).existsSync()) return;
     final l = await draft();
     if (!l.contains(path)) l.insert(index.clamp(0, l.length), path);
@@ -2383,19 +2418,28 @@ class Store {
   static Future<void> setBatchImg(String path, {bool fresh = false}) async {
     final p = await _p;
     final old = p.getString('batchImg');
-    if (old != null && old != path) await del(old);
+    if (old != null && old != path) {
+      if (fresh && File(old).existsSync()) {
+        // cam: باتش جديد مبيمسحش القديم، بيروح للأرشيف (المسح يدوي بس)
+        final arch = p.getStringList('archive') ?? [];
+        if (!arch.contains(old)) arch.add(old);
+        await p.setStringList('archive', arch);
+      } else {
+        await del(old);
+      }
+    }
     await p.setString('batchImg', path);
     // باتش جديد من الكاميرا/المعرض: صورة السيستم القديمة متتعادلش معاه
-    if (fresh && old != null && old != path) await _clearSystemPhoto(p);
-    if (fresh && p.getInt('batchSentAt') != null) await _resetBatchMeta(p);
+    if (fresh && old != null && old != path) await _clearSystemPhoto(p, archive: true);
+    if (fresh && p.getInt('batchSentAt') != null) await _resetBatchMeta(p, archive: true);
   }
 
-  static Future<void> _resetBatchMeta(SharedPreferences p) async {
+  static Future<void> _resetBatchMeta(SharedPreferences p, {bool archive = false}) async {
     await p.remove('batchSentAt');
     for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
       await p.remove(k);
     }
-    await _clearSystemPhoto(p);
+    await _clearSystemPhoto(p, archive: archive);
   }
 
   /// صورة السيستم المرفقة بالباتش الحالي (بتتبعت معاه كصورة مستقلة بنفس الوصف).
@@ -2409,18 +2453,59 @@ class Store {
     return s;
   }
 
+  static Future<void> archivePath(String path) async => _archivePath(await _p, path);
+
   static Future<void> setSystemPhoto(String path) async {
     final p = await _p;
     final old = p.getString('systemImg');
-    if (old != null && old != path) await del(old);
+    if (old != null && old != path) await _archivePath(p, old); // cam: القديمة للأرشيف مش بتتمسح
     await p.setString('systemImg', path);
   }
 
-  static Future<void> _clearSystemPhoto(SharedPreferences p) async {
+  /// cam: بينقل ملف للأرشيف من غير ما يمسحه (المسح يدوي بس من شاشة الأرشيف).
+  static Future<void> _archivePath(SharedPreferences p, String path) async {
+    if (!File(path).existsSync()) return;
+    final arch = p.getStringList('archive') ?? [];
+    if (!arch.contains(path)) arch.add(path);
+    await p.setStringList('archive', arch);
+  }
+
+  static Future<void> _clearSystemPhoto(SharedPreferences p, {bool archive = false}) async {
     final old = p.getString('systemImg');
-    if (old != null) await del(old);
+    if (old != null) {
+      if (archive) {
+        await _archivePath(p, old);
+      } else {
+        await del(old);
+      }
+    }
     await p.remove('systemImg');
   }
+
+  /// cam: إعادة أخذ للباتش: الصورة والسيستم بيروحوا للأرشيف مش بيتمسحوا.
+  static Future<void> retireBatchImg() async {
+    final p = await _p;
+    final old = p.getString('batchImg');
+    if (old != null) await _archivePath(p, old);
+    await p.remove('batchImg');
+    await _resetBatchMeta(p, archive: true);
+  }
+
+  /// cam: الـPDF المتبعت بيتنقل لأرشيف بإسم فيه الوقت بدل ما يتمسح أو يتكتب فوقه.
+  static Future<void> _archiveSentPdf(SharedPreferences p, String path) async {
+    final f = File(path);
+    if (!f.existsSync()) return;
+    final dir = (await dir_()).path;
+    final base = path.split('/').last;
+    final pre = p.getInt('rcSentAt') != null ? 'sent' : 'pdf';
+    final dst = '$dir/${pre}_${DateTime.now().millisecondsSinceEpoch}_$base';
+    await f.rename(dst);
+    final arch = p.getStringList('archive') ?? [];
+    arch.add(dst);
+    await p.setStringList('archive', arch);
+  }
+
+  static Future<Directory> dir_() => dir();
 
   static Future<void> clearBatchImg() async {
     final p = await _p;
@@ -2455,7 +2540,9 @@ class Store {
     return l.where((e) => File(e).existsSync()).toList();
   }
 
-  static Future<void> addToDraft(String path) async {
+  static Future<void> addToDraft(String path) => _draftLocked(() => _addToDraftRaw(path));
+
+  static Future<void> _addToDraftRaw(String path) async {
     final l = await draft();
     final p = await _p;
     if (l.isEmpty) {
@@ -2467,7 +2554,9 @@ class Store {
     await p.setStringList('draft', l);
   }
 
-  static Future<void> removeFromDraft(String path) async {
+  static Future<void> removeFromDraft(String path) => _draftLocked(() => _removeFromDraftRaw(path));
+
+  static Future<void> _removeFromDraftRaw(String path) async {
     final l = await draft();
     l.remove(path);
     await del(path);
@@ -2583,7 +2672,9 @@ class Store {
       (await _p).setString('edit:$path', e.encode());
 
   /// بعد تعديل إيصال: الصورة الجديدة تاخد مكان القديمة في نفس الترتيب.
-  static Future<void> replaceInDraft(String old, String neu) async {
+  static Future<void> replaceInDraft(String old, String neu) => _draftLocked(() => _replaceInDraftRaw(old, neu));
+
+  static Future<void> _replaceInDraftRaw(String old, String neu) async {
     final l = await draft();
     final i = l.indexOf(old);
     if (i < 0) {
@@ -2619,7 +2710,7 @@ class Store {
     final age = DateTime.now()
         .difference(sentT == null ? time : DateTime.fromMillisecondsSinceEpoch(sentT));
     final life = sentT == null ? pdfLife : sentLife;
-    if (age > life || !File(path).existsSync()) {
+    if (!File(path).existsSync()) {
       await clearPdf();
       return null;
     }
@@ -2629,7 +2720,7 @@ class Store {
   static Future<void> setPdf(File f, List<String> imgs) async {
     final p = await _p;
     final old = p.getString('pdfPath');
-    if (old != null && old != f.path) await del(old);
+    if (old != null && old != f.path) await _archiveSentPdf(p, old); // cam: أي PDF بيتبدّل بيتحفظ
     await p.setString('pdfPath', f.path);
     await p.setInt('pdfTime', DateTime.now().millisecondsSinceEpoch);
     await p.setStringList('pdfImgs', imgs);
@@ -2638,7 +2729,7 @@ class Store {
   static Future<void> clearPdf() async {
     final p = await _p;
     final old = p.getString('pdfPath');
-    if (old != null) await del(old);
+    if (old != null) await _archiveSentPdf(p, old); // cam: أي PDF بيتنضّف بيتحفظ في الأرشيف
     await p.remove('pdfPath');
     await p.remove('pdfTime');
     await p.remove('pdfImgs');
@@ -2674,18 +2765,23 @@ class Store {
     final p = await _p;
     final sent = p.getStringList('rcSentImgs') ?? [];
     final left = await draft();
+    final arch = p.getStringList('archive') ?? [];
     for (final u in sent) {
-      await del(u);
+      // cam: «ابدأ جديد» مبيمسحش المتبعت، بينقله للأرشيف (المسح يدوي بس)
+      if (File(u).existsSync() && !arch.contains(u)) arch.add(u);
       left.remove(u);
     }
+    await p.setStringList('archive', arch);
     await p.setStringList('draft', left);
+    await clearPdf(); // قبل ما نمسح علامة الإرسال، عشان الـPDF المتبعت يتحفظ
     await p.remove('rcSentAt');
     await p.remove('rcSentImgs');
-    await clearPdf();
   }
 
   /// بيتنفّذ مع فتح التطبيق: بيمسح الباتش والإيصالات اللي عدّى عليهم أكتر من ١٢ ساعة من الإرسال.
   static Future<void> expireSent() async {
+    return; // cam: الملفات بتفضل محفوظة ومبتتمسحش تلقائياً، المسح يدوي بس
+    // ignore: dead_code
     if (working > 0) return;
     final p = await _p;
     final now = DateTime.now();
@@ -2797,6 +2893,11 @@ class Store {
     final keep = <String>{...await draft(), ...await pdfImgs(), ...await archive()};
     final bi = await batchImg();
     if (bi != null) keep.add(bi);
+    // cam: صفحات السكانر وصورة السيستم متتمسحش في التنضيف التلقائي
+    final pp = await _p;
+    keep.addAll(pp.getStringList('scanPages') ?? []);
+    final sysI = pp.getString('systemImg');
+    if (sysI != null) keep.add(sysI);
     final pdfPath = (await pdf())?.file.path;
     if (pdfPath != null) keep.add(pdfPath);
     keep.addAll(keep.map(baseOf).toList());
@@ -3994,7 +4095,6 @@ Future<bool> preSendCheckReceipts(BuildContext context, Session s, List<String> 
     if (hidden.isNotEmpty) {
       w.add('إيصال رقم ${hidden.join('، ')}: من غير ورقة البيانات (الاسم والوحدة)');
     }
-    if (!await Store.flag('batch')) w.add('الباتش لسه ما اتبعتش النهارده');
     if (await Store.flag('receipts')) {
       w.add('إيصالات الدفع اتبعتت النهارده قبل كده. لو بتبعت نسخة معدّلة تمام، غير كده اتأكد إنها مش مكررة');
     }
@@ -4021,9 +4121,19 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
   if (!context.mounted) return false;
   final sys = await Store.systemPhoto();
   // نسخ مضبوطة لواتساب: الباتش بتحسين مستند، وصورة السيستم تصغير جيد فقط (زي ما اتصورت) + شريط تحتها
-  final outShare = await waShareCopy(out.path, enhance: true);
-  // صورة السيستم + شريط A2R SYS تحتها (الترمنل وكود الوحدة) علشان POS2 يعرف الماكينة صح
-  final sysShare = sys == null ? null : await sysShareCopy(sys, s);
+  // بالجودة الكاملة من غير تصغير؛ لو التجهيز فشل مبنبعتش حاجة تانية بدالها، والملفات المحفوظة زي ما هي
+  final String outShare;
+  final String? sysShare;
+  try {
+    outShare = await waShareCopy(out.path, enhance: true, fullRes: true);
+    // صورة السيستم + شريط A2R SYS تحتها (الترمنل وكود الوحدة) علشان POS2 يعرف الماكينة صح
+    sysShare = sys == null ? null : await sysShareCopy(sys, s);
+  } catch (e) {
+    if (context.mounted) {
+      snack(context, 'ما اتبعتش حاجة: تجهيز الصورة بالجودة الكاملة فشل (${errText(e)}). الملفات المحفوظة زي ما هي');
+    }
+    return false;
+  }
   final ok = await shareFiles(context, [outShare, if (sysShare != null) sysShare],
       text: caption);
   if (ok) {
@@ -5131,6 +5241,8 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   List<String> draft = [];
+  List<String> saved = []; // cam: الملفات المحفوظة (اللي اتبدّلت أو اتبعتت) تحت «ملفاتي»
+  int scanCount = 0;
   String? batchImg;
   ({File file, DateTime time})? pdf;
   bool batchSent = false;
@@ -5197,8 +5309,20 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final r = await Store.flag('receipts');
     final bs = await Store.batchSentAt();
     final rs = await Store.receiptsSentAt();
+    final sv = await Store.archive();
+    sv.sort((a, b) {
+      try {
+        return File(b).lastModifiedSync().compareTo(File(a).lastModifiedSync());
+      } catch (_) {
+        return 0;
+      }
+    });
+    final sp = await SharedPreferences.getInstance();
+    final sc = (sp.getStringList('scanPages') ?? []).where((e) => File(e).existsSync()).length;
     if (!mounted) return;
     setState(() {
+      saved = sv;
+      scanCount = sc;
       draft = d;
       pdf = f;
       batchImg = bi;
@@ -5207,6 +5331,65 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       batchSentAt = bs;
       receiptsSentAt = rs;
     });
+  }
+
+  String _savedKind(String path) {
+    final n = path.split('/').last;
+    if (n.toLowerCase().endsWith('.pdf')) return n.startsWith('sent_') ? 'ملف PDF متبعت' : 'ملف PDF';
+    if (n.startsWith('batch')) return 'باتش محفوظ';
+    if (n.startsWith('scan')) return 'سكانر محفوظ';
+    if (n.startsWith('r_')) return 'إيصال محفوظ';
+    return 'صورة محفوظة';
+  }
+
+  String _savedDate(String path) {
+    try {
+      final t = File(path).lastModifiedSync();
+      return '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Widget _savedCard(String path) {
+    final pdfFile = path.toLowerCase().endsWith('.pdf');
+    return Card(
+      key: ValueKey('saved:$path'),
+      shape: kCardShape,
+      child: ListTile(
+        leading: pdfFile
+            ? const Icon(Icons.picture_as_pdf_rounded, size: 36, color: Colors.red)
+            : ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.file(File(path),
+                    width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
+              ),
+        title: Text(_savedKind(path)),
+        subtitle: Text(_savedDate(path)),
+        onTap: () => pdfFile
+            ? OpenFilex.open(path)
+            : Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => ZoomPage(child: Image.file(File(path))))),
+        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+          IconButton(
+              tooltip: 'مشاركة',
+              icon: const Icon(Icons.share_rounded),
+              onPressed: () => shareFiles(context, [path])),
+          IconButton(
+              tooltip: 'مسح',
+              icon: const Icon(Icons.delete_rounded, color: Colors.red),
+              onPressed: () async {
+                if (!await askYesNo(context, 'مسح الملف؟', 'هيتمسح نهائياً من التطبيق.',
+                    yes: 'امسح', no: 'إلغاء')) {
+                  return;
+                }
+                await Store.unarchive(path);
+                if (mounted) _reload();
+              }),
+        ]),
+      ),
+    );
   }
 
   Future<void> _showSettings() async {
@@ -5249,7 +5432,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           child: AlertDialog(
             title: const Text('إيصالات اتبعتت'),
             content: const Text(
-                'عندك إيصالات اتبعتت ومحتفظ بيها للتعديل. تفتحها تعدّل وتبعت تاني، ولا تبدأ إيصالات جديدة؟ (البدء من جديد بيمسح اللي اتبعت)'),
+                'عندك إيصالات اتبعتت ومحتفظ بيها للتعديل. تفتحها تعدّل وتبعت تاني، ولا تبدأ إيصالات جديدة؟ (البدء من جديد بينقل اللي اتبعت للأرشيف)'),
             actions: [
               TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
               TextButton(onPressed: () => Navigator.pop(ctx, 'new'), child: const Text('ابدأ جديد')),
@@ -5358,7 +5541,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await _reload();
   }
 
-  Widget _big(IconData icon, String label, VoidCallback onTap, {required bool sent}) {
+  Widget _big(IconData icon, String label, VoidCallback onTap, {required bool sent, bool compact = false}) {
     final cs = Theme.of(context).colorScheme;
     return Material(
       color: cs.surfaceContainerHigh,
@@ -5369,7 +5552,37 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       ),
       child: InkWell(
         onTap: onTap,
-        child: ConstrainedBox(
+        child: compact
+            ? Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                child: Row(children: [
+                  Container(
+                    width: 38, height: 38,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      color: kAccent.withAlpha(32),
+                      border: Border.all(color: kAccent.withAlpha(100)),
+                    ),
+                    child: Icon(icon, size: 22, color: kAccent),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                      child: Semantics(
+                    label: '$label: ${sent ? "تم الإرسال" : "لم يُرسل"}',
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                      Text(label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                      Text(sent ? 'تم الإرسال' : 'لم يُرسل',
+                          style: TextStyle(
+                              fontSize: 10,
+                              color: sent ? Colors.green.shade400 : cs.onSurfaceVariant)),
+                    ]),
+                  )),
+                ]),
+              )
+            : ConstrainedBox(
           constraints: const BoxConstraints(minHeight: 158),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 13),
@@ -5427,24 +5640,25 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             tooltip: 'المزيد',
             icon: const Icon(Icons.more_horiz_rounded),
             onSelected: (value) {
-              if (value == 'archive') _open(const ArchiveScreen());
               if (value == 'history') _open(const SendLogScreen());
               if (value == 'account') Navigator.pop(context);
             },
             itemBuilder: (_) => const [
-              PopupMenuItem(value: 'archive', child: Text('الأرشيف')),
               PopupMenuItem(value: 'history', child: Text('سجل الإرسال')),
               PopupMenuItem(value: 'account', child: Text('تغيير الحساب')),
             ],
           )),
         ],
       ),
-      body: ListView(padding: const EdgeInsets.all(14), children: [
+      body: LayoutBuilder(builder: (ctx, bc) {
+        // شاشة قصيرة: الجزء الثابت بيصغّر (مضغوط) بدل ما كله يتحرك، عشان «ملفاتي» تفضل ظاهرة.
+        final compact = bc.maxHeight < 700;
+        final top = <Widget>[
         if (busy) const LinearProgressIndicator(),
         Container(
-          padding: const EdgeInsets.all(14),
+          padding: EdgeInsets.all(compact ? 9 : 14),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(22),
+            borderRadius: BorderRadius.circular(compact ? 16 : 22),
             gradient: LinearGradient(
               begin: Alignment.topRight,
               end: Alignment.bottomLeft,
@@ -5462,13 +5676,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                     child: Text(s.name,
                         style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
               ]),
-              const SizedBox(height: 6),
+              SizedBox(height: compact ? 2 : 6),
               Row(children: [
                 Icon(Icons.location_on_rounded, color: kAccent),
                 const SizedBox(width: 8),
                 Expanded(child: Text(unitLine)),
               ]),
-              const SizedBox(height: 6),
+              SizedBox(height: compact ? 2 : 6),
               Wrap(spacing: 7, runSpacing: 3, crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
                   Icon(Icons.calendar_today_rounded, color: kAccent, size: 18),
@@ -5481,27 +5695,34 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             ]),
           ),
         ),
-        const SizedBox(height: 14),
+        SizedBox(height: compact ? 8 : 14),
         IntrinsicHeight(child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Expanded(
               child: _big(Icons.receipt_long_rounded, 'الباتش',
-                  _newBatch, sent: batchSent)),
+                  _newBatch, sent: batchSent, compact: compact)),
           const SizedBox(width: 12),
           Expanded(
               child: _big(
-                  Icons.payments_rounded, 'إيصالات الدفع', _openReceipts, sent: receiptsSent)),
+                  Icons.payments_rounded, 'إيصالات الدفع', _openReceipts, sent: receiptsSent, compact: compact)),
         ])),
-        const SizedBox(height: 12),
+        SizedBox(height: compact ? 8 : 12),
         Card(
           shape: kCardShape,
           child: ListTile(
+            dense: compact,
+            visualDensity: compact ? VisualDensity.compact : null,
             leading: Icon(Icons.document_scanner_rounded, color: kAccent),
             title: const Text('سكانر', style: TextStyle(fontWeight: FontWeight.bold)),
-            subtitle: const Text('مستند، متتابع، بطاقة وش وضهر، تصدير PDF أو صور'),
-            onTap: () => _open(const ScannerScreen()),
+            subtitle: const Text('مستند أو بطاقة وش وضهر، تصدير PDF أو صور'),
+            onTap: () async {
+              await _open(const ScannerScreen(autoStart: true));
+              if (mounted) _reload();
+            },
           ),
         ),
-        if (draft.isNotEmpty || pf != null || bi != null) ...[
+        ];
+        final files = <Widget>[
+        if (draft.isNotEmpty || pf != null || bi != null || saved.isNotEmpty || scanCount > 0) ...[
           const SizedBox(height: 24),
           const Text('ملفاتي',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
@@ -5518,7 +5739,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text('الباتش - ${s.batchName}.jpg'),
                 subtitle: Text(batchSentAt == null
                     ? 'اضغط للمعاينة'
-                    : 'اتبعت ✓ - اضغط للتعديل - يتمسح بعد ${_leftText(batchSentAt!)}'),
+                    : 'اتبعت ✓ - اضغط للتعديل'),
                 onTap: () => _open(BatchScreen(session: s)),
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -5544,7 +5765,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text('إيصالات الدفع (${draft.length} صورة)'),
                 subtitle: Text(receiptsSentAt == null
                     ? 'اضغط للمعاينة أو لتكمل التصوير'
-                    : 'اتبعت ✓ - اضغط للتعديل - يتمسح بعد ${_leftText(receiptsSentAt!)}'),
+                    : 'اتبعت ✓ - اضغط للتعديل'),
                 onTap: _openReceipts,
                 trailing: IconButton(
                     tooltip: 'مسح',
@@ -5560,8 +5781,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text(pf.file.path.split('/').last,
                     maxLines: 2, overflow: TextOverflow.ellipsis),
                 subtitle: Text(receiptsSentAt != null
-                    ? 'اتبعت ✓ - اضغط لفتحه - يتمسح بعد ${_leftText(receiptsSentAt!)}'
-                    : 'اضغط لفتحه - يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
+                    ? 'اتبعت ✓ - اضغط لفتحه'
+                    : 'اضغط لفتحه'),
                 onTap: _openPdf,
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -5573,12 +5794,34 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 ]),
               ),
             ),
+          if (scanCount > 0)
+            Card(
+              shape: kCardShape,
+              child: ListTile(
+                leading: Icon(Icons.document_scanner_rounded, size: 36, color: kAccent),
+                title: Text('سكانر ($scanCount صفحة)'),
+                subtitle: const Text('اضغط للفتح'),
+                onTap: () async {
+                  await _open(const ScannerScreen());
+                  if (mounted) _reload();
+                },
+              ),
+            ),
+          for (final sp in saved) _savedCard(sp),
         ],
         const SizedBox(height: 24),
         Center(
             child: Text('v$kVersion',
                 style: const TextStyle(fontSize: 11, color: Colors.grey))),
-      ]),
+        ];
+        // الجزء اللي فوق (لحد السكانر) ثابت و«ملفاتي» بس هي اللي بتتحرك (والجزء الثابت بيتضغط على الشاشات القصيرة).
+        return Column(children: [
+          Padding(
+              padding: EdgeInsets.fromLTRB(14, compact ? 8 : 14, 14, 0),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: top)),
+          Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(14, 0, 14, 14), children: files)),
+        ]);
+      }),
     );
   }
 }
@@ -5781,7 +6024,7 @@ class _BatchScreenState extends State<BatchScreen> {
     }
     _lastScanManual = manual;
     if (mounted && await _edit(tab: manual ? 0 : 2, fromCam: true, path: saved)) {
-      await Store.clearBatchImg();
+      await Store.retireBatchImg();
       if (mounted) setState(() => img = null);
       await _captureGoogle(); // إعادة أخذ
       return;
@@ -5820,7 +6063,7 @@ class _BatchScreenState extends State<BatchScreen> {
             if (saved == null) return null;
             if (mounted && await _edit(tab: 2, fromCam: true, path: saved)) {
               // إعادة أخذ: نمسح الصورة دي والكاميرا تفضل مفتوحة
-              await Store.clearBatchImg();
+              await Store.retireBatchImg();
               if (mounted) setState(() => img = null);
               return null;
             }
@@ -5974,11 +6217,6 @@ class _BatchScreenState extends State<BatchScreen> {
     return Scaffold(
       appBar: AppBar(title: const Text('الباتش'), actions: [
         if (img != null) ...[
-          IconButton(
-              tooltip: kept ? 'محفوظ للأرشيف' : 'احتفظ بيه في الأرشيف',
-              icon: Icon(kept ? Icons.bookmark_rounded : Icons.bookmark_outline_rounded,
-                  color: kept ? Colors.teal : null),
-              onPressed: busy ? null : _toggleKeep),
           IconButton(
               tooltip: 'استخراج النص',
               icon: const Icon(Icons.text_snippet_outlined),
@@ -8832,7 +9070,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
       final dir = await getTemporaryDirectory();
       for (var i = 0; i < n; i++) {
         final bytes = await composeReceiptImage(widget.imgs[i], widget.session,
-            pageLabel: n > 1 ? '${i + 1} / $n' : null);
+            pageLabel: '${i + 1} / $n');
         final f = File('${dir.path}/${widget.session.pdfName}_${i + 1}.jpg');
         await f.writeAsBytes(bytes, flush: true);
         files.add(f.path);
@@ -11004,7 +11242,11 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       if (!mounted || out == null) return false;
       if (out == kRetake || out == kDelete) {
         await Store.unlistFromDraft(old);
-        await Store.del(old);
+        if (out == kRetake) {
+          await Store.archivePath(old); // cam: إعادة أخذ مبتمسحش الصورة، بتروح للأرشيف
+        } else {
+          await Store.del(old);
+        }
         if (mounted) {
           setState(() {
             imgs.remove(old);
@@ -11064,7 +11306,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   Widget _card(String path, int i, bool searching) {
     final cs = Theme.of(context).colorScheme;
-    final isKept = kept.contains(path);
     return Card(
       shape: kCardShape,
       key: ValueKey(path),
@@ -11111,12 +11352,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   const Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey)),
-                  if (isKept)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 4),
-                      child: Text('🔖 محفوظة للأرشيف',
-                          style: TextStyle(fontSize: 11, color: Colors.teal)),
-                    ),
                 ]),
               ),
               if (!searching)
@@ -11126,12 +11361,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                         padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle_rounded))),
             ]),
             Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-              IconButton(
-                  tooltip: isKept ? 'إلغاء الحفظ في الأرشيف' : 'احتفظ بيها في الأرشيف',
-                  icon: Icon(
-                      isKept ? Icons.bookmark_rounded : Icons.bookmark_outline_rounded,
-                      color: isKept ? Colors.teal : null),
-                  onPressed: busy ? null : () => _toggleKeep(path)),
               IconButton(
                   tooltip: 'استخراج النص',
                   icon: const Icon(Icons.text_snippet_outlined),
@@ -11149,7 +11378,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
               IconButton(
                   tooltip: 'مسح',
                   icon: const Icon(Icons.delete_outline_rounded, color: Colors.red),
-                  onPressed: busy ? null : () => _remove(i)),
+                  onPressed: (busy && progress != null) ? null : () => _remove(i)), // cam: المسح مش بيتعطل بسبب حفظ صورة جديدة
             ]),
           ]),
         ),
@@ -11392,7 +11621,7 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
                   child: Padding(
                     padding: EdgeInsets.all(24),
                     child: Text(
-                        'مفيش حاجة محفوظة لسه.\nعلّم أي باتش أو إيصال بعلامة الحفظ قبل ما تبعته، وهيتحفظ هنا بدل ما يتمسح بعد ١٢ ساعة.',
+                        'مفيش حاجة محفوظة لسه.\nالصور والملفات اللي بتتبدّل أو بتتبعت بتتحفظ هنا، وبتتمسح بإيدك بس.',
                         textAlign: TextAlign.center,
                         style: TextStyle(fontSize: 15)),
                   ),
@@ -11406,22 +11635,32 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
                       shape: kCardShape,
                       margin: const EdgeInsets.symmetric(vertical: 4),
                       child: ListTile(
-                        leading: ClipRRect(
-                          borderRadius: BorderRadius.circular(8),
-                          child: Image.file(File(path),
-                              width: 48, height: 64, fit: BoxFit.cover, cacheWidth: 150),
-                        ),
-                        title: Text('محفوظ ${_dateOf(path)}'),
+                        leading: path.toLowerCase().endsWith('.pdf')
+                            ? const SizedBox(
+                                width: 48, height: 64, child: Icon(Icons.picture_as_pdf_rounded, size: 34))
+                            : ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.file(File(path),
+                                    width: 48, height: 64, fit: BoxFit.cover, cacheWidth: 150),
+                              ),
+                        title: Text(path.toLowerCase().endsWith('.pdf')
+                            ? (path.split('/').last.startsWith('sent_')
+                                ? 'ملف PDF متبعت\n${_dateOf(path)}'
+                                : 'ملف PDF\n${_dateOf(path)}')
+                            : 'محفوظ\n${_dateOf(path)}'),
                         subtitle: const Text('اضغط للمعاينة'),
-                        onTap: () => Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                                builder: (_) => ZoomPage(child: Image.file(File(path))))),
+                        onTap: () => path.toLowerCase().endsWith('.pdf')
+                            ? OpenFilex.open(path)
+                            : Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                    builder: (_) => ZoomPage(child: Image.file(File(path))))),
                         trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                          IconButton(
-                              tooltip: 'استخراج النص',
-                              icon: const Icon(Icons.text_snippet_outlined),
-                              onPressed: () => showOcrTextSheet(context, path)),
+                          if (!path.toLowerCase().endsWith('.pdf'))
+                            IconButton(
+                                tooltip: 'استخراج النص',
+                                icon: const Icon(Icons.text_snippet_outlined),
+                                onPressed: () => showOcrTextSheet(context, path)),
                           IconButton(
                               tooltip: 'مشاركة',
                               icon: const Icon(Icons.share_rounded),
@@ -11594,14 +11833,16 @@ class _SendLogScreenState extends State<SendLogScreen> {
 // ===================== سكانر مستقل (فرع cam) =====================
 /// أوضاع السكانر: مستند (صفحة)، متتابع (صفحات)، بطاقة (وش وضهر على A4 واحدة).
 class ScannerScreen extends StatefulWidget {
-  const ScannerScreen({super.key});
+  /// autoStart: الضغط على كارت «سكانر» يفتح الكاميرا على طول (لو مفيش صفحات محفوظة).
+  final bool autoStart;
+  const ScannerScreen({super.key, this.autoStart = false});
   @override
   State<ScannerScreen> createState() => _ScannerScreenState();
 }
 
 class _ScannerScreenState extends State<ScannerScreen> {
   static const _prefKey = 'scanDefaultFilter';
-  int mode = 0; // 0 مستند، 1 متتابع، 2 بطاقة
+  int mode = 0; // 0 مستند، 2 بطاقة (وش وضهر في صورة واحدة)
   final List<String> pages = [];
   ScanFilter sel = ScanFilter.original;
   ScanFilter? saved; // الفلتر الافتراضي المحفوظ (النجمة)
@@ -11611,6 +11852,55 @@ class _ScannerScreenState extends State<ScannerScreen> {
   void initState() {
     super.initState();
     _loadDefault();
+    _restorePages().then((_) {
+      if (widget.autoStart && mounted) _scan(append: pages.isNotEmpty);
+    });
+  }
+
+  static const _pagesKey = 'scanPages';
+
+  /// صفحات السكانر بتتحفظ تلقائياً وترجع لما تفتح الشاشة تاني (المسح يدوي بس).
+  Future<void> _restorePages() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final l = (p.getStringList(_pagesKey) ?? []).where((e) => File(e).existsSync()).toList();
+      if (l.isNotEmpty && pages.isEmpty && mounted) setState(() => pages.addAll(l));
+    } catch (e, st) {
+      AppLog.e('scanner.restore', e, st);
+    }
+  }
+
+  Future<void> _persistPages() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setStringList(_pagesKey, List.of(pages));
+    } catch (e, st) {
+      AppLog.e('scanner.persist', e, st);
+    }
+  }
+
+  /// أي مستند قديم بيتبدّل بمستند جديد بيتنقل للأرشيف (مبيتمسحش).
+  Future<void> _archiveCurrent() async {
+    if (pages.isEmpty) return;
+    final p = await SharedPreferences.getInstance();
+    final a = p.getStringList('archive') ?? []; // نفس أرشيف التطبيق (قايمة الأرشيف الموجودة)
+    for (final x in pages) {
+      if (!a.contains(x)) a.add(x);
+    }
+    await p.setStringList('archive', a);
+  }
+
+  /// بينقل صورة الماسح من الكاش (أندرويد ممكن يمسحه) لمجلد التطبيق الدائم.
+  Future<String> _keep(String src) async {
+    final dir = (await Store.dir()).path;
+    if (src.startsWith(dir)) {
+      await Store.setQualityProfile(src, ImageQualityProfile.receipts);
+      return src;
+    }
+    final dst = '$dir/scan_${DateTime.now().microsecondsSinceEpoch}.jpg';
+    await File(src).copy(dst);
+    await Store.setQualityProfile(dst, ImageQualityProfile.receipts); // تعديل السكانر بدقة الأصل وجودة 100
+    return dst;
   }
 
   Future<void> _loadDefault() async {
@@ -11640,38 +11930,98 @@ class _ScannerScreenState extends State<ScannerScreen> {
   }
 
   String get _hint => mode == 0
-      ? 'صفحة واحدة'
-      : mode == 1
-          ? 'صفحات متتابعة في ملف واحد'
-          : 'وش وضهر البطاقة على صفحة A4';
+      ? 'مستند، صفحة أو أكتر'
+      : 'وش وضهر البطاقة في صورة واحدة';
+
+  /// بيجمع وش وضهر البطاقة في صورة JPEG واحدة بدقتهم الأصلية من غير تصغير (الوش فوق والضهر تحت على خلفية بيضا).
+  /// مفيش حد أقصى للأبعاد: الصورة بتاخد عرض أكبر وش + هوامش وطول الاتنين.
+  Future<String> _composeCard(String front, String back) async {
+    final a = await decodeImage(await File(front).readAsBytes());
+    final b = await decodeImage(await File(back).readAsBytes());
+    try {
+      final inner = math.max(a.width, b.width).toDouble();
+      final m = (inner * 0.03).roundToDouble(), gap = (inner * 0.012).roundToDouble();
+      final w = inner + 2 * m;
+      final h = a.height + b.height + 2 * m + gap;
+      final rec = ui.PictureRecorder();
+      final c = ui.Canvas(rec);
+      c.drawRect(ui.Rect.fromLTWH(0, 0, w, h), ui.Paint()..color = const ui.Color(0xFFFFFFFF));
+      double y = m;
+      for (final im in [a, b]) {
+        c.drawImage(im, ui.Offset((w - im.width) / 2, y), ui.Paint());
+        y += im.height + gap;
+      }
+      final out = await rec.endRecording().toImage(w.toInt(), h.toInt());
+      final bd = await out.toByteData(format: ui.ImageByteFormat.png);
+      out.dispose();
+      if (bd == null) throw Exception('تعذر دمج الوش والضهر');
+      final q = await Store.jpegQuality(profile: ImageQualityProfile.receipts);
+      final jpg = await FlutterImageCompress.compressWithList(
+          bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+          minWidth: w.toInt(), minHeight: h.toInt(), quality: q, format: CompressFormat.jpeg);
+      final dir = (await Store.dir()).path;
+      final dst = '$dir/scan_${DateTime.now().microsecondsSinceEpoch}.jpg';
+      await File(dst).writeAsBytes(jpg, flush: true);
+      await Store.setQualityProfile(dst, ImageQualityProfile.receipts);
+      return dst;
+    } finally {
+      a.dispose();
+      b.dispose();
+    }
+  }
 
   Future<String> _filtered(String p) async {
     if (sel == ScanFilter.original || _lastScanEnhanced) return p;
     return renderEditedPage(p, 'scan_', EditParams(filter: sel));
   }
 
-  Future<void> _scan() async {
+  /// وش أو ضهر بطاقة اتصوّر: بيتحفظ فوراً في «ملفاتي» (مسح يدوي بس)، حتى لو العملية اتلغت بعده.
+  Future<void> _saveCardFace(String path) async {
+    final ap = await SharedPreferences.getInstance();
+    final al = ap.getStringList('archive') ?? [];
+    if (!al.contains(path)) al.add(path);
+    await ap.setStringList('archive', al);
+  }
+
+  /// append: لو فيه صفحات محفوظة، التصوير بيضيف عليها من غير ما يبدّلها أو يمسحها.
+  Future<void> _scan({bool append = false}) async {
     if (busy) return;
     setState(() => busy = true);
     try {
       final List<String> got = [];
-      if (mode == 2) {
+      if (append) {
+        got.addAll(await scanImages(context, 24, camFallback: true));
+      } else if (mode == 2) {
         final f = await scanImages(context, 1, camFallback: true);
         if (f.isEmpty || !mounted) return;
+        // الوش بيتحفظ فوراً (حتى لو الضهر اتلغى) تحت «ملفاتي»
+        final fa = await _keep(await _filtered(await _keep(f.first)));
+        await _saveCardFace(fa);
         if (!mounted) return;
         snack(context, 'دلوقتي صوّر ضهر البطاقة');
         final b = await scanImages(context, 1, camFallback: true);
         if (b.isEmpty || !mounted) return;
         got..add(f.first)..add(b.first);
+        final fb = await _keep(await _filtered(await _keep(b.first)));
+        await _saveCardFace(fb);
+        final one = await _composeCard(fa, fb);
+        await _archiveCurrent();
         pages.clear();
+        pages.add(one);
+        await _persistPages();
+        return;
       } else {
         got.addAll(await scanImages(context, mode == 0 ? 1 : 24, camFallback: true));
-        if (mode == 0) pages.clear();
+        if (mode == 0) {
+          await _archiveCurrent();
+          pages.clear();
+        }
       }
       if (got.isEmpty || !mounted) return;
       for (final g in got) {
-        pages.add(await _filtered(g));
+        pages.add(await _keep(await _filtered(await _keep(g))));
       }
+      await _persistPages();
     } catch (e, st) {
       AppLog.e('scanner.scan', e, st);
       if (mounted) snack(context, errText(e));
@@ -11700,6 +12050,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
               sharp: prev?.sharp ?? 0,
             ));
       }
+      await _persistPages();
     } catch (e, st) {
       AppLog.e('scanner.applyAll', e, st);
       if (mounted) snack(context, errText(e));
@@ -11717,6 +12068,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
     );
     if (out == null || out == kRetake || !mounted) return;
     setState(() => pages[i] = out);
+    await _persistPages();
   }
 
   Future<File> _buildPdf() async {
@@ -11797,16 +12149,21 @@ class _ScannerScreenState extends State<ScannerScreen> {
           padding: const EdgeInsets.all(12),
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             Wrap(spacing: 8, children: [
-              for (final e in const [0, 1, 2])
+              for (final e in const [0, 2])
                 ChoiceChip(
-                  label: Text(const ['مستند', 'متتابع', 'بطاقة'][e]),
+                  label: Text(e == 0 ? 'مستند' : 'بطاقة'),
                   selected: mode == e,
                   onSelected: busy
                       ? null
-                      : (_) => setState(() {
+                      : (_) async {
+                          await _archiveCurrent();
+                          if (!mounted) return;
+                          setState(() {
                             mode = e;
                             pages.clear();
-                          }),
+                          });
+                          await _persistPages();
+                        },
                 ),
             ]),
             const SizedBox(height: 6),
@@ -11845,7 +12202,14 @@ class _ScannerScreenState extends State<ScannerScreen> {
                             visualDensity: VisualDensity.compact,
                             tooltip: 'حذف',
                             icon: const Icon(Icons.close_rounded),
-                            onPressed: busy ? null : () => setState(() => pages.removeAt(i)),
+                            onPressed: busy
+                                ? null
+                                : () async {
+                                    final gone = pages[i];
+                                    setState(() => pages.removeAt(i));
+                                    await _persistPages();
+                                    await Store.del(gone); // مسح يدوي بس
+                                  },
                           ),
                         ),
                       ]),
@@ -11861,7 +12225,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
                   icon: const Icon(Icons.document_scanner_rounded),
                   label: FittedBox(
                       fit: BoxFit.scaleDown,
-                      child: Text(pages.isEmpty || mode != 1 ? 'تصوير' : 'إضافة صفحات')),
+                      child: Text(pages.isEmpty ? 'تصوير' : 'إضافة صفحة')),
                 ),
               ),
               if (pages.isNotEmpty) ...[
