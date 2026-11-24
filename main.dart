@@ -1758,7 +1758,43 @@ const kWaMaxSide = 1600;
 
 /// نسخة إرسال واتساب في Isolate: تصغير بمتوسط المساحة (لو أكبر من kWaMaxSide بس) + اختياريًا
 /// مستويات تلقائية (سحق الحبر وقص الورق)، والحدة بس لو حصل تصغير. الأصل لا يُمس.
+/// نفس نتيجة _waCopyCore، ولو a['bmp'] == true والصورة كلها معتمة بيرجّع BMP 24 بت جاهز للضغط بدل RGBA
+/// (من غير ترميز PNG تقيل). نفس البكسلات بالظبط. لو فيها شفافية بيرجّع RGBA زي الأول.
 Map<String, dynamic> _waCopyJob(Map<String, dynamic> a) {
+  final r = _waCopyCore(a);
+  if (a['bmp'] != true) return r;
+  final px = r['rgba'] as Uint8List;
+  final w = r['w'] as int, h = r['h'] as int;
+  for (var i = 3; i < px.length; i += 4) {
+    if (px[i] != 255) return r;
+  }
+  final rowBytes = ((w * 3 + 3) ~/ 4) * 4;
+  final dataSize = rowBytes * h;
+  final bmp = Uint8List(54 + dataSize);
+  final hd = ByteData.view(bmp.buffer);
+  bmp[0] = 0x42;
+  bmp[1] = 0x4D;
+  hd.setUint32(2, 54 + dataSize, Endian.little);
+  hd.setUint32(10, 54, Endian.little);
+  hd.setUint32(14, 40, Endian.little);
+  hd.setInt32(18, w, Endian.little);
+  hd.setInt32(22, h, Endian.little);
+  hd.setUint16(26, 1, Endian.little);
+  hd.setUint16(28, 24, Endian.little);
+  hd.setUint32(34, dataSize, Endian.little);
+  for (var y = 0; y < h; y++) {
+    var o = 54 + (h - 1 - y) * rowBytes;
+    var j = y * w * 4;
+    for (var x = 0; x < w; x++, j += 4) {
+      bmp[o++] = px[j + 2];
+      bmp[o++] = px[j + 1];
+      bmp[o++] = px[j];
+    }
+  }
+  return {'bmp': bmp, 'lum': _meanLum(px, w, h), 'w': w, 'h': h};
+}
+
+Map<String, dynamic> _waCopyCore(Map<String, dynamic> a) {
   final src = a['src'] as Uint8List;
   final sw = a['sw'] as int, sh = a['sh'] as int;
   final enhance = a['enhance'] as bool;
@@ -1885,39 +1921,60 @@ Future<String> waShareCopy(String path, {required bool enhance, bool fullRes = f
       if (fullRes) throw Exception('تعذر قراءة الصورة');
       return path;
     }
-    final res = await compute(_waCopyJob, <String, dynamic>{
-      'src': _bytesOf(bd),
+    final srcBytes = _bytesOf(bd);
+    final args = <String, dynamic>{
+      'src': srcBytes,
       'sw': w,
       'sh': h,
       'enhance': enhance,
       'max': fullRes ? kNoResizeSide : kWaMaxSide,
-    });
-    final rgba = res['rgba'] as Uint8List;
-    final ow = res['w'] as int, oh = res['h'] as int;
-    // الضاغط محتاج صورة مشفّرة (PNG)، مش بكسلات خام: قبل كده كان بيفشل وبيرجع الأصل من غير التحسين
-    final comp = Completer<ui.Image>();
-    ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
-    final outImg = await comp.future;
-    final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
-    outImg.dispose();
-    if (pngBd == null) {
-      if (fullRes) throw Exception('تعذر تجهيز نسخة الإرسال');
-      return path;
+    };
+    Uint8List? jpg;
+    // المسار الأساسي: BMP (نفس البكسلات من غير ترميز PNG كامل الحجم). لو فشل أو الناتج مشوّه بنرجع للمسار القديم (PNG) بنفس الأبعاد والجودة.
+    try {
+      final r = await compute(_waCopyJob, <String, dynamic>{...args, 'bmp': true});
+      final bmp = r['bmp'] as Uint8List?;
+      if (bmp != null) {
+        final bw = r['w'] as int, bh = r['h'] as int;
+        final j = await FlutterImageCompress.compressWithList(bmp,
+            minWidth: bw, minHeight: bh, quality: fullRes ? 100 : 95, format: CompressFormat.jpeg);
+        final got = await _jpegMeanLum(j);
+        final want = r['lum'] as double;
+        AppLog.i('waCopy bmp ${bw}x$bh ${j.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} got=${got?.toStringAsFixed(0)}');
+        if (_isJpegHeader(j) && got != null && (got - want).abs() < 25) jpg = j;
+      }
+    } catch (e, st) {
+      AppLog.e('waCopy.bmp', e, st);
     }
-    final jpg = await FlutterImageCompress.compressWithList(
-      pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes),
-      minWidth: ow,
-      minHeight: oh,
-      quality: fullRes ? 100 : 95,
-      format: CompressFormat.jpeg,
-    );
-    if (!_isJpegHeader(jpg)) {
-      if (fullRes) throw Exception('نسخة الإرسال طلعت غير سليمة');
-      return path;
+    if (jpg == null) {
+      final res = await compute(_waCopyJob, args);
+      final rgba = res['rgba'] as Uint8List;
+      final ow = res['w'] as int, oh = res['h'] as int;
+      // الضاغط محتاج صورة مشفّرة (PNG)، مش بكسلات خام: قبل كده كان بيفشل وبيرجع الأصل من غير التحسين
+      final comp = Completer<ui.Image>();
+      ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
+      final outImg = await comp.future;
+      final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
+      outImg.dispose();
+      if (pngBd == null) {
+        if (fullRes) throw Exception('تعذر تجهيز نسخة الإرسال');
+        return path;
+      }
+      jpg = await FlutterImageCompress.compressWithList(
+        pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes),
+        minWidth: ow,
+        minHeight: oh,
+        quality: fullRes ? 100 : 95,
+        format: CompressFormat.jpeg,
+      );
+      if (!_isJpegHeader(jpg)) {
+        if (fullRes) throw Exception('نسخة الإرسال طلعت غير سليمة');
+        return path;
+      }
     }
     final f = File('${dir}/wa_${DateTime.now().microsecondsSinceEpoch}_${_waSeq++}.jpg');
     await f.writeAsBytes(jpg, flush: true);
-    AppLog.i('waCopy ${w}x$h -> ${ow}x$oh ${jpg.length ~/ 1024}KB enhance=$enhance');
+    AppLog.i('waCopy ${w}x$h ${jpg.length ~/ 1024}KB enhance=$enhance');
     return f.path;
   } catch (e, st) {
     AppLog.e('waCopy', e, st);
@@ -4191,7 +4248,8 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img, {BatchIn
     }
     return false;
   }
-  final ok = await shareFiles(context, [outShare, if (sysShare != null) sysShare],
+  // صورة السيستم الأول والباتش آخر صورة: واتساب بيحط الوصف تحت آخر صورة في الاختيار
+  final ok = await shareFiles(context, [if (sysShare != null) sysShare, outShare],
       text: caption);
   if (ok) {
     await Store.afterBatchSent();
@@ -5904,7 +5962,7 @@ class _BatchInfoPanel extends StatefulWidget {
   State<_BatchInfoPanel> createState() => _BatchInfoPanelState();
 }
 
-final ButtonStyle kSysBtn = OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8));
+final ButtonStyle kSysBtn = OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8), minimumSize: const Size(0, 38), tapTargetSize: MaterialTapTargetSize.shrinkWrap, visualDensity: VisualDensity.compact);
 
 class _BatchInfoPanelState extends State<_BatchInfoPanel> {
   late final c1 = TextEditingController(); // صورة جديدة: عمرنا ما نملّا عدد قديم
@@ -5914,7 +5972,7 @@ class _BatchInfoPanelState extends State<_BatchInfoPanel> {
       TextEditingController(text: widget.init.collected.isEmpty ? '0' : widget.init.collected);
   late final c4 = TextEditingController(); // صورة جديدة: عمرنا ما نملّا إجمالي قديم
   String? err;
-  bool reading = true, d1 = false, d4 = false, alertsOpen = false;
+  bool reading = true, d1 = false, d4 = false, alertsOpen = false, sysWarnOpen = false;
   String? note;
   List<String> alerts = const [];
   String? sysImg;
@@ -6065,18 +6123,18 @@ class _BatchInfoPanelState extends State<_BatchInfoPanel> {
                 ? () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length)
                 : null,
             keyboardType: TextInputType.numberWithOptions(decimal: dec),
-            decoration: InputDecoration(labelText: label, isDense: true, border: kFieldBorder),
+            decoration: InputDecoration(labelText: label, isDense: true, border: kFieldBorder, contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9)),
           ),
         ),
       );
 
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+        padding: const EdgeInsets.fromLTRB(8, 0, 8, 2),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           if (reading)
             const Padding(
-              padding: EdgeInsets.only(bottom: 8),
+              padding: EdgeInsets.only(bottom: 4),
               child: Row(children: [
                 SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
                 SizedBox(width: 10),
@@ -6085,7 +6143,7 @@ class _BatchInfoPanelState extends State<_BatchInfoPanel> {
             )
           else if (note != null)
             Padding(
-              padding: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.only(bottom: 4),
               child: Text(note!, style: const TextStyle(color: Colors.grey, fontSize: 12.5)),
             ),
           if (alerts.isNotEmpty)
@@ -6093,7 +6151,7 @@ class _BatchInfoPanelState extends State<_BatchInfoPanel> {
               onTap: () => setState(() => alertsOpen = !alertsOpen),
               child: Container(
                 width: double.infinity,
-                margin: const EdgeInsets.only(bottom: 8),
+                margin: const EdgeInsets.only(bottom: 6),
                 padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(
                   color: Colors.red.withAlpha(28),
@@ -6123,17 +6181,17 @@ class _BatchInfoPanelState extends State<_BatchInfoPanel> {
             _f(c1, 'عدد المعاملات', onEdit: () => d1 = true),
             _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true),
           ]),
-          const SizedBox(height: 10),
+          const SizedBox(height: 6),
           Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
             _f(c2, 'القروش الفاصلة', selectAll: true),
             _f(c3, 'المعاملات المجمعة', selectAll: true),
           ]),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Row(children: [
             Expanded(
                 child: OutlinedButton.icon(
               onPressed: sysBusy ? null : () => _pickSystem(ImageSource.camera),
-              icon: const Icon(Icons.add_a_photo_rounded, size: 18),
+              icon: const Icon(Icons.add_a_photo_rounded, size: 16),
               label: const FittedBox(fit: BoxFit.scaleDown, child: Text('صوّر السيستم', maxLines: 1, style: TextStyle(fontSize: 12.5))),
               style: kSysBtn,
             )),
@@ -6141,7 +6199,7 @@ class _BatchInfoPanelState extends State<_BatchInfoPanel> {
             Expanded(
                 child: OutlinedButton.icon(
               onPressed: sysBusy ? null : () => _pickSystem(ImageSource.gallery),
-              icon: const Icon(Icons.photo_library_rounded, size: 18),
+              icon: const Icon(Icons.photo_library_rounded, size: 16),
               label: const FittedBox(fit: BoxFit.scaleDown, child: Text('معرض', maxLines: 1, style: TextStyle(fontSize: 12.5))),
               style: kSysBtn,
             )),
@@ -6149,28 +6207,34 @@ class _BatchInfoPanelState extends State<_BatchInfoPanel> {
             Expanded(
                 child: OutlinedButton.icon(
               onPressed: sysImg == null || sysBusy ? null : _previewSystem,
-              icon: const Icon(Icons.visibility_rounded, size: 18),
+              icon: const Icon(Icons.visibility_rounded, size: 16),
               label: FittedBox(fit: BoxFit.scaleDown, child: Text(sysImg == null ? 'معاينة' : '✓ معاينة', maxLines: 1, style: const TextStyle(fontSize: 12.5))),
               style: kSysBtn,
             )),
           ]),
           if (sysWarn != null)
-            Container(
-              width: double.infinity,
-              margin: const EdgeInsets.only(top: 8),
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: Colors.orange.withAlpha(30),
-                border: Border.all(color: Colors.orange.withAlpha(190)),
-                borderRadius: BorderRadius.circular(12),
+            InkWell(
+              onTap: () => setState(() => sysWarnOpen = !sysWarnOpen),
+              child: Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(top: 6),
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withAlpha(30),
+                  border: Border.all(color: Colors.orange.withAlpha(190)),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 17),
+                  const SizedBox(width: 6),
+                  Expanded(
+                      child: Text(sysWarn!,
+                          maxLines: sysWarnOpen ? null : 2,
+                          overflow: sysWarnOpen ? null : TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600))),
+                  Text(sysWarnOpen ? '▴' : '▾', style: const TextStyle(fontSize: 12)),
+                ]),
               ),
-              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 18),
-                const SizedBox(width: 6),
-                Expanded(
-                    child: Text(sysWarn!,
-                        style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600))),
-              ]),
             ),
           if (err != null)
             Padding(
@@ -6579,6 +6643,45 @@ class _BatchScreenState extends State<BatchScreen> {
     }
   }
 
+  /// شريط حجم الورقة ظاهر دايماً تحت أزرار السيستم (نفس تحكم شيت «الورقة»، والسحب/القرصة على الورقة شغالين).
+  Widget _sizeRow() {
+    final p = pos!;
+    final pct = (p.s * 100).round();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 8, 4),
+      child: Row(children: [
+        const Text('الورقة', style: TextStyle(fontSize: 12.5)),
+        Transform.scale(
+          scale: 0.78,
+          child: Switch(value: !noTag, onChanged: busy ? null : (v) => _toggleTag(!v)),
+        ),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(trackHeight: 3, overlayShape: const RoundSliderOverlayShape(overlayRadius: 14)),
+            child: IgnorePointer(ignoring: noTag || busy, child: Opacity(opacity: noTag ? 0.38 : 1, child: Slider(
+              value: p.s.clamp(kTagMinScale, 1.0).toDouble(),
+              min: kTagMinScale,
+              max: 1.0,
+              onChanged: (v) {
+                if (noTag || busy) return; // مش بنبدّل onChanged لـ null (التبديل بيكسر semantics السلايدر)، بس بنتجاهل التغيير
+                _set(fitTagPos(p.copyWith(s: v), tag!, aspect!));
+              },
+            ))),
+          ),
+        ),
+        SizedBox(width: 46, child: Text('$pct%', maxLines: 1, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12))),
+        IconButton(
+          tooltip: 'أسفل الصورة بعرضها كله',
+          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+          icon: const Icon(Icons.restart_alt_rounded, size: 20),
+          onPressed: noTag || busy ? null : () => _set(bottomTagPos(tag!, aspect!)),
+        ),
+      ]),
+    );
+  }
+
   /// شيت «الورقة»: إظهار/إخفاء + حجم + رجوع لأسفل الصورة. السحب والتكبير بإصبعين شغالين على الورقة نفسها.
   Future<void> _paperSheet() async {
     await showModalBottomSheet<void>(
@@ -6700,9 +6803,12 @@ class _BatchScreenState extends State<BatchScreen> {
           ? const Center(child: CircularProgressIndicator())
           : LayoutBuilder(builder: (ctx, cons) {
               // الصورة ثابتة فوق (سحب الورقة مش بيتحوّل لتمرير)، والتمرير للي تحتها بس. الزر ثابت تحت.
-              const fixedBelow = 0.0, toolbarH = 46.0, minPanel = 96.0;
+              // الصورة بتاخد اللي فاضل بعد ما اللوحة اللي تحتها (الخانات والتحذيرات والتحكم) تاخد مساحتها؛
+              // اللوحة بتسكرول بس لو الصورة وصلت لأقل ارتفاع (110). تكبير العرض والتصدير مش متأثرين.
+              const toolbarH = 46.0, minImg = 110.0;
               final total = cons.maxHeight;
-              final ih = (total * 0.45).clamp(110.0, 420.0).clamp(0.0, math.max(70.0, total - fixedBelow - toolbarH - minPanel)).toDouble();
+              final imgCap = (total * 0.48).clamp(110.0, 420.0).toDouble();
+              final panelMax = math.max(96.0, total - toolbarH - minImg);
               return Column(children: [
                 SizedBox(
                   height: toolbarH,
@@ -6720,13 +6826,14 @@ class _BatchScreenState extends State<BatchScreen> {
                               z > 1.01 ? () => _viewTc.value = Matrix4.identity() : null);
                         },
                       ),
-                      const SizedBox(width: 6),
-                      _pill(Icons.badge_outlined, 'الورقة', busy ? null : _paperSheet),
                     ],
                   ),
                 ),
-                SizedBox(
-                  height: ih,
+                Expanded(
+                  child: LayoutBuilder(builder: (_, ic) => Align(
+                    alignment: Alignment.topCenter,
+                    child: SizedBox(
+                  height: math.min(ic.maxHeight, imgCap),
                   child: Padding(
                     padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
                     child: ClipRect(
@@ -6748,19 +6855,24 @@ class _BatchScreenState extends State<BatchScreen> {
                       ),
                     ),
                   ),
-                ),
-                Expanded(
+                )),
+                )),
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxHeight: panelMax),
                   child: SingleChildScrollView(
                     keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                    child: KeyedSubtree(
-                      key: ValueKey(img),
-                      child: _BatchInfoPanel(
-                          key: _panelKey,
-                          init: _binit!,
-                          img: img!,
-                          session: widget.session,
-                          sysReady: _sysReady),
-                    ),
+                    child: Column(children: [
+                      KeyedSubtree(
+                        key: ValueKey(img),
+                        child: _BatchInfoPanel(
+                            key: _panelKey,
+                            init: _binit!,
+                            img: img!,
+                            session: widget.session,
+                            sysReady: _sysReady),
+                      ),
+                      _sizeRow(),
+                    ]),
                   ),
                 ),
               ]);
