@@ -1,6 +1,8 @@
-name: Build APK (Cam)
+name: Build APK
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -386,8 +388,8 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: cam-v1.${{ github.run_number }}
-          name: A2R Cam v1.${{ github.run_number }}
+          tag_name: v1.${{ github.run_number }}
+          name: A2R v1.${{ github.run_number }}
           body: |
             Commit ${{ github.sha }}
             Android 7.0+ (API 24), ARM32/ARM64. Signing mode: ${{ env.A2R_SIGNING_MODE }}.
@@ -398,14 +400,14 @@ jobs:
             apk-signature-report.txt
             apk-min-sdk.txt
           fail_on_unmatched_files: true
-          make_latest: false
+          make_latest: true
 
-      - name: Keep only the latest 5 cam releases
+      - name: Keep only the latest 5 releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release list --limit 200 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("cam-v"))] | sort_by(.createdAt) | reverse | .[5:][].tagName' |
+            --jq 'sort_by(.createdAt) | reverse | .[5:][].tagName' |
           while read -r tag; do
             echo "Deleting old release $tag"
             gh release delete "$tag" --cleanup-tag --yes
