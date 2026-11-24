@@ -5491,6 +5491,16 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               child: _big(
                   Icons.payments_rounded, 'إيصالات الدفع', _openReceipts, sent: receiptsSent)),
         ])),
+        const SizedBox(height: 12),
+        Card(
+          shape: kCardShape,
+          child: ListTile(
+            leading: Icon(Icons.document_scanner_rounded, color: kAccent),
+            title: const Text('سكانر', style: TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: const Text('مستند، متتابع، بطاقة وش وضهر، تصدير PDF أو صور'),
+            onTap: () => _open(const ScannerScreen()),
+          ),
+        ),
         if (draft.isNotEmpty || pf != null || bi != null) ...[
           const SizedBox(height: 24),
           const Text('ملفاتي',
@@ -11581,3 +11591,299 @@ class _SendLogScreenState extends State<SendLogScreen> {
   }
 }
 
+// ===================== سكانر مستقل (فرع cam) =====================
+/// أوضاع السكانر: مستند (صفحة)، متتابع (صفحات)، بطاقة (وش وضهر على A4 واحدة).
+class ScannerScreen extends StatefulWidget {
+  const ScannerScreen({super.key});
+  @override
+  State<ScannerScreen> createState() => _ScannerScreenState();
+}
+
+class _ScannerScreenState extends State<ScannerScreen> {
+  static const _prefKey = 'scanDefaultFilter';
+  int mode = 0; // 0 مستند، 1 متتابع، 2 بطاقة
+  final List<String> pages = [];
+  ScanFilter sel = ScanFilter.original;
+  ScanFilter? saved; // الفلتر الافتراضي المحفوظ (النجمة)
+  bool busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDefault();
+  }
+
+  Future<void> _loadDefault() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final i = p.getInt(_prefKey);
+      if (i != null && i >= 0 && i < ScanFilter.values.length) {
+        saved = ScanFilter.values[i];
+        sel = saved!;
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.loadDefault', e, st);
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _toggleDefault() async {
+    final p = await SharedPreferences.getInstance();
+    if (saved == sel) {
+      await p.remove(_prefKey);
+      saved = null;
+    } else {
+      await p.setInt(_prefKey, sel.index);
+      saved = sel;
+    }
+    if (mounted) setState(() {});
+  }
+
+  String get _hint => mode == 0
+      ? 'صفحة واحدة'
+      : mode == 1
+          ? 'صفحات متتابعة في ملف واحد'
+          : 'وش وضهر البطاقة على صفحة A4';
+
+  Future<String> _filtered(String p) async {
+    if (sel == ScanFilter.original || _lastScanEnhanced) return p;
+    return renderEditedPage(p, 'scan_', EditParams(filter: sel));
+  }
+
+  Future<void> _scan() async {
+    if (busy) return;
+    setState(() => busy = true);
+    try {
+      final List<String> got = [];
+      if (mode == 2) {
+        final f = await scanImages(context, 1, camFallback: true);
+        if (f.isEmpty || !mounted) return;
+        if (!mounted) return;
+        snack(context, 'دلوقتي صوّر ضهر البطاقة');
+        final b = await scanImages(context, 1, camFallback: true);
+        if (b.isEmpty || !mounted) return;
+        got..add(f.first)..add(b.first);
+        pages.clear();
+      } else {
+        got.addAll(await scanImages(context, mode == 0 ? 1 : 24, camFallback: true));
+        if (mode == 0) pages.clear();
+      }
+      if (got.isEmpty || !mounted) return;
+      for (final g in got) {
+        pages.add(await _filtered(g));
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.scan', e, st);
+      if (mounted) snack(context, errText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _applyAll() async {
+    if (busy || pages.isEmpty) return;
+    setState(() => busy = true);
+    try {
+      for (var i = 0; i < pages.length; i++) {
+        // بنحافظ على القص والدوران والتباين المحفوظين للصفحة ونغيّر الفلتر بس
+        final prev = await Store.editOf(pages[i]);
+        pages[i] = await renderEditedPage(
+            pages[i],
+            'scan_',
+            EditParams(
+              quad: prev?.quad,
+              turns: prev?.turns ?? 0,
+              angle: prev?.angle ?? 0,
+              filter: sel,
+              contrast: prev?.contrast ?? 0,
+              brightness: prev?.brightness ?? 0,
+              sharp: prev?.sharp ?? 0,
+            ));
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.applyAll', e, st);
+      if (mounted) snack(context, errText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _edit(int i) async {
+    final out = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(
+          builder: (_) => EditorPage(
+              path: pages[i], prefix: 'scan_', pageIndex: i, pageCount: pages.length)),
+    );
+    if (out == null || out == kRetake || !mounted) return;
+    setState(() => pages[i] = out);
+  }
+
+  Future<File> _buildPdf() async {
+    final doc = pw.Document();
+    if (mode == 2 && pages.length == 2) {
+      final a = pw.MemoryImage(await File(pages[0]).readAsBytes());
+      final b = pw.MemoryImage(await File(pages[1]).readAsBytes());
+      doc.addPage(pw.Page(
+        pageFormat: PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.all(36),
+        build: (_) => pw.Column(
+          mainAxisAlignment: pw.MainAxisAlignment.spaceEvenly,
+          children: [
+            pw.Expanded(child: pw.Center(child: pw.Image(a, fit: pw.BoxFit.contain))),
+            pw.SizedBox(height: 24),
+            pw.Expanded(child: pw.Center(child: pw.Image(b, fit: pw.BoxFit.contain))),
+          ],
+        ),
+      ));
+    } else {
+      for (final p in pages) {
+        final img = pw.MemoryImage(await File(p).readAsBytes());
+        doc.addPage(pw.Page(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(18),
+          build: (_) => pw.Center(child: pw.Image(img, fit: pw.BoxFit.contain)),
+        ));
+      }
+    }
+    final d = await getTemporaryDirectory();
+    final f = File('${d.path}/scan_${DateTime.now().millisecondsSinceEpoch}.pdf');
+    await f.writeAsBytes(await doc.save(), flush: true);
+    return f;
+  }
+
+  /// بنسأل في كل مرة: PDF ولا صور.
+  Future<void> _export() async {
+    if (busy || pages.isEmpty) return;
+    final pick = await showModalBottomSheet<String>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+              leading: const Icon(Icons.picture_as_pdf_rounded),
+              title: const Text('PDF'),
+              onTap: () => Navigator.pop(c, 'pdf')),
+          ListTile(
+              leading: const Icon(Icons.image_rounded),
+              title: Text(pages.length > 1 ? 'صور (JPG)' : 'صورة (JPG)'),
+              onTap: () => Navigator.pop(c, 'jpg')),
+        ]),
+      ),
+    );
+    if (pick == null || !mounted) return;
+    setState(() => busy = true);
+    try {
+      if (pick == 'pdf') {
+        final f = await _buildPdf();
+        await Share.shareXFiles([XFile(f.path)]);
+      } else {
+        await Share.shareXFiles([for (final p in pages) XFile(p)]);
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.export', e, st);
+      if (mounted) snack(context, errText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(title: const Text('سكانر')),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Wrap(spacing: 8, children: [
+              for (final e in const [0, 1, 2])
+                ChoiceChip(
+                  label: Text(const ['مستند', 'متتابع', 'بطاقة'][e]),
+                  selected: mode == e,
+                  onSelected: busy
+                      ? null
+                      : (_) => setState(() {
+                            mode = e;
+                            pages.clear();
+                          }),
+                ),
+            ]),
+            const SizedBox(height: 6),
+            Text(_hint, style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+            const SizedBox(height: 8),
+            Row(children: [
+              Expanded(child: FilterBar(selected: sel, onChanged: busy ? null : (f) => setState(() => sel = f))),
+              IconButton(
+                tooltip: 'فلتر افتراضي',
+                icon: Icon(saved == sel ? Icons.star_rounded : Icons.star_border_rounded, color: kAccent),
+                onPressed: busy ? null : _toggleDefault,
+              ),
+            ]),
+            const SizedBox(height: 8),
+            Expanded(
+              child: pages.isEmpty
+                  ? Center(
+                      child: Text('اضغط تصوير للبدء', style: TextStyle(color: cs.onSurfaceVariant)))
+                  : GridView.builder(
+                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 3, mainAxisSpacing: 8, crossAxisSpacing: 8, childAspectRatio: 0.72),
+                      itemCount: pages.length,
+                      itemBuilder: (_, i) => Stack(fit: StackFit.expand, children: [
+                        InkWell(
+                          onTap: busy ? null : () => _edit(i),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(10),
+                            child: Image.file(File(pages[i]), fit: BoxFit.cover, cacheWidth: 360),
+                          ),
+                        ),
+                        PositionedDirectional(
+                          top: 2,
+                          end: 2,
+                          child: IconButton.filledTonal(
+                            iconSize: 16,
+                            visualDensity: VisualDensity.compact,
+                            tooltip: 'حذف',
+                            icon: const Icon(Icons.close_rounded),
+                            onPressed: busy ? null : () => setState(() => pages.removeAt(i)),
+                          ),
+                        ),
+                      ]),
+                    ),
+            ),
+            if (busy) const LinearProgressIndicator(),
+            const SizedBox(height: 8),
+            Row(children: [
+              Expanded(
+                flex: 3,
+                child: FilledButton.icon(
+                  onPressed: busy ? null : _scan,
+                  icon: const Icon(Icons.document_scanner_rounded),
+                  label: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(pages.isEmpty || mode != 1 ? 'تصوير' : 'إضافة صفحات')),
+                ),
+              ),
+              if (pages.isNotEmpty) ...[
+                const SizedBox(width: 6),
+                Expanded(
+                  flex: 3,
+                  child: OutlinedButton(
+                      onPressed: busy ? null : _applyAll,
+                      child: const FittedBox(fit: BoxFit.scaleDown, child: Text('طبّق على الكل'))),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  flex: 2,
+                  child: OutlinedButton(
+                      onPressed: busy ? null : _export,
+                      child: const FittedBox(fit: BoxFit.scaleDown, child: Text('تصدير'))),
+                ),
+              ],
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
