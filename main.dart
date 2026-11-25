@@ -2262,11 +2262,115 @@ String _dayKey() {
   return '${n.year}-${n.month}-${n.day}';
 }
 
+// >>> SLOTS — منطق "ملفاتي" (دالّة صافية من غير ملفات ولا إعدادات، عشان تتجرّب لوحدها)
+/// كل باتش/إيصالات قديمة بتتحفظ هنا كـ "جلسة" (نفس مفاتيح الإعدادات بتاعتها بالظبط)
+/// ومبتتمسحش غير لما الموظف يمسحها بإيده. الأحدث الأول.
+class SavedSlots {
+  static const rcKeys = <String>['draft', 'pdfPath', 'pdfTime', 'pdfImgs', 'rcSentAt', 'rcSentImgs'];
+  static const biKeys = <String>[
+    'batchImg', 'batchSentAt', 'bi_count', 'bi_pi', 'bi_col', 'bi_total', 'systemImg'
+  ];
+  static const listKeys = <String>{'draft', 'pdfImgs', 'rcSentImgs'};
+  static const intKeys = <String>{'pdfTime', 'rcSentAt', 'batchSentAt', 'savedAt'};
+  static List<String> keysOf(bool batch) => batch ? biKeys : rcKeys;
+
+  static List<String> strList(Object? v) =>
+      v is List ? [for (final e in v) if (e is String && e.isNotEmpty) e] : <String>[];
+
+  static bool hasContent(Map<String, Object?> s, bool batch) {
+    if (batch) return s['batchImg'] is String;
+    return strList(s['draft']).isNotEmpty || s['pdfPath'] is String;
+  }
+
+  /// كل الملفات اللي الجلسة دي محتاجاها (عشان التنظيف ميمسحهاش).
+  static Set<String> files(Map<String, Object?> s) => {
+        ...strList(s['draft']),
+        ...strList(s['pdfImgs']),
+        ...strList(s['rcSentImgs']),
+        for (final k in ['pdfPath', 'batchImg', 'systemImg'])
+          if (s[k] is String) s[k] as String,
+      };
+
+  static Map<String, Object?> _only(Map<String, Object?> s, bool batch) => {
+        for (final k in keysOf(batch))
+          if (s[k] != null) k: listKeys.contains(k) ? strList(s[k]) : s[k],
+      };
+
+  /// الجلسة الحالية تتنقل لأول "ملفاتي" (لو فيها حاجة) والحالية تبقى فاضية.
+  static ({Map<String, Object?> cur, List<Map<String, Object?>> saved}) stash(
+      Map<String, Object?> cur, List<Map<String, Object?>> saved, bool batch, int now) {
+    final out = [for (final x in saved) Map<String, Object?>.from(x)];
+    if (hasContent(cur, batch)) out.insert(0, {..._only(cur, batch), 'savedAt': now});
+    return (cur: <String, Object?>{}, saved: out);
+  }
+
+  /// فتح جلسة محفوظة للتعديل: الحالية (لو فيها حاجة) تتحفظ مكانها، ومفيش حاجة بتضيع.
+  static ({Map<String, Object?> cur, List<Map<String, Object?>> saved}) reopen(
+      Map<String, Object?> cur, List<Map<String, Object?>> saved, int i, bool batch, int now) {
+    if (i < 0 || i >= saved.length) return (cur: cur, saved: saved);
+    final rest = [for (final x in saved) Map<String, Object?>.from(x)];
+    final item = rest.removeAt(i);
+    final st = stash(cur, rest, batch, now);
+    return (cur: _only(item, batch), saved: st.saved);
+  }
+
+  /// بيشيل الملفات اللي اتمسحت من على التليفون، ويشيل الجلسة لو مبقاش فيها حاجة.
+  static List<Map<String, Object?>> prune(
+      List<Map<String, Object?>> saved, bool batch, bool Function(String) exists) {
+    final out = <Map<String, Object?>>[];
+    for (final s0 in saved) {
+      final s = Map<String, Object?>.from(s0);
+      for (final k in listKeys) {
+        if (s[k] != null) s[k] = strList(s[k]).where(exists).toList();
+      }
+      for (final k in ['pdfPath', 'batchImg', 'systemImg']) {
+        final v = s[k];
+        if (v != null && (v is! String || !exists(v))) s.remove(k);
+      }
+      if (!batch && s['pdfPath'] == null) {
+        s.remove('pdfTime');
+        s.remove('pdfImgs');
+      }
+      if (!batch && strList(s['rcSentImgs']).isEmpty) {
+        s.remove('rcSentAt');
+        s.remove('rcSentImgs');
+      }
+      if (hasContent(s, batch)) out.add(s);
+    }
+    return out;
+  }
+
+  static List<Map<String, Object?>> decode(String? raw) {
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final l = jsonDecode(raw);
+      if (l is! List) return [];
+      return [
+        for (final e in l)
+          if (e is Map)
+            {
+              for (final en in e.entries)
+                if (en.key is String && en.value != null)
+                  en.key as String: listKeys.contains(en.key)
+                      ? strList(en.value)
+                      : (intKeys.contains(en.key) && en.value is num
+                          ? (en.value as num).toInt()
+                          : en.value),
+            }
+      ];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static String encode(List<Map<String, Object?>> l) => jsonEncode(l);
+}
+// <<< SLOTS
+
 class Store {
   static const pdfLife = Duration(hours: 24);
 
-  /// مدة الاحتفاظ بالباتش والإيصالات بعد الإرسال (قابلة للتعديل وإعادة الإرسال).
-  /// بتتمسح تلقائياً مع فتح التطبيق لما المدة تعدّي.
+  /// (قديم) مدة الاحتفاظ بعد الإرسال — مبقتش مستخدمة: الملفات بتفضل لحد ما تتمسح بالإيد.
   static const sentLife = Duration(hours: 12);
   static int working = 0; // عدد العمليات الشغالة (بتمنع التنظيف أثناءها)
   static Future<SharedPreferences> get _p => SharedPreferences.getInstance();
@@ -2812,11 +2916,7 @@ class Store {
     final t = p.getInt('pdfTime');
     if (path == null || t == null) return null;
     final time = DateTime.fromMillisecondsSinceEpoch(t);
-    // لو الإيصالات اتبعتت: المدة ١٢ ساعة من وقت الإرسال، وإلا ٢٤ ساعة من وقت إنشاء الـ PDF
-    final sentT = p.getInt('rcSentAt');
-    final age = DateTime.now()
-        .difference(sentT == null ? time : DateTime.fromMillisecondsSinceEpoch(sentT));
-    final life = sentT == null ? pdfLife : sentLife;
+    // الـ PDF بيفضل لحد ما الموظف يمسحه بإيده (مفيش مسح بالوقت)
     if (!File(path).existsSync()) {
       await clearPdf();
       return null;
@@ -2885,52 +2985,9 @@ class Store {
     await p.remove('rcSentImgs');
   }
 
-  /// بيتنفّذ مع فتح التطبيق: بيمسح الباتش والإيصالات اللي عدّى عليهم أكتر من ١٢ ساعة من الإرسال.
-  static Future<void> expireSent() async {
-    return; // cam: الملفات بتفضل محفوظة ومبتتمسحش تلقائياً، المسح يدوي بس
-    // ignore: dead_code
-    if (working > 0) return;
-    final p = await _p;
-    final now = DateTime.now();
-    final bt = p.getInt('batchSentAt');
-    if (bt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(bt)) > sentLife) {
-      final bi = p.getString('batchImg');
-      if (bi != null && await isKept(bi)) {
-        // محفوظ: يروح للأرشيف بدل المسح (ميفضلش باتش حالي)
-        final arch = p.getStringList('archive') ?? [];
-        if (!arch.contains(bi)) arch.add(bi);
-        await p.setStringList('archive', arch);
-        await setKept(bi, false);
-        await p.remove('batchImg');
-        await _resetBatchMeta(p);
-      } else {
-        await clearBatchImg();
-      }
-    }
-    final rt = p.getInt('rcSentAt');
-    if (rt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(rt)) > sentLife) {
-      // الإيصالات المحفوظة تروح للأرشيف الأول، والباقي يتمسح عادي
-      final sent = p.getStringList('rcSentImgs') ?? [];
-      final arch = p.getStringList('archive') ?? [];
-      final left = await draft();
-      var changed = false;
-      for (final u in List.of(sent)) {
-        if (await isKept(u)) {
-          if (!arch.contains(u)) arch.add(u);
-          changed = true;
-          await setKept(u, false);
-          sent.remove(u);
-          left.remove(u);
-        }
-      }
-      if (changed) {
-        await p.setStringList('archive', arch);
-        await p.setStringList('rcSentImgs', sent);
-        await p.setStringList('draft', left);
-      }
-      await discardSentReceipts();
-    }
-  }
+  /// كان بيمسح الباتش والإيصالات بعد ١٢ ساعة من الإرسال. دلوقتي كل حاجة بتفضل في "ملفاتي"
+  /// لحد ما الموظف يمسحها بإيده، فالدالة مبقتش بتمسح حاجة.
+  static Future<void> expireSent() async {}
 
   // --- علامة ✓ (بتتصفّر كل يوم جديد) ---
   static Future<bool> flag(String k) async {
@@ -2994,6 +3051,135 @@ class Store {
 
   static Future<void> clearLog() async => (await _p).remove('sendLog');
 
+  /// قبل مسح الباتش/الإيصالات الحالية بالإيد: الصور المعلّم عليها "احتفظ بيها" تروح للأرشيف بدل المسح.
+  static Future<void> keptToArchive(bool batch) async {
+    final p = await _p;
+    final arch = p.getStringList('archive') ?? [];
+    final moved = <String>[];
+    if (batch) {
+      final bi = p.getString('batchImg');
+      if (bi != null && await isKept(bi)) moved.add(bi);
+    } else {
+      for (final x in await draft()) {
+        if (await isKept(x)) moved.add(x);
+      }
+    }
+    if (moved.isEmpty) return;
+    for (final f in moved) {
+      if (!arch.contains(f)) arch.add(f);
+      await setKept(f, false);
+    }
+    await p.setStringList('archive', arch);
+    if (batch) {
+      await p.remove('batchImg');
+    } else {
+      for (final k in ['draft', 'pdfImgs', 'rcSentImgs']) {
+        final l = p.getStringList(k);
+        if (l != null) await p.setStringList(k, l.where((e) => !moved.contains(e)).toList());
+      }
+    }
+  }
+
+  // --- ملفاتي: الباتشات والإيصالات القديمة (بتفضل لحد ما الموظف يمسحها بإيده) ---
+  static String _savedKey(bool batch) => batch ? 'savedBatches' : 'savedReceipts';
+
+  static Map<String, Object?> _readCur(SharedPreferences p, bool batch) {
+    final m = <String, Object?>{};
+    for (final k in SavedSlots.keysOf(batch)) {
+      final Object? v = SavedSlots.listKeys.contains(k)
+          ? p.getStringList(k)
+          : (SavedSlots.intKeys.contains(k) ? p.getInt(k) : p.getString(k));
+      if (v != null) m[k] = v;
+    }
+    return m;
+  }
+
+  static Future<void> _writeCur(SharedPreferences p, Map<String, Object?> m, bool batch) async {
+    for (final k in SavedSlots.keysOf(batch)) {
+      final v = m[k];
+      if (v == null) {
+        if (k == 'draft') {
+          await p.setStringList(k, []);
+        } else {
+          await p.remove(k);
+        }
+      } else if (SavedSlots.listKeys.contains(k)) {
+        await p.setStringList(k, SavedSlots.strList(v));
+      } else if (v is int) {
+        await p.setInt(k, v);
+      } else {
+        await p.setString(k, v.toString());
+      }
+    }
+  }
+
+  static Future<void> _writeSaved(
+      SharedPreferences p, bool batch, List<Map<String, Object?>> l) async {
+    if (l.isEmpty) {
+      await p.remove(_savedKey(batch));
+    } else {
+      await p.setString(_savedKey(batch), SavedSlots.encode(l));
+    }
+  }
+
+  /// الباتشات/الإيصالات المحفوظة في "ملفاتي"، الأحدث الأول.
+  static Future<List<Map<String, Object?>>> saved(bool batch) async {
+    final p = await _p;
+    final raw = SavedSlots.decode(p.getString(_savedKey(batch)));
+    final l = SavedSlots.prune(raw, batch, (f) => File(f).existsSync());
+    if (jsonEncode(l) != jsonEncode(raw)) await _writeSaved(p, batch, l);
+    return l;
+  }
+
+  /// قبل ما نفتح باتش/إيصالات جديدة: اللي شغالين عليه يتحفظ في "ملفاتي" (اتبعت أو لأ).
+  static Future<void> stashCurrent(bool batch) async {
+    final p = await _p;
+    final st = SavedSlots.stash(
+        _readCur(p, batch), await saved(batch), batch, DateTime.now().millisecondsSinceEpoch);
+    await _writeSaved(p, batch, st.saved);
+    await _writeCur(p, st.cur, batch);
+  }
+
+  /// فتح واحد من "ملفاتي" للتعديل (اللي كان مفتوح بيتحفظ مكانه).
+  static Future<void> reopenSaved(bool batch, int i) async {
+    final p = await _p;
+    final st = SavedSlots.reopen(_readCur(p, batch), await saved(batch), i, batch,
+        DateTime.now().millisecondsSinceEpoch);
+    await _writeSaved(p, batch, st.saved);
+    await _writeCur(p, st.cur, batch);
+  }
+
+  /// مسح واحد من "ملفاتي" بإيد الموظف. الصور المعلّم عليها "احتفظ بيها" بتروح للأرشيف بدل المسح.
+  static Future<void> deleteSaved(bool batch, int i) async {
+    final p = await _p;
+    final l = await saved(batch);
+    if (i < 0 || i >= l.length) return;
+    final item = l.removeAt(i);
+    await _writeSaved(p, batch, l);
+    final inUse = <String>{
+      ...await draft(),
+      ...await pdfImgs(),
+      ...(p.getStringList('rcSentImgs') ?? []),
+      if (p.getString('batchImg') != null) p.getString('batchImg')!,
+      if (p.getString('systemImg') != null) p.getString('systemImg')!,
+      if (p.getString('pdfPath') != null) p.getString('pdfPath')!,
+      for (final s in [...l, ...await saved(!batch)]) ...SavedSlots.files(s),
+    };
+    final arch = p.getStringList('archive') ?? [];
+    var archChanged = false;
+    for (final f in SavedSlots.files(item)) {
+      if (inUse.contains(f) || arch.contains(f)) continue;
+      if (f != item['pdfPath'] && f != item['systemImg'] && await isKept(f)) {
+        arch.add(f);
+        archChanged = true;
+        await setKept(f, false);
+      } else {
+        await del(f);
+      }
+    }
+    if (archChanged) await p.setStringList('archive', arch);
+  }
+
   /// مسح أي ملفات مؤقتة مش تابعة لمسودة أو PDF شغّال. مبتشتغلش لو فيه عملية شغالة.
   static Future<void> cleanup() async {
     if (working > 0) return;
@@ -3007,6 +3193,12 @@ class Store {
     if (sysI != null) keep.add(sysI);
     final pdfPath = (await pdf())?.file.path;
     if (pdfPath != null) keep.add(pdfPath);
+    keep.addAll((await _p).getStringList('rcSentImgs') ?? []);
+    for (final b in [true, false]) {
+      for (final s in await saved(b)) {
+        keep.addAll(SavedSlots.files(s));
+      }
+    }
     keep.addAll(keep.map(baseOf).toList());
     await for (final e in (await dir()).list()) {
       if (working > 0) return;
@@ -5369,6 +5561,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   bool receiptsSent = false;
   DateTime? batchSentAt; // لو الباتش اتبعت وسايبينه ١٢ ساعة للتعديل
   DateTime? receiptsSentAt; // نفس الكلام للإيصالات
+  List<Map<String, Object?>> savedB = []; // باتشات قديمة في "ملفاتي" (الأحدث الأول)
+  List<Map<String, Object?>> savedR = []; // إيصالات قديمة في "ملفاتي"
   bool busy = false;
 
   @override
@@ -5390,30 +5584,22 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _onResume() async {
-    // التنظيف بعد ١٢ ساعة بس لو الشاشة الرئيسية هي اللي قدام (مش وإحنا في تعديل)
-    if (mounted && (ModalRoute.of(context)?.isCurrent ?? false)) {
-      try {
-        await Store.expireSent();
-      } catch (e, st) {
-        AppLog.e('expireSent', e, st);
-      }
-    }
+    // مفيش مسح بالوقت: كل حاجة بتفضل في "ملفاتي" لحد ما تتمسح بالإيد
     await _reload();
   }
 
-  /// الوقت المتبقي قبل مسح الملف المتبعت.
-  String _leftText(DateTime sent) {
-    final left = Store.sentLife - DateTime.now().difference(sent);
-    if (left.inMinutes <= 0) return 'أقل من دقيقة';
-    final h = left.inHours, m = left.inMinutes % 60;
-    if (h == 0) return '$m دقيقة';
-    return m == 0 ? '$h ساعة' : '$h ساعة و$m دقيقة';
+  /// وقت مختصر: "النهارده 14:05" أو "24/11 14:05".
+  String _when(DateTime t) {
+    final n = DateTime.now();
+    String two(int v) => v.toString().padLeft(2, '0');
+    final hm = '${two(t.hour)}:${two(t.minute)}';
+    if (t.year == n.year && t.month == n.month && t.day == n.day) return 'النهارده $hm';
+    return '${t.day}/${t.month} $hm';
   }
 
   Future<void> _init() async {
     await requestAllPermissions();
     try {
-      await Store.expireSent(); // مسح اللي عدّى عليه ١٢ ساعة من الإرسال
       await Store.cleanup();
     } catch (e, st) {
       AppLog.e('_init', e, st);
@@ -5439,10 +5625,14 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     });
     final sp = await SharedPreferences.getInstance();
     final sc = (sp.getStringList('scanPages') ?? []).where((e) => File(e).existsSync()).length;
+    final sb = await Store.saved(true);
+    final sr = await Store.saved(false);
     if (!mounted) return;
     setState(() {
       saved = sv;
       scanCount = sc;
+      savedB = sb;
+      savedR = sr;
       draft = d;
       pdf = f;
       batchImg = bi;
@@ -5530,46 +5720,97 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _reload();
   }
 
-  /// باتش جديد: لو فيه باتش اتبعت محتفظين بيه، نأكد قبل ما يتبدل.
+  /// زرار الباتش: دايماً باتش جديد فاضي. اللي كان مفتوح (اتبعت أو لأ) بيتحفظ في "ملفاتي".
   Future<void> _newBatch() async {
-    if (batchSentAt != null &&
-        !await askYesNo(context, 'باتش جديد؟',
-            'الباتش اللي اتبعت هيتمسح لما تصوّر باتش جديد. لو عايز تعدّله افتحه من "ملفاتي".',
-            yes: 'باتش جديد', no: 'إلغاء')) {
-      return;
-    }
+    if (_opening) return;
+    await Store.stashCurrent(true);
     if (!mounted) return;
     await _open(BatchScreen(session: widget.session, fresh: true));
   }
 
-  /// إيصالات الدفع: لو فيه إيصالات اتبعتت محتفظين بيها، نسأل: نعدّلها ولا نبدأ جديد.
+  /// زرار إيصالات الدفع: دايماً إيصالات جديدة فاضية. اللي كانت مفتوحة بتتحفظ في "ملفاتي".
   Future<void> _openReceipts() async {
-    if (receiptsSentAt != null) {
-      final c = await showDialog<String>(
-        context: context,
-        builder: (ctx) => Directionality(
-          textDirection: TextDirection.rtl,
-          child: AlertDialog(
-            title: const Text('إيصالات اتبعتت'),
-            content: const Text(
-                'عندك إيصالات اتبعتت ومحتفظ بيها للتعديل. تفتحها تعدّل وتبعت تاني، ولا تبدأ إيصالات جديدة؟ (البدء من جديد بينقل اللي اتبعت للأرشيف)'),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
-              TextButton(onPressed: () => Navigator.pop(ctx, 'new'), child: const Text('ابدأ جديد')),
-              FilledButton(
-                  onPressed: () => Navigator.pop(ctx, 'edit'), child: const Text('فتح للتعديل')),
-            ],
-          ),
-        ),
-      );
-      if (c == null || !mounted) return;
-      if (c == 'new') {
-        await Store.discardSentReceipts();
-        await _reload();
-      }
-    }
+    if (_opening) return;
+    await Store.stashCurrent(false);
     if (!mounted) return;
     await _open(ReceiptsScreen(session: widget.session));
+  }
+
+  /// فتح الإيصالات الحالية زي ما هي (من "ملفاتي").
+  Future<void> _editReceipts() async {
+    await _open(ReceiptsScreen(session: widget.session));
+  }
+
+  /// فتح باتش/إيصالات قديمة من "ملفاتي" للتعديل أو إعادة الإرسال.
+  Future<void> _openSaved(bool batch, int i) async {
+    if (_opening) return;
+    await Store.reopenSaved(batch, i);
+    if (!mounted) return;
+    await _open(batch
+        ? BatchScreen(session: widget.session)
+        : ReceiptsScreen(session: widget.session));
+  }
+
+  Future<void> _trashSaved(bool batch, int i) async {
+    if (!await askYesNo(
+        context,
+        batch ? 'مسح الباتش ده؟' : 'مسح الإيصالات دي؟',
+        batch
+            ? 'الباتش وصورة السيستم بتاعته هيتمسحوا من التطبيق.'
+            : 'الصور والـ PDF بتوعها هيتمسحوا من التطبيق.',
+        yes: 'امسح',
+        no: 'إلغاء')) {
+      return;
+    }
+    await Store.deleteSaved(batch, i);
+    await _reload();
+  }
+
+  /// الباتشات والإيصالات القديمة مع بعض، الأحدث الأول.
+  List<(bool, int)> _savedOrder() {
+    int t(Map<String, Object?> m) => (m['savedAt'] as int?) ?? 0;
+    final l = <(bool, int, int)>[
+      for (var i = 0; i < savedB.length; i++) (true, i, t(savedB[i])),
+      for (var i = 0; i < savedR.length; i++) (false, i, t(savedR[i])),
+    ]..sort((a, b) => b.$3.compareTo(a.$3));
+    return [for (final e in l) (e.$1, e.$2)];
+  }
+
+  Widget _sessionCard(Map<String, Object?> it, bool batch, int i) {
+    final imgs = batch
+        ? [if (it['batchImg'] is String) it['batchImg'] as String]
+        : SavedSlots.strList(it['draft']);
+    final sentMs = it[batch ? 'batchSentAt' : 'rcSentAt'];
+    final savedMs = it['savedAt'];
+    final hasPdf = !batch && it['pdfPath'] is String;
+    final when = sentMs is int
+        ? 'اتبعت ✓ ${_when(DateTime.fromMillisecondsSinceEpoch(sentMs))}'
+        : 'لسه متبعتش${savedMs is int ? ' - ${_when(DateTime.fromMillisecondsSinceEpoch(savedMs))}' : ''}';
+    final title = batch
+        ? 'باتش قديم${it['bi_total'] is String && (it['bi_total'] as String).isNotEmpty ? ' - ${it['bi_total']}' : ''}'
+        : 'إيصالات قديمة (${imgs.length} صورة${hasPdf ? ' + PDF' : ''})';
+    return Card(
+      shape: kCardShape,
+      child: ListTile(
+        leading: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: imgs.isEmpty
+              ? const SizedBox(
+                  width: 48,
+                  height: 48,
+                  child: Icon(Icons.picture_as_pdf_rounded, size: 36, color: Colors.red))
+              : Image.file(File(imgs.first),
+                  width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
+        ),
+        title: Text(title),
+        subtitle: Text('$when - اضغط للتعديل'),
+        onTap: busy ? null : () => _openSaved(batch, i),
+        trailing: IconButton(
+            tooltip: 'مسح',
+            icon: const Icon(Icons.delete_rounded, color: Colors.red),
+            onPressed: busy ? null : () => _trashSaved(batch, i)),
+      ),
+    );
   }
 
   Future<void> _sendBatch() async {
@@ -5596,6 +5837,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         yes: 'امسح', no: 'إلغاء')) {
       return;
     }
+    await Store.keptToArchive(true);
     await Store.clearBatchImg();
     await _reload();
   }
@@ -5657,6 +5899,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         yes: 'امسح', no: 'إلغاء')) {
       return;
     }
+    await Store.keptToArchive(false);
     await Store.clearDraft();
     await _reload();
   }
@@ -5842,7 +6085,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         ),
         ];
         final files = <Widget>[
-        if (draft.isNotEmpty || pf != null || bi != null || saved.isNotEmpty || scanCount > 0) ...[
+        if (draft.isNotEmpty || pf != null || bi != null || saved.isNotEmpty || scanCount > 0 || savedB.isNotEmpty || savedR.isNotEmpty) ...[
           const SizedBox(height: 24),
           const Text('ملفاتي',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
@@ -5859,7 +6102,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text('الباتش - ${s.batchName}.jpg'),
                 subtitle: Text(batchSentAt == null
                     ? 'اضغط للمعاينة'
-                    : 'اتبعت ✓ - اضغط للتعديل'),
+                    : 'اتبعت ✓ ${_when(batchSentAt!)} - اضغط للتعديل'),
                 onTap: () => _open(BatchScreen(session: s)),
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -5885,8 +6128,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text('إيصالات الدفع (${draft.length} صورة)'),
                 subtitle: Text(receiptsSentAt == null
                     ? 'اضغط للمعاينة أو لتكمل التصوير'
-                    : 'اتبعت ✓ - اضغط للتعديل'),
-                onTap: _openReceipts,
+                    : 'اتبعت ✓ ${_when(receiptsSentAt!)} - اضغط للتعديل'),
+                onTap: _editReceipts,
                 trailing: IconButton(
                     tooltip: 'مسح',
                     icon: const Icon(Icons.delete_rounded, color: Colors.red),
@@ -5901,7 +6144,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text(pf.file.path.split('/').last,
                     maxLines: 2, overflow: TextOverflow.ellipsis),
                 subtitle: Text(receiptsSentAt != null
-                    ? 'اتبعت ✓ - اضغط لفتحه'
+                    ? 'اتبعت ✓ ${_when(receiptsSentAt!)} - اضغط لفتحه'
                     : 'اضغط لفتحه'),
                 onTap: _openPdf,
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
@@ -5914,6 +6157,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 ]),
               ),
             ),
+          for (final e in _savedOrder()) _sessionCard(e.$1 ? savedB[e.$2] : savedR[e.$2], e.$1, e.$2),
           if (scanCount > 0)
             Card(
               shape: kCardShape,
@@ -6295,7 +6539,7 @@ class _BatchScreenState extends State<BatchScreen> {
     final v = !kept;
     setState(() => kept = v);
     await Store.setKept(path, v);
-    if (mounted) snack(context, v ? 'هيتحفظ في الأرشيف بعد الإرسال' : 'اتشال من المحفوظات');
+    if (mounted) snack(context, v ? 'هيتحفظ في الأرشيف لما تمسحه من "ملفاتي"' : 'اتشال من المحفوظات');
   }
 
   Future<void> _init() async {
@@ -11220,7 +11464,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
         kept.remove(path);
       }
     });
-    snack(context, v ? 'هتتحفظ في الأرشيف بعد الإرسال' : 'اتشالت من المحفوظات');
+    snack(context, v ? 'هتتحفظ في الأرشيف لما تمسحها من "ملفاتي"' : 'اتشالت من المحفوظات');
   }
 
   /// البحث في نص الإيصالات: بيقرأ OCR لأي إيصال متقريش (أول مرة بس) والنتايج بتظهر أول بأول.
