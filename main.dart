@@ -2176,8 +2176,36 @@ Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel
   await logImageQuality('share-photo', jpg, profile: ImageQualityProfile.receipts);
   return jpg;
 }
-/// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال الأصلية (JPEG بيتحط في الـ PDF زي ما هو
-/// من غير إعادة رسم ولا إعادة ضغط، فالجودة أحسن والذاكرة أقل بكتير).
+/// حجم الـ PDF: الصورة بتتحط بنفس الوضوح لكن بحجم أقل.
+/// - أطول ضلع لحد 3200 بكسل (صورة الكاميرا 4080 → 3200)، وأصغر من كده بتفضل بأبعادها.
+/// - JPEG جودة 88 بدل نسخة التعديل (جودة 100) أو صورة الكاميرا الكاملة.
+/// - لو النسخة الجديدة مش أخف بـ10% على الأقل أو فيها أي مشكلة: بنحط الأصل زي ما هو.
+/// الصورة المحفوظة نفسها (للتعديل والمشاركة) مبتتغيرش.
+const kPdfMaxSide = 3200;
+const kPdfJpegQuality = 88;
+Future<Uint8List> pdfPageJpeg(Uint8List bytes) async {
+  try {
+    final sz = await imageSize(bytes);
+    if (sz.w <= 0 || sz.h <= 0) return bytes;
+    final long = math.max(sz.w, sz.h), short = math.min(sz.w, sz.h);
+    final k = long > kPdfMaxSide ? kPdfMaxSide / long : 1.0;
+    // flutter_image_compress بيصغّر بنسبة min(w/minW, h/minH)، فالضلع الصغير هو اللي بيحدد النسبة
+    final side = math.max(1, (short * k).round());
+    final c = await FlutterImageCompress.compressWithList(bytes,
+        minWidth: side, minHeight: side, quality: kPdfJpegQuality, format: CompressFormat.jpeg);
+    if (!_isJpegHeader(c) || c.length >= bytes.length * 0.9) return bytes;
+    final nz = await imageSize(c);
+    if (math.min(nz.w, nz.h) < side - 2) return bytes; // اتصغّرت أكتر من المطلوب: نرجع للأصل
+    final a = await _jpegMeanLum(bytes), b = await _jpegMeanLum(c);
+    if (a == null || b == null || (a - b).abs() >= 25) return bytes;
+    return c;
+  } catch (e, st) {
+    AppLog.e('pdf.fit', e, st);
+    return bytes;
+  }
+}
+
+/// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال (بنفس الوضوح وحجم أقل، شوف pdfPageJpeg).
 Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     {bool? forceCompact, void Function(int done, int total)? onProgress}) async {
   Store.working++;
@@ -2203,8 +2231,10 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
         } catch (e, st) {
           AppLog.e('pdf.compact', e, st);
         }
+      } else {
+        bytes = await pdfPageJpeg(bytes);
       }
-      await logImageQuality(compact ? 'pdf-compact' : 'pdf-original', bytes,
+      await logImageQuality(compact ? 'pdf-compact' : 'pdf-fit', bytes,
           profile: ImageQualityProfile.receipts);
       final sz = await imageSize(bytes);
       final imgH = pageW * sz.h / sz.w;
