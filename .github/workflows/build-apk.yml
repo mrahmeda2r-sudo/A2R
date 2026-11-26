@@ -31,7 +31,9 @@ jobs:
 
       - name: Add packages (pinned)
         run: |
-          flutter pub add google_mlkit_document_scanner:0.4.1 google_mlkit_text_recognition:^0.15.0 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 camera:^0.11.0
+          flutter pub add google_mlkit_document_scanner:0.4.1 google_mlkit_text_recognition:0.15.1 pdf:3.13.1 path_provider:2.1.6 share_plus:10.1.4 shared_preferences:2.5.6 flutter_image_compress:2.5.1 image_picker:1.2.4 permission_handler:11.4.0 open_filex:4.7.0 camera:0.11.4
+          # الكاميرا مثبّتة عشان أي build جديد ميجيبش نسخة مختلفة (نفس نسخ فرع cam)
+          flutter pub add "override:camera_android_camerax:0.6.30"
           flutter pub add flutter_localizations --sdk=flutter
           flutter pub add "override:path_provider_android:2.2.23"
           flutter pub add "override:shared_preferences_android:>=2.4.0 <2.5.0"
@@ -59,7 +61,7 @@ jobs:
         run: flutter analyze lib --no-fatal-infos --no-fatal-warnings
 
       - name: App label
-        run: sed -i 's/android:label="[^"]*"/android:label="A2R"/' android/app/src/main/AndroidManifest.xml
+        run: sed -i 's/android:label="[^"]*"/android:label="A2R Shared"/' android/app/src/main/AndroidManifest.xml
 
       - name: Camera permission
         run: |
@@ -264,6 +266,19 @@ jobs:
               env.write('A2R_SIGNING_MODE=stable-release\n')
           PYSIGN
 
+      - name: Separate Shared application identity
+        run: |
+          python3 - <<'PYID'
+          from pathlib import Path
+          p = Path('android/app/build.gradle.kts')
+          s = p.read_text()
+          original = 'applicationId = "com.a2r.a2r"'
+          assert s.count(original) == 1, 'Unexpected application ID template'
+          # الـ namespace وباكدج MainActivity بيفضلوا com.a2r.a2r (قنوات a2r/cam_hw و a2r/tilt شغالة زي ما هي)
+          p.write_text(s.replace(original, 'applicationId = "com.a2r.a2r.shared"'))
+          PYID
+          grep -n 'applicationId\|namespace' android/app/build.gradle.kts
+
       - name: App icon and splash screen
         run: |
           python3 -m pip install --break-system-packages pillow
@@ -316,7 +331,7 @@ jobs:
           test -n "$APK_ANALYZER"
           "$APK_ANALYZER" manifest min-sdk A2R-Shared.apk | tee apk-min-sdk.txt
           test "$(tr -d '[:space:]' < apk-min-sdk.txt)" = 24
-          "$APK_ANALYZER" manifest application-id A2R-Shared.apk
+          test "$("$APK_ANALYZER" manifest application-id A2R-Shared.apk)" = com.a2r.a2r.shared
           "$APK_ANALYZER" manifest version-code A2R-Shared.apk
           unzip -l A2R-Shared.apk | grep -E 'lib/(armeabi-v7a|arm64-v8a)/(libapp|libflutter)\.so'
 
