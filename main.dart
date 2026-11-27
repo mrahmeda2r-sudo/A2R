@@ -32,6 +32,9 @@ const kImageQualityRevision = 'receipt-q5-smooth';
 
 const kTagFont = 0.05; // حجم خط الورقة (نسبة من عرض الصورة)
 const kTagTop = 0.03; // بُعد ورقة الباتش عن أعلى الصورة
+/// تصغير ورقة بيانات إيصالات الدفع (الباتش مش متأثر): الخط والهوامش بالنسبة دي.
+const kReceiptTagScale = 1.0;
+const kTagMinScale = 0.05; // أصغر حجم لورقة الباتش (نسبة من عرض الصورة)
 const kBandPad = 0.02; // المسافة البيضاء حوالين الورقة في إيصالات الدفع
 const kReceiptScanMode = ScannerMode.base; // قص فقط، والتحسين بيتعمل من التطبيق
 const kBatchTagW = 0.7; // عرض الورقة في شريط الباتش (نسبة من عرض الصورة)
@@ -100,14 +103,17 @@ int gResLevel = 0;
 
 /// Receipt quality is independent of global performance/resolution preferences.
 /// Persisted per image and passed explicitly to capture and export.
+/// بدون تصغير تلقائي: الباتش والإيصالات بتتحفظ وتتعدّل وتتبعت بدقة الأصل.
+const kNoResizeSide = 100000;
+
 class ImageQualityProfile {
   final String id;
   final int maxSide;
   final int jpegQuality;
   const ImageQualityProfile(this.id, this.maxSide, this.jpegQuality);
-  static const receipts = ImageQualityProfile('receipts-v1', 4096, 100);
+  static const receipts = ImageQualityProfile('receipts-v1', kNoResizeSide, 100);
   static const detailedCapture = ImageQualityProfile('camera-detail-v1', 3200, 92);
-  static const batch = ImageQualityProfile('batch-v1', 4096, 100);
+  static const batch = ImageQualityProfile('batch-v1', kNoResizeSide, 100);
 }
 
 // Per-shot handoff only. Persisted on the image as soon as ingest consumes it.
@@ -1185,6 +1191,26 @@ Uint8List? _takeHotBytes(String path) {
   return null;
 }
 
+/// بينسخ المصدر لمجلد التطبيق الدائم ويضيفه للمحفوظات (مسح يدوي بس) لما التحويل يفشل.
+Future<void> _retainFailedCapture(String src) async {
+  try {
+    final dir = (await Store.dir()).path;
+    var keep = src;
+    if (!src.startsWith(dir)) {
+      final dot = src.lastIndexOf('.');
+      final ext = dot > src.lastIndexOf('/') ? src.substring(dot) : '.jpg';
+      keep = '$dir/capture_${DateTime.now().microsecondsSinceEpoch}$ext';
+      await File(src).copy(keep);
+    }
+    final p = await SharedPreferences.getInstance();
+    final a = p.getStringList('archive') ?? [];
+    if (!a.contains(keep)) a.add(keep);
+    await p.setStringList('archive', a);
+  } catch (e, st) {
+    AppLog.e('retainFailedCapture', e, st);
+  }
+}
+
 bool _isJpegHeader(Uint8List b) => b.length > 100 && b[0] == 0xFF && b[1] == 0xD8;
 
 /// نسخ الصورة من مكان الماسح المؤقت لمكان ثابت كـ JPEG واحد مضغوط (مرة واحدة بس).
@@ -1253,7 +1279,9 @@ Future<String> persistImage(String src, String name,
     }
   }
   if (bytes == null || !_isJpegHeader(bytes)) {
-    throw Exception('الصورة دي مش مدعومة، صوّرها تاني');
+    // اللقطة متضيعش: بنحفظ المصدر في مجلد التطبيق (ويظهر تحت «ملفاتي») قبل ما نبلّغ بالفشل
+    await _retainFailedCapture(src);
+    throw Exception('الصورة دي ماتحوّلتش لـ JPEG، الأصل اتحفظ تحت «ملفاتي». جرّب تاني أو افتحه من هناك');
   }
   await logImageQuality('ingest', bytes, profile: profile);
   final f = File('${(await Store.dir()).path}/$name');
@@ -1332,7 +1360,7 @@ class TagPos {
     if (a == null || b == null || c == null) return null;
     if (!a.isFinite || !b.isFinite || !c.isFinite) return null;
     return TagPos(a.clamp(0.0, 1.0).toDouble(), b.clamp(0.0, 10.0).toDouble(),
-        c.clamp(0.1, 1.0).toDouble());
+        c.clamp(kTagMinScale, 1.0).toDouble());
   }
 }
 
@@ -1391,15 +1419,19 @@ Future<Tag> receiptTag(double w, Session s, {bool batch = false, String? pageLab
 }
 
 Future<Tag> _renderTag(double w, Session s, {bool batch = false, String? pageLabel}) async {
-  final fs = w * kTagFont;
+  final fs = w * kTagFont * (batch ? 1.0 : kReceiptTagScale);
   final unitLine = s.building == null ? s.unit.name : '${s.unit.name} - ${s.building}';
   final l1 = _tp('${s.name}  |  $unitLine', fs, TextDirection.rtl);
   final baseL2 = batch ? _isoLtr(s.date) : '${_isoLtr('TID: ${s.unit.tid}')}  |  ${_isoLtr(s.date)}';
-  final l2 = _tp(pageLabel == null ? baseL2 : '$baseL2  |  ${_isoLtr(pageLabel)}', fs, TextDirection.rtl);
-  final pad = fs * 0.6;
-  final gap = fs * 0.25;
-  final textW = l1.width > l2.width ? l1.width : l2.width;
-  final cw = (textW + pad * 2).clamp(0.0, w * 0.96).toDouble();
+  final l2 = _tp(baseL2, fs, TextDirection.rtl);
+  // رقم الصفحة بترتيبها: سطر لوحده بخط متوسط (أكبر من سطور البيانات) جوه ورقة البيانات
+  final l3 = pageLabel == null ? null : _tp(_isoLtr(pageLabel), fs * 1.5, TextDirection.ltr);
+  final pad = fs * (batch ? 0.6 : 0.3);
+  final gap = fs * (batch ? 0.25 : 0.12);
+  final textW = math.max(l1.width, l2.width);
+  // رقم الصفحة في جنب الورقة (شمال) بدل سطر زيادة، فارتفاع الورقة زي ما هو
+  final numW = l3 == null ? 0.0 : l3.width + pad * 2;
+  final cw = batch ? (textW + pad * 2 + numW).clamp(0.0, w * 0.96).toDouble() : w * 0.96;
   final ch = l1.height + l2.height + gap + pad * 2;
   final rec = ui.PictureRecorder();
   final c = Canvas(rec, Rect.fromLTWH(0, 0, cw, ch));
@@ -1415,8 +1447,14 @@ Future<Tag> _renderTag(double w, Session s, {bool batch = false, String? pageLab
         ..style = PaintingStyle.stroke
         ..strokeWidth = sw
         ..color = Colors.black);
-  l1.paint(c, Offset((cw - l1.width) / 2, pad));
-  l2.paint(c, Offset((cw - l2.width) / 2, pad + l1.height + gap));
+  final tx0 = numW; // البيانات في باقي العرض
+  l1.paint(c, Offset(tx0 + (cw - tx0 - l1.width) / 2, pad));
+  l2.paint(c, Offset(tx0 + (cw - tx0 - l2.width) / 2, pad + l1.height + gap));
+  if (l3 != null) {
+    l3.paint(c, Offset((numW - l3.width) / 2, (ch - l3.height) / 2));
+    c.drawLine(Offset(numW, ch * 0.18), Offset(numW, ch * 0.82),
+        Paint()..color = Colors.black..strokeWidth = math.max(1.0, sw * 0.6));
+  }
   final img = await rec.endRecording().toImage(cw.ceil(), ch.ceil());
   final bd = await img.toByteData(format: ui.ImageByteFormat.png);
   img.dispose();
@@ -1503,6 +1541,145 @@ Future<double?> _jpegMeanLum(Uint8List jpg) async {
   }
 }
 
+/// تركيب مباشر بصيغة BMP 24 بت (من غير نسخة RGBA كاملة تانية ولا ضغط PNG): الصورة + الورقة، صف صف.
+/// بيرجّع BMP جاهز للضغط JPEG ومتوسط السطوع بنفس عينات _meanLum.
+Map<String, dynamic> _composeBmpJob(Map<String, dynamic> a) {
+  final img = a['img'] as Uint8List;
+  final iw = a['iw'] as int, ih = a['ih'] as int;
+  final tag = a['tag'] as Uint8List;
+  final tw = a['tw'] as int, th = a['th'] as int;
+  final ow = a['ow'] as int, oh = a['oh'] as int;
+  final ix = a['ix'] as int, iy = a['iy'] as int;
+  final tx = a['tx'] as int, ty = a['ty'] as int;
+  final rowBytes = ((ow * 3 + 3) ~/ 4) * 4;
+  final dataSize = rowBytes * oh;
+  final bmp = Uint8List(54 + dataSize);
+  final hd = ByteData.view(bmp.buffer);
+  bmp[0] = 0x42;
+  bmp[1] = 0x4D;
+  hd.setUint32(2, 54 + dataSize, Endian.little);
+  hd.setUint32(10, 54, Endian.little);
+  hd.setUint32(14, 40, Endian.little);
+  hd.setInt32(18, ow, Endian.little);
+  hd.setInt32(22, oh, Endian.little); // موجب = الصفوف من تحت لفوق
+  hd.setUint16(26, 1, Endian.little);
+  hd.setUint16(28, 24, Endian.little);
+  hd.setUint32(34, dataSize, Endian.little);
+  final row = Uint8List(ow * 4);
+  final sx0 = math.max(0, -ix), sx1 = math.min(iw, ow - ix);
+  final n = ow * oh;
+  final step = math.max(1, n ~/ 20000) | 1;
+  var lumSum = 0.0, lumCnt = 0;
+  for (var y = 0; y < oh; y++) {
+    row.fillRange(0, row.length, 255);
+    final sy = y - iy;
+    if (sy >= 0 && sy < ih && sx1 > sx0) {
+      row.setRange((ix + sx0) * 4, (ix + sx1) * 4, img, (sy * iw + sx0) * 4);
+    }
+    final ty0 = y - ty;
+    if (ty0 >= 0 && ty0 < th) {
+      for (var x = 0; x < tw; x++) {
+        final dx = x + tx;
+        if (dx < 0 || dx >= ow) continue;
+        final si = (ty0 * tw + x) * 4, di = dx * 4;
+        final al = tag[si + 3];
+        if (al == 0) continue;
+        if (al == 255) {
+          row[di] = tag[si];
+          row[di + 1] = tag[si + 1];
+          row[di + 2] = tag[si + 2];
+        } else {
+          final k = 1 - al / 255;
+          for (var c = 0; c < 3; c++) {
+            final v = tag[si + c] + row[di + c] * k;
+            row[di + c] = v > 255 ? 255 : v.round();
+          }
+        }
+      }
+    }
+    var o = 54 + (oh - 1 - y) * rowBytes;
+    for (var x = 0, j = 0; x < ow; x++, j += 4) {
+      bmp[o++] = row[j + 2];
+      bmp[o++] = row[j + 1];
+      bmp[o++] = row[j];
+    }
+    // عينات السطوع: نفس الفهارس i = y*ow + x اللي بتقبل القسمة على step
+    final base = y * ow;
+    var x0 = (step - base % step) % step;
+    for (var x = x0; x < ow; x += step) {
+      final j = x * 4;
+      lumSum += (row[j] * 54 + row[j + 1] * 183 + row[j + 2] * 19) >> 8;
+      lumCnt++;
+    }
+  }
+  return {'bmp': bmp, 'lum': lumCnt == 0 ? 0.0 : lumSum / lumCnt};
+}
+
+/// بيركّب الصورة والورقة ويطلّع JPEG بنفس الأبعاد من غير أي تصغير. المسار الأساسي BMP (أقل ذاكرة)،
+/// ولو فشل ضغطه بيرجع للمسار القديم (PNG) بنفس الأبعاد. لو الناتج مشوّه بنفشل بدل ما نصغّر أو نبعت صورة بايظة.
+Future<Uint8List> _composeEncode(ui.Image img, Tag tag,
+    {required int ow, required int oh, required int ix, required int iy, required int tx, required int ty,
+    required int q, required String label}) async {
+  final iw = img.width, ih = img.height;
+  final tImg = await decodeImage(tag.png);
+  final tw = tImg.width, th = tImg.height;
+  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
+  img.dispose();
+  tImg.dispose();
+  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
+  final args = <String, dynamic>{
+    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
+    'iw': iw,
+    'ih': ih,
+    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
+    'tw': tw,
+    'th': th,
+    'ow': ow,
+    'oh': oh,
+    'ix': ix,
+    'iy': iy,
+    'tx': tx,
+    'ty': ty,
+  };
+  try {
+    final r = await compute(_composeBmpJob, args);
+    final jpg = await FlutterImageCompress.compressWithList(
+      r['bmp'] as Uint8List,
+      minWidth: ow,
+      minHeight: oh,
+      quality: q,
+      format: CompressFormat.jpeg,
+    );
+    final got = await _jpegMeanLum(jpg);
+    final want = r['lum'] as double;
+    AppLog.i('$label bmp ${ow}x$oh ${jpg.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} got=${got?.toStringAsFixed(0)}');
+    if (_isJpegHeader(jpg) && got != null && (got - want).abs() < 25) return jpg;
+  } catch (e, st) {
+    AppLog.e('$label.bmp', e, st);
+  }
+  // المسار القديم (PNG) بنفس الأبعاد الكاملة، من غير تصغير
+  final rgba = await compute(_composeJob, args);
+  final comp = Completer<ui.Image>();
+  ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
+  final outImg = await comp.future;
+  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
+  outImg.dispose();
+  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
+  final want = _meanLum(rgba, ow, oh);
+  final jpg = await FlutterImageCompress.compressWithList(
+    pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes),
+    minWidth: ow,
+    minHeight: oh,
+    quality: q,
+    format: CompressFormat.jpeg,
+  );
+  final got = await _jpegMeanLum(jpg);
+  if (_isJpegHeader(jpg) && got != null && (got - want).abs() < 25) return jpg;
+  throw Exception('الصورة النهائية طلعت مشوّهة، الأصل محفوظ. جرّب تاني أو وضع الأداء Lite');
+}
+
+
 /// صورة الباتش + الورقة. layout 1: شريط أبيض تحت الصورة (الصورة كاملة من غير تغطية)،
 /// layout 2: الورقة فوق الصورة في المكان اللي الموظف اختاره.
 Future<Uint8List> composeBatch(String path, Session s) async {
@@ -1537,51 +1714,9 @@ Future<Uint8List> composeBatch(String path, Session s) async {
     imgY = 0;
     oh = ih + band.ceil();
   }
-  final tImg = await decodeImage(tag.png);
-  final tw = tImg.width, th = tImg.height;
-  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
-  img.dispose();
-  tImg.dispose();
-  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
-  final rgba = await compute(_composeJob, <String, dynamic>{
-    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
-    'iw': iw,
-    'ih': ih,
-    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
-    'tw': tw,
-    'th': th,
-    'ow': ow,
-    'oh': oh,
-    'ix': imgX,
-    'iy': imgY,
-    'tx': tagAt.dx.round(),
-    'ty': tagAt.dy.round(),
-  });
-  final comp = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
-  final outImg = await comp.future;
-  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
-  outImg.dispose();
-  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
-  final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
   final q = await Store.jpegQuality(profile: profile);
-  final want = _meanLum(rgba, ow, oh);
-  // أول محاولة بالأبعاد الكاملة، ولو الناتج مشوّه نجرّب أبعاد أصغر، ولو برضه مشوّه منبعتش صورة بايظة
-  for (final k in const [1.0, 0.75]) {
-    final jpg = await FlutterImageCompress.compressWithList(
-      png,
-      minWidth: (ow * k).round(),
-      minHeight: (oh * k).round(),
-      quality: q,
-      format: CompressFormat.jpeg,
-    );
-    final got = await _jpegMeanLum(jpg);
-    AppLog.i('compose ${ow}x$oh k=$k ${jpg.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} '
-        'got=${got?.toStringAsFixed(0)}');
-    if (got != null && (got - want).abs() < 25) return jpg;
-  }
-  throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
+  return _composeEncode(img, tag,
+      ow: ow, oh: oh, ix: imgX, iy: imgY, tx: tagAt.dx.round(), ty: tagAt.dy.round(), q: q, label: 'batchImg');
 }
 
 /// صورة الإيصال النهائية للمشاركة: نفس صفحة الـ PDF (شريط أبيض فيه الورقة فوق الإيصال).
@@ -1591,30 +1726,21 @@ Future<Uint8List> composeIdCard(String frontPath, String backPath) async {
   final f = await decodeImage(await File(frontPath).readAsBytes());
   final b = await decodeImage(await File(backPath).readAsBytes());
   try {
-    const w = 1240.0, m = 48.0, gap = 48.0;
-    const iw = w - m * 2;
-    final fh = iw * f.height / f.width, bh = iw * b.height / b.width;
-    final h = m + fh + gap + bh + m;
+    // بدقة الأصل من غير تصغير: العرض = أعرض وش + هوامش، والطول = الاتنين + فاصل صغير
+    final inner = math.max(f.width, b.width).toDouble();
+    final m = (inner * 0.03).roundToDouble(), gap = (inner * 0.03).roundToDouble();
+    final w = inner + 2 * m;
+    final h = m + f.height + gap + b.height + m;
     final rec = ui.PictureRecorder();
     final c = Canvas(rec);
     c.drawRect(Rect.fromLTWH(0, 0, w, h), Paint()..color = const Color(0xFFFFFFFF));
-    c.drawImageRect(
-        f,
-        Rect.fromLTWH(0, 0, f.width.toDouble(), f.height.toDouble()),
-        Rect.fromLTWH(m, m, iw, fh),
-        Paint());
-    c.drawImageRect(
-        b,
-        Rect.fromLTWH(0, 0, b.width.toDouble(), b.height.toDouble()),
-        Rect.fromLTWH(m, m + fh + gap, iw, bh),
-        Paint());
+    c.drawImage(f, Offset((w - f.width) / 2, m), Paint());
+    c.drawImage(b, Offset((w - b.width) / 2, m + f.height + gap), Paint());
     // خط فاصل خفيف بين الوش والضهر
-    c.drawLine(
-        Offset(m, m + fh + gap / 2),
-        Offset(w - m, m + fh + gap / 2),
-        Paint()
-          ..color = const Color(0xFFE0E0E0)
-          ..strokeWidth = 2);
+    final ly = m + f.height + gap / 2;
+    c.drawLine(Offset(m, ly), Offset(w - m, ly), Paint()
+      ..color = const Color(0xFFE0E0E0)
+      ..strokeWidth = math.max(2.0, inner / 600));
     final img = await rec.endRecording().toImage(w.round(), h.round());
     final bd = await img.toByteData(format: ui.ImageByteFormat.png);
     img.dispose();
@@ -1632,11 +1758,48 @@ const kWaMaxSide = 1600;
 
 /// نسخة إرسال واتساب في Isolate: تصغير بمتوسط المساحة (لو أكبر من kWaMaxSide بس) + اختياريًا
 /// مستويات تلقائية (سحق الحبر وقص الورق)، والحدة بس لو حصل تصغير. الأصل لا يُمس.
+/// نفس نتيجة _waCopyCore، ولو a['bmp'] == true والصورة كلها معتمة بيرجّع BMP 24 بت جاهز للضغط بدل RGBA
+/// (من غير ترميز PNG تقيل). نفس البكسلات بالظبط. لو فيها شفافية بيرجّع RGBA زي الأول.
 Map<String, dynamic> _waCopyJob(Map<String, dynamic> a) {
+  final r = _waCopyCore(a);
+  if (a['bmp'] != true) return r;
+  final px = r['rgba'] as Uint8List;
+  final w = r['w'] as int, h = r['h'] as int;
+  for (var i = 3; i < px.length; i += 4) {
+    if (px[i] != 255) return r;
+  }
+  final rowBytes = ((w * 3 + 3) ~/ 4) * 4;
+  final dataSize = rowBytes * h;
+  final bmp = Uint8List(54 + dataSize);
+  final hd = ByteData.view(bmp.buffer);
+  bmp[0] = 0x42;
+  bmp[1] = 0x4D;
+  hd.setUint32(2, 54 + dataSize, Endian.little);
+  hd.setUint32(10, 54, Endian.little);
+  hd.setUint32(14, 40, Endian.little);
+  hd.setInt32(18, w, Endian.little);
+  hd.setInt32(22, h, Endian.little);
+  hd.setUint16(26, 1, Endian.little);
+  hd.setUint16(28, 24, Endian.little);
+  hd.setUint32(34, dataSize, Endian.little);
+  for (var y = 0; y < h; y++) {
+    var o = 54 + (h - 1 - y) * rowBytes;
+    var j = y * w * 4;
+    for (var x = 0; x < w; x++, j += 4) {
+      bmp[o++] = px[j + 2];
+      bmp[o++] = px[j + 1];
+      bmp[o++] = px[j];
+    }
+  }
+  return {'bmp': bmp, 'lum': _meanLum(px, w, h), 'w': w, 'h': h};
+}
+
+Map<String, dynamic> _waCopyCore(Map<String, dynamic> a) {
   final src = a['src'] as Uint8List;
   final sw = a['sw'] as int, sh = a['sh'] as int;
   final enhance = a['enhance'] as bool;
-  final k = math.min(1.0, kWaMaxSide / math.max(sw, sh));
+  final cap = (a['max'] as int?) ?? kWaMaxSide;
+  final k = math.min(1.0, cap / math.max(sw, sh));
   final ow = math.max(8, (sw * k).round()), oh = math.max(8, (sh * k).round());
   final out = Uint8List(ow * oh * 4);
   for (var y = 0; y < oh; y++) {
@@ -1739,7 +1902,8 @@ int _waSeq = 0;
 
 /// نسخة الإرسال للواتساب: نفس الصورة بمقاس واتساب وجودة جيدة، ولو enhance بتحسين مستند.
 /// عند أي فشل نرجع مسار الأصل كما هو (الإرسال لا يتعطل أبدًا بسبب النسخة).
-Future<String> waShareCopy(String path, {required bool enhance}) async {
+/// fullRes: من غير تصغير وجودة 100، وأي فشل بيرمي استثناء (مبنرجعش ملف تاني بدل المطلوب).
+Future<String> waShareCopy(String path, {required bool enhance, bool fullRes = false}) async {
   try {
     final dir = (await Store.dir()).path;
     // Keep every prepared attachment alive until the share operation has
@@ -1748,41 +1912,73 @@ Future<String> waShareCopy(String path, {required bool enhance}) async {
     final raw = await File(path).readAsBytes();
     final sz = await imageSize(raw);
     // من غير تحسين ومن غير تصغير: نبعت الأصل زي ما هو (مفيش أي إعادة ضغط تقلل الجودة)
-    if (!enhance && math.max(sz.w, sz.h) <= kWaMaxSide) return path;
+    if (!enhance && (fullRes || math.max(sz.w, sz.h) <= kWaMaxSide)) return path;
     final img = await decodeImage(raw);
     final w = img.width, h = img.height;
     final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
     img.dispose();
-    if (bd == null) return path;
-    final res = await compute(_waCopyJob, <String, dynamic>{
-      'src': _bytesOf(bd),
+    if (bd == null) {
+      if (fullRes) throw Exception('تعذر قراءة الصورة');
+      return path;
+    }
+    final srcBytes = _bytesOf(bd);
+    final args = <String, dynamic>{
+      'src': srcBytes,
       'sw': w,
       'sh': h,
       'enhance': enhance,
-    });
-    final rgba = res['rgba'] as Uint8List;
-    final ow = res['w'] as int, oh = res['h'] as int;
-    // الضاغط محتاج صورة مشفّرة (PNG)، مش بكسلات خام: قبل كده كان بيفشل وبيرجع الأصل من غير التحسين
-    final comp = Completer<ui.Image>();
-    ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
-    final outImg = await comp.future;
-    final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
-    outImg.dispose();
-    if (pngBd == null) return path;
-    final jpg = await FlutterImageCompress.compressWithList(
-      pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes),
-      minWidth: ow,
-      minHeight: oh,
-      quality: 95,
-      format: CompressFormat.jpeg,
-    );
-    if (!_isJpegHeader(jpg)) return path;
+      'max': fullRes ? kNoResizeSide : kWaMaxSide,
+    };
+    Uint8List? jpg;
+    // المسار الأساسي: BMP (نفس البكسلات من غير ترميز PNG كامل الحجم). لو فشل أو الناتج مشوّه بنرجع للمسار القديم (PNG) بنفس الأبعاد والجودة.
+    try {
+      final r = await compute(_waCopyJob, <String, dynamic>{...args, 'bmp': true});
+      final bmp = r['bmp'] as Uint8List?;
+      if (bmp != null) {
+        final bw = r['w'] as int, bh = r['h'] as int;
+        final j = await FlutterImageCompress.compressWithList(bmp,
+            minWidth: bw, minHeight: bh, quality: fullRes ? 100 : 95, format: CompressFormat.jpeg);
+        final got = await _jpegMeanLum(j);
+        final want = r['lum'] as double;
+        AppLog.i('waCopy bmp ${bw}x$bh ${j.length ~/ 1024}KB lum want=${want.toStringAsFixed(0)} got=${got?.toStringAsFixed(0)}');
+        if (_isJpegHeader(j) && got != null && (got - want).abs() < 25) jpg = j;
+      }
+    } catch (e, st) {
+      AppLog.e('waCopy.bmp', e, st);
+    }
+    if (jpg == null) {
+      final res = await compute(_waCopyJob, args);
+      final rgba = res['rgba'] as Uint8List;
+      final ow = res['w'] as int, oh = res['h'] as int;
+      // الضاغط محتاج صورة مشفّرة (PNG)، مش بكسلات خام: قبل كده كان بيفشل وبيرجع الأصل من غير التحسين
+      final comp = Completer<ui.Image>();
+      ui.decodeImageFromPixels(rgba, ow, oh, ui.PixelFormat.rgba8888, comp.complete);
+      final outImg = await comp.future;
+      final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
+      outImg.dispose();
+      if (pngBd == null) {
+        if (fullRes) throw Exception('تعذر تجهيز نسخة الإرسال');
+        return path;
+      }
+      jpg = await FlutterImageCompress.compressWithList(
+        pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes),
+        minWidth: ow,
+        minHeight: oh,
+        quality: fullRes ? 100 : 95,
+        format: CompressFormat.jpeg,
+      );
+      if (!_isJpegHeader(jpg)) {
+        if (fullRes) throw Exception('نسخة الإرسال طلعت غير سليمة');
+        return path;
+      }
+    }
     final f = File('${dir}/wa_${DateTime.now().microsecondsSinceEpoch}_${_waSeq++}.jpg');
     await f.writeAsBytes(jpg, flush: true);
-    AppLog.i('waCopy ${w}x$h -> ${ow}x$oh ${jpg.length ~/ 1024}KB enhance=$enhance');
+    AppLog.i('waCopy ${w}x$h ${jpg.length ~/ 1024}KB enhance=$enhance');
     return f.path;
   } catch (e, st) {
     AppLog.e('waCopy', e, st);
+    if (fullRes) rethrow;
     return path;
   }
 }
@@ -1889,6 +2085,9 @@ List<String> sysPhotoTids(String text) {
 
 /// تنبيه بس (عمره ما يمنع الإرسال): الترمنل المقروء من صورة السيستم مختلف عن الوحدة المختارة.
 /// لو الفرق رقم واحد بس بنعتبره غلطة قراءة (زي 50383702 تتقرا 50383700) ومش بننبّه.
+/// M2/F9: ملاحظة لما قراءة الترمنل من صورة السيستم متكملش (مهلة أو خطأ) — مش تنبيه ومبتوقفش حاجة.
+const kSysTidUnread = 'مقدرناش نقرا رقم الترمنل من صورة السيستم دلوقتي. بص عليه بعينك قبل الإرسال';
+
 String? sysTidWarning(List<String> read, Unit sel, List<Unit> units) {
   if (read.isEmpty) return null;
   if (read.any((t) => _tidDigitDiff(t, sel.tid) <= 1)) return null;
@@ -1903,30 +2102,16 @@ String? sysTidWarning(List<String> read, Unit sel, List<Unit> units) {
 }
 
 /// نسخة واتساب لصورة السيستم + شريط أبيض تحتها فيه A2R SYS والترمنل والكود والتاريخ.
-/// الشريط بيتضاف تحت الصورة (مش فوقها)، والصورة نفسها بنفس بكسلاتها (أو نفس تصغير واتساب القديم لو أكبر
-/// من kWaMaxSide). عند أي فشل بنرجع للنسخة القديمة من غير شريط (الإرسال لا يتعطل أبدًا).
+/// الشريط بيتضاف تحت الصورة (مش فوقها)، والصورة نفسها بنفس بكسلاتها من غير تصغير.
+/// B6: عند أي فشل الدالة بترمي خطأ، و sendBatchFile بيوقف الإرسال كله بدل ما يبعت نسخة أقل جودة
+/// (مقصود: مفيش صورة بجودة أقل تتبعت من غير ما الموظف يعرف). الملفات المحفوظة زي ما هي.
 Future<String> sysShareCopy(String path, Session s) async {
   try {
     final dir = (await Store.dir()).path;
     final raw = await File(path).readAsBytes();
     final sz = await imageSize(raw);
-    ui.Image src;
-    if (math.max(sz.w, sz.h) > kWaMaxSide) {
-      final img = await decodeImage(raw);
-      final w0 = img.width, h0 = img.height;
-      final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-      img.dispose();
-      if (bd == null) return await waShareCopy(path, enhance: false);
-      final res = await compute(_waCopyJob, <String, dynamic>{
-        'src': _bytesOf(bd),
-        'sw': w0,
-        'sh': h0,
-        'enhance': false,
-      });
-      src = await _imageFromRgba(res['rgba'] as Uint8List, res['w'] as int, res['h'] as int);
-    } else {
-      src = await decodeImage(raw);
-    }
+    // من غير تصغير: صورة السيستم بتتبعت بمقاسها المخزّن
+    final src = await decodeImage(raw);
     final w = src.width, h = src.height;
     final text = sysStripText(s.unit, DateTime.now());
     TextPainter mk(double f) => TextPainter(
@@ -1953,35 +2138,28 @@ Future<String> sysShareCopy(String path, Session s) async {
     final pad = math.max(8.0, fs * 0.5);
     final band = (tp.height + pad * 2).ceil();
     final oh = h + band;
+    // الشريط بس بيترسم (صغير)، والصورة الكاملة بتتركّب صف صف من غير نسخ RGBA/PNG كاملة زيادة
     final rec = ui.PictureRecorder();
     final c = Canvas(rec);
-    c.drawRect(Rect.fromLTWH(0, 0, w.toDouble(), oh.toDouble()), Paint()..color = const Color(0xFFFFFFFF));
-    c.drawImage(src, Offset.zero, Paint()..filterQuality = FilterQuality.none);
-    c.drawRect(Rect.fromLTWH(0, h.toDouble(), w.toDouble(), math.max(1.0, fs * 0.06)),
+    c.drawRect(Rect.fromLTWH(0, 0, w.toDouble(), band.toDouble()), Paint()..color = const Color(0xFFFFFFFF));
+    c.drawRect(Rect.fromLTWH(0, 0, w.toDouble(), math.max(1.0, fs * 0.06)),
         Paint()..color = const Color(0xFF000000));
-    tp.paint(c, Offset((w - tp.width) / 2, h + pad));
+    tp.paint(c, Offset((w - tp.width) / 2, pad));
     final pic = rec.endRecording();
-    final out = await pic.toImage(w, oh);
+    final stripImg = await pic.toImage(w, band);
     pic.dispose();
-    src.dispose();
-    final png = await out.toByteData(format: ui.ImageByteFormat.png);
-    out.dispose();
-    if (png == null) return await waShareCopy(path, enhance: false);
-    final jpg = await FlutterImageCompress.compressWithList(
-      _bytesOf(png),
-      minWidth: w,
-      minHeight: oh,
-      quality: 97,
-      format: CompressFormat.jpeg,
-    );
-    if (!_isJpegHeader(jpg)) return await waShareCopy(path, enhance: false);
+    final stripPng = await stripImg.toByteData(format: ui.ImageByteFormat.png);
+    stripImg.dispose();
+    if (stripPng == null) throw Exception('تعذر تجهيز صورة السيستم بالجودة الكاملة');
+    final jpg = await _composeEncode(src, Tag(_bytesOf(stripPng), w.toDouble(), band.toDouble()),
+        ow: w, oh: oh, ix: 0, iy: 0, tx: 0, ty: h, q: 100, label: 'sysCopy');
     final f = File('$dir/wa_sys_${DateTime.now().microsecondsSinceEpoch}_${_waSeq++}.jpg');
     await f.writeAsBytes(jpg, flush: true);
     AppLog.i('sysCopy ${sz.w}x${sz.h} -> ${w}x$oh strip="$text" ${jpg.length ~/ 1024}KB');
     return f.path;
   } catch (e, st) {
     AppLog.e('sysCopy', e, st);
-    return await waShareCopy(path, enhance: false);
+    rethrow;
   }
 }
 
@@ -1996,55 +2174,42 @@ Future<Uint8List> composeReceiptImage(String path, Session s, {String? pageLabel
   final pad = iw * kBandPad;
   final band = (tag.h + pad * 2).ceil();
   final oh = ih + band;
-  final tImg = await decodeImage(tag.png);
-  final tw = tImg.width, th = tImg.height;
-  final imgBd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-  final tagBd = await tImg.toByteData(format: ui.ImageByteFormat.rawRgba);
-  img.dispose();
-  tImg.dispose();
-  if (imgBd == null || tagBd == null) throw Exception('تعذر قراءة الصورة');
-  final rgba = await compute(_composeJob, <String, dynamic>{
-    'img': imgBd.buffer.asUint8List(imgBd.offsetInBytes, imgBd.lengthInBytes),
-    'iw': iw,
-    'ih': ih,
-    'tag': tagBd.buffer.asUint8List(tagBd.offsetInBytes, tagBd.lengthInBytes),
-    'tw': tw,
-    'th': th,
-    'ow': iw,
-    'oh': oh,
-    'ix': 0,
-    'iy': band,
-    'tx': ((iw - tag.w) / 2).round(),
-    'ty': pad.round(),
-  });
-  final comp = Completer<ui.Image>();
-  ui.decodeImageFromPixels(rgba, iw, oh, ui.PixelFormat.rgba8888, comp.complete);
-  final outImg = await comp.future;
-  final pngBd = await outImg.toByteData(format: ui.ImageByteFormat.png);
-  outImg.dispose();
-  if (pngBd == null) throw Exception('تعذر حفظ الصورة');
-  final png = pngBd.buffer.asUint8List(pngBd.offsetInBytes, pngBd.lengthInBytes);
   final q = await Store.jpegQuality(profile: ImageQualityProfile.receipts);
-  final want = _meanLum(rgba, iw, oh);
-  for (final k in const [1.0, 0.75]) {
-    final jpg = await FlutterImageCompress.compressWithList(
-      png,
-      minWidth: (iw * k).round(),
-      minHeight: (oh * k).round(),
-      quality: q,
-      format: CompressFormat.jpeg,
-    );
-    final got = await _jpegMeanLum(jpg);
-    if (got != null && (got - want).abs() < 25) {
-      await logImageQuality('share-photo', jpg, profile: ImageQualityProfile.receipts);
-      return jpg;
-    }
+  final jpg = await _composeEncode(img, tag,
+      ow: iw, oh: oh, ix: 0, iy: band, tx: ((iw - tag.w) / 2).round(), ty: pad.round(), q: q, label: 'receiptImg');
+  await logImageQuality('share-photo', jpg, profile: ImageQualityProfile.receipts);
+  return jpg;
+}
+/// حجم الـ PDF: الصورة بتتحط بنفس الوضوح لكن بحجم أقل.
+/// - أطول ضلع لحد 3200 بكسل (صورة الكاميرا 4080 → 3200)، وأصغر من كده بتفضل بأبعادها.
+/// - JPEG جودة 88 بدل نسخة التعديل (جودة 100) أو صورة الكاميرا الكاملة.
+/// - لو النسخة الجديدة مش أخف بـ10% على الأقل أو فيها أي مشكلة: بنحط الأصل زي ما هو.
+/// الصورة المحفوظة نفسها (للتعديل والمشاركة) مبتتغيرش.
+const kPdfMaxSide = 3200;
+const kPdfJpegQuality = 88;
+Future<Uint8List> pdfPageJpeg(Uint8List bytes) async {
+  try {
+    final sz = await imageSize(bytes);
+    if (sz.w <= 0 || sz.h <= 0) return bytes;
+    final long = math.max(sz.w, sz.h), short = math.min(sz.w, sz.h);
+    final k = long > kPdfMaxSide ? kPdfMaxSide / long : 1.0;
+    // flutter_image_compress بيصغّر بنسبة min(w/minW, h/minH)، فالضلع الصغير هو اللي بيحدد النسبة
+    final side = math.max(1, (short * k).round());
+    final c = await FlutterImageCompress.compressWithList(bytes,
+        minWidth: side, minHeight: side, quality: kPdfJpegQuality, format: CompressFormat.jpeg);
+    if (!_isJpegHeader(c) || c.length >= bytes.length * 0.9) return bytes;
+    final nz = await imageSize(c);
+    if (math.min(nz.w, nz.h) < side - 2) return bytes; // اتصغّرت أكتر من المطلوب: نرجع للأصل
+    final a = await _jpegMeanLum(bytes), b = await _jpegMeanLum(c);
+    if (a == null || b == null || (a - b).abs() >= 25) return bytes;
+    return c;
+  } catch (e, st) {
+    AppLog.e('pdf.fit', e, st);
+    return bytes;
   }
-  throw Exception('الصورة النهائية طلعت مشوّهة، جرّب وضع الأداء Lite من الإعدادات وابعت تاني');
 }
 
-/// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال الأصلية (JPEG بيتحط في الـ PDF زي ما هو
-/// من غير إعادة رسم ولا إعادة ضغط، فالجودة أحسن والذاكرة أقل بكتير).
+/// PDF الإيصالات: كل صفحة = جزء أبيض فيه الورقة + صورة الإيصال (بنفس الوضوح وحجم أقل، شوف pdfPageJpeg).
 Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     {bool? forceCompact, void Function(int done, int total)? onProgress}) async {
   Store.working++;
@@ -2054,18 +2219,11 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     final pad = pageW * kBandPad;
     final compact = forceCompact ?? false;
     final swPdf = Stopwatch()..start();
-    final multi = receipts.length > 1;
-    Tag? sharedTag;
-    pw.MemoryImage? sharedTagImg;
-    if (!multi) {
-      sharedTag = await receiptTag(1000, s);
-      sharedTagImg = pw.MemoryImage(sharedTag.png);
-    }
     for (var i = 0; i < receipts.length; i++) {
       onProgress?.call(i, receipts.length);
       var bytes = await File(receipts[i]).readAsBytes();
       if (compact) {
-        // PDF مضغوط: نسخة أصغر (عرض ~720 وجودة 70) لو طلعت أخف وسليمة، وإلا بنستخدم الأصلية
+        // PDF مضغوط: نسخة أصغر (أقل ضلع ~2200 وجودة 78) لو طلعت أخف وسليمة، وإلا بنستخدم الأصلية
         try {
           // صورة فيها ١٥ إيصال: الضغط لـ 720 هيمسح الأرقام، فبنخلّي دقة أعلى بكتير
           final c = await FlutterImageCompress.compressWithList(bytes,
@@ -2077,8 +2235,10 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
         } catch (e, st) {
           AppLog.e('pdf.compact', e, st);
         }
+      } else {
+        bytes = await pdfPageJpeg(bytes);
       }
-      await logImageQuality(compact ? 'pdf-compact' : 'pdf-original', bytes,
+      await logImageQuality(compact ? 'pdf-compact' : 'pdf-fit', bytes,
           profile: ImageQualityProfile.receipts);
       final sz = await imageSize(bytes);
       final imgH = pageW * sz.h / sz.w;
@@ -2087,8 +2247,8 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
       pw.MemoryImage? pTagImg;
       var tw = 0.0, th = 0.0, bandH = 0.0;
       if (!hide) {
-        pTag = multi ? await receiptTag(1000, s, pageLabel: '${i + 1} / ${receipts.length}') : sharedTag!;
-        pTagImg = multi ? pw.MemoryImage(pTag.png) : sharedTagImg!;
+        pTag = await receiptTag(1000, s, pageLabel: '${i + 1} / ${receipts.length}');
+        pTagImg = pw.MemoryImage(pTag.png);
         tw = pageW * pTag.w / 1000;
         th = pageW * pTag.h / 1000;
         bandH = th + pad * 2;
@@ -2114,7 +2274,11 @@ Future<File> buildReceiptsPdf(Session s, List<String> receipts,
     onProgress?.call(receipts.length, receipts.length);
     final dir = await Store.dir();
     final suffix = compact ? '_compact' : '';
-    final file = File('${dir.path}/${s.pdfName}$suffix.pdf');
+    // R1: كل PDF بيتعمل في فولدر داخلي لوحده، فـ PDF جديد لنفس الوحدة في نفس اليوم مبيكتبش أبداً فوق
+    // PDF جلسة قديمة محفوظة في «ملفاتي». اسم الملف اللي بيتبعت زي ما هو بالظبط (POS2 بيتعرف من المحتوى).
+    final sub = Directory('${dir.path}/pdfs/${DateTime.now().microsecondsSinceEpoch}');
+    await sub.create(recursive: true);
+    final file = File('${sub.path}/${s.pdfName}$suffix.pdf');
     await file.writeAsBytes(await doc.save(), flush: true);
     AppLog.i('t pdf compact=$compact ${swPdf.elapsedMilliseconds}ms ${await file.length()}B');
     return file;
@@ -2132,11 +2296,116 @@ String _dayKey() {
   return '${n.year}-${n.month}-${n.day}';
 }
 
+// >>> SLOTS — منطق "ملفاتي" (دالّة صافية من غير ملفات ولا إعدادات، عشان تتجرّب لوحدها)
+/// كل باتش/إيصالات قديمة بتتحفظ هنا كـ "جلسة" (نفس مفاتيح الإعدادات بتاعتها بالظبط)
+/// ومبتتمسحش غير لما الموظف يمسحها بإيده. الأحدث الأول.
+class SavedSlots {
+  static const rcKeys = <String>['draft', 'pdfPath', 'pdfTime', 'pdfImgs', 'rcSentAt', 'rcSentImgs'];
+  static const biKeys = <String>[
+    'batchImg', 'batchSentAt', 'bi_count', 'bi_pi', 'bi_col', 'bi_total', 'systemImg',
+    'bt_count', 'bt_pi', 'bt_col', 'bt_total', // الأرقام اللي الموظف كتبها للباتش ده (بتتحفظ وهو بيكتب)
+  ];
+  static const listKeys = <String>{'draft', 'pdfImgs', 'rcSentImgs'};
+  static const intKeys = <String>{'pdfTime', 'rcSentAt', 'batchSentAt', 'savedAt'};
+  static List<String> keysOf(bool batch) => batch ? biKeys : rcKeys;
+
+  static List<String> strList(Object? v) =>
+      v is List ? [for (final e in v) if (e is String && e.isNotEmpty) e] : <String>[];
+
+  static bool hasContent(Map<String, Object?> s, bool batch) {
+    if (batch) return s['batchImg'] is String;
+    return strList(s['draft']).isNotEmpty || s['pdfPath'] is String;
+  }
+
+  /// كل الملفات اللي الجلسة دي محتاجاها (عشان التنظيف ميمسحهاش).
+  static Set<String> files(Map<String, Object?> s) => {
+        ...strList(s['draft']),
+        ...strList(s['pdfImgs']),
+        ...strList(s['rcSentImgs']),
+        for (final k in ['pdfPath', 'batchImg', 'systemImg'])
+          if (s[k] is String) s[k] as String,
+      };
+
+  static Map<String, Object?> _only(Map<String, Object?> s, bool batch) => {
+        for (final k in keysOf(batch))
+          if (s[k] != null) k: listKeys.contains(k) ? strList(s[k]) : s[k],
+      };
+
+  /// الجلسة الحالية تتنقل لأول "ملفاتي" (لو فيها حاجة) والحالية تبقى فاضية.
+  static ({Map<String, Object?> cur, List<Map<String, Object?>> saved}) stash(
+      Map<String, Object?> cur, List<Map<String, Object?>> saved, bool batch, int now) {
+    final out = [for (final x in saved) Map<String, Object?>.from(x)];
+    if (hasContent(cur, batch)) out.insert(0, {..._only(cur, batch), 'savedAt': now});
+    return (cur: <String, Object?>{}, saved: out);
+  }
+
+  /// فتح جلسة محفوظة للتعديل: الحالية (لو فيها حاجة) تتحفظ مكانها، ومفيش حاجة بتضيع.
+  static ({Map<String, Object?> cur, List<Map<String, Object?>> saved}) reopen(
+      Map<String, Object?> cur, List<Map<String, Object?>> saved, int i, bool batch, int now) {
+    if (i < 0 || i >= saved.length) return (cur: cur, saved: saved);
+    final rest = [for (final x in saved) Map<String, Object?>.from(x)];
+    final item = rest.removeAt(i);
+    final st = stash(cur, rest, batch, now);
+    return (cur: _only(item, batch), saved: st.saved);
+  }
+
+  /// بيشيل الملفات اللي اتمسحت من على التليفون، ويشيل الجلسة لو مبقاش فيها حاجة.
+  static List<Map<String, Object?>> prune(
+      List<Map<String, Object?>> saved, bool batch, bool Function(String) exists) {
+    final out = <Map<String, Object?>>[];
+    for (final s0 in saved) {
+      final s = Map<String, Object?>.from(s0);
+      for (final k in listKeys) {
+        if (s[k] != null) s[k] = strList(s[k]).where(exists).toList();
+      }
+      for (final k in ['pdfPath', 'batchImg', 'systemImg']) {
+        final v = s[k];
+        if (v != null && (v is! String || !exists(v))) s.remove(k);
+      }
+      if (!batch && s['pdfPath'] == null) {
+        s.remove('pdfTime');
+        s.remove('pdfImgs');
+      }
+      if (!batch && strList(s['rcSentImgs']).isEmpty) {
+        s.remove('rcSentAt');
+        s.remove('rcSentImgs');
+      }
+      if (hasContent(s, batch)) out.add(s);
+    }
+    return out;
+  }
+
+  static List<Map<String, Object?>> decode(String? raw) {
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final l = jsonDecode(raw);
+      if (l is! List) return [];
+      return [
+        for (final e in l)
+          if (e is Map)
+            {
+              for (final en in e.entries)
+                if (en.key is String && en.value != null)
+                  en.key as String: listKeys.contains(en.key)
+                      ? strList(en.value)
+                      : (intKeys.contains(en.key) && en.value is num
+                          ? (en.value as num).toInt()
+                          : en.value),
+            }
+      ];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static String encode(List<Map<String, Object?>> l) => jsonEncode(l);
+}
+// <<< SLOTS
+
 class Store {
   static const pdfLife = Duration(hours: 24);
 
-  /// مدة الاحتفاظ بالباتش والإيصالات بعد الإرسال (قابلة للتعديل وإعادة الإرسال).
-  /// بتتمسح تلقائياً مع فتح التطبيق لما المدة تعدّي.
+  /// (قديم) مدة الاحتفاظ بعد الإرسال — مبقتش مستخدمة: الملفات بتفضل لحد ما تتمسح بالإيد.
   static const sentLife = Duration(hours: 12);
   static int working = 0; // عدد العمليات الشغالة (بتمنع التنظيف أثناءها)
   static Future<SharedPreferences> get _p => SharedPreferences.getInstance();
@@ -2245,13 +2514,25 @@ class Store {
   }
 
   /// شيل الصورة من المسودة من غير ما نمسح الملف (عشان "تراجع").
-  static Future<void> unlistFromDraft(String path) async {
+  // cam: تعديلات قايمة المسودة بتتنفّذ واحدة ورا التانية، عشان حفظ لقطة ومسح لقطة في نفس الوقت ميضيّعوش تعديل بعض
+  static Future<void> _draftTail = Future<void>.value();
+  static Future<void> _draftLocked(Future<void> Function() f) {
+    final r = _draftTail.then((_) => f());
+    _draftTail = r.then((_) {}, onError: (_) {});
+    return r;
+  }
+
+  static Future<void> unlistFromDraft(String path) => _draftLocked(() => _unlistFromDraftRaw(path));
+
+  static Future<void> _unlistFromDraftRaw(String path) async {
     final l = await draft();
     l.remove(path);
     await (await _p).setStringList('draft', l);
   }
 
-  static Future<void> relistInDraft(String path, int index) async {
+  static Future<void> relistInDraft(String path, int index) => _draftLocked(() => _relistInDraftRaw(path, index));
+
+  static Future<void> _relistInDraftRaw(String path, int index) async {
     if (!File(path).existsSync()) return;
     final l = await draft();
     if (!l.contains(path)) l.insert(index.clamp(0, l.length), path);
@@ -2358,7 +2639,7 @@ class Store {
     if (v == null || v.length != 3) return null;
     final a = double.tryParse(v[0]), b = double.tryParse(v[1]), c = double.tryParse(v[2]);
     if (a == null || b == null || c == null || !a.isFinite || !b.isFinite || !c.isFinite) return null;
-    return TagPos(a.clamp(0.0, 1.0).toDouble(), aspect - b, c.clamp(0.1, 1.0).toDouble());
+    return TagPos(a.clamp(0.0, 1.0).toDouble(), aspect - b, c.clamp(kTagMinScale, 1.0).toDouble());
   }
 
   /// بيحفظ مكان الورقة لصورة واحدة بس من غير ما يغيّر المكان الافتراضي المحفوظ للباتشات الجاية.
@@ -2380,22 +2661,37 @@ class Store {
 
   /// [fresh] = true لما تكون صورة باتش جديدة (تصوير/معرض)، false لما تكون نتيجة تعديل نفس الباتش.
   /// الباتش الجديد بعد باتش اتبعت بيبدأ من الأول (علامة الإرسال وبيانات الباتش القديمة بتتصفّر).
-  static Future<void> setBatchImg(String path, {bool fresh = false}) async {
+  /// keepSystem (B7 «صوّر الورقة بس»): باتش جديد بس صورة السيستم الحالية بتفضل معاه.
+  static Future<void> setBatchImg(String path, {bool fresh = false, bool keepSystem = false}) async {
     final p = await _p;
     final old = p.getString('batchImg');
-    if (old != null && old != path) await del(old);
+    if (old != null && old != path) {
+      if (fresh && File(old).existsSync()) {
+        // cam: باتش جديد مبيمسحش القديم، بيروح للأرشيف (المسح يدوي بس)
+        final arch = p.getStringList('archive') ?? [];
+        if (!arch.contains(old)) arch.add(old);
+        await p.setStringList('archive', arch);
+      } else {
+        await del(old);
+      }
+    }
     await p.setString('batchImg', path);
+    if (fresh && old != path) {
+      for (final k in kBatchTypedKeys) {
+        await p.remove(k); // صورة باتش جديدة: الأرقام بتتقرا من جديد
+      }
+    }
     // باتش جديد من الكاميرا/المعرض: صورة السيستم القديمة متتعادلش معاه
-    if (fresh && old != null && old != path) await _clearSystemPhoto(p);
-    if (fresh && p.getInt('batchSentAt') != null) await _resetBatchMeta(p);
+    if (fresh && old != null && old != path && !keepSystem) await _clearSystemPhoto(p, archive: true);
+    if (fresh && p.getInt('batchSentAt') != null) await _resetBatchMeta(p, archive: true);
   }
 
-  static Future<void> _resetBatchMeta(SharedPreferences p) async {
+  static Future<void> _resetBatchMeta(SharedPreferences p, {bool archive = false}) async {
     await p.remove('batchSentAt');
-    for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total']) {
+    for (final k in ['bi_count', 'bi_pi', 'bi_col', 'bi_total', ...kBatchTypedKeys]) {
       await p.remove(k);
     }
-    await _clearSystemPhoto(p);
+    await _clearSystemPhoto(p, archive: archive);
   }
 
   /// صورة السيستم المرفقة بالباتش الحالي (بتتبعت معاه كصورة مستقلة بنفس الوصف).
@@ -2409,18 +2705,59 @@ class Store {
     return s;
   }
 
+  static Future<void> archivePath(String path) async => _archivePath(await _p, path);
+
   static Future<void> setSystemPhoto(String path) async {
     final p = await _p;
     final old = p.getString('systemImg');
-    if (old != null && old != path) await del(old);
+    if (old != null && old != path) await _archivePath(p, old); // cam: القديمة للأرشيف مش بتتمسح
     await p.setString('systemImg', path);
   }
 
-  static Future<void> _clearSystemPhoto(SharedPreferences p) async {
+  /// cam: بينقل ملف للأرشيف من غير ما يمسحه (المسح يدوي بس من شاشة الأرشيف).
+  static Future<void> _archivePath(SharedPreferences p, String path) async {
+    if (!File(path).existsSync()) return;
+    final arch = p.getStringList('archive') ?? [];
+    if (!arch.contains(path)) arch.add(path);
+    await p.setStringList('archive', arch);
+  }
+
+  static Future<void> _clearSystemPhoto(SharedPreferences p, {bool archive = false}) async {
     final old = p.getString('systemImg');
-    if (old != null) await del(old);
+    if (old != null) {
+      if (archive) {
+        await _archivePath(p, old);
+      } else {
+        await del(old);
+      }
+    }
     await p.remove('systemImg');
   }
+
+  /// cam: إعادة أخذ للباتش: الصورة والسيستم بيروحوا للأرشيف مش بيتمسحوا.
+  static Future<void> retireBatchImg() async {
+    final p = await _p;
+    final old = p.getString('batchImg');
+    if (old != null) await _archivePath(p, old);
+    await p.remove('batchImg');
+    await _resetBatchMeta(p, archive: true);
+  }
+
+  /// cam: الـPDF المتبعت بيتنقل لأرشيف بإسم فيه الوقت بدل ما يتمسح أو يتكتب فوقه.
+  static Future<void> _archiveSentPdf(SharedPreferences p, String path) async {
+    final f = File(path);
+    if (!f.existsSync()) return;
+    final dir = (await dir_()).path;
+    final base = path.split('/').last;
+    final pre = p.getInt('rcSentAt') != null ? 'sent' : 'pdf';
+    final dst = '$dir/${pre}_${DateTime.now().millisecondsSinceEpoch}_$base';
+    await f.rename(dst);
+    final arch = p.getStringList('archive') ?? [];
+    arch.add(dst);
+    await p.setStringList('archive', arch);
+  }
+
+  static Future<Directory> dir_() => dir();
 
   static Future<void> clearBatchImg() async {
     final p = await _p;
@@ -2431,10 +2768,48 @@ class Store {
   }
 
   /// بعد إرسال الباتش: الصورة وبياناتها بيفضلوا ١٢ ساعة (قابلين للتعديل وإعادة الإرسال).
-  static Future<void> afterBatchSent() async {
+  static Future<void> afterBatchSent([String? tid]) async {
     final p = await _p;
     await p.setInt('batchSentAt', DateTime.now().millisecondsSinceEpoch);
     await setFlag('batch');
+    if (tid != null && tid.isNotEmpty) {
+      // B9: «اتبعت النهارده» لكل ماكينة لوحدها (وحدة تانية النهارده متتحسبش مكرر)
+      final day = _dayKey();
+      final cur = p.getString('batchSentTids') ?? '';
+      final parts = cur.split('|');
+      final set = parts.length == 2 && parts[0] == day ? parts[1].split(',').where((e) => e.isNotEmpty).toSet() : <String>{};
+      set.add(tid);
+      await p.setString('batchSentTids', '$day|${set.join(',')}');
+    }
+  }
+
+  /// B9: الباتش بتاع الماكينة دي اتبعت النهارده؟
+  static Future<bool> batchSentToday(String tid) async {
+    final cur = (await _p).getString('batchSentTids') ?? '';
+    final parts = cur.split('|');
+    if (parts.length != 2 || parts[0] != _dayKey()) return false;
+    return parts[1].split(',').contains(tid);
+  }
+
+  /// B8: آخر تنبيه ترمنل لصورة سيستم معيّنة (بيتعرض تاني قبل الإرسال). null = مفيش تنبيه.
+  static Future<void> setSysTidWarn(String path, String? w) async {
+    final p = await _p;
+    if (w == null) {
+      await p.remove('sysTidWarn');
+    } else {
+      await p.setString('sysTidWarn', jsonEncode({'p': path, 'w': w}));
+    }
+  }
+
+  static Future<String?> sysTidWarn(String path) async {
+    try {
+      final raw = (await _p).getString('sysTidWarn');
+      if (raw == null) return null;
+      final m = jsonDecode(raw) as Map<String, dynamic>;
+      return m['p'] == path ? m['w'] as String? : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   /// وقت إرسال الباتش (null لو لسه متبعتش).
@@ -2455,7 +2830,9 @@ class Store {
     return l.where((e) => File(e).existsSync()).toList();
   }
 
-  static Future<void> addToDraft(String path) async {
+  static Future<void> addToDraft(String path) => _draftLocked(() => _addToDraftRaw(path));
+
+  static Future<void> _addToDraftRaw(String path) async {
     final l = await draft();
     final p = await _p;
     if (l.isEmpty) {
@@ -2467,7 +2844,9 @@ class Store {
     await p.setStringList('draft', l);
   }
 
-  static Future<void> removeFromDraft(String path) async {
+  static Future<void> removeFromDraft(String path) => _draftLocked(() => _removeFromDraftRaw(path));
+
+  static Future<void> _removeFromDraftRaw(String path) async {
     final l = await draft();
     l.remove(path);
     await del(path);
@@ -2583,7 +2962,9 @@ class Store {
       (await _p).setString('edit:$path', e.encode());
 
   /// بعد تعديل إيصال: الصورة الجديدة تاخد مكان القديمة في نفس الترتيب.
-  static Future<void> replaceInDraft(String old, String neu) async {
+  static Future<void> replaceInDraft(String old, String neu) => _draftLocked(() => _replaceInDraftRaw(old, neu));
+
+  static Future<void> _replaceInDraftRaw(String old, String neu) async {
     final l = await draft();
     final i = l.indexOf(old);
     if (i < 0) {
@@ -2614,12 +2995,8 @@ class Store {
     final t = p.getInt('pdfTime');
     if (path == null || t == null) return null;
     final time = DateTime.fromMillisecondsSinceEpoch(t);
-    // لو الإيصالات اتبعتت: المدة ١٢ ساعة من وقت الإرسال، وإلا ٢٤ ساعة من وقت إنشاء الـ PDF
-    final sentT = p.getInt('rcSentAt');
-    final age = DateTime.now()
-        .difference(sentT == null ? time : DateTime.fromMillisecondsSinceEpoch(sentT));
-    final life = sentT == null ? pdfLife : sentLife;
-    if (age > life || !File(path).existsSync()) {
+    // الـ PDF بيفضل لحد ما الموظف يمسحه بإيده (مفيش مسح بالوقت)
+    if (!File(path).existsSync()) {
       await clearPdf();
       return null;
     }
@@ -2629,7 +3006,7 @@ class Store {
   static Future<void> setPdf(File f, List<String> imgs) async {
     final p = await _p;
     final old = p.getString('pdfPath');
-    if (old != null && old != f.path) await del(old);
+    if (old != null && old != f.path) await _archiveSentPdf(p, old); // cam: أي PDF بيتبدّل بيتحفظ
     await p.setString('pdfPath', f.path);
     await p.setInt('pdfTime', DateTime.now().millisecondsSinceEpoch);
     await p.setStringList('pdfImgs', imgs);
@@ -2638,7 +3015,7 @@ class Store {
   static Future<void> clearPdf() async {
     final p = await _p;
     final old = p.getString('pdfPath');
-    if (old != null) await del(old);
+    if (old != null) await _archiveSentPdf(p, old); // cam: أي PDF بيتنضّف بيتحفظ في الأرشيف
     await p.remove('pdfPath');
     await p.remove('pdfTime');
     await p.remove('pdfImgs');
@@ -2674,60 +3051,22 @@ class Store {
     final p = await _p;
     final sent = p.getStringList('rcSentImgs') ?? [];
     final left = await draft();
+    final arch = p.getStringList('archive') ?? [];
     for (final u in sent) {
-      await del(u);
+      // cam: «ابدأ جديد» مبيمسحش المتبعت، بينقله للأرشيف (المسح يدوي بس)
+      if (File(u).existsSync() && !arch.contains(u)) arch.add(u);
       left.remove(u);
     }
+    await p.setStringList('archive', arch);
     await p.setStringList('draft', left);
+    await clearPdf(); // قبل ما نمسح علامة الإرسال، عشان الـPDF المتبعت يتحفظ
     await p.remove('rcSentAt');
     await p.remove('rcSentImgs');
-    await clearPdf();
   }
 
-  /// بيتنفّذ مع فتح التطبيق: بيمسح الباتش والإيصالات اللي عدّى عليهم أكتر من ١٢ ساعة من الإرسال.
-  static Future<void> expireSent() async {
-    if (working > 0) return;
-    final p = await _p;
-    final now = DateTime.now();
-    final bt = p.getInt('batchSentAt');
-    if (bt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(bt)) > sentLife) {
-      final bi = p.getString('batchImg');
-      if (bi != null && await isKept(bi)) {
-        // محفوظ: يروح للأرشيف بدل المسح (ميفضلش باتش حالي)
-        final arch = p.getStringList('archive') ?? [];
-        if (!arch.contains(bi)) arch.add(bi);
-        await p.setStringList('archive', arch);
-        await setKept(bi, false);
-        await p.remove('batchImg');
-        await _resetBatchMeta(p);
-      } else {
-        await clearBatchImg();
-      }
-    }
-    final rt = p.getInt('rcSentAt');
-    if (rt != null && now.difference(DateTime.fromMillisecondsSinceEpoch(rt)) > sentLife) {
-      // الإيصالات المحفوظة تروح للأرشيف الأول، والباقي يتمسح عادي
-      final sent = p.getStringList('rcSentImgs') ?? [];
-      final arch = p.getStringList('archive') ?? [];
-      final left = await draft();
-      var changed = false;
-      for (final u in List.of(sent)) {
-        if (await isKept(u)) {
-          if (!arch.contains(u)) arch.add(u);
-          changed = true;
-          await setKept(u, false);
-          sent.remove(u);
-          left.remove(u);
-        }
-      }
-      if (changed) {
-        await p.setStringList('archive', arch);
-        await p.setStringList('rcSentImgs', sent);
-        await p.setStringList('draft', left);
-      }
-      await discardSentReceipts();
-    }
-  }
+  /// كان بيمسح الباتش والإيصالات بعد ١٢ ساعة من الإرسال. دلوقتي كل حاجة بتفضل في "ملفاتي"
+  /// لحد ما الموظف يمسحها بإيده، فالدالة مبقتش بتمسح حاجة.
+  static Future<void> expireSent() async {}
 
   // --- علامة ✓ (بتتصفّر كل يوم جديد) ---
   static Future<bool> flag(String k) async {
@@ -2791,14 +3130,155 @@ class Store {
 
   static Future<void> clearLog() async => (await _p).remove('sendLog');
 
+  /// قبل مسح الباتش/الإيصالات الحالية بالإيد: الصور المعلّم عليها "احتفظ بيها" تروح للأرشيف بدل المسح.
+  static Future<void> keptToArchive(bool batch) async {
+    final p = await _p;
+    final arch = p.getStringList('archive') ?? [];
+    final moved = <String>[];
+    if (batch) {
+      final bi = p.getString('batchImg');
+      if (bi != null && await isKept(bi)) moved.add(bi);
+    } else {
+      for (final x in await draft()) {
+        if (await isKept(x)) moved.add(x);
+      }
+    }
+    if (moved.isEmpty) return;
+    for (final f in moved) {
+      if (!arch.contains(f)) arch.add(f);
+      await setKept(f, false);
+    }
+    await p.setStringList('archive', arch);
+    if (batch) {
+      await p.remove('batchImg');
+    } else {
+      for (final k in ['draft', 'pdfImgs', 'rcSentImgs']) {
+        final l = p.getStringList(k);
+        if (l != null) await p.setStringList(k, l.where((e) => !moved.contains(e)).toList());
+      }
+    }
+  }
+
+  // --- ملفاتي: الباتشات والإيصالات القديمة (بتفضل لحد ما الموظف يمسحها بإيده) ---
+  static String _savedKey(bool batch) => batch ? 'savedBatches' : 'savedReceipts';
+
+  static Map<String, Object?> _readCur(SharedPreferences p, bool batch) {
+    final m = <String, Object?>{};
+    for (final k in SavedSlots.keysOf(batch)) {
+      final Object? v = SavedSlots.listKeys.contains(k)
+          ? p.getStringList(k)
+          : (SavedSlots.intKeys.contains(k) ? p.getInt(k) : p.getString(k));
+      if (v != null) m[k] = v;
+    }
+    return m;
+  }
+
+  static Future<void> _writeCur(SharedPreferences p, Map<String, Object?> m, bool batch) async {
+    for (final k in SavedSlots.keysOf(batch)) {
+      final v = m[k];
+      if (v == null) {
+        if (k == 'draft') {
+          await p.setStringList(k, []);
+        } else {
+          await p.remove(k);
+        }
+      } else if (SavedSlots.listKeys.contains(k)) {
+        await p.setStringList(k, SavedSlots.strList(v));
+      } else if (v is int) {
+        await p.setInt(k, v);
+      } else {
+        await p.setString(k, v.toString());
+      }
+    }
+  }
+
+  static Future<void> _writeSaved(
+      SharedPreferences p, bool batch, List<Map<String, Object?>> l) async {
+    if (l.isEmpty) {
+      await p.remove(_savedKey(batch));
+    } else {
+      await p.setString(_savedKey(batch), SavedSlots.encode(l));
+    }
+  }
+
+  /// الباتشات/الإيصالات المحفوظة في "ملفاتي"، الأحدث الأول.
+  static Future<List<Map<String, Object?>>> saved(bool batch) async {
+    final p = await _p;
+    final raw = SavedSlots.decode(p.getString(_savedKey(batch)));
+    final l = SavedSlots.prune(raw, batch, (f) => File(f).existsSync());
+    if (jsonEncode(l) != jsonEncode(raw)) await _writeSaved(p, batch, l);
+    return l;
+  }
+
+  /// قبل ما نفتح باتش/إيصالات جديدة: اللي شغالين عليه يتحفظ في "ملفاتي" (اتبعت أو لأ).
+  static Future<void> stashCurrent(bool batch) async {
+    final p = await _p;
+    final st = SavedSlots.stash(
+        _readCur(p, batch), await saved(batch), batch, DateTime.now().millisecondsSinceEpoch);
+    await _writeSaved(p, batch, st.saved);
+    await _writeCur(p, st.cur, batch);
+  }
+
+  /// فتح واحد من "ملفاتي" للتعديل (اللي كان مفتوح بيتحفظ مكانه).
+  static Future<void> reopenSaved(bool batch, int i) async {
+    final p = await _p;
+    final st = SavedSlots.reopen(_readCur(p, batch), await saved(batch), i, batch,
+        DateTime.now().millisecondsSinceEpoch);
+    await _writeSaved(p, batch, st.saved);
+    await _writeCur(p, st.cur, batch);
+  }
+
+  /// مسح واحد من "ملفاتي" بإيد الموظف. الصور المعلّم عليها "احتفظ بيها" بتروح للأرشيف بدل المسح.
+  static Future<void> deleteSaved(bool batch, int i) async {
+    final p = await _p;
+    final l = await saved(batch);
+    if (i < 0 || i >= l.length) return;
+    final item = l.removeAt(i);
+    await _writeSaved(p, batch, l);
+    final inUse = <String>{
+      ...await draft(),
+      ...await pdfImgs(),
+      ...(p.getStringList('rcSentImgs') ?? []),
+      if (p.getString('batchImg') != null) p.getString('batchImg')!,
+      if (p.getString('systemImg') != null) p.getString('systemImg')!,
+      if (p.getString('pdfPath') != null) p.getString('pdfPath')!,
+      for (final s in [...l, ...await saved(!batch)]) ...SavedSlots.files(s),
+    };
+    final arch = p.getStringList('archive') ?? [];
+    var archChanged = false;
+    for (final f in SavedSlots.files(item)) {
+      if (inUse.contains(f) || arch.contains(f)) continue;
+      if (f != item['pdfPath'] && f != item['systemImg'] && await isKept(f)) {
+        arch.add(f);
+        archChanged = true;
+        await setKept(f, false);
+      } else {
+        await del(f);
+      }
+    }
+    if (archChanged) await p.setStringList('archive', arch);
+  }
+
   /// مسح أي ملفات مؤقتة مش تابعة لمسودة أو PDF شغّال. مبتشتغلش لو فيه عملية شغالة.
   static Future<void> cleanup() async {
     if (working > 0) return;
     final keep = <String>{...await draft(), ...await pdfImgs(), ...await archive()};
     final bi = await batchImg();
     if (bi != null) keep.add(bi);
+    // cam: صفحات السكانر وصورة السيستم متتمسحش في التنضيف التلقائي
+    final pp = await _p;
+    keep.addAll(pp.getStringList('scanPages') ?? []);
+    keep.addAll(await ScanDocs.files()); // مستندات السكانر (مسح يدوي بس)
+    final sysI = pp.getString('systemImg');
+    if (sysI != null) keep.add(sysI);
     final pdfPath = (await pdf())?.file.path;
     if (pdfPath != null) keep.add(pdfPath);
+    keep.addAll((await _p).getStringList('rcSentImgs') ?? []);
+    for (final b in [true, false]) {
+      for (final s in await saved(b)) {
+        keep.addAll(SavedSlots.files(s));
+      }
+    }
     keep.addAll(keep.map(baseOf).toList());
     await for (final e in (await dir()).list()) {
       if (working > 0) return;
@@ -2903,6 +3383,15 @@ Future<void> markPickTarget(String t) async {
   }
 }
 
+/// B2: بعد ما المنتقي يرجع (اتصور أو اتلغى) العلامة بتتمسح، عشان صورة قديمة متتحسبش على شاشة غلط.
+Future<void> clearPickTarget() async {
+  try {
+    await (await SharedPreferences.getInstance()).remove('pickTarget');
+  } catch (e, st) {
+    AppLog.e('clearPickTarget', e, st);
+  }
+}
+
 Future<void> stashLostPick() async {
   try {
     final r = await ImagePicker().retrieveLostData();
@@ -2968,25 +3457,36 @@ bool _scanBusy = false; // يمنع فتح الماسح مرتين (الضغط �
 /// آخر صور رجعت من ماسح جوجل: هل اتعملها تحسين الوضع الكامل؟ (متحسّمة = ميتحطش عليها فلتر تاني)
 bool _lastScanEnhanced = false;
 
+/// retryFailed (السكانر بس): يجرّب ماسح جوجل تاني حتى لو فشل قبل كده، بدل قفل الـ ٣ أيام.
+/// الباتش والإيصالات مبيبعتوهاش، فسلوكهم زي ما هو.
 Future<List<String>> scanImages(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.base, bool camFallback = false, ImageQualityProfile? profile}) async {
+    {ScannerMode mode = ScannerMode.base,
+    bool camFallback = false,
+    ImageQualityProfile? profile,
+    bool retryFailed = false}) async {
   if (_scanBusy) return [];
   _scanBusy = true;
   try {
-    return await _scanImagesImpl(context, limit, mode: mode, camFallback: camFallback, profile: profile);
+    return await _scanImagesImpl(context, limit,
+        mode: mode, camFallback: camFallback, profile: profile, retryFailed: retryFailed);
   } finally {
     _scanBusy = false;
   }
 }
 
 Future<List<String>> _scanImagesImpl(BuildContext context, int limit,
-    {ScannerMode mode = ScannerMode.base, bool camFallback = false, ImageQualityProfile? profile}) async {
+    {ScannerMode mode = ScannerMode.base,
+    bool camFallback = false,
+    ImageQualityProfile? profile,
+    bool retryFailed = false}) async {
   _lastScanManual = false;
   _lastScanEnhanced = false;
   if (!await ensureCamera(context)) return [];
   if (!context.mounted) return [];
   final perf = await Store.perfMode();
-  if (_scannerFailed || perf == PerfMode.lite) return _manualPick(context, multi: limit > 1, profile: profile);
+  if ((_scannerFailed && !retryFailed) || perf == PerfMode.lite) {
+    return _manualPick(context, multi: limit > 1, profile: profile);
+  }
   Object? lastErr;
 
   // بيرجّع قائمة الصور، أو قائمة فاضية لو المستخدم لغى، أو null لو الماسح فشل.
@@ -3512,13 +4012,44 @@ Future<BatchInfo?> askBatchInfo(BuildContext context, String img, Session s) asy
           textDirection: TextDirection.rtl, child: _BatchInfoSheet(init: init, img: img, session: s)),
     ),
   );
-  if (r != null) {
-    await p.setString('bi_count', r.count);
-    await p.setString('bi_pi', r.piasters);
-    await p.setString('bi_col', r.collected);
-    await p.setString('bi_total', r.total);
-  }
+  if (r != null) await rememberBatchInfo(r);
   return r;
+}
+
+/// أرقام الباتش الحالي زي ما الموظف كتبها (B3/B4/B5): بتتحفظ وهو بيكتب، وبتفضل بعد القص/الفلتر،
+/// وبعد ما أندرويد يقفل التطبيق، ولما الباتش يتفتح تاني من «ملفاتي». الـ OCR مبيكتبش فوقها.
+const kBatchTypedKeys = <String>['bt_count', 'bt_pi', 'bt_col', 'bt_total'];
+
+/// null لكل خانة متكتبتش. باتش متبعت قديم (من غير bt_*) بيرجع بالأرقام اللي اتبعتت.
+Future<({String? count, String? pi, String? col, String? total})> loadTypedBatchInfo() async {
+  final p = await SharedPreferences.getInstance();
+  String? g(String k) => p.getString(k);
+  final sent = p.getInt('batchSentAt') != null;
+  return (
+    count: g('bt_count') ?? (sent ? g('bi_count') : null),
+    pi: g('bt_pi') ?? (sent ? g('bi_pi') : null),
+    col: g('bt_col') ?? (sent ? g('bi_col') : null),
+    total: g('bt_total') ?? (sent ? g('bi_total') : null),
+  );
+}
+
+Future<void> saveTypedBatchInfo({String? count, String? pi, String? col, String? total}) async {
+  final p = await SharedPreferences.getInstance();
+  Future<void> put(String k, String? v) async {
+    if (v != null) await p.setString(k, v);
+  }
+  await put('bt_count', count);
+  await put('bt_pi', pi);
+  await put('bt_col', col);
+  await put('bt_total', total);
+}
+
+Future<void> rememberBatchInfo(BatchInfo r) async {
+  final p = await SharedPreferences.getInstance();
+  await p.setString('bi_count', r.count);
+  await p.setString('bi_pi', r.piasters);
+  await p.setString('bi_col', r.collected);
+  await p.setString('bi_total', r.total);
 }
 
 /// صورة بتتكبّر وتتصغّر بإصبعين، ونقرتين بتكبّر عند مكان النقر (ونقرتين تاني بترجّع).
@@ -3618,7 +4149,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
   @override
   void initState() {
     super.initState();
-    _ocr();
+    _restoreTyped().whenComplete(_ocr); // الأرقام المحفوظة الأول، وبعدها الـ OCR (مبيكتبش فوقها)
     Store.systemPhoto().then((s) {
       if (mounted && s != null) {
         setState(() => sysImg = s);
@@ -3633,7 +4164,14 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     if (sysBusy) return;
     setState(() => sysBusy = true);
     try {
-      final x = await ImagePicker().pickImage(source: src); // الأصل زي ما اتصور
+      // B2: لو أندرويد قفل التطبيق في كاميرا النظام، الصورة بترجع كصورة سيستم (مش باتش جديد)
+      await markPickTarget('system');
+      final XFile? x;
+      try {
+        x = await ImagePicker().pickImage(source: src); // الأصل زي ما اتصور
+      } finally {
+        await clearPickTarget();
+      }
       if (x == null || !mounted) return;
       final dest =
           '${(await Store.dir()).path}/system_${DateTime.now().microsecondsSinceEpoch}.jpg';
@@ -3662,9 +4200,14 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
       final w = sysTidWarning(tids, widget.session.unit, AppData.units);
       AppLog.i('sys tid read=${tids.join(',')} unit=${widget.session.unit.tid} warn=${w != null}');
       if (w != null) HapticFeedback.vibrate();
+      unawaited(Store.setSysTidWarn(path, w)); // B8: التنبيه بيتكرر تاني قبل الإرسال
       setState(() => sysWarn = w);
     } catch (e) {
       AppLog.i('sys tid ocr failed: $e');
+      // M2/F9: الفحص مخلصش (مهلة/خطأ): ملاحظة بس، مش تنبيه ومبتوقفش الإرسال
+      if (mounted && sysImg == path && sysWarn == null) {
+        setState(() => sysWarn = kSysTidUnread);
+      }
     }
   }
 
@@ -3673,6 +4216,41 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     if (s == null) return;
     Navigator.push(context,
         MaterialPageRoute(builder: (_) => ZoomPage(child: Image.file(File(s)))));
+  }
+
+  bool _restored = false;
+  Timer? _saveT;
+
+  Future<void> _restoreTyped() async {
+    try {
+      final t = await loadTypedBatchInfo();
+      if (!mounted) return;
+      setState(() {
+        if (t.count != null && t.count!.isNotEmpty) {
+          c1.text = t.count!;
+          d1 = true;
+          _restored = true;
+        }
+        if (t.total != null && t.total!.isNotEmpty) {
+          c4.text = t.total!;
+          d4 = true;
+          _restored = true;
+        }
+        if (t.pi != null) c2.text = t.pi!;
+        if (t.col != null) c3.text = t.col!;
+      });
+    } catch (e, st) {
+      AppLog.e('batch.restoreTyped', e, st);
+    }
+  }
+
+  /// بيحفظ اللي الموظف كتبه بس (العدد والإجمالي لو كتبهم بإيده، والقروش والمجمعة).
+  void _saveSoon() {
+    _saveT?.cancel();
+    _saveT = Timer(const Duration(milliseconds: 400), () {
+      saveTypedBatchInfo(
+          count: d1 ? c1.text : null, pi: c2.text, col: c3.text, total: d4 ? c4.text : null);
+    });
   }
 
   Future<void> _ocr() async {
@@ -3701,6 +4279,7 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
       } else {
         note = 'اتقرا من الصورة، راجع القيم قبل الإرسال';
       }
+      if (_restored) note = 'الأرقام اللي كتبتها قبل كده اترجعت. راجعها قبل الإرسال';
     });
   }
 
@@ -3709,6 +4288,11 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
     c1.dispose();
     c2.dispose();
     c3.dispose();
+    _saveT?.cancel();
+    if (d1 || d4) {
+      // آخر حاجة اتكتبت قبل ما الشاشة تتقفل
+      saveTypedBatchInfo(count: d1 ? c1.text : null, pi: c2.text, col: c3.text, total: d4 ? c4.text : null);
+    }
     c4.dispose();
     super.dispose();
   }
@@ -3810,14 +4394,20 @@ class _BatchInfoSheetState extends State<_BatchInfoSheet> {
                         ),
                       ),
                     Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Expanded(child: _f(c1, 'عدد المعاملات', onEdit: () => d1 = true)),
+                      Expanded(child: _f(c1, 'عدد المعاملات', onEdit: () {
+                        d1 = true;
+                        _saveSoon();
+                      })),
                       const SizedBox(width: 10),
-                      Expanded(child: _f(c4, 'الإجمالي', dec: true, onEdit: () => d4 = true)),
+                      Expanded(child: _f(c4, 'الإجمالي', dec: true, onEdit: () {
+                        d4 = true;
+                        _saveSoon();
+                      })),
                     ]),
                     Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Expanded(child: _f(c2, 'القروش الفاصلة', selectAll: true)),
+                      Expanded(child: _f(c2, 'القروش الفاصلة', selectAll: true, onEdit: _saveSoon)),
                       const SizedBox(width: 10),
-                      Expanded(child: _f(c3, 'المعاملات المجمعة', selectAll: true)),
+                      Expanded(child: _f(c3, 'المعاملات المجمعة', selectAll: true, onEdit: _saveSoon)),
                     ]),
                     Row(children: [
                       Expanded(
@@ -3966,8 +4556,13 @@ Future<bool> preSendCheckBatch(BuildContext context, Session s, String img) asyn
     final q = await _runWithProgress<String?>(context, 'بنراجع صورة الباتش...', () => qualityWarning(img));
     if (q != null) w.add('صورة الباتش: $q');
     if (await Store.noTag(img)) w.add('ورقة البيانات (الاسم والوحدة) مخفية في صورة الباتش');
-    if (await Store.flag('batch')) {
-      w.add('الباتش اتبعت النهارده قبل كده. لو بتبعت نسخة معدّلة تمام، غير كده اتأكد إنه مش مكرر');
+    if (await Store.batchSentToday(s.unit.tid)) {
+      w.add('الباتش بتاع الماكينة دي اتبعت النهارده قبل كده. لو بتبعت نسخة معدّلة تمام، غير كده اتأكد إنه مش مكرر');
+    }
+    final sys = await Store.systemPhoto();
+    if (sys != null) {
+      final tw = await Store.sysTidWarn(sys);
+      if (tw != null) w.add('صورة السيستم: $tw'); // B8: تنبيه بس، "كمّل" بيبعت عادي
     }
   } catch (e, st) {
     AppLog.e('preSendCheckBatch', e, st);
@@ -3994,7 +4589,6 @@ Future<bool> preSendCheckReceipts(BuildContext context, Session s, List<String> 
     if (hidden.isNotEmpty) {
       w.add('إيصال رقم ${hidden.join('، ')}: من غير ورقة البيانات (الاسم والوحدة)');
     }
-    if (!await Store.flag('batch')) w.add('الباتش لسه ما اتبعتش النهارده');
     if (await Store.flag('receipts')) {
       w.add('إيصالات الدفع اتبعتت النهارده قبل كده. لو بتبعت نسخة معدّلة تمام، غير كده اتأكد إنها مش مكررة');
     }
@@ -4005,8 +4599,12 @@ Future<bool> preSendCheckReceipts(BuildContext context, Session s, List<String> 
   return confirmWarnings(context, w);
 }
 
-Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
-  final info = await askBatchInfo(context, img, s);
+Future<bool> sendBatchFile(BuildContext context, Session s, String img, {BatchInfo? info}) async {
+  if (info != null) {
+    await rememberBatchInfo(info);
+  } else {
+    info = await askBatchInfo(context, img, s);
+  }
   if (info == null || !context.mounted) return false;
   final caption = batchCaption(s, info);
   Store.working++;
@@ -4021,13 +4619,24 @@ Future<bool> sendBatchFile(BuildContext context, Session s, String img) async {
   if (!context.mounted) return false;
   final sys = await Store.systemPhoto();
   // نسخ مضبوطة لواتساب: الباتش بتحسين مستند، وصورة السيستم تصغير جيد فقط (زي ما اتصورت) + شريط تحتها
-  final outShare = await waShareCopy(out.path, enhance: true);
-  // صورة السيستم + شريط A2R SYS تحتها (الترمنل وكود الوحدة) علشان POS2 يعرف الماكينة صح
-  final sysShare = sys == null ? null : await sysShareCopy(sys, s);
-  final ok = await shareFiles(context, [outShare, if (sysShare != null) sysShare],
+  // بالجودة الكاملة من غير تصغير؛ لو التجهيز فشل مبنبعتش حاجة تانية بدالها، والملفات المحفوظة زي ما هي
+  final String outShare;
+  final String? sysShare;
+  try {
+    outShare = await waShareCopy(out.path, enhance: true, fullRes: true);
+    // صورة السيستم + شريط A2R SYS تحتها (الترمنل وكود الوحدة) علشان POS2 يعرف الماكينة صح
+    sysShare = sys == null ? null : await sysShareCopy(sys, s);
+  } catch (e) {
+    if (context.mounted) {
+      snack(context, 'ما اتبعتش حاجة: تجهيز الصورة بالجودة الكاملة فشل (${errText(e)}). الملفات المحفوظة زي ما هي');
+    }
+    return false;
+  }
+  // صورة السيستم الأول والباتش آخر صورة: واتساب بيحط الوصف تحت آخر صورة في الاختيار
+  final ok = await shareFiles(context, [if (sysShare != null) sysShare, outShare],
       text: caption);
   if (ok) {
-    await Store.afterBatchSent();
+    await Store.afterBatchSent(s.unit.tid);
     await Store.addLog(s, 'batch', 'عدد المعاملات ${info.count} - الإجمالي ${info.total}');
   }
   return ok;
@@ -4044,6 +4653,7 @@ class TaggedImage extends StatelessWidget {
   final double? aspect;
   final ValueChanged<TagPos>? onChanged;
   final bool showTag;
+  final double zoom;
   const TaggedImage(
       {super.key,
       required this.path,
@@ -4051,7 +4661,8 @@ class TaggedImage extends StatelessWidget {
       required this.pos,
       this.aspect,
       this.onChanged,
-      this.showTag = true});
+      this.showTag = true,
+      this.zoom = 1});
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (ctx, cons) {
@@ -4073,6 +4684,7 @@ class TaggedImage extends StatelessWidget {
             pos: pos,
             cw: cw,
             maxCy: aspect ?? 3,
+            zoom: zoom,
             onChanged: onChanged!,
             child: DecoratedBox(
                 decoration: BoxDecoration(border: Border.all(color: Colors.blue, width: 2)),
@@ -4106,6 +4718,7 @@ class TaggedImage extends StatelessWidget {
 class _TagDrag extends StatefulWidget {
   final TagPos pos;
   final double cw, maxCy;
+  final double zoom; // تكبير العرض (محفوظ للتوافق: فلتر الحركة بيتحول لإحداثيات الورقة تلقائياً)
   final ValueChanged<TagPos> onChanged;
   final Widget child;
   const _TagDrag(
@@ -4113,7 +4726,8 @@ class _TagDrag extends StatefulWidget {
       required this.cw,
       required this.maxCy,
       required this.onChanged,
-      required this.child});
+      required this.child,
+      this.zoom = 1});
   @override
   State<_TagDrag> createState() => _TagDragState();
 }
@@ -4127,7 +4741,7 @@ class _TagDragState extends State<_TagDrag> {
         onScaleStart: (_) => startS = widget.pos.s,
         onScaleUpdate: (d) {
           final p = widget.pos;
-          final s = (startS * d.scale).clamp(0.1, 1.0).toDouble();
+          final s = (startS * d.scale).clamp(kTagMinScale, 1.0).toDouble();
           final cx = (p.cx + d.focalPointDelta.dx / widget.cw).clamp(0.0, 1.0).toDouble();
           final cy =
               (p.cy + d.focalPointDelta.dy / widget.cw).clamp(0.0, widget.maxCy).toDouble();
@@ -4392,7 +5006,8 @@ Future<void> main() async {
     }
     gResLevel = (sp.getInt('resLevel') ?? 0).clamp(0, kResLevels.length);
     final t = sp.getInt('scannerFailedAt') ?? 0;
-    _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 3 * 24 * 3600 * 1000;
+    // B17: كانت بتقفل ماسح جوجل ٣ أيام بعد غلطة واحدة؛ دلوقتي ١٠ دقايق بس وبعدها يتجرّب تاني
+    _scannerFailed = DateTime.now().millisecondsSinceEpoch - t < 10 * 60 * 1000;
   } catch (e, st) {
     AppLog.e('main', e, st);
   }
@@ -4526,7 +5141,11 @@ class _LoginScreenState extends State<LoginScreen> {
     final nav = Navigator.of(context);
     nav.push(MaterialPageRoute(builder: (_) => MainScreen(session: s)));
     nav.push(MaterialPageRoute(
-        builder: (_) => target == 'batch' ? BatchScreen(session: s) : ReceiptsScreen(session: s)));
+        builder: (_) => target == 'batch' || target == 'system'
+            ? BatchScreen(session: s) // system: صورة السيستم بترجع للباتش المفتوح (مش باتش جديد)
+            : target == 'scanner'
+                ? ScanDocScreen(session: s)
+                : ReceiptsScreen(session: s)));
   }
 
   Future<void> _save() async {
@@ -5131,12 +5750,16 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   List<String> draft = [];
+  List<String> saved = []; // cam: الملفات المحفوظة (اللي اتبدّلت أو اتبعتت) تحت «ملفاتي»
+  int scanCount = 0;
   String? batchImg;
   ({File file, DateTime time})? pdf;
   bool batchSent = false;
   bool receiptsSent = false;
   DateTime? batchSentAt; // لو الباتش اتبعت وسايبينه ١٢ ساعة للتعديل
   DateTime? receiptsSentAt; // نفس الكلام للإيصالات
+  List<Map<String, Object?>> savedB = []; // باتشات قديمة في "ملفاتي" (الأحدث الأول)
+  List<Map<String, Object?>> savedR = []; // إيصالات قديمة في "ملفاتي"
   bool busy = false;
 
   @override
@@ -5158,30 +5781,22 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _onResume() async {
-    // التنظيف بعد ١٢ ساعة بس لو الشاشة الرئيسية هي اللي قدام (مش وإحنا في تعديل)
-    if (mounted && (ModalRoute.of(context)?.isCurrent ?? false)) {
-      try {
-        await Store.expireSent();
-      } catch (e, st) {
-        AppLog.e('expireSent', e, st);
-      }
-    }
+    // مفيش مسح بالوقت: كل حاجة بتفضل في "ملفاتي" لحد ما تتمسح بالإيد
     await _reload();
   }
 
-  /// الوقت المتبقي قبل مسح الملف المتبعت.
-  String _leftText(DateTime sent) {
-    final left = Store.sentLife - DateTime.now().difference(sent);
-    if (left.inMinutes <= 0) return 'أقل من دقيقة';
-    final h = left.inHours, m = left.inMinutes % 60;
-    if (h == 0) return '$m دقيقة';
-    return m == 0 ? '$h ساعة' : '$h ساعة و$m دقيقة';
+  /// وقت مختصر: "النهارده 14:05" أو "24/11 14:05".
+  String _when(DateTime t) {
+    final n = DateTime.now();
+    String two(int v) => v.toString().padLeft(2, '0');
+    final hm = '${two(t.hour)}:${two(t.minute)}';
+    if (t.year == n.year && t.month == n.month && t.day == n.day) return 'النهارده $hm';
+    return '${t.day}/${t.month} $hm';
   }
 
   Future<void> _init() async {
     await requestAllPermissions();
     try {
-      await Store.expireSent(); // مسح اللي عدّى عليه ١٢ ساعة من الإرسال
       await Store.cleanup();
     } catch (e, st) {
       AppLog.e('_init', e, st);
@@ -5197,8 +5812,23 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final r = await Store.flag('receipts');
     final bs = await Store.batchSentAt();
     final rs = await Store.receiptsSentAt();
+    final sv = await Store.archive();
+    sv.sort((a, b) {
+      try {
+        return File(b).lastModifiedSync().compareTo(File(a).lastModifiedSync());
+      } catch (_) {
+        return 0;
+      }
+    });
+    final sc = (await ScanDocs.all()).length;
+    final sb = await Store.saved(true);
+    final sr = await Store.saved(false);
     if (!mounted) return;
     setState(() {
+      saved = sv;
+      scanCount = sc;
+      savedB = sb;
+      savedR = sr;
       draft = d;
       pdf = f;
       batchImg = bi;
@@ -5207,6 +5837,65 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       batchSentAt = bs;
       receiptsSentAt = rs;
     });
+  }
+
+  String _savedKind(String path) {
+    final n = path.split('/').last;
+    if (n.toLowerCase().endsWith('.pdf')) return n.startsWith('sent_') ? 'ملف PDF متبعت' : 'ملف PDF';
+    if (n.startsWith('batch')) return 'باتش محفوظ';
+    if (n.startsWith('scan')) return 'سكانر محفوظ';
+    if (n.startsWith('r_')) return 'إيصال محفوظ';
+    return 'صورة محفوظة';
+  }
+
+  String _savedDate(String path) {
+    try {
+      final t = File(path).lastModifiedSync();
+      return '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Widget _savedCard(String path) {
+    final pdfFile = path.toLowerCase().endsWith('.pdf');
+    return Card(
+      key: ValueKey('saved:$path'),
+      shape: kCardShape,
+      child: ListTile(
+        leading: pdfFile
+            ? const Icon(Icons.picture_as_pdf_rounded, size: 36, color: Colors.red)
+            : ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.file(File(path),
+                    width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
+              ),
+        title: Text(_savedKind(path)),
+        subtitle: Text(_savedDate(path)),
+        onTap: () => pdfFile
+            ? OpenFilex.open(path)
+            : Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => ZoomPage(child: Image.file(File(path))))),
+        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+          IconButton(
+              tooltip: 'مشاركة',
+              icon: const Icon(Icons.share_rounded),
+              onPressed: () => shareFiles(context, [path])),
+          IconButton(
+              tooltip: 'مسح',
+              icon: const Icon(Icons.delete_rounded, color: Colors.red),
+              onPressed: () async {
+                if (!await askYesNo(context, 'مسح الملف؟', 'هيتمسح نهائياً من التطبيق.',
+                    yes: 'امسح', no: 'إلغاء')) {
+                  return;
+                }
+                await Store.unarchive(path);
+                if (mounted) _reload();
+              }),
+        ]),
+      ),
+    );
   }
 
   Future<void> _showSettings() async {
@@ -5227,46 +5916,97 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _reload();
   }
 
-  /// باتش جديد: لو فيه باتش اتبعت محتفظين بيه، نأكد قبل ما يتبدل.
+  /// زرار الباتش: دايماً باتش جديد فاضي. اللي كان مفتوح (اتبعت أو لأ) بيتحفظ في "ملفاتي".
   Future<void> _newBatch() async {
-    if (batchSentAt != null &&
-        !await askYesNo(context, 'باتش جديد؟',
-            'الباتش اللي اتبعت هيتمسح لما تصوّر باتش جديد. لو عايز تعدّله افتحه من "ملفاتي".',
-            yes: 'باتش جديد', no: 'إلغاء')) {
-      return;
-    }
+    if (_opening) return;
+    await Store.stashCurrent(true);
     if (!mounted) return;
     await _open(BatchScreen(session: widget.session, fresh: true));
   }
 
-  /// إيصالات الدفع: لو فيه إيصالات اتبعتت محتفظين بيها، نسأل: نعدّلها ولا نبدأ جديد.
+  /// زرار إيصالات الدفع: دايماً إيصالات جديدة فاضية. اللي كانت مفتوحة بتتحفظ في "ملفاتي".
   Future<void> _openReceipts() async {
-    if (receiptsSentAt != null) {
-      final c = await showDialog<String>(
-        context: context,
-        builder: (ctx) => Directionality(
-          textDirection: TextDirection.rtl,
-          child: AlertDialog(
-            title: const Text('إيصالات اتبعتت'),
-            content: const Text(
-                'عندك إيصالات اتبعتت ومحتفظ بيها للتعديل. تفتحها تعدّل وتبعت تاني، ولا تبدأ إيصالات جديدة؟ (البدء من جديد بيمسح اللي اتبعت)'),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
-              TextButton(onPressed: () => Navigator.pop(ctx, 'new'), child: const Text('ابدأ جديد')),
-              FilledButton(
-                  onPressed: () => Navigator.pop(ctx, 'edit'), child: const Text('فتح للتعديل')),
-            ],
-          ),
-        ),
-      );
-      if (c == null || !mounted) return;
-      if (c == 'new') {
-        await Store.discardSentReceipts();
-        await _reload();
-      }
-    }
+    if (_opening) return;
+    await Store.stashCurrent(false);
     if (!mounted) return;
     await _open(ReceiptsScreen(session: widget.session));
+  }
+
+  /// فتح الإيصالات الحالية زي ما هي (من "ملفاتي").
+  Future<void> _editReceipts() async {
+    await _open(ReceiptsScreen(session: widget.session));
+  }
+
+  /// فتح باتش/إيصالات قديمة من "ملفاتي" للتعديل أو إعادة الإرسال.
+  Future<void> _openSaved(bool batch, int i) async {
+    if (_opening) return;
+    await Store.reopenSaved(batch, i);
+    if (!mounted) return;
+    await _open(batch
+        ? BatchScreen(session: widget.session)
+        : ReceiptsScreen(session: widget.session));
+  }
+
+  Future<void> _trashSaved(bool batch, int i) async {
+    if (!await askYesNo(
+        context,
+        batch ? 'مسح الباتش ده؟' : 'مسح الإيصالات دي؟',
+        batch
+            ? 'الباتش وصورة السيستم بتاعته هيتمسحوا من التطبيق.'
+            : 'الصور والـ PDF بتوعها هيتمسحوا من التطبيق.',
+        yes: 'امسح',
+        no: 'إلغاء')) {
+      return;
+    }
+    await Store.deleteSaved(batch, i);
+    await _reload();
+  }
+
+  /// الباتشات والإيصالات القديمة مع بعض، الأحدث الأول.
+  List<(bool, int)> _savedOrder() {
+    int t(Map<String, Object?> m) => (m['savedAt'] as int?) ?? 0;
+    final l = <(bool, int, int)>[
+      for (var i = 0; i < savedB.length; i++) (true, i, t(savedB[i])),
+      for (var i = 0; i < savedR.length; i++) (false, i, t(savedR[i])),
+    ]..sort((a, b) => b.$3.compareTo(a.$3));
+    return [for (final e in l) (e.$1, e.$2)];
+  }
+
+  Widget _sessionCard(Map<String, Object?> it, bool batch, int i) {
+    final imgs = batch
+        ? [if (it['batchImg'] is String) it['batchImg'] as String]
+        : SavedSlots.strList(it['draft']);
+    final sentMs = it[batch ? 'batchSentAt' : 'rcSentAt'];
+    final savedMs = it['savedAt'];
+    final hasPdf = !batch && it['pdfPath'] is String;
+    final when = sentMs is int
+        ? 'اتبعت ✓ ${_when(DateTime.fromMillisecondsSinceEpoch(sentMs))}'
+        : 'لسه متبعتش${savedMs is int ? ' - ${_when(DateTime.fromMillisecondsSinceEpoch(savedMs))}' : ''}';
+    final title = batch
+        ? 'باتش قديم${it['bi_total'] is String && (it['bi_total'] as String).isNotEmpty ? ' - ${it['bi_total']}' : ''}'
+        : 'إيصالات قديمة (${imgs.length} صورة${hasPdf ? ' + PDF' : ''})';
+    return Card(
+      shape: kCardShape,
+      child: ListTile(
+        leading: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: imgs.isEmpty
+              ? const SizedBox(
+                  width: 48,
+                  height: 48,
+                  child: Icon(Icons.picture_as_pdf_rounded, size: 36, color: Colors.red))
+              : Image.file(File(imgs.first),
+                  width: 48, height: 48, fit: BoxFit.cover, cacheWidth: 150),
+        ),
+        title: Text(title),
+        subtitle: Text('$when - اضغط للتعديل'),
+        onTap: busy ? null : () => _openSaved(batch, i),
+        trailing: IconButton(
+            tooltip: 'مسح',
+            icon: const Icon(Icons.delete_rounded, color: Colors.red),
+            onPressed: busy ? null : () => _trashSaved(batch, i)),
+      ),
+    );
   }
 
   Future<void> _sendBatch() async {
@@ -5293,6 +6033,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         yes: 'امسح', no: 'إلغاء')) {
       return;
     }
+    await Store.keptToArchive(true);
     await Store.clearBatchImg();
     await _reload();
   }
@@ -5354,11 +6095,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         yes: 'امسح', no: 'إلغاء')) {
       return;
     }
+    await Store.keptToArchive(false);
     await Store.clearDraft();
     await _reload();
   }
 
-  Widget _big(IconData icon, String label, VoidCallback onTap, {required bool sent}) {
+  Widget _big(IconData icon, String label, VoidCallback onTap, {required bool sent, bool compact = false}) {
     final cs = Theme.of(context).colorScheme;
     return Material(
       color: cs.surfaceContainerHigh,
@@ -5369,7 +6111,37 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       ),
       child: InkWell(
         onTap: onTap,
-        child: ConstrainedBox(
+        child: compact
+            ? Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                child: Row(children: [
+                  Container(
+                    width: 38, height: 38,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      color: kAccent.withAlpha(32),
+                      border: Border.all(color: kAccent.withAlpha(100)),
+                    ),
+                    child: Icon(icon, size: 22, color: kAccent),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                      child: Semantics(
+                    label: '$label: ${sent ? "تم الإرسال" : "لم يُرسل"}',
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                      Text(label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                      Text(sent ? 'تم الإرسال' : 'لم يُرسل',
+                          style: TextStyle(
+                              fontSize: 10,
+                              color: sent ? Colors.green.shade400 : cs.onSurfaceVariant)),
+                    ]),
+                  )),
+                ]),
+              )
+            : ConstrainedBox(
           constraints: const BoxConstraints(minHeight: 158),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 13),
@@ -5427,24 +6199,25 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             tooltip: 'المزيد',
             icon: const Icon(Icons.more_horiz_rounded),
             onSelected: (value) {
-              if (value == 'archive') _open(const ArchiveScreen());
               if (value == 'history') _open(const SendLogScreen());
               if (value == 'account') Navigator.pop(context);
             },
             itemBuilder: (_) => const [
-              PopupMenuItem(value: 'archive', child: Text('الأرشيف')),
               PopupMenuItem(value: 'history', child: Text('سجل الإرسال')),
               PopupMenuItem(value: 'account', child: Text('تغيير الحساب')),
             ],
           )),
         ],
       ),
-      body: ListView(padding: const EdgeInsets.all(14), children: [
+      body: LayoutBuilder(builder: (ctx, bc) {
+        // شاشة قصيرة: الجزء الثابت بيصغّر (مضغوط) بدل ما كله يتحرك، عشان «ملفاتي» تفضل ظاهرة.
+        final compact = bc.maxHeight < 700;
+        final top = <Widget>[
         if (busy) const LinearProgressIndicator(),
         Container(
-          padding: const EdgeInsets.all(14),
+          padding: EdgeInsets.all(compact ? 9 : 14),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(22),
+            borderRadius: BorderRadius.circular(compact ? 16 : 22),
             gradient: LinearGradient(
               begin: Alignment.topRight,
               end: Alignment.bottomLeft,
@@ -5462,13 +6235,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                     child: Text(s.name,
                         style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
               ]),
-              const SizedBox(height: 6),
+              SizedBox(height: compact ? 2 : 6),
               Row(children: [
                 Icon(Icons.location_on_rounded, color: kAccent),
                 const SizedBox(width: 8),
                 Expanded(child: Text(unitLine)),
               ]),
-              const SizedBox(height: 6),
+              SizedBox(height: compact ? 2 : 6),
               Wrap(spacing: 7, runSpacing: 3, crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
                   Icon(Icons.calendar_today_rounded, color: kAccent, size: 18),
@@ -5481,17 +6254,35 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             ]),
           ),
         ),
-        const SizedBox(height: 14),
+        SizedBox(height: compact ? 8 : 14),
         IntrinsicHeight(child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Expanded(
               child: _big(Icons.receipt_long_rounded, 'الباتش',
-                  _newBatch, sent: batchSent)),
+                  _newBatch, sent: batchSent, compact: compact)),
           const SizedBox(width: 12),
           Expanded(
               child: _big(
-                  Icons.payments_rounded, 'إيصالات الدفع', _openReceipts, sent: receiptsSent)),
+                  Icons.payments_rounded, 'إيصالات الدفع', _openReceipts, sent: receiptsSent, compact: compact)),
         ])),
-        if (draft.isNotEmpty || pf != null || bi != null) ...[
+        SizedBox(height: compact ? 8 : 12),
+        Card(
+          shape: kCardShape,
+          child: ListTile(
+            dense: compact,
+            visualDensity: compact ? VisualDensity.compact : null,
+            leading: Icon(Icons.document_scanner_rounded, color: kAccent),
+            title: const Text('سكانر', style: TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: const Text('مستند أو بطاقة وش وضهر، تصدير PDF أو صور'),
+            onTap: () async {
+              // الضغطة بتفتح رئيسية السكانر (بحث + أدوات + «الأخيرة»). القديم بيفضل لحد ما تمسحه بإيدك.
+              await _open(ScannerHome(session: widget.session));
+              if (mounted) _reload();
+            },
+          ),
+        ),
+        ];
+        final files = <Widget>[
+        if (draft.isNotEmpty || pf != null || bi != null || saved.isNotEmpty || scanCount > 0 || savedB.isNotEmpty || savedR.isNotEmpty) ...[
           const SizedBox(height: 24),
           const Text('ملفاتي',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
@@ -5508,7 +6299,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text('الباتش - ${s.batchName}.jpg'),
                 subtitle: Text(batchSentAt == null
                     ? 'اضغط للمعاينة'
-                    : 'اتبعت ✓ - اضغط للتعديل - يتمسح بعد ${_leftText(batchSentAt!)}'),
+                    : 'اتبعت ✓ ${_when(batchSentAt!)} - اضغط للتعديل'),
                 onTap: () => _open(BatchScreen(session: s)),
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -5534,8 +6325,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text('إيصالات الدفع (${draft.length} صورة)'),
                 subtitle: Text(receiptsSentAt == null
                     ? 'اضغط للمعاينة أو لتكمل التصوير'
-                    : 'اتبعت ✓ - اضغط للتعديل - يتمسح بعد ${_leftText(receiptsSentAt!)}'),
-                onTap: _openReceipts,
+                    : 'اتبعت ✓ ${_when(receiptsSentAt!)} - اضغط للتعديل'),
+                onTap: _editReceipts,
                 trailing: IconButton(
                     tooltip: 'مسح',
                     icon: const Icon(Icons.delete_rounded, color: Colors.red),
@@ -5550,8 +6341,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 title: Text(pf.file.path.split('/').last,
                     maxLines: 2, overflow: TextOverflow.ellipsis),
                 subtitle: Text(receiptsSentAt != null
-                    ? 'اتبعت ✓ - اضغط لفتحه - يتمسح بعد ${_leftText(receiptsSentAt!)}'
-                    : 'اضغط لفتحه - يتمسح بعد ${(24 - DateTime.now().difference(pf.time).inHours).clamp(1, 24)} ساعة'),
+                    ? 'اتبعت ✓ ${_when(receiptsSentAt!)} - اضغط لفتحه'
+                    : 'اضغط لفتحه'),
                 onTap: _openPdf,
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(
@@ -5563,12 +6354,35 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 ]),
               ),
             ),
+          for (final e in _savedOrder()) _sessionCard(e.$1 ? savedB[e.$2] : savedR[e.$2], e.$1, e.$2),
+          if (scanCount > 0)
+            Card(
+              shape: kCardShape,
+              child: ListTile(
+                leading: Icon(Icons.document_scanner_rounded, size: 36, color: kAccent),
+                title: Text('سكانر ($scanCount ${scanCount == 1 ? 'مستند' : 'مستندات'})'),
+                subtitle: const Text('اضغط للفتح'),
+                onTap: () async {
+                  await _open(ScanDocsScreen(session: widget.session));
+                  if (mounted) _reload();
+                },
+              ),
+            ),
+          for (final sp in saved) _savedCard(sp),
         ],
         const SizedBox(height: 24),
         Center(
             child: Text('v$kVersion',
                 style: const TextStyle(fontSize: 11, color: Colors.grey))),
-      ]),
+        ];
+        // الجزء اللي فوق (لحد السكانر) ثابت و«ملفاتي» بس هي اللي بتتحرك (والجزء الثابت بيتضغط على الشاشات القصيرة).
+        return Column(children: [
+          Padding(
+              padding: EdgeInsets.fromLTRB(14, compact ? 8 : 14, 14, 0),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: top)),
+          Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(14, 0, 14, 14), children: files)),
+        ]);
+      }),
     );
   }
 }
@@ -5576,6 +6390,360 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 // =====================================================================
 //  شاشة الباتش
 // =====================================================================
+
+/// نموذج بيانات الباتش جوه شاشة الباتش نفسها (بدل شاشة منفصلة). نفس القراءة والتحقق القديمين.
+class _BatchInfoPanel extends StatefulWidget {
+  final BatchInfo init;
+  final String img;
+  final Session session;
+  final ValueNotifier<bool> sysReady;
+  const _BatchInfoPanel(
+      {super.key, required this.init, required this.img, required this.session, required this.sysReady});
+  @override
+  State<_BatchInfoPanel> createState() => _BatchInfoPanelState();
+}
+
+final ButtonStyle kSysBtn = OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8), minimumSize: const Size(0, 38), tapTargetSize: MaterialTapTargetSize.shrinkWrap, visualDensity: VisualDensity.compact);
+
+class _BatchInfoPanelState extends State<_BatchInfoPanel> {
+  late final c1 = TextEditingController(); // صورة جديدة: عمرنا ما نملّا عدد قديم
+  late final c2 =
+      TextEditingController(text: widget.init.piasters.isEmpty ? '0' : widget.init.piasters);
+  late final c3 =
+      TextEditingController(text: widget.init.collected.isEmpty ? '0' : widget.init.collected);
+  late final c4 = TextEditingController(); // صورة جديدة: عمرنا ما نملّا إجمالي قديم
+  String? err;
+  bool reading = true, d1 = false, d4 = false, alertsOpen = false, sysWarnOpen = false;
+  String? note;
+  List<String> alerts = const [];
+  String? sysImg;
+  bool sysBusy = false;
+  String? sysWarn;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.sysReady.value = false;
+    _restoreTyped().whenComplete(_ocr); // الأرقام المحفوظة الأول، وبعدها الـ OCR (مبيكتبش فوقها)
+    Store.systemPhoto().then((s) {
+      if (mounted && s != null) {
+        setState(() => sysImg = s);
+        widget.sysReady.value = true;
+        _checkSysTid(s);
+      }
+    });
+  }
+
+  Future<void> _pickSystem(ImageSource src) async {
+    if (sysBusy) return;
+    setState(() => sysBusy = true);
+    try {
+      // B2: لو أندرويد قفل التطبيق في كاميرا النظام، الصورة بترجع كصورة سيستم (مش باتش جديد)
+      await markPickTarget('system');
+      final XFile? x;
+      try {
+        x = await ImagePicker().pickImage(source: src); // الأصل زي ما اتصور
+      } finally {
+        await clearPickTarget();
+      }
+      if (x == null || !mounted) return;
+      final dest =
+          '${(await Store.dir()).path}/system_${DateTime.now().microsecondsSinceEpoch}.jpg';
+      await File(x.path).copy(dest);
+      await Store.setSystemPhoto(dest);
+      if (mounted) {
+        setState(() {
+          sysImg = dest;
+          sysWarn = null;
+          err = null;
+        });
+        widget.sysReady.value = true;
+        _checkSysTid(dest);
+      }
+    } catch (e) {
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+    } finally {
+      if (mounted) setState(() => sysBusy = false);
+    }
+  }
+
+  Future<void> _checkSysTid(String path) async {
+    try {
+      final lines = await _ocrLinesOf(path).timeout(const Duration(seconds: 20));
+      final tids = sysPhotoTids(lines.map((l) => l.text).join('\n'));
+      if (!mounted || sysImg != path) return;
+      final w = sysTidWarning(tids, widget.session.unit, AppData.units);
+      AppLog.i('sys tid read=${tids.join(',')} unit=${widget.session.unit.tid} warn=${w != null}');
+      if (w != null) HapticFeedback.vibrate();
+      unawaited(Store.setSysTidWarn(path, w)); // B8: التنبيه بيتكرر تاني قبل الإرسال
+      setState(() => sysWarn = w);
+    } catch (e) {
+      AppLog.i('sys tid ocr failed: $e');
+      // M2/F9: الفحص مخلصش (مهلة/خطأ): ملاحظة بس، مش تنبيه ومبتوقفش الإرسال
+      if (mounted && sysImg == path && sysWarn == null) {
+        setState(() => sysWarn = kSysTidUnread);
+      }
+    }
+  }
+
+  void _previewSystem() {
+    final s = sysImg;
+    if (s == null) return;
+    Navigator.push(context,
+        MaterialPageRoute(builder: (_) => ZoomPage(child: Image.file(File(s)))));
+  }
+
+  bool _restored = false;
+  Timer? _saveT;
+
+  Future<void> _restoreTyped() async {
+    try {
+      final t = await loadTypedBatchInfo();
+      if (!mounted) return;
+      setState(() {
+        if (t.count != null && t.count!.isNotEmpty) {
+          c1.text = t.count!;
+          d1 = true;
+          _restored = true;
+        }
+        if (t.total != null && t.total!.isNotEmpty) {
+          c4.text = t.total!;
+          d4 = true;
+          _restored = true;
+        }
+        if (t.pi != null) c2.text = t.pi!;
+        if (t.col != null) c3.text = t.col!;
+      });
+    } catch (e, st) {
+      AppLog.e('batch.restoreTyped', e, st);
+    }
+  }
+
+  /// بيحفظ اللي الموظف كتبه بس (العدد والإجمالي لو كتبهم بإيده، والقروش والمجمعة).
+  void _saveSoon() {
+    _saveT?.cancel();
+    _saveT = Timer(const Duration(milliseconds: 400), () {
+      saveTypedBatchInfo(
+          count: d1 ? c1.text : null, pi: c2.text, col: c3.text, total: d4 ? c4.text : null);
+    });
+  }
+
+  Future<void> _ocr() async {
+    BatchOcr? r;
+    try {
+      r = await readBatchInfo(widget.img).timeout(const Duration(seconds: 25));
+    } catch (e) {
+      AppLog.i('batch ocr failed: $e');
+    }
+    if (!mounted) return;
+    final ws = r == null ? const <String>[] : batchOcrWarnings(r, widget.session);
+    if (ws.isNotEmpty) HapticFeedback.vibrate();
+    setState(() {
+      reading = false;
+      alerts = ws;
+      if (!d1) c1.text = r?.count ?? ''; // قراءة فاشلة/ملتبسة تفضل فاضية
+      if (!d4) c4.text = r?.total ?? '';
+      if (r?.count == null && r?.total == null) {
+        note = 'معرفتش أقرا الأرقام من الصورة، اكتبها بإيدك';
+      } else if (r?.count == null || r?.total == null) {
+        note = 'اتقرا جزء بس من الصورة، كمّل الباقي وراجع القيم';
+      } else if ((r?.missing ?? 0) > 0) {
+        note = 'في ورقة باتش مش واضحة في الصورة، الإجمالي والعدد ممكن يكونوا ناقصين. راجعهم من الصورة';
+      } else if ((r?.parts ?? 1) > 1) {
+        note = 'اتقرا ${r!.parts} أوراق باتش في الصورة واتجمعوا (${r!.detail}). راجع القيم قبل الإرسال';
+      } else {
+        note = 'اتقرا من الصورة، راجع القيم قبل الإرسال';
+      }
+      if (_restored) note = 'الأرقام اللي كتبتها قبل كده اترجعت. راجعها قبل الإرسال';
+    });
+  }
+
+  @override
+  void dispose() {
+    c1.dispose();
+    c2.dispose();
+    c3.dispose();
+    _saveT?.cancel();
+    if (d1 || d4) {
+      // آخر حاجة اتكتبت قبل ما الشاشة تتقفل
+      saveTypedBatchInfo(count: d1 ? c1.text : null, pi: c2.text, col: c3.text, total: d4 ? c4.text : null);
+    }
+    c4.dispose();
+    super.dispose();
+  }
+
+  /// نفس تحققات الشاشة القديمة بالظبط. بيرجّع null لو في خطأ (والرسالة بتظهر) أو المستخدم ما كملش.
+  Future<BatchInfo?> submit() async {
+    if (sysImg == null) {
+      setState(() => err = 'صوّر أو اختار صورة السيستم الأول');
+      return null;
+    }
+    final count = _digits(c1.text), pi = _digits(c2.text);
+    final col = _digits(c3.text), tot = _digits(c4.text);
+    bool isInt(String s) => RegExp(r'^\d+$').hasMatch(s);
+    String? e;
+    if (!isInt(count)) {
+      e = 'اكتب عدد المعاملات (أرقام بس)';
+    } else if (pi.isNotEmpty && !isInt(pi)) {
+      e = 'عدد القروش الفاصلة لازم يكون رقم';
+    } else if (col.isNotEmpty && !isInt(col)) {
+      e = 'عدد المعاملات المجمعة لازم يكون رقم';
+    }
+    final t = double.tryParse(tot);
+    if (e == null && (t == null || t < 0)) e = 'اكتب الإجمالي صح (مثال 28107.19)';
+    if (e != null) {
+      setState(() => err = e);
+      snack(context, e);
+      return null;
+    }
+    setState(() => err = null);
+    if (alerts.isNotEmpty) {
+      final go = await confirmWarnings(context, alerts, title: 'تنبيه في ورقة الباتش', go: 'متابعة برضه');
+      if (!go || !mounted) return null;
+    }
+    return BatchInfo('${int.parse(count)}', pi.isEmpty ? '0' : '${int.parse(pi)}',
+        col.isEmpty ? '0' : '${int.parse(col)}', t!.toStringAsFixed(2));
+  }
+
+  Widget _f(TextEditingController c, String label,
+          {bool dec = false, bool selectAll = false, VoidCallback? onEdit}) =>
+      Expanded(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: TextField(
+            controller: c,
+            onChanged: onEdit == null ? null : (_) => onEdit(),
+            onTap: selectAll
+                ? () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length)
+                : null,
+            keyboardType: TextInputType.numberWithOptions(decimal: dec),
+            decoration: InputDecoration(labelText: label, isDense: true, border: kFieldBorder, contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9)),
+          ),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.fromLTRB(8, 0, 8, 2),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          if (reading)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 4),
+              child: Row(children: [
+                SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 10),
+                Expanded(child: Text('جاري قراءة الأرقام من صورة الباتش...')),
+              ]),
+            )
+          else if (note != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: Text(note!, style: const TextStyle(color: Colors.grey, fontSize: 12.5)),
+            ),
+          if (alerts.isNotEmpty)
+            InkWell(
+              onTap: () => setState(() => alertsOpen = !alertsOpen),
+              child: Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 6),
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.red.withAlpha(28),
+                  border: Border.all(color: Colors.redAccent.withAlpha(170)),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 17),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      for (final a in (alertsOpen ? alerts : alerts.take(1)))
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 3),
+                          child: Text(a,
+                              maxLines: alertsOpen ? null : 2,
+                              overflow: alertsOpen ? null : TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                        ),
+                    ]),
+                  ),
+                  if (alerts.length > 1) Text(alertsOpen ? '▴' : '${alerts.length} ▾', style: const TextStyle(fontSize: 12)),
+                ]),
+              ),
+            ),
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            _f(c1, 'عدد المعاملات', onEdit: () {
+                        d1 = true;
+                        _saveSoon();
+                      }),
+            _f(c4, 'الإجمالي', dec: true, onEdit: () {
+                        d4 = true;
+                        _saveSoon();
+                      }),
+          ]),
+          const SizedBox(height: 6),
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            _f(c2, 'القروش الفاصلة', selectAll: true, onEdit: _saveSoon),
+            _f(c3, 'المعاملات المجمعة', selectAll: true, onEdit: _saveSoon),
+          ]),
+          const SizedBox(height: 6),
+          Row(children: [
+            Expanded(
+                child: OutlinedButton.icon(
+              onPressed: sysBusy ? null : () => _pickSystem(ImageSource.camera),
+              icon: const Icon(Icons.add_a_photo_rounded, size: 16),
+              label: const FittedBox(fit: BoxFit.scaleDown, child: Text('صوّر السيستم', maxLines: 1, style: TextStyle(fontSize: 12.5))),
+              style: kSysBtn,
+            )),
+            const SizedBox(width: 6),
+            Expanded(
+                child: OutlinedButton.icon(
+              onPressed: sysBusy ? null : () => _pickSystem(ImageSource.gallery),
+              icon: const Icon(Icons.photo_library_rounded, size: 16),
+              label: const FittedBox(fit: BoxFit.scaleDown, child: Text('معرض', maxLines: 1, style: TextStyle(fontSize: 12.5))),
+              style: kSysBtn,
+            )),
+            const SizedBox(width: 6),
+            Expanded(
+                child: OutlinedButton.icon(
+              onPressed: sysImg == null || sysBusy ? null : _previewSystem,
+              icon: const Icon(Icons.visibility_rounded, size: 16),
+              label: FittedBox(fit: BoxFit.scaleDown, child: Text(sysImg == null ? 'معاينة' : '✓ معاينة', maxLines: 1, style: const TextStyle(fontSize: 12.5))),
+              style: kSysBtn,
+            )),
+          ]),
+          if (sysWarn != null)
+            InkWell(
+              onTap: () => setState(() => sysWarnOpen = !sysWarnOpen),
+              child: Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(top: 6),
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withAlpha(30),
+                  border: Border.all(color: Colors.orange.withAlpha(190)),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 17),
+                  const SizedBox(width: 6),
+                  Expanded(
+                      child: Text(sysWarn!,
+                          maxLines: sysWarnOpen ? null : 2,
+                          overflow: sysWarnOpen ? null : TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600))),
+                  Text(sysWarnOpen ? '▴' : '▾', style: const TextStyle(fontSize: 12)),
+                ]),
+              ),
+            ),
+          if (err != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(err!, style: const TextStyle(color: Colors.red)),
+            ),
+        ]),
+      );
+}
 
 class BatchScreen extends StatefulWidget {
   final Session session;
@@ -5593,12 +6761,25 @@ class _BatchScreenState extends State<BatchScreen> {
   bool busy = false;
   bool noTag = false; // الصورة دي من غير ورقة بيانات
   bool kept = false; // الصورة دي محفوظة للأرشيف بعد الإرسال
+  final _panelKey = GlobalKey<_BatchInfoPanelState>();
+  bool _keepSys = false; // B7: الموظف اختار يعيد ورقة الباتش بس ويسيب صورة السيستم
+  final _sysReady = ValueNotifier<bool>(false);
+  final _viewTc = TransformationController(); // تكبير عرض الصورة بس (مش بيأثر على الملف المبعوت)
+  BatchInfo? _binit;
 
   @override
   void initState() {
     super.initState();
     unawaited(_warmTags());
+    unawaited(_loadBatchInit());
     _init();
+  }
+
+  Future<void> _loadBatchInit() async {
+    final p = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() => _binit = BatchInfo(p.getString('bi_count') ?? '', p.getString('bi_pi') ?? '',
+        p.getString('bi_col') ?? '', p.getString('bi_total') ?? ''));
   }
 
   Future<void> _toggleTag(bool hide) async {
@@ -5615,17 +6796,29 @@ class _BatchScreenState extends State<BatchScreen> {
     final v = !kept;
     setState(() => kept = v);
     await Store.setKept(path, v);
-    if (mounted) snack(context, v ? 'هيتحفظ في الأرشيف بعد الإرسال' : 'اتشال من المحفوظات');
+    if (mounted) snack(context, v ? 'هيتحفظ في الأرشيف لما تمسحه من "ملفاتي"' : 'اتشال من المحفوظات');
   }
 
   Future<void> _init() async {
+    // B2: صورة سيستم رجعت بعد ما أندرويد قفل التطبيق في الكاميرا: بتتحط صورة سيستم للباتش الحالي
+    final lostSys = await takeLostPick('system');
+    if (lostSys != null) {
+      try {
+        final dest = '${(await Store.dir()).path}/system_${DateTime.now().microsecondsSinceEpoch}.jpg';
+        await File(lostSys).copy(dest);
+        await Store.setSystemPhoto(dest);
+        if (mounted) snack(context, 'صورة السيستم رجعت بعد ما التطبيق اتقفل');
+      } catch (e, st) {
+        AppLog.e('batch.lostSystem', e, st);
+      }
+    }
     final lost = await takeLostPick('batch');
     if (lost != null && mounted) {
       try {
         final path = await persistImage(
             lost, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
             filter: ScanFilter.adaptive, profile: ImageQualityProfile.batch);
-        await Store.setBatchImg(path, fresh: true);
+        await Store.setBatchImg(path, fresh: true, keepSystem: _keepSys);
         await _show(path);
         _lastScanManual = true;
         if (mounted && img != null) await _edit(tab: 2);
@@ -5671,6 +6864,7 @@ class _BatchScreenState extends State<BatchScreen> {
       final nt = await Store.noTag(path);
       final kp = await Store.isKept(path);
       if (!mounted) return;
+      _viewTc.value = Matrix4.identity();
       setState(() {
         noTag = nt;
         kept = kp;
@@ -5695,7 +6889,7 @@ class _BatchScreenState extends State<BatchScreen> {
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
           filter: ScanFilter.adaptive, applyNow: false,
           profile: ImageQualityProfile.batch);
-      await Store.setBatchImg(path, fresh: true);
+      await Store.setBatchImg(path, fresh: true, keepSystem: _keepSys);
       await _show(path);
       unawaited(qualityWarning(path).then((warn) {
         if (warn != null && mounted) snack(context, warn);
@@ -5717,7 +6911,7 @@ class _BatchScreenState extends State<BatchScreen> {
           src, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
           filter: ScanFilter.adaptive, applyNow: false, keepOriginal: keepOriginal,
           profile: ImageQualityProfile.batch);
-      await Store.setBatchImg(path, fresh: true);
+      await Store.setBatchImg(path, fresh: true, keepSystem: _keepSys);
       return path;
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
@@ -5730,9 +6924,17 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       final f = File(path);
       if (await f.exists()) {
-        await f.writeAsBytes(await applyFilter(await f.readAsBytes(),
+        final base0 = File(Store.baseOf(path));
+        // لو الأصل محفوظ: الفلتر بيترسم منه (مرة تانية = نفس النتيجة، مش فلتر فوق فلتر)
+        final raw = await base0.exists() ? await base0.readAsBytes() : await f.readAsBytes();
+        // B1: الأصل الخام بيتحفظ كنسخة _base قبل ما الفلتر يترسم على الملف، فأي قص/فلتر بعد كده
+        // بيترسم من الأصل مرة واحدة (مش فلتر فوق فلتر). الملف اللي بيتبعت نفس الناتج بالظبط زي الأول.
+        final base = File(Store.baseOf(path));
+        if (!await base.exists()) await base.writeAsBytes(raw, flush: true);
+        await f.writeAsBytes(await applyFilter(raw,
           await resolveImageFilter(path),
           profile: await Store.qualityProfile(path)));
+        await Store.setEditPending(path, false); // الفلتر اترسم خلاص
         await FileImage(f).evict();
       }
     } catch (e, st) {
@@ -5741,6 +6943,20 @@ class _BatchScreenState extends State<BatchScreen> {
   }
 
   /// كاميرا التطبيق: صورة واحدة بس، بعدها شاشة التعديل علطول (من غير عداد).
+  /// B7: لو فيه باتش وصورة سيستم ولسه متبعتش، نسأل: نصوّر الورقة بس ونسيب صورة السيستم؟
+  Future<void> _retake(Future<void> Function() go) async {
+    var keep = false;
+    if (img != null && await Store.batchSentAt() == null && await Store.systemPhoto() != null) {
+      if (!mounted) return;
+      keep = await askYesNo(context, 'صورة السيستم',
+          'تحتفظ بصورة السيستم الحالية وتعيد تصوير ورقة الباتش بس؟',
+          yes: 'احتفظ بيها', no: 'صورة سيستم جديدة');
+    }
+    _keepSys = keep;
+    if (!mounted) return;
+    await go();
+  }
+
   Future<void> _capture() async {
     final engine = await Store.scanEngine();
     final perf = await Store.perfMode();
@@ -5771,7 +6987,7 @@ class _BatchScreenState extends State<BatchScreen> {
     }
     _lastScanManual = manual;
     if (mounted && await _edit(tab: manual ? 0 : 2, fromCam: true, path: saved)) {
-      await Store.clearBatchImg();
+      await Store.retireBatchImg();
       if (mounted) setState(() => img = null);
       await _captureGoogle(); // إعادة أخذ
       return;
@@ -5810,7 +7026,7 @@ class _BatchScreenState extends State<BatchScreen> {
             if (saved == null) return null;
             if (mounted && await _edit(tab: 2, fromCam: true, path: saved)) {
               // إعادة أخذ: نمسح الصورة دي والكاميرا تفضل مفتوحة
-              await Store.clearBatchImg();
+              await Store.retireBatchImg();
               if (mounted) setState(() => img = null);
               return null;
             }
@@ -5872,6 +7088,8 @@ class _BatchScreenState extends State<BatchScreen> {
       final path = img, p = pos, a = aspect;
       if (path != null && p != null && a != null) Store.saveBatchPos(path, p, a);
     }
+    _viewTc.dispose();
+    _sysReady.dispose();
     super.dispose();
   }
 
@@ -5886,6 +7104,8 @@ class _BatchScreenState extends State<BatchScreen> {
       AppLog.e('_gallery', e, st);
       if (mounted) snack(context, 'تعذر فتح المعرض');
       return;
+    } finally {
+      await clearPickTarget();
     }
     if (x == null || !mounted) return;
     setState(() => busy = true);
@@ -5894,7 +7114,7 @@ class _BatchScreenState extends State<BatchScreen> {
           x.path, 'batch_${DateTime.now().microsecondsSinceEpoch}.jpg',
           filter: ScanFilter.adaptive, applyNow: false,
           profile: ImageQualityProfile.batch);
-      await Store.setBatchImg(path, fresh: true);
+      await Store.setBatchImg(path, fresh: true, keepSystem: _keepSys);
       await _show(path);
     } catch (e) {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
@@ -5946,9 +7166,11 @@ class _BatchScreenState extends State<BatchScreen> {
     try {
       await _flushPos();
       if (!mounted) return;
+      final info = await _panelKey.currentState?.submit();
+      if (info == null || !mounted) return;
       if (!await preSendCheckBatch(context, widget.session, img!)) return;
       if (!mounted) return;
-      final ok = await sendBatchFile(context, widget.session, img!);
+      final ok = await sendBatchFile(context, widget.session, img!, info: info);
       if (ok) HapticFeedback.mediumImpact();
       if (ok && mounted) Navigator.pop(context);
     } catch (e) {
@@ -5958,134 +7180,240 @@ class _BatchScreenState extends State<BatchScreen> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final ready = img != null && tag != null && pos != null && aspect != null;
-    return Scaffold(
-      appBar: AppBar(title: const Text('الباتش'), actions: [
-        if (img != null) ...[
-          IconButton(
-              tooltip: kept ? 'محفوظ للأرشيف' : 'احتفظ بيه في الأرشيف',
-              icon: Icon(kept ? Icons.bookmark_rounded : Icons.bookmark_outline_rounded,
-                  color: kept ? Colors.teal : null),
-              onPressed: busy ? null : _toggleKeep),
-          IconButton(
-              tooltip: 'استخراج النص',
-              icon: const Icon(Icons.text_snippet_outlined),
-              onPressed:
-                  busy ? null : () => showOcrTextSheet(context, img!, title: 'نص الباتش')),
-        ],
+  /// شريط حجم الورقة ظاهر دايماً تحت أزرار السيستم (نفس تحكم شيت «الورقة»، والسحب/القرصة على الورقة شغالين).
+  Widget _sizeRow() {
+    final p = pos!;
+    final pct = (p.s * 100).round();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 8, 4),
+      child: Row(children: [
+        const Text('الورقة', style: TextStyle(fontSize: 12.5)),
+        Transform.scale(
+          scale: 0.78,
+          child: Switch(value: !noTag, onChanged: busy ? null : (v) => _toggleTag(!v)),
+        ),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(trackHeight: 3, overlayShape: const RoundSliderOverlayShape(overlayRadius: 14)),
+            child: IgnorePointer(ignoring: noTag || busy, child: Opacity(opacity: noTag ? 0.38 : 1, child: Slider(
+              value: p.s.clamp(kTagMinScale, 1.0).toDouble(),
+              min: kTagMinScale,
+              max: 1.0,
+              onChanged: (v) {
+                if (noTag || busy) return; // مش بنبدّل onChanged لـ null (التبديل بيكسر semantics السلايدر)، بس بنتجاهل التغيير
+                _set(fitTagPos(p.copyWith(s: v), tag!, aspect!));
+              },
+            ))),
+          ),
+        ),
+        SizedBox(width: 46, child: Text('$pct%', maxLines: 1, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12))),
+        IconButton(
+          tooltip: 'أسفل الصورة بعرضها كله',
+          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+          icon: const Icon(Icons.restart_alt_rounded, size: 20),
+          onPressed: noTag || busy ? null : () => _set(bottomTagPos(tag!, aspect!)),
+        ),
       ]),
-      body: !ready
-          ? const Center(child: CircularProgressIndicator())
-          : Column(children: [
-              Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.all(8),
-                  child: TaggedImage(
-                      path: img!,
-                      tag: tag!,
-                      pos: pos!,
-                      aspect: aspect,
-                      showTag: !noTag,
-                      onChanged: noTag ? null : _set),
+    );
+  }
+
+  /// شيت «الورقة»: إظهار/إخفاء + حجم + رجوع لأسفل الصورة. السحب والتكبير بإصبعين شغالين على الورقة نفسها.
+  Future<void> _paperSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: StatefulBuilder(builder: (ctx, setSheet) {
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('الورقة', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  title: const Text('ورقة البيانات على الصورة دي'),
+                  subtitle: const Text('اقفلها لو الصورة مش محتاجة ورقة (الصورة الجاية بتبدأ بالورقة)',
+                      style: TextStyle(fontSize: 11)),
+                  value: !noTag,
+                  onChanged: busy
+                      ? null
+                      : (v) async {
+                          await _toggleTag(!v);
+                          setSheet(() {});
+                        },
                 ),
-              ),
-              if (!noTag)
-                Container(
-                  margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: Colors.orange.withAlpha(28),
-                    border: Border.all(color: Colors.orange.withAlpha(150)),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 22),
-                    SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                          'تنبيه: حرّك الورقة لمكان فاضي من الصورة، وماتغطيش أي بيانات (خصوصًا العدد والإجمالي). '
-                          'اسحب بإصبع للتحريك، وبإصبعين للتكبير والتصغير.',
-                          style: TextStyle(fontSize: 12.5)),
-                    ),
-                  ]),
-                ),
-              SwitchListTile(
-                dense: true,
-                title: const Text('ورقة البيانات على الصورة دي'),
-                subtitle: const Text('اقفلها لو الصورة مش محتاجة ورقة (الصورة الجاية بتبدأ بالورقة)',
-                    style: TextStyle(fontSize: 11)),
-                value: !noTag,
-                onChanged: busy ? null : (v) => _toggleTag(!v),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Row(children: [
+                const Text('حجم الورقة: من 5% إلى 100% من عرض الصورة', style: TextStyle(fontSize: 12)),
+                Row(children: [
                   const Icon(Icons.format_size_rounded),
                   Expanded(
                     child: Slider(
-                      value: pos!.s.clamp(0.1, 1.0).toDouble(),
-                      min: 0.1,
+                      value: pos!.s.clamp(kTagMinScale, 1.0).toDouble(),
+                      min: kTagMinScale,
                       max: 1.0,
-                      onChanged: noTag ? null : (v) => _set(pos!.copyWith(s: v)),
+                      onChanged: noTag
+                          ? null
+                          : (v) {
+                              _set(fitTagPos(pos!.copyWith(s: v), tag!, aspect!));
+                              setSheet(() {});
+                            },
                     ),
                   ),
                   IconButton(
                     tooltip: 'أسفل الصورة بعرضها كله',
                     icon: const Icon(Icons.restart_alt_rounded),
-                    onPressed: noTag ? null : () => _set(bottomTagPos(tag!, aspect!)),
+                    onPressed: noTag
+                        ? null
+                        : () {
+                            _set(bottomTagPos(tag!, aspect!));
+                            setSheet(() {});
+                          },
                   ),
                 ]),
-              ),
-              SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    Row(children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _capture,
-                          icon: const Icon(Icons.add_a_photo_rounded),
-                          label: const Text('تصوير'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _gallery,
-                          icon: const Icon(Icons.photo_library_rounded),
-                          label: const Text('معرض'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: busy ? null : _edit,
-                          icon: const Icon(Icons.crop_rounded),
-                          label: const Text('تعديل'),
-                        ),
-                      ),
-                    ]),
-                    const SizedBox(height: 8),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 50,
-                      child: FilledButton.icon(
-                        onPressed: busy ? null : _send,
-                        icon: busy
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.send_rounded),
-                        label: const Text('إرسال'),
-                      ),
-                    ),
-                  ]),
+                const Text(
+                    'حرّك الورقة لمكان فاضي من الصورة وماتغطيش أي بيانات (خصوصًا العدد والإجمالي). '
+                    'تقدر تسحب الورقة نفسها وتكبّرها وتصغّرها بإصبعين.',
+                    style: TextStyle(fontSize: 11.5, color: Colors.orange)),
+              ]),
+            ),
+          );
+        }),
+      ),
+    );
+  }
+
+  Widget _pill(IconData i, String t, VoidCallback? f) => OutlinedButton.icon(
+        onPressed: f,
+        icon: Icon(i, size: 16),
+        label: Text(t, style: const TextStyle(fontSize: 12)),
+        style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 10), visualDensity: VisualDensity.compact),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final ready = img != null && tag != null && pos != null && aspect != null && _binit != null;
+    return Scaffold(
+      appBar: AppBar(title: const Text('الباتش'), toolbarHeight: 52, actions: [
+        IconButton(
+            tooltip: 'تصوير',
+            icon: const Icon(Icons.add_a_photo_rounded),
+            onPressed: busy ? null : () => _retake(_capture)),
+        IconButton(
+            tooltip: 'معرض',
+            icon: const Icon(Icons.photo_library_rounded),
+            onPressed: busy ? null : () => _retake(_gallery)),
+        if (img != null)
+          IconButton(
+              tooltip: 'استخراج النص',
+              icon: const Icon(Icons.text_snippet_outlined),
+              onPressed: busy ? null : () => showOcrTextSheet(context, img!, title: 'نص الباتش')),
+      ]),
+      // الزر في bottomNavigationBar عشان رسائل الخطأ (snackbar) تظهر فوقه مش عليه
+      bottomNavigationBar: !ready
+          ? null
+          : SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+            child: ValueListenableBuilder<bool>(
+              valueListenable: _sysReady,
+              builder: (_, sysOk, __) => SizedBox(
+                width: double.infinity,
+                height: 50,
+                child: FilledButton.icon(
+                  onPressed: busy || !sysOk ? null : _send,
+                  icon: busy
+                      ? const SizedBox(
+                          width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.send_rounded),
+                  label: const Text('إرسال'),
                 ),
               ),
-            ]),
+            ),
+          ),
+        ),
+      body: !ready
+          ? const Center(child: CircularProgressIndicator())
+          : LayoutBuilder(builder: (ctx, cons) {
+              // الصورة ثابتة فوق (سحب الورقة مش بيتحوّل لتمرير)، والتمرير للي تحتها بس. الزر ثابت تحت.
+              // الصورة بتاخد اللي فاضل بعد ما اللوحة اللي تحتها (الخانات والتحذيرات والتحكم) تاخد مساحتها؛
+              // اللوحة بتسكرول بس لو الصورة وصلت لأقل ارتفاع (110). تكبير العرض والتصدير مش متأثرين.
+              const toolbarH = 46.0, minImg = 110.0;
+              final total = cons.maxHeight;
+              final imgCap = (total * 0.48).clamp(110.0, 420.0).toDouble();
+              final panelMax = math.max(96.0, total - toolbarH - minImg);
+              return Column(children: [
+                SizedBox(
+                  height: toolbarH,
+                  child: ListView(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    children: [
+                      _pill(Icons.crop_rounded, 'تعديل', busy ? null : _edit),
+                      const SizedBox(width: 6),
+                      ListenableBuilder(
+                        listenable: _viewTc,
+                        builder: (_, __) {
+                          final z = _viewTc.value.getMaxScaleOnAxis();
+                          return _pill(Icons.zoom_in_rounded, 'عرض ×${z.toStringAsFixed(1)}  ↺',
+                              z > 1.01 ? () => _viewTc.value = Matrix4.identity() : null);
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: LayoutBuilder(builder: (_, ic) => Align(
+                    alignment: Alignment.topCenter,
+                    child: SizedBox(
+                  height: math.min(ic.maxHeight, imgCap),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
+                    child: ClipRect(
+                      child: InteractiveViewer(
+                        transformationController: _viewTc,
+                        minScale: 1,
+                        maxScale: 6,
+                        child: AnimatedBuilder(
+                          animation: _viewTc,
+                          builder: (_, __) => TaggedImage(
+                              path: img!,
+                              tag: tag!,
+                              pos: pos!,
+                              aspect: aspect,
+                              showTag: !noTag,
+                              zoom: _viewTc.value.getMaxScaleOnAxis(),
+                              onChanged: noTag ? null : _set),
+                        ),
+                      ),
+                    ),
+                  ),
+                )),
+                )),
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxHeight: panelMax),
+                  child: SingleChildScrollView(
+                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                    child: Column(children: [
+                      KeyedSubtree(
+                        key: ValueKey(img),
+                        child: _BatchInfoPanel(
+                            key: _panelKey,
+                            init: _binit!,
+                            img: img!,
+                            session: widget.session,
+                            sysReady: _sysReady),
+                      ),
+                      _sizeRow(),
+                    ]),
+                  ),
+                ),
+              ]);
+            }),
     );
   }
 }
@@ -8799,6 +10127,8 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
   void _markShared(String how) {
     HapticFeedback.mediumImpact();
     unawaited(Store.addLog(widget.session, 'receipts', '${widget.imgs.length} صفحة - $how'));
+    // R5: الإرسال اتأكد: الإيصالات بتتعلّم «اتبعت» على طول، حتى لو الموظف رجع بزرار الرجوع من غير «تم»
+    unawaited(Store.afterPdfSent());
     if (!mounted) return;
     setState(() => shared = true);
     snack(context, 'اتبعت ✓ اضغط "تم" لما تخلص');
@@ -8822,7 +10152,7 @@ class _PdfResultScreenState extends State<PdfResultScreen> {
       final dir = await getTemporaryDirectory();
       for (var i = 0; i < n; i++) {
         final bytes = await composeReceiptImage(widget.imgs[i], widget.session,
-            pageLabel: n > 1 ? '${i + 1} / $n' : null);
+            pageLabel: '${i + 1} / $n');
         final f = File('${dir.path}/${widget.session.pdfName}_${i + 1}.jpg');
         await f.writeAsBytes(bytes, flush: true);
         files.add(f.path);
@@ -8990,9 +10320,13 @@ class A2RCameraScreen extends StatefulWidget {
   /// مسح آخر صورة اتلقطت من جوه الكاميرا مباشرة.
   final Future<A2RCamState?> Function()? onUndoLast;
   final Future<A2RCamState?> Function()? onGallery;
+  /// السكانر بس: بيسجّل اتجاه الموبايل وقت اللقطة في [gShotTurns] عشان المستند العرضي يطلع معدول.
+  /// الباتش والإيصالات مبيفعّلوهاش، فصورهم زي ما هي.
+  final bool autoOrient;
   const A2RCameraScreen({
     super.key,
     required this.title,
+    this.autoOrient = false,
     required this.onShot,
     this.onFastShot,
     this.onUndoLast,
@@ -9047,6 +10381,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   double _tiltX = 0, _tiltY = 0;
   static const _hwChannel = MethodChannel('a2r/cam_hw');
   static const _tiltChannel = EventChannel('a2r/tilt');
+  double _gx = 0, _gy = 9.8, _gz = 0; // آخر قراءة جاذبية (للسكانر بس: autoOrient)
   StreamSubscription<dynamic>? _tiltSub;
   late int _count = widget.count;
   String? _thumb;
@@ -9094,7 +10429,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _autoCap = p.getBool('camAutoCap') ?? widget.single;
       _showLevel = p.getBool('camLevel') ?? true;
       _setVolumeCapture(true);
-      if (_showLevel) _startTilt();
+      if (_showLevel || widget.autoOrient) _startTilt();
       _start();
     }).catchError((Object e, StackTrace st) {
       AppLog.e('cam.prefs', e, st);
@@ -9120,7 +10455,13 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
     _tiltSub = null;
     try {
       _tiltSub = _tiltChannel.receiveBroadcastStream().listen((ev) {
-        if (!mounted || !_showLevel) return;
+        if (!mounted) return;
+        if (widget.autoOrient && ev is List && ev.length >= 3) {
+          _gx = (ev[0] as num).toDouble();
+          _gy = (ev[1] as num).toDouble();
+          _gz = (ev[2] as num).toDouble();
+        }
+        if (!_showLevel) return;
         if (ev is List && ev.length >= 3) {
           final ax = (ev[0] as num).toDouble();
           final ay = (ev[1] as num).toDouble();
@@ -9149,7 +10490,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       _showLevel = !_showLevel;
       if (!_showLevel) _tiltFlat = false;
     });
-    if (_showLevel) {
+    if (_showLevel || widget.autoOrient) {
       _startTilt();
     } else {
       _stopTilt();
@@ -9205,13 +10546,21 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _setVolumeCapture(true);
-      if (_showLevel) _startTilt();
+      if (_showLevel || widget.autoOrient) _startTilt();
       if (_c == null && !_starting) _start();
+      return;
+    }
+    if (state == AppLifecycleState.inactive) {
+      // C1: ستارة الإشعارات / نافذة إذن / المشاركة بتبعت inactive بس: الكاميرا تفضل شغالة
+      // (الزوم وقفل الفوكس مايضيعوش). بنقفلها لما التطبيق يروح الخلفية فعلاً (paused/hidden).
+      _setVolumeCapture(false);
       return;
     }
     final c = _c;
     if (c == null) return;
-    if (state == AppLifecycleState.inactive) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
       _setVolumeCapture(false);
       _stopTilt();
       _c = null;
@@ -9313,14 +10662,16 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
         _minZoom = 1;
         _maxZoom = 1;
       }
-      _zoom = 1.0.clamp(_minZoom, _maxZoom).toDouble();
+      // C3: بعد إعادة التشغيل (رجوع من الخلفية) الزوم والإضاءة بيرجعوا زي ما كانوا
+      _zoom = _zoom.clamp(_minZoom, _maxZoom).toDouble();
       try {
         await c.setZoomLevel(_zoom);
       } catch (_) {}
       try {
         _minExp = await c.getMinExposureOffset();
         _maxExp = await c.getMaxExposureOffset();
-        _exp = 0;
+        _exp = _exp.clamp(_minExp, _maxExp).toDouble();
+        if (_exp != 0) await c.setExposureOffset(_exp);
       } catch (_) {
         _minExp = 0;
         _maxExp = 0;
@@ -9697,6 +11048,7 @@ class _A2RCameraScreenState extends State<A2RCameraScreen> with WidgetsBindingOb
       }
       await _stopLive();
       final x = await c.takePicture();
+      if (widget.autoOrient) gShotTurns[x.path] = shotTurnsFromGravity(_gx, _gy, _gz);
       if (_detailedCapture && !widget.receiptQuality) {
         _rememberCaptureProfile(x.path, ImageQualityProfile.detailedCapture);
       }
@@ -10429,7 +11781,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
         kept.remove(path);
       }
     });
-    snack(context, v ? 'هتتحفظ في الأرشيف بعد الإرسال' : 'اتشالت من المحفوظات');
+    snack(context, v ? 'هتتحفظ في الأرشيف لما تمسحها من "ملفاتي"' : 'اتشالت من المحفوظات');
   }
 
   /// البحث في نص الإيصالات: بيقرأ OCR لأي إيصال متقريش (أول مرة بس) والنتايج بتظهر أول بأول.
@@ -10480,15 +11832,21 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
     final engine = await Store.scanEngineReceipts();
     final mode = engine == 2 ? ScannerMode.full : ScannerMode.base;
     if (!mounted) return;
-    final front = await scanImages(context, 1, mode: mode, camFallback: true, profile: ImageQualityProfile.receipts);
+    final tmpFaces = <String>[];
+    final front = await _idFace(mode, tmpFaces);
     if (front.isEmpty || !mounted) return;
     if (!await askYesNo(context, 'اتصوّر الوش ✓', 'دلوقتي صوّر ضهر البطاقة.',
         yes: 'تصوير', no: 'إلغاء')) {
       return;
     }
     if (!mounted) return;
-    final back = await scanImages(context, 1, mode: mode, camFallback: true, profile: ImageQualityProfile.receipts);
-    if (back.isEmpty || !mounted) return;
+    final back = await _idFace(mode, tmpFaces);
+    if (back.isEmpty || !mounted) {
+      for (final t in tmpFaces) {
+        await Store.del(t);
+      }
+      return;
+    }
     setState(() => busy = true);
     String? tmp;
     try {
@@ -10516,8 +11874,51 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
     } finally {
       if (tmp != null) await Store.del(tmp);
+      for (final t in tmpFaces) {
+        await Store.del(t); // نسخ مؤقتة من كاميرا A2R (البطاقة نفسها اتحفظت كصفحة واحدة)
+      }
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  /// وش/ضهر البطاقة: ماسح جوجل زي الأول؛ ولو فشل دلوقتي (R3) كاميرا A2R تفتح فعلاً وبعدها القص.
+  Future<List<String>> _idFace(ScannerMode mode, List<String> tmpFaces) async {
+    final before = (await SharedPreferences.getInstance()).getInt('scannerFailedAt');
+    if (!mounted) return const [];
+    final r = await scanImages(context, 1, mode: mode, camFallback: true, profile: ImageQualityProfile.receipts);
+    if (r.isNotEmpty || !mounted) return r;
+    final after = (await SharedPreferences.getInstance()).getInt('scannerFailedAt');
+    if (after == null || after == before || !mounted) return const []; // اتلغى
+    if (!await ensureCamera(context) || !mounted) return const [];
+    String? shot;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => A2RCameraScreen(
+          title: 'بطاقة',
+          receiptQuality: true,
+          single: true,
+          onShot: (p) async {
+            shot = p;
+            return const A2RCamState(close: true);
+          },
+        ),
+      ),
+    );
+    final s0 = shot;
+    if (s0 == null || !mounted) return const [];
+    final saved = await persistImage(s0, 'idf_${DateTime.now().microsecondsSinceEpoch}.jpg',
+        filter: ScanFilter.original, applyNow: false, profile: ImageQualityProfile.receipts);
+    tmpFaces.add(saved);
+    _lastScanManual = true; // القص التلقائي يشتغل
+    if (!mounted) return const [];
+    final out = await Navigator.push<String>(
+        context, MaterialPageRoute(builder: (_) => EditorPage(path: saved, prefix: 'idf_', initialTab: 0)));
+    if (out == null) return [saved];
+    if (out == kRetake || out == kDelete) return const [];
+    final path = parseEditorResult(out).path;
+    if (path != saved) tmpFaces.add(path);
+    return [File(path).existsSync() ? path : saved];
   }
 
   @override
@@ -10783,6 +12184,8 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       AppLog.e('_addGallery', e, st);
       if (mounted) snack(context, 'تعذر فتح المعرض');
       return;
+    } finally {
+      await clearPickTarget();
     }
     if (xs.isEmpty || !mounted) return;
     _lastScanManual = true; // صور من غير قص: شاشة التعديل تحدد حدود الورقة تلقائياً
@@ -10918,7 +12321,9 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
   }
 
   /// تطبيق الفلتر والسطوع والتباين والحدة على كل الصفحات (القص والتدوير بتاع كل صفحة زي ما هما).
-  Future<void> _applyToAll(EditParams style, String exceptPath) async {
+  /// keepManual (زرار «تطبيق فلتر … على كل الصور» تحت، R4): بيغيّر الفلتر بس، ويسيب تباين/إضاءة/حدة كل صفحة
+  /// زي ما اتظبطت بالإيد، ومبيحطش فلتر إيصال على صفحات ماسح جوجل الكامل أو البطاقة (متحسّنة جاهزة).
+  Future<void> _applyToAll(EditParams style, String exceptPath, {bool keepManual = false}) async {
     if (!mounted) return;
     setState(() {
       busy = true;
@@ -10931,15 +12336,17 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
         if (p == exceptPath) continue;
         if (mounted) setState(() => progress = '${i + 1}/${imgs.length}');
         try {
+          if (keepManual && await Store.enhanced(p)) continue;
           final old = await Store.editOf(p);
           final ep = EditParams(
             quad: old?.quad,
             turns: old?.turns ?? 0,
             angle: old?.angle ?? 0,
             filter: style.filter,
-            contrast: style.contrast,
-            brightness: style.brightness,
-            sharp: style.sharp,
+            contrast: keepManual ? (old?.contrast ?? 0) : style.contrast,
+            brightness: keepManual ? (old?.brightness ?? 0) : style.brightness,
+            sharp: keepManual ? (old?.sharp ?? 0) : style.sharp,
+            levels: keepManual && old?.filter == style.filter ? old?.levels : null,
           );
           final np = await renderEditedPage(p, 'r_', ep);
           await Store.replaceInDraft(p, np);
@@ -10994,7 +12401,11 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
       if (!mounted || out == null) return false;
       if (out == kRetake || out == kDelete) {
         await Store.unlistFromDraft(old);
-        await Store.del(old);
+        if (out == kRetake) {
+          await Store.archivePath(old); // cam: إعادة أخذ مبتمسحش الصورة، بتروح للأرشيف
+        } else {
+          await Store.del(old);
+        }
         if (mounted) {
           setState(() {
             imgs.remove(old);
@@ -11054,7 +12465,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
 
   Widget _card(String path, int i, bool searching) {
     final cs = Theme.of(context).colorScheme;
-    final isKept = kept.contains(path);
     return Card(
       shape: kCardShape,
       key: ValueKey(path),
@@ -11101,12 +12511,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   const Text('اضغط للمعاينة', style: TextStyle(color: Colors.grey)),
-                  if (isKept)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 4),
-                      child: Text('🔖 محفوظة للأرشيف',
-                          style: TextStyle(fontSize: 11, color: Colors.teal)),
-                    ),
                 ]),
               ),
               if (!searching)
@@ -11116,12 +12520,6 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                         padding: EdgeInsets.all(8), child: Icon(Icons.drag_handle_rounded))),
             ]),
             Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-              IconButton(
-                  tooltip: isKept ? 'إلغاء الحفظ في الأرشيف' : 'احتفظ بيها في الأرشيف',
-                  icon: Icon(
-                      isKept ? Icons.bookmark_rounded : Icons.bookmark_outline_rounded,
-                      color: isKept ? Colors.teal : null),
-                  onPressed: busy ? null : () => _toggleKeep(path)),
               IconButton(
                   tooltip: 'استخراج النص',
                   icon: const Icon(Icons.text_snippet_outlined),
@@ -11139,7 +12537,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
               IconButton(
                   tooltip: 'مسح',
                   icon: const Icon(Icons.delete_outline_rounded, color: Colors.red),
-                  onPressed: busy ? null : () => _remove(i)),
+                  onPressed: (busy && progress != null) ? null : () => _remove(i)), // cam: المسح مش بيتعطل بسبب حفظ صورة جديدة
             ]),
           ]),
         ),
@@ -11251,7 +12649,7 @@ class _ReceiptsScreenState extends State<ReceiptsScreen> {
                   child: OutlinedButton.icon(
                     onPressed: busy
                         ? null
-                        : () => _applyToAll(EditParams(filter: filter), ''),
+                        : () => _applyToAll(EditParams(filter: filter), '', keepManual: true),
                     icon: const Icon(Icons.auto_fix_high_rounded, size: 18),
                     label: Text(
                         'تطبيق فلتر "${kFilterLabels[filter] ?? filter.name}" على كل الصور (${imgs.length})'),
@@ -11382,7 +12780,7 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
                   child: Padding(
                     padding: EdgeInsets.all(24),
                     child: Text(
-                        'مفيش حاجة محفوظة لسه.\nعلّم أي باتش أو إيصال بعلامة الحفظ قبل ما تبعته، وهيتحفظ هنا بدل ما يتمسح بعد ١٢ ساعة.',
+                        'مفيش حاجة محفوظة لسه.\nالصور والملفات اللي بتتبدّل أو بتتبعت بتتحفظ هنا، وبتتمسح بإيدك بس.',
                         textAlign: TextAlign.center,
                         style: TextStyle(fontSize: 15)),
                   ),
@@ -11396,22 +12794,32 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
                       shape: kCardShape,
                       margin: const EdgeInsets.symmetric(vertical: 4),
                       child: ListTile(
-                        leading: ClipRRect(
-                          borderRadius: BorderRadius.circular(8),
-                          child: Image.file(File(path),
-                              width: 48, height: 64, fit: BoxFit.cover, cacheWidth: 150),
-                        ),
-                        title: Text('محفوظ ${_dateOf(path)}'),
+                        leading: path.toLowerCase().endsWith('.pdf')
+                            ? const SizedBox(
+                                width: 48, height: 64, child: Icon(Icons.picture_as_pdf_rounded, size: 34))
+                            : ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.file(File(path),
+                                    width: 48, height: 64, fit: BoxFit.cover, cacheWidth: 150),
+                              ),
+                        title: Text(path.toLowerCase().endsWith('.pdf')
+                            ? (path.split('/').last.startsWith('sent_')
+                                ? 'ملف PDF متبعت\n${_dateOf(path)}'
+                                : 'ملف PDF\n${_dateOf(path)}')
+                            : 'محفوظ\n${_dateOf(path)}'),
                         subtitle: const Text('اضغط للمعاينة'),
-                        onTap: () => Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                                builder: (_) => ZoomPage(child: Image.file(File(path))))),
+                        onTap: () => path.toLowerCase().endsWith('.pdf')
+                            ? OpenFilex.open(path)
+                            : Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                    builder: (_) => ZoomPage(child: Image.file(File(path))))),
                         trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                          IconButton(
-                              tooltip: 'استخراج النص',
-                              icon: const Icon(Icons.text_snippet_outlined),
-                              onPressed: () => showOcrTextSheet(context, path)),
+                          if (!path.toLowerCase().endsWith('.pdf'))
+                            IconButton(
+                                tooltip: 'استخراج النص',
+                                icon: const Icon(Icons.text_snippet_outlined),
+                                onPressed: () => showOcrTextSheet(context, path)),
                           IconButton(
                               tooltip: 'مشاركة',
                               icon: const Icon(Icons.share_rounded),
@@ -11518,7 +12926,8 @@ class _SendLogScreenState extends State<SendLogScreen> {
     } else {
       final counts = <String, List<int>>{};
       for (final e in l) {
-        counts.putIfAbsent(_day(e.time), () => [0, 0])[e.kind == 'batch' ? 0 : 1]++;
+        counts.putIfAbsent(_day(e.time), () => [0, 0, 0])[
+            e.kind == 'batch' ? 0 : (e.kind == 'scan' ? 2 : 1)]++;
       }
       final rows = <Object>[];
       String? last;
@@ -11539,12 +12948,13 @@ class _SendLogScreenState extends State<SendLogScreen> {
             final c = counts[r]!;
             return Padding(
               padding: const EdgeInsets.fromLTRB(4, 12, 4, 6),
-              child: Text('$r  -  ${c[0]} باتش  -  ${c[1]} إرسال إيصالات',
+              child: Text('$r  -  ${c[0]} باتش  -  ${c[1]} إرسال إيصالات${c[2] > 0 ? '  -  ${c[2]} سكانر' : ''}',
                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
             );
           }
           final e = r as SendLogEntry;
           final isBatch = e.kind == 'batch';
+          final isScan = e.kind == 'scan'; // مستند من السكانر
           return Card(
             shape: kCardShape,
             margin: const EdgeInsets.symmetric(vertical: 4),
@@ -11552,10 +12962,13 @@ class _SendLogScreenState extends State<SendLogScreen> {
               isThreeLine: true,
               leading: CircleAvatar(
                 backgroundColor: cs.primary.withAlpha(40),
-                child: Icon(isBatch ? Icons.receipt_long_rounded : Icons.payments_rounded,
+                child: Icon(
+                    isBatch
+                        ? Icons.receipt_long_rounded
+                        : (isScan ? Icons.document_scanner_rounded : Icons.payments_rounded),
                     color: cs.primary),
               ),
-              title: Text(isBatch ? 'الباتش' : 'إيصالات الدفع',
+              title: Text(isBatch ? 'الباتش' : (isScan ? 'سكانر' : 'إيصالات الدفع'),
                   style: const TextStyle(fontWeight: FontWeight.bold)),
               subtitle: Text(
                   '${e.unit}${e.building == null ? '' : ' - ${e.building}'}\n${e.name}${e.detail.isEmpty ? '' : '\n${e.detail}'}'),
@@ -11581,3 +12994,2904 @@ class _SendLogScreenState extends State<SendLogScreen> {
   }
 }
 
+// ===================== سكانر مستقل (فرع cam) =====================
+// مستندات السكانر: كل مستند (اسم + تاريخ + صفحات) بيتحفظ لوحده في «ملفاتي»، ومفيش مسح تلقائي خالص:
+// المستند والـ PDF بتوعه بيفضلوا لحد ما تمسحهم بإيدك. ضغطة «سكانر» من الرئيسية = مستند جديد فاضي.
+
+const kScanMaxPages = 24;
+
+/// اتجاه الموبايل وقت لقطة كاميرا A2R (السكانر بس، autoOrient): مسار اللقطة → عدد لفّات 90° مع عقارب الساعة.
+final Map<String, int> gShotTurns = {};
+
+/// من قراءة الجاذبية (a2r/tilt: x,y,z) بنعرف الموبايل كان عرضي ولا طولي.
+/// x موجب = الحافة اليمين للموبايل لفوق (اتلف عكس عقارب الساعة) → الصورة محتاجة ٣ لفّات.
+/// x سالب = الحافة الشمال لفوق → لفّة واحدة. الموبايل نايم على الترابيزة (z كبيرة) = مش معروف → من غير لف.
+int shotTurnsFromGravity(double ax, double ay, double az) {
+  if (az.abs() > 8.0) return 0;
+  if (ax.abs() < 4.0 || ax.abs() < ay.abs() * 1.5) {
+    return ay < -4.0 && ay.abs() > ax.abs() * 1.5 ? 2 : 0;
+  }
+  return ax > 0 ? 3 : 1;
+}
+
+/// لف حدود القص (TL,TR,BR,BL كنسب) مع الصورة [turns] لفّة مع عقارب الساعة.
+List<Offset> rotateQuadCw(List<Offset> q, int turns) {
+  var r = List<Offset>.of(q);
+  for (var i = 0; i < ((turns % 4) + 4) % 4; i++) {
+    final p = [for (final o in r) Offset(1 - o.dy, o.dx)];
+    // بعد اللف: الركن اللي كان تحت شمال بقى فوق شمال
+    r = [p[3], p[0], p[1], p[2]];
+  }
+  return r;
+}
+
+String _two(int v) => v.toString().padLeft(2, '0');
+String scanDefaultName(DateTime t, {bool card = false}) =>
+    '${card ? 'بطاقة' : 'مستند'} ${_two(t.day)}-${_two(t.month)} ${_two(t.hour)}:${_two(t.minute)}';
+
+/// اسم ملف آمن للمشاركة (الواتساب بيعرض الاسم ده).
+String scanSafeName(String s) {
+  var n = s.trim().replaceAll(RegExp(r'[\\/:*?"<>|\n\r\t]'), '-');
+  if (n.isEmpty) n = 'مستند';
+  return n.length > 60 ? n.substring(0, 60) : n;
+}
+
+/// توقيع/ختم فوق صفحة: صورة PNG في مجلد المستند + مكانه كنسب من الصفحة (المركز والعرض).
+/// بيترسم كطبقة منفصلة وقت التصدير بس: صورة الصفحة نفسها مبتتعدلش ولا بيتعاد ضغطها.
+class ScanMark {
+  final String png;
+  final double cx, cy, w; // w = عرض العلامة كنسبة من عرض الصفحة
+  const ScanMark(this.png, this.cx, this.cy, this.w);
+  Map<String, dynamic> toJson() => {'p': png, 'x': cx, 'y': cy, 'w': w};
+  static ScanMark? fromJson(Object? j) {
+    if (j is! Map) return null;
+    final p = j['p'];
+    if (p is! String) return null;
+    double d(Object? v, double def) => v is num ? v.toDouble() : def;
+    return ScanMark(p, d(j['x'], .5), d(j['y'], .8), d(j['w'], .3).clamp(.03, 1.0).toDouble());
+  }
+
+  ScanMark copy({double? cx, double? cy, double? w}) => ScanMark(png, cx ?? this.cx, cy ?? this.cy, w ?? this.w);
+}
+
+class ScanPage {
+  String path;
+  List<ScanMark> marks;
+  ScanPage(this.path, [List<ScanMark>? m]) : marks = m ?? [];
+  Map<String, dynamic> toJson() => {'p': path, if (marks.isNotEmpty) 'm': [for (final m in marks) m.toJson()]};
+  static ScanPage? fromJson(Object? j) {
+    if (j is String) return ScanPage(j);
+    if (j is! Map || j['p'] is! String) return null;
+    final ms = <ScanMark>[];
+    final mm = j['m'];
+    if (mm is List) {
+      for (final x in mm) {
+        final m = ScanMark.fromJson(x);
+        if (m != null) ms.add(m);
+      }
+    }
+    return ScanPage(j['p'] as String, ms);
+  }
+}
+
+class ScanDoc {
+  final String id;
+  String name;
+  final int created;
+  int updated;
+  String kind; // doc | card
+  final List<ScanPage> pages;
+  final List<String> pdfs; // كل PDF اتعمل للمستند (محفوظ في «ملفاتي»)
+  ScanDoc({
+    required this.id,
+    required this.name,
+    required this.created,
+    required this.updated,
+    this.kind = 'doc',
+    List<ScanPage>? pages,
+    List<String>? pdfs,
+  })  : pages = pages ?? [],
+        pdfs = pdfs ?? [];
+
+  bool get isCard => kind == 'card';
+
+  factory ScanDoc.fresh({bool card = false}) {
+    final now = DateTime.now();
+    return ScanDoc(
+        id: '${now.microsecondsSinceEpoch}',
+        name: scanDefaultName(now, card: card),
+        created: now.millisecondsSinceEpoch,
+        updated: now.millisecondsSinceEpoch,
+        kind: card ? 'card' : 'doc');
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'n': name,
+        'c': created,
+        'u': updated,
+        'k': kind,
+        'pg': [for (final p in pages) p.toJson()],
+        if (pdfs.isNotEmpty) 'pdf': pdfs,
+      };
+
+  static ScanDoc? fromJson(Object? j) {
+    if (j is! Map || j['id'] is! String) return null;
+    final pg = <ScanPage>[];
+    final l = j['pg'];
+    if (l is List) {
+      for (final x in l) {
+        final p = ScanPage.fromJson(x);
+        if (p != null) pg.add(p);
+      }
+    }
+    int n(Object? v) => v is num ? v.toInt() : 0;
+    return ScanDoc(
+      id: j['id'] as String,
+      name: (j['n'] is String && (j['n'] as String).trim().isNotEmpty) ? j['n'] as String : 'مستند',
+      created: n(j['c']),
+      updated: n(j['u']),
+      kind: j['k'] == 'card' ? 'card' : 'doc',
+      pages: pg,
+      pdfs: [
+        if (j['pdf'] is List)
+          for (final x in j['pdf'] as List)
+            if (x is String) x
+      ],
+    );
+  }
+}
+
+/// تخزين مستندات السكانر (SharedPreferences: scanDocs = JSON). المسح يدوي بس.
+class ScanDocs {
+  static const key = 'scanDocs';
+  static const _migKey = 'scanDocsMig1';
+  static const _legacyKey = 'scanPages';
+
+  /// صفحات اتمسحت ولسه رسالة «تراجع» ظاهرة: التنضيف ميقربلهاش.
+  static final Set<String> hold = {};
+
+  static List<ScanDoc> decodeList(String? raw) {
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final j = jsonDecode(raw);
+      if (j is! List) return [];
+      return [
+        for (final x in j) ?ScanDoc.fromJson(x),
+      ];
+    } catch (e, st) {
+      AppLog.e('scanDocs.decode', e, st);
+      return [];
+    }
+  }
+
+  static String encodeList(List<ScanDoc> l) => jsonEncode([for (final d in l) d.toJson()]);
+
+  /// مرة واحدة: صفحات السكانر القديمة (scanPages) بتتجمع في مستند واحد. الملفات زي ما هي.
+  static Future<void> _migrate(SharedPreferences p) async {
+    if (p.getBool(_migKey) == true) return;
+    final old = (p.getStringList(_legacyKey) ?? []).where((e) => File(e).existsSync()).toList();
+    if (old.isNotEmpty) {
+      final l = decodeList(p.getString(key));
+      var t = DateTime.now();
+      try {
+        t = File(old.first).lastModifiedSync();
+      } catch (_) {}
+      l.add(ScanDoc(
+          id: 'old${t.microsecondsSinceEpoch}',
+          name: 'مستند قديم ${_two(t.day)}-${_two(t.month)}',
+          created: t.millisecondsSinceEpoch,
+          updated: t.millisecondsSinceEpoch,
+          pages: [for (final x in old) ScanPage(x)]));
+      await p.setString(key, encodeList(l));
+    }
+    await p.setBool(_migKey, true); // قايمة scanPages القديمة بتفضل زي ما هي (التنضيف لسه بيحافظ عليها)
+  }
+
+  static Future<List<ScanDoc>> all() async {
+    final p = await SharedPreferences.getInstance();
+    await _migrate(p);
+    final l = decodeList(p.getString(key));
+    l.sort((a, b) => b.updated.compareTo(a.updated));
+    return l;
+  }
+
+  static Future<ScanDoc?> byId(String id) async {
+    for (final d in await all()) {
+      if (d.id == id) return d;
+    }
+    return null;
+  }
+
+  /// حفظ/تحديث مستند. مستند من غير صفحات ولا PDF مبيتحفظش (عشان «ملفاتي» متتملاش فاضي).
+  static Future<void> put(ScanDoc d) async {
+    final p = await SharedPreferences.getInstance();
+    await _migrate(p);
+    final l = decodeList(p.getString(key));
+    final i = l.indexWhere((e) => e.id == d.id);
+    final empty = d.pages.isEmpty && d.pdfs.isEmpty;
+    if (i >= 0) {
+      if (empty) {
+        l.removeAt(i);
+      } else {
+        l[i] = d;
+      }
+    } else if (!empty) {
+      l.add(d);
+    }
+    await p.setString(key, encodeList(l));
+  }
+
+  /// مسح مستند بإيدك (بعد تأكيد): صفحاته وعلاماته والـ PDF بتاعه.
+  static Future<void> remove(ScanDoc d) async {
+    final p = await SharedPreferences.getInstance();
+    final l = decodeList(p.getString(key))..removeWhere((e) => e.id == d.id);
+    await p.setString(key, encodeList(l));
+    for (final pg in d.pages) {
+      await Store.del(pg.path);
+    }
+    try {
+      final f = await folder(d.id, create: false);
+      if (await f.exists()) await f.delete(recursive: true);
+    } catch (e, st) {
+      AppLog.e('scanDocs.remove', e, st);
+    }
+  }
+
+  static Future<Directory> folder(String id, {bool create = true}) async {
+    final d = Directory('${(await Store.dir()).path}/scandocs/$id');
+    if (create && !await d.exists()) await d.create(recursive: true);
+    return d;
+  }
+
+  /// كل الملفات اللي التنضيف التلقائي لازم يسيبها.
+  static List<String> filesOf(Iterable<ScanDoc> l) => [
+        for (final d in l) ...[
+          for (final p in d.pages) ...[p.path, for (final m in p.marks) m.png],
+          ...d.pdfs,
+        ],
+      ];
+
+  static Future<List<String>> files() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      return [...filesOf(decodeList(p.getString(key))), ...hold];
+    } catch (e, st) {
+      AppLog.e('scanDocs.files', e, st);
+      return [...hold];
+    }
+  }
+}
+
+/// مصدر التصوير في السكانر (بيتفتكر): 0 كاميرا A2R، 1 ماسح جوجل، 2 جوجل + تنضيف (الكامل)، 3 المعرض.
+/// أول مرة بيمشي على «محرك التصوير» من الإعدادات.
+const kScanSources = <(int, String, IconData)>[
+  (1, 'ماسح جوجل', Icons.document_scanner_rounded),
+  (2, 'جوجل + تنضيف', Icons.auto_fix_high_rounded),
+  (0, 'كاميرا A2R', Icons.photo_camera_rounded),
+  (3, 'المعرض', Icons.photo_library_rounded),
+];
+
+Future<int> scanDocSource() async {
+  final p = await SharedPreferences.getInstance();
+  final v = p.getInt('scanDocSource');
+  if (v != null && v >= 0 && v <= 3) return v;
+  return (await Store.scanEngine()).clamp(0, 2);
+}
+
+/// ترتيب فلاتر المستندات (كلها موجودة في الكود أصلاً).
+const kDocFilterOrder = <ScanFilter>[
+  ScanFilter.original,
+  ScanFilter.gentle,
+  ScanFilter.magic,
+  ScanFilter.gray,
+  ScanFilter.bw,
+  ScanFilter.lighten,
+  ScanFilter.clean,
+  ScanFilter.document,
+  ScanFilter.enhance,
+];
+
+/// الدخول للسكانر: startNew = مستند جديد فاضي، غير كده رئيسية السكانر (زي CamScanner).
+class ScannerHome extends StatelessWidget {
+  final bool startNew;
+  final Session? session;
+  const ScannerHome({super.key, this.startNew = false, this.session});
+  @override
+  Widget build(BuildContext context) =>
+      startNew ? ScanDocScreen(session: session, autoStart: true) : ScanHomeScreen(session: session);
+}
+
+// ---------------------------------------------------------------------
+//  رئيسية السكانر (شكل CamScanner): بحث + أدوات + «الأخيرة» + زرار كاميرا
+// ---------------------------------------------------------------------
+
+/// تطبيع للبحث: من غير مسافات زيادة، والهمزات/التاء المربوطة/الألف المقصورة واحد، والإنجليزي صغير.
+String scanSearchNorm(String s) => s
+    .toLowerCase()
+    .replaceAll(RegExp('[أإآ]'), 'ا')
+    .replaceAll('ة', 'ه')
+    .replaceAll('ى', 'ي')
+    .replaceAll(RegExp(r'\s+'), ' ')
+    .trim();
+
+/// الأحدث الأول (آخر تعديل، وبعده تاريخ الإنشاء).
+List<ScanDoc> scanHomeSorted(Iterable<ScanDoc> l) {
+  final r = l.toList();
+  r.sort((a, b) {
+    final c = b.updated.compareTo(a.updated);
+    return c != 0 ? c : b.created.compareTo(a.created);
+  });
+  return r;
+}
+
+/// البحث بالاسم (كل كلمة لازم تكون موجودة). بحث فاضي = الكل. النتيجة الأحدث الأول.
+List<ScanDoc> scanHomeFilter(Iterable<ScanDoc> l, String q) {
+  final words = scanSearchNorm(q).split(' ').where((w) => w.isNotEmpty).toList();
+  final r = words.isEmpty ? l : l.where((d) {
+    final n = scanSearchNorm(d.name);
+    return words.every(n.contains);
+  });
+  return scanHomeSorted(r);
+}
+
+/// التعليم (اختيار أكتر من مستند): ids بس، ومستند اتمسح بيطلع من التعليم لوحده.
+class ScanSelection {
+  final Set<String> ids = {};
+  bool get active => ids.isNotEmpty;
+  int get count => ids.length;
+  bool has(ScanDoc d) => ids.contains(d.id);
+  void toggle(ScanDoc d) => ids.contains(d.id) ? ids.remove(d.id) : ids.add(d.id);
+  void clear() => ids.clear();
+  void selectAll(Iterable<ScanDoc> l) => ids.addAll(l.map((e) => e.id));
+  void keepOnly(Iterable<ScanDoc> l) {
+    final ok = l.map((e) => e.id).toSet();
+    ids.removeWhere((e) => !ok.contains(e));
+  }
+
+  List<ScanDoc> of(Iterable<ScanDoc> l) => [for (final d in l) if (ids.contains(d.id)) d];
+}
+
+/// عدد المستندات اللي بتظهر في «الأخيرة».
+const kScanRecentCount = 10;
+
+class ScanHomeScreen extends StatefulWidget {
+  final Session? session;
+  final bool showAll; // «الكل» / «عرض الكل»: كل المستندات من غير الأدوات
+  const ScanHomeScreen({super.key, this.session, this.showAll = false});
+  @override
+  State<ScanHomeScreen> createState() => _ScanHomeScreenState();
+}
+
+class _ScanHomeScreenState extends State<ScanHomeScreen> {
+  List<ScanDoc>? docs;
+  String q = '';
+  final sel = ScanSelection();
+  final search = TextEditingController();
+  bool busy = false;
+  String? progress;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    search.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final l = await ScanDocs.all();
+    if (!mounted) return;
+    setState(() {
+      docs = scanHomeSorted(l);
+      sel.keepOnly(docs!);
+    });
+  }
+
+  String _date(int ms) {
+    final t = DateTime.fromMillisecondsSinceEpoch(ms);
+    return '${_two(t.day)}/${_two(t.month)}/${t.year}  ${_two(t.hour)}:${_two(t.minute)}';
+  }
+
+  Future<void> _go(Widget w) async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => w));
+    await _load();
+  }
+
+  /// مستند جديد: source = مصدر أول تصوير (null = المصدر المحفوظ)، card = بطاقة، ocr = يفتح النص بعد التصوير.
+  Future<void> _new({int? source, bool card = false, bool ocr = false}) => _go(ScanDocScreen(
+      session: widget.session, autoStart: true, startCard: card, startSource: source, startOcr: ocr));
+
+  Future<void> _open(ScanDoc d) => _go(ScanDocScreen(docId: d.id, session: widget.session));
+
+  Future<void> _all() => _go(ScanHomeScreen(session: widget.session, showAll: true));
+
+  /// «أدوات PDF»: تختار مستند وتفتح شاشة التصدير بتاعته (PDF أو صور، متوازن/الأصل، الاسم).
+  Future<void> _pdfTools() async {
+    final l = (docs ?? const <ScanDoc>[]).where((d) => d.pages.isNotEmpty).toList();
+    if (l.isEmpty) {
+      snack(context, 'لسه مفيش مستندات — صوّر مستند الأول');
+      return;
+    }
+    final d = await showModalBottomSheet<ScanDoc>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (c) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(c).size.height * .7),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Text('اختار المستند اللي هتعمله PDF أو صور',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+            Flexible(
+              child: ListView(shrinkWrap: true, children: [
+                for (final x in l)
+                  ListTile(
+                    leading: _thumb(x, 40, 50),
+                    title: Text(x.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    subtitle: Text('${x.pages.length} صفحة · ${_date(x.updated)}'),
+                    onTap: () => Navigator.pop(c, x),
+                  ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+    if (d == null || !mounted) return;
+    await _go(ScanDocScreen(docId: d.id, session: widget.session, startExport: true));
+  }
+
+  void _toggle(ScanDoc d) => setState(() => sel.toggle(d));
+
+  Future<void> _renameSel() async {
+    final l = sel.of(docs ?? const []);
+    if (l.length != 1) return;
+    final d = l.first;
+    final n = await askScanName(context, d.name);
+    if (n == null) return;
+    d.name = n;
+    d.updated = DateTime.now().millisecondsSinceEpoch;
+    await ScanDocs.put(d);
+    sel.clear();
+    await _load();
+  }
+
+  /// مشاركة المتعلّم: كل مستند PDF (متوازن) زي «تصدير» بالظبط، والـ PDF بيتحفظ مع المستند.
+  Future<void> _shareSel() async {
+    final l = sel.of(docs ?? const []).where((d) => d.pages.isNotEmpty).toList();
+    if (l.isEmpty || busy) return;
+    setState(() {
+      busy = true;
+      progress = 'بنعمل الـ PDF...';
+    });
+    final out = <String>[];
+    try {
+      for (var i = 0; i < l.length; i++) {
+        final d = l[i];
+        if (mounted) setState(() => progress = 'بنعمل الـ PDF ${i + 1}/${l.length}');
+        final f = await buildScanPdf(d, balanced: true, realCardSize: true);
+        if (!d.pdfs.contains(f.path)) {
+          d.pdfs.add(f.path);
+          await ScanDocs.put(d);
+        }
+        out.add(f.path);
+      }
+    } catch (e, st) {
+      AppLog.e('scanHome.share', e, st);
+      if (mounted) snack(context, errText(e));
+    }
+    if (mounted) {
+      setState(() {
+        busy = false;
+        progress = null;
+      });
+    }
+    if (out.isEmpty || !mounted) return;
+    final sent = await shareFiles(context, out);
+    final s = widget.session;
+    if (sent && s != null) {
+      for (final d in l) {
+        await Store.addLog(s, 'scan', '${d.name} · ${d.pages.length} صفحة · PDF');
+      }
+    }
+  }
+
+  /// مسح المتعلّم بعد تأكيد (مفيش مسح تلقائي خالص).
+  Future<void> _deleteSel() async {
+    final l = sel.of(docs ?? const []);
+    if (l.isEmpty) return;
+    final ok = await askYesNo(
+        context,
+        l.length == 1 ? 'مسح المستند؟' : 'مسح ${l.length} مستندات؟',
+        l.length == 1
+            ? '«${l.first.name}» (${l.first.pages.length} صفحة${l.first.pdfs.isEmpty ? '' : ' + الـ PDF'}) هيتمسح نهائي.'
+            : '${l.map((e) => '«${e.name}»').join('، ')}\nهيتمسحوا نهائي بصفحاتهم والـ PDF بتاعهم.',
+        yes: 'امسح',
+        no: 'لا');
+    if (!ok) return;
+    for (final d in l) {
+      await ScanDocs.remove(d);
+    }
+    sel.clear();
+    await _load();
+  }
+
+  Widget _thumb(ScanDoc d, double w, double h) {
+    final cs = Theme.of(context).colorScheme;
+    final first = d.pages.isEmpty ? null : d.pages.first.path;
+    return SizedBox(
+      width: w,
+      height: h,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: first != null && File(first).existsSync()
+            ? Image.file(File(first), fit: BoxFit.cover, cacheWidth: 200, gaplessPlayback: true)
+            : ColoredBox(
+                color: cs.surfaceContainerHighest,
+                child: Icon(d.isCard ? Icons.badge_rounded : Icons.description_rounded,
+                    color: cs.onSurfaceVariant)),
+      ),
+    );
+  }
+
+  Widget _tile(IconData ic, String t, VoidCallback onTap) {
+    final cs = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: busy ? null : onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 58,
+            height: 58,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: cs.surfaceContainerHighest,
+              border: Border.all(color: kAccent.withAlpha(70)),
+            ),
+            child: Icon(ic, color: kAccent, size: 28),
+          ),
+          const SizedBox(height: 6),
+          FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(t, maxLines: 1, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600))),
+        ]),
+      ),
+    );
+  }
+
+  Widget _tools() {
+    final tiles = <Widget>[
+      _tile(Icons.document_scanner_rounded, 'المسح الضوئي', () => _new()),
+      _tile(Icons.photo_library_rounded, 'استيراد صور', () => _new(source: 3)),
+      _tile(Icons.picture_as_pdf_rounded, 'أدوات PDF', _pdfTools),
+      _tile(Icons.badge_rounded, 'بطاقة ID', () => _new(card: true)),
+      _tile(Icons.text_snippet_rounded, 'استخراج النص', () => _new(ocr: true)),
+      _tile(Icons.grid_view_rounded, 'الكل', _all),
+    ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
+      child: Column(children: [
+        for (var r = 0; r < tiles.length; r += 3)
+          Row(children: [
+            for (var i = r; i < r + 3; i++) Expanded(child: i < tiles.length ? tiles[i] : const SizedBox()),
+          ]),
+      ]),
+    );
+  }
+
+  Widget _row(ScanDoc d) {
+    final cs = Theme.of(context).colorScheme;
+    final on = sel.has(d);
+    return Material(
+      color: on ? kAccent.withAlpha(40) : Colors.transparent,
+      child: InkWell(
+        onTap: busy ? null : () => sel.active ? _toggle(d) : _open(d),
+        onLongPress: busy ? null : () => _toggle(d),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 8, 6, 8),
+          child: Row(children: [
+            DecoratedBox(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(7),
+                border: Border.all(color: cs.outlineVariant),
+              ),
+              child: Padding(padding: const EdgeInsets.all(1), child: _thumb(d, 62, 78)),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(d.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                Row(children: [
+                  if (d.isCard) ...[
+                    Icon(Icons.badge_rounded, size: 15, color: kAccent),
+                    const SizedBox(width: 4),
+                  ],
+                  Text('${d.pages.length}', style: TextStyle(color: cs.onSurfaceVariant)),
+                  const SizedBox(width: 3),
+                  Icon(Icons.filter_none_rounded, size: 14, color: cs.onSurfaceVariant),
+                  if (d.pdfs.isNotEmpty) ...[
+                    const SizedBox(width: 6),
+                    Text('PDF', style: TextStyle(fontSize: 11, color: kAccent, fontWeight: FontWeight.bold)),
+                  ],
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Text('|', style: TextStyle(color: cs.outlineVariant)),
+                  ),
+                  Flexible(
+                    child: Text(_date(d.updated),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textDirection: TextDirection.ltr,
+                        style: TextStyle(color: cs.onSurfaceVariant)),
+                  ),
+                ]),
+              ]),
+            ),
+            Checkbox(
+              value: on,
+              activeColor: kAccent,
+              checkColor: Colors.black,
+              onChanged: busy ? null : (_) => _toggle(d),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final all = docs;
+    final searching = q.trim().isNotEmpty;
+    final list = all == null
+        ? null
+        : searching
+            ? scanHomeFilter(all, q)
+            : (widget.showAll ? all : all.take(kScanRecentCount).toList());
+    final selecting = sel.active;
+    return PopScope(
+      canPop: !selecting,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && selecting) setState(sel.clear);
+      },
+      child: Scaffold(
+        appBar: selecting
+            ? AppBar(
+                leading: IconButton(
+                    tooltip: 'إلغاء التعليم',
+                    icon: const Icon(Icons.close_rounded),
+                    onPressed: () => setState(sel.clear)),
+                title: Text('${sel.count} متعلّم'),
+                actions: [
+                  IconButton(
+                      tooltip: 'علّم الكل',
+                      icon: const Icon(Icons.select_all_rounded),
+                      onPressed: list == null ? null : () => setState(() => sel.selectAll(list))),
+                  if (sel.count == 1)
+                    IconButton(
+                        tooltip: 'تغيير الاسم',
+                        icon: const Icon(Icons.edit_rounded),
+                        onPressed: busy ? null : _renameSel),
+                  IconButton(
+                      tooltip: 'مشاركة PDF',
+                      icon: const Icon(Icons.ios_share_rounded),
+                      onPressed: busy ? null : _shareSel),
+                  IconButton(
+                      tooltip: 'مسح',
+                      icon: Icon(Icons.delete_rounded, color: cs.error),
+                      onPressed: busy ? null : _deleteSel),
+                ],
+              )
+            : AppBar(title: Text(widget.showAll ? 'كل المستندات' : 'سكانر')),
+        floatingActionButton: selecting
+            ? null
+            : FloatingActionButton.large(
+                tooltip: 'مستند جديد بالكاميرا',
+                shape: const CircleBorder(),
+                backgroundColor: kAccent,
+                foregroundColor: Colors.black,
+                onPressed: busy ? null : () => _new(),
+                child: const Icon(Icons.photo_camera_rounded, size: 40),
+              ),
+        body: SafeArea(
+          child: Column(children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
+              child: TextField(
+                controller: search,
+                textInputAction: TextInputAction.search,
+                decoration: InputDecoration(
+                  hintText: 'بحث',
+                  prefixIcon: const Icon(Icons.search_rounded),
+                  suffixIcon: searching
+                      ? IconButton(
+                          tooltip: 'مسح البحث',
+                          icon: const Icon(Icons.close_rounded),
+                          onPressed: () => setState(() {
+                                search.clear();
+                                q = '';
+                              }))
+                      : null,
+                  filled: true,
+                  fillColor: cs.surfaceContainerHighest,
+                  isDense: true,
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                ),
+                onChanged: (v) => setState(() => q = v),
+              ),
+            ),
+            if (busy)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                child: Column(children: [
+                  if (progress != null) Text(progress!, style: const TextStyle(fontSize: 12)),
+                  const LinearProgressIndicator(),
+                ]),
+              ),
+            Expanded(
+              child: list == null
+                  ? const Center(child: CircularProgressIndicator())
+                  : ListView(
+                      padding: const EdgeInsets.only(bottom: 120),
+                      children: [
+                        if (!widget.showAll && !searching) _tools(),
+                        if (!widget.showAll && !searching) const SizedBox(height: 4),
+                        Container(
+                          decoration: BoxDecoration(
+                            color: cs.surfaceContainerLow,
+                            borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
+                          ),
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 6, 8, 4),
+                              child: Row(children: [
+                                Expanded(
+                                  child: Text(
+                                      searching
+                                          ? 'نتايج البحث (${list.length})'
+                                          : (widget.showAll ? 'كل المستندات (${all!.length})' : 'الأخيرة'),
+                                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                ),
+                                if (!widget.showAll && !searching && all!.isNotEmpty)
+                                  TextButton(
+                                    onPressed: busy ? null : _all,
+                                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                      Text('عرض الكل (${all.length})'),
+                                      const Icon(Icons.chevron_left_rounded),
+                                    ]),
+                                  ),
+                              ]),
+                            ),
+                            if (list.isEmpty)
+                              Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 40),
+                                child: Center(
+                                  child: Text(
+                                      searching
+                                          ? 'مفيش نتايج'
+                                          : 'لسه مفيش مستندات — دوس الكاميرا أو «المسح الضوئي»',
+                                      style: TextStyle(color: cs.onSurfaceVariant)),
+                                ),
+                              )
+                            else
+                              for (final d in list) _row(d),
+                          ]),
+                        ),
+                      ],
+                    ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+/// المظهر بتاع التطبيق (للاختبارات واللقطات).
+ThemeData appThemeFor(Brightness b) => _theme(b);
+
+// ---------------------------------------------------------------------
+//  قايمة المستندات
+// ---------------------------------------------------------------------
+class ScanDocsScreen extends StatefulWidget {
+  final Session? session;
+  const ScanDocsScreen({super.key, this.session});
+  @override
+  State<ScanDocsScreen> createState() => _ScanDocsScreenState();
+}
+
+class _ScanDocsScreenState extends State<ScanDocsScreen> {
+  List<ScanDoc>? docs;
+  String q = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final l = await ScanDocs.all();
+    if (mounted) setState(() => docs = l);
+  }
+
+  String _date(int ms) {
+    final t = DateTime.fromMillisecondsSinceEpoch(ms);
+    return '${_two(t.day)}/${_two(t.month)}/${t.year}  ${_two(t.hour)}:${_two(t.minute)}';
+  }
+
+  Future<void> _open({ScanDoc? d, bool card = false}) async {
+    await Navigator.push(
+        context,
+        MaterialPageRoute(
+            builder: (_) => ScanDocScreen(
+                docId: d?.id, session: widget.session, autoStart: d == null, startCard: card)));
+    await _load();
+  }
+
+  Future<void> _rename(ScanDoc d) async {
+    final n = await askScanName(context, d.name);
+    if (n == null) return;
+    d.name = n;
+    d.updated = DateTime.now().millisecondsSinceEpoch;
+    await ScanDocs.put(d);
+    await _load();
+  }
+
+  Future<void> _delete(ScanDoc d) async {
+    final ok = await askYesNo(context, 'مسح المستند؟',
+        '«${d.name}» (${d.pages.length} صفحة${d.pdfs.isEmpty ? '' : ' + الـ PDF'}) هيتمسح نهائي.',
+        yes: 'امسح', no: 'لا');
+    if (!ok) return;
+    await ScanDocs.remove(d);
+    await _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final all = docs;
+    final l = all == null
+        ? null
+        : (q.trim().isEmpty ? all : all.where((d) => d.name.contains(q.trim())).toList());
+    return Scaffold(
+      appBar: AppBar(title: const Text('مستندات السكانر')),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _open(),
+        icon: const Icon(Icons.add_rounded),
+        label: const Text('مستند جديد'),
+      ),
+      body: SafeArea(
+        child: Column(children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+            child: TextField(
+              decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search_rounded), hintText: 'دوّر بالاسم', isDense: true),
+              onChanged: (v) => setState(() => q = v),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: TextButton.icon(
+                  onPressed: () => _open(card: true),
+                  icon: const Icon(Icons.badge_rounded),
+                  label: const Text('بطاقة جديدة (وش وضهر)')),
+            ),
+          ),
+          Expanded(
+            child: l == null
+                ? const Center(child: CircularProgressIndicator())
+                : l.isEmpty
+                    ? Center(
+                        child: Text(all!.isEmpty ? 'لسه مفيش مستندات' : 'مفيش نتايج',
+                            style: TextStyle(color: cs.onSurfaceVariant)))
+                    : ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 90),
+                        itemCount: l.length,
+                        itemBuilder: (_, i) {
+                          final d = l[i];
+                          final first = d.pages.isEmpty ? null : d.pages.first.path;
+                          return Card(
+                            shape: kCardShape,
+                            margin: const EdgeInsets.symmetric(vertical: 4),
+                            child: ListTile(
+                              onTap: () => _open(d: d),
+                              leading: SizedBox(
+                                width: 46,
+                                height: 58,
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(6),
+                                  child: first != null && File(first).existsSync()
+                                      ? Image.file(File(first), fit: BoxFit.cover, cacheWidth: 140)
+                                      : ColoredBox(
+                                          color: cs.surfaceContainerHighest,
+                                          child: Icon(d.isCard ? Icons.badge_rounded : Icons.description_rounded)),
+                                ),
+                              ),
+                              title: Text(d.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                              subtitle: Text(
+                                  '${d.isCard ? 'بطاقة · ' : ''}${d.pages.length} صفحة${d.pdfs.isEmpty ? '' : ' · PDF'}\n${_date(d.updated)}'),
+                              isThreeLine: true,
+                              trailing: PopupMenuButton<String>(
+                                onSelected: (v) => v == 'r' ? _rename(d) : _delete(d),
+                                itemBuilder: (_) => const [
+                                  PopupMenuItem(value: 'r', child: Text('تغيير الاسم')),
+                                  PopupMenuItem(value: 'd', child: Text('مسح')),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+Future<String?> askScanName(BuildContext context, String current, {String title = 'اسم المستند'}) async {
+  final c = TextEditingController(text: current);
+  final r = await showDialog<String>(
+    context: context,
+    builder: (d) => Directionality(
+      textDirection: TextDirection.rtl,
+      child: AlertDialog(
+        title: Text(title),
+        content: TextField(
+            controller: c,
+            autofocus: true,
+            textInputAction: TextInputAction.done,
+            onSubmitted: (v) => Navigator.pop(d, v)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(d, c.text), child: const Text('حفظ')),
+        ],
+      ),
+    ),
+  );
+  c.dispose();
+  final n = r?.trim();
+  return (n == null || n.isEmpty) ? null : n;
+}
+
+// ---------------------------------------------------------------------
+//  شاشة المستند
+// ---------------------------------------------------------------------
+class ScanDocScreen extends StatefulWidget {
+  final String? docId; // null = مستند جديد فاضي
+  final Session? session;
+  final bool autoStart; // يفتح التصوير على طول (مستند جديد)
+  final bool startCard; // مستند جديد = بطاقة (وش وضهر)
+  final int? startSource; // أول تصوير بمصدر معيّن (3 = المعرض) من غير ما يغيّر المصدر المحفوظ
+  final bool startOcr; // بعد أول تصوير يفتح «النص» على طول (أداة «استخراج النص»)
+  final bool startExport; // مستند موجود: يفتح شاشة التصدير على طول (أداة «أدوات PDF»)
+  const ScanDocScreen(
+      {super.key,
+      this.docId,
+      this.session,
+      this.autoStart = false,
+      this.startCard = false,
+      this.startSource,
+      this.startOcr = false,
+      this.startExport = false});
+  @override
+  State<ScanDocScreen> createState() => _ScanDocScreenState();
+}
+
+class _ScanDocScreenState extends State<ScanDocScreen> {
+  static const _prefKey = 'scanDefaultFilter';
+  ScanDoc? doc;
+  ScanFilter sel = ScanFilter.original; // فلتر الصفحات الجديدة
+  ScanFilter? saved; // ⭐
+  int source = 1;
+  bool busy = false;
+  String? progress;
+  int cur = 0;
+  final pager = PageController();
+  final Map<String, double> _aspect = {}; // عرض/طول كل صفحة (للعلامات)
+
+  List<ScanPage> get pages => doc?.pages ?? const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  @override
+  void dispose() {
+    pager.dispose();
+    super.dispose();
+  }
+
+  Future<void> _init() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final i = p.getInt(_prefKey);
+      if (i != null && i >= 0 && i < ScanFilter.values.length) {
+        saved = ScanFilter.values[i];
+        sel = saved!;
+      }
+      source = await scanDocSource();
+      ScanDoc? d;
+      if (widget.docId != null) d = await ScanDocs.byId(widget.docId!);
+      d ??= ScanDoc.fresh(card: widget.startCard);
+      d.pages.removeWhere((e) => !File(e.path).existsSync());
+      if (!mounted) return;
+      setState(() => doc = d);
+      // صورة رجعت بعد ما أندرويد قفل التطبيق وهو في المعرض/الكاميرا
+      final lost = await takeLostPick('scanner');
+      if (lost != null && mounted) {
+        await _addFiles([lost], manual: true);
+      } else if (widget.autoStart && mounted) {
+        if (d.isCard) {
+          await _captureCard();
+        } else {
+          await _capture(forceSource: widget.startSource);
+          if (widget.startOcr && mounted && pages.isNotEmpty) await _ocr();
+        }
+      } else if (widget.startExport && mounted && d.pages.isNotEmpty) {
+        await _export();
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.init', e, st);
+      if (mounted) setState(() => doc ??= ScanDoc.fresh());
+    }
+  }
+
+  Future<void> _persist() async {
+    final d = doc;
+    if (d == null) return;
+    d.updated = DateTime.now().millisecondsSinceEpoch;
+    try {
+      await ScanDocs.put(d);
+    } catch (e, st) {
+      AppLog.e('scanner.persist', e, st);
+    }
+  }
+
+  void _setBusy(bool v, [String? text]) {
+    if (!mounted) return;
+    setState(() {
+      busy = v;
+      progress = v ? text : null;
+    });
+  }
+
+  Future<void> _toggleDefault() async {
+    final p = await SharedPreferences.getInstance();
+    if (saved == sel) {
+      await p.remove(_prefKey);
+      saved = null;
+    } else {
+      await p.setInt(_prefKey, sel.index);
+      saved = sel;
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _goto(int i) {
+    if (pages.isEmpty) return;
+    cur = i.clamp(0, pages.length - 1);
+    if (pager.hasClients) pager.jumpToPage(cur);
+    setState(() {});
+  }
+
+  // ---------- التصوير ----------
+
+  int get _room => kScanMaxPages - pages.length;
+
+  Future<void> _pickSource() async {
+    final v = await showModalBottomSheet<int>(
+      context: context,
+      showDragHandle: true,
+      builder: (c) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Padding(
+              padding: EdgeInsets.only(bottom: 6),
+              child: Text('التصوير بـ', style: TextStyle(fontWeight: FontWeight.bold))),
+          for (final (v, t, ic) in kScanSources)
+            ListTile(
+              leading: Icon(ic),
+              title: Text(t),
+              subtitle: v == 1
+                  ? const Text('قص تلقائي، صورة أصغر شوية')
+                  : v == 2
+                      ? const Text('قص + تنضيف من جوجل نفسها')
+                      : v == 0
+                          ? const Text('أعلى دقة: حدود حيّة وتصوير تلقائي وسريع')
+                          : const Text('صور من الموبايل وبعدها القص'),
+              trailing: v == source ? Icon(Icons.check_rounded, color: kAccent) : null,
+              onTap: () => Navigator.pop(c, v),
+            ),
+        ]),
+      ),
+    );
+    if (v == null) return;
+    (await SharedPreferences.getInstance()).setInt('scanDocSource', v);
+    if (mounted) setState(() => source = v);
+  }
+
+  /// ماسح جوجل فشل في آخر ١٠ دقايق؟ (للسكانر بس: نروح لكاميرا A2R على طول من غير ما نستنى الخطأ تاني)
+  Future<bool> _googleRecentlyFailed() async {
+    final t = (await SharedPreferences.getInstance()).getInt('scanDocGoogleFailAt') ?? 0;
+    return DateTime.now().millisecondsSinceEpoch - t < 10 * 60 * 1000;
+  }
+
+  /// تصوير صفحات جديدة (أو صفحة واحدة مكان [replaceAt] = إعادة تصوير).
+  Future<void> _capture({int? replaceAt, int? forceSource}) async {
+    if (busy || doc == null) return;
+    if (replaceAt == null && _room <= 0) {
+      snack(context, 'وصلت للحد: $kScanMaxPages صفحة في المستند');
+      return;
+    }
+    final limit = replaceAt != null ? 1 : (doc!.isCard ? 1 : _room);
+    final src = forceSource ?? source;
+    try {
+      if (src == 3) {
+        await _addGallery(replaceAt: replaceAt, limit: limit);
+      } else if (src == 0) {
+        await _captureA2R(replaceAt: replaceAt, limit: limit);
+      } else {
+        if (await _googleRecentlyFailed()) {
+          await _captureA2R(replaceAt: replaceAt, limit: limit);
+          return;
+        }
+        final before = (await SharedPreferences.getInstance()).getInt('scannerFailedAt');
+        if (!mounted) return;
+        final got = await scanImages(context, limit,
+            mode: src == 2 ? ScannerMode.full : ScannerMode.base,
+            camFallback: true,
+            profile: ImageQualityProfile.receipts,
+            retryFailed: true);
+        final manual = _lastScanManual;
+        final enhanced = _lastScanEnhanced && !manual;
+        if (!mounted) return;
+        if (got.isEmpty) {
+          final after = (await SharedPreferences.getInstance()).getInt('scannerFailedAt');
+          if (after != null && after != before) {
+            // B4: ماسح جوجل فشل دلوقتي → كاميرا A2R تفتح فعلاً
+            await (await SharedPreferences.getInstance())
+                .setInt('scanDocGoogleFailAt', DateTime.now().millisecondsSinceEpoch);
+            if (mounted) await _captureA2R(replaceAt: replaceAt, limit: limit);
+          }
+          return;
+        }
+        await _addFiles(got, manual: manual, enhanced: enhanced, replaceAt: replaceAt);
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.capture', e, st);
+      if (mounted) snack(context, errText(e));
+    }
+  }
+
+  /// بيحفظ صورة في مجلد التطبيق بأصلها (من غير تصغير ولا إعادة ضغط).
+  Future<String> _persistShot(String src) => persistImage(src, 'scan_${DateTime.now().microsecondsSinceEpoch}.jpg',
+      filter: ScanFilter.original, applyNow: false, keepOriginal: true, profile: ImageQualityProfile.receipts);
+
+  void _insert(String path, {int? replaceAt}) {
+    final d = doc!;
+    if (replaceAt != null && replaceAt <= d.pages.length) {
+      d.pages.insert(replaceAt, ScanPage(path));
+      cur = replaceAt;
+    } else {
+      d.pages.add(ScanPage(path));
+      cur = d.pages.length - 1;
+    }
+  }
+
+  /// صور جت من ماسح جوجل أو المعرض أو الكاميرا العادية.
+  /// manual (مش مقصوصة) → شاشة القص لكل صورة (B6/B18). من جوجل → فلتر المستند الافتراضي مرة واحدة من الأصل.
+  Future<void> _addFiles(List<String> got,
+      {bool manual = false, bool enhanced = false, int? replaceAt}) async {
+    final start = replaceAt ?? pages.length;
+    var n = 0;
+    _setBusy(true, 'بنحفظ الصفحات...');
+    try {
+      for (final g in got) {
+        if (replaceAt == null && _room <= 0) break;
+        final saved = await _persistShot(g);
+        if (enhanced) await Store.setEnhanced(saved, true);
+        if (!manual && !enhanced && sel != ScanFilter.original) {
+          await Store.setEdit(saved, EditParams(filter: sel));
+          await Store.setEditPending(saved, true);
+        }
+        _insert(saved, replaceAt: replaceAt == null ? null : replaceAt + n);
+        n++;
+      }
+      await _persist();
+    } finally {
+      _setBusy(false);
+    }
+    if (n == 0 || !mounted) return;
+    setState(() {});
+    if (got.length > n) snack(context, 'اتضاف $n بس: الحد $kScanMaxPages صفحة');
+    _goto(start);
+    if (manual) {
+      for (var i = start; i < start + n && i < pages.length; i++) {
+        if (!mounted) break;
+        _lastScanManual = true; // القص التلقائي يشتغل في شاشة التعديل
+        final r = await _edit(i, tab: 0, fromCapture: true);
+        if (r == _EditEnd.retake || r == _EditEnd.stop) break;
+      }
+    } else {
+      for (var i = start; i < start + n && i < pages.length; i++) {
+        await _bakePending(i);
+      }
+    }
+  }
+
+  /// لو الصفحة عليها تعديل متسجّل ومش مرسوم (فلتر/اتجاه): بنرسمه مرة واحدة من الأصل.
+  Future<void> _bakePending(int i) async {
+    if (i < 0 || i >= pages.length) return;
+    final p = pages[i].path;
+    if (!await Store.editPending(p)) return;
+    final e = await Store.editOf(p);
+    if (e == null) return;
+    try {
+      _setBusy(true, 'بنطبّق الفلتر...');
+      final np = await renderEditedPage(p, 'scan_', e);
+      if (i < pages.length && pages[i].path == p) {
+        pages[i].path = np;
+        await _persist();
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.bake', e, st);
+    } finally {
+      _setBusy(false);
+    }
+  }
+
+  A2RCamState _camState({bool close = false}) => A2RCamState(
+      count: pages.length, thumb: pages.isEmpty ? null : pages.last.path, close: close);
+
+  /// كاميرا A2R (أعلى دقة): كل لقطة بتتحفظ بأصلها، وبعدها شاشة القص. التصوير السريع بيقص في الخلفية.
+  /// autoOrient: لو الموبايل كان عرضي، الصفحة بتتلف لوحدها (C2، السكانر بس).
+  Future<void> _captureA2R({int? replaceAt, int limit = kScanMaxPages}) async {
+    if (!await ensureCamera(context)) return;
+    if (!mounted) return;
+    final single = replaceAt != null || limit <= 1;
+    var added = 0;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => A2RCameraScreen(
+          title: doc!.isCard ? 'بطاقة' : 'سكانر',
+          receiptQuality: true,
+          single: single,
+          autoOrient: true,
+          count: pages.length,
+          thumb: pages.isEmpty ? null : pages.last.path,
+          onShot: (p) async {
+            final at = replaceAt == null ? null : replaceAt + added;
+            final i = await _saveShot(p, replaceAt: at);
+            if (i == null) return _camState();
+            added++;
+            _lastScanManual = true;
+            final r = await _edit(i, tab: 0, fromCapture: true);
+            if (r == _EditEnd.retake) {
+              added--;
+              return _camState(); // الصفحة القديمة راحت الأرشيف والكاميرا مفتوحة
+            }
+            return _camState(close: single || _room <= 0);
+          },
+          onFastShot: single ? null : (p, quad) => _fastShot(p),
+          onUndoLast: single ? null : _undoLast,
+          onGallery: () async {
+            final before = pages.length;
+            await _addGallery(replaceAt: replaceAt, limit: limit);
+            return _camState(close: pages.length > before);
+          },
+        ),
+      ),
+    );
+  }
+
+  Future<int?> _saveShot(String p, {int? replaceAt}) async {
+    if (replaceAt == null && _room <= 0) {
+      if (mounted) snack(context, 'وصلت للحد: $kScanMaxPages صفحة');
+      return null;
+    }
+    try {
+      final turns = gShotTurns.remove(p) ?? 0;
+      final saved = await _persistShot(p);
+      if (turns != 0 || sel != ScanFilter.original) {
+        await Store.setEdit(saved, EditParams(turns: turns, filter: sel));
+        await Store.setEditPending(saved, true);
+      }
+      _insert(saved, replaceAt: replaceAt);
+      await _persist();
+      if (mounted) setState(() {});
+      return cur;
+    } catch (e, st) {
+      AppLog.e('scanner.saveShot', e, st);
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+      return null;
+    }
+  }
+
+  /// لقطة سريعة: قص تلقائي + اتجاه + فلتر في رسمة واحدة من الأصل، من غير فتح المحرر.
+  Future<A2RCamState?> _fastShot(String src) async {
+    if (_room <= 0) {
+      return A2RCamState(count: pages.length, thumb: pages.last.path, warning: 'وصلت للحد: $kScanMaxPages صفحة');
+    }
+    String? saved;
+    try {
+      final turns = gShotTurns.remove(src) ?? 0;
+      saved = await _persistShot(src);
+      var path = saved;
+      final q = await detectDocQuad(saved); // على الصورة قبل اللف
+      if (q != null || turns != 0 || sel != ScanFilter.original) {
+        path = await renderEditedPage(
+            saved, 'scan_', EditParams(quad: q == null ? null : rotateQuadCw(q, turns), turns: turns, filter: sel));
+        await Store.del(saved);
+        saved = null;
+      }
+      _insert(path);
+      await _persist();
+      if (mounted) setState(() {});
+      final warn = q == null
+          ? 'حدود الورقة مش واضحة. الصورة كاملة محفوظة، افتح القص وحدد الأركان بإيدك'
+          : await qualityWarning(path);
+      return A2RCamState(count: pages.length, thumb: path, warning: warn);
+    } catch (e, st) {
+      AppLog.e('scanner.fastShot', e, st);
+      if (saved != null) await Store.del(saved);
+      if (mounted) snack(context, 'حصل خطأ: ${errText(e)}');
+      return null;
+    }
+  }
+
+  Future<A2RCamState?> _undoLast() async {
+    if (pages.isEmpty) return _camState();
+    final p = pages.removeLast();
+    cur = math.max(0, pages.length - 1);
+    await _persist();
+    if (mounted) setState(() {});
+    await Store.del(p.path); // لقطة لسه متصوّرة حالاً واتلغت من جوه الكاميرا
+    return _camState();
+  }
+
+  Future<void> _addGallery({int? replaceAt, int limit = kScanMaxPages}) async {
+    await markPickTarget('scanner');
+    List<XFile> xs;
+    try {
+      if (limit <= 1) {
+        final x = await ImagePicker().pickImage(source: ImageSource.gallery);
+        xs = [?x];
+      } else {
+        xs = await ImagePicker().pickMultiImage(); // الزيادة عن الحد بتتشال في _addFiles
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.gallery', e, st);
+      if (mounted) snack(context, 'تعذر فتح المعرض');
+      return;
+    } finally {
+      await clearPickTarget();
+    }
+    if (xs.isEmpty || !mounted) return;
+    await _addFiles([for (final x in xs) x.path], manual: true, replaceAt: replaceAt);
+  }
+
+  // ---------- بطاقة ----------
+
+  Future<bool> _bigPrompt(String title, String body, IconData icon) async {
+    final r = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (c) => Scaffold(
+          appBar: AppBar(title: const Text('بطاقة')),
+          body: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                Icon(icon, size: 120, color: kAccent),
+                const SizedBox(height: 20),
+                Text(title,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 10),
+                Text(body, textAlign: TextAlign.center, style: const TextStyle(fontSize: 16)),
+                const SizedBox(height: 30),
+                SizedBox(
+                  width: double.infinity,
+                  height: 56,
+                  child: FilledButton.icon(
+                      onPressed: () => Navigator.pop(c, true),
+                      icon: const Icon(Icons.photo_camera_rounded),
+                      label: const Text('صوّر', style: TextStyle(fontSize: 18))),
+                ),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    );
+    return r == true;
+  }
+
+  /// بطاقة: الوش والضهر صفحتين في نفس المستند (مفيش نسخ سايبة في الأرشيف).
+  Future<void> _captureCard() async {
+    final d = doc;
+    if (d == null || busy) return;
+    if (!d.isCard) {
+      if (d.pages.isNotEmpty) {
+        // البطاقة مستند لوحدها: القديم بيفضل محفوظ في «ملفاتي»
+        await _persist();
+        if (!mounted) return;
+        await Navigator.pushReplacement(context,
+            MaterialPageRoute(builder: (_) => ScanDocScreen(session: widget.session, autoStart: true, startCard: true)));
+        return;
+      }
+      setState(() {
+        d.kind = 'card';
+        d.name = scanDefaultName(DateTime.fromMillisecondsSinceEpoch(d.created), card: true);
+      });
+    }
+    if (d.pages.isEmpty) {
+      if (!await _bigPrompt('وش البطاقة', 'حط البطاقة على حاجة غامقة وصوّر الوش', Icons.badge_rounded)) return;
+      if (!mounted) return;
+      await _capture();
+      if (!mounted || d.pages.isEmpty) return;
+    }
+    if (d.pages.length == 1) {
+      if (!await _bigPrompt('اقلب البطاقة', 'دلوقتي صوّر الضهر', Icons.flip_rounded)) return;
+      if (!mounted) return;
+      await _capture();
+    }
+  }
+
+  // ---------- التعديل ----------
+
+  /// شاشة التعديل (قص/تدوير/فلتر) مع التنقل بين الصفحات والحذف وإعادة التصوير.
+  /// B1: الأوامر اللي بترجع من المحرر (‹ › / طبّق على الكل) بتتفك صح ومبتتحفظش كمسار صفحة.
+  Future<_EditEnd> _edit(int i, {int tab = 0, bool fromCapture = false}) async {
+    var idx = i;
+    while (mounted && pages.isNotEmpty) {
+      idx = idx.clamp(0, pages.length - 1);
+      final page = pages[idx];
+      final old = page.path;
+      if (!mounted) break;
+      final nav = Navigator.of(context);
+      final out = await nav.push<String>(
+        PageRouteBuilder<String>(
+          transitionDuration: const Duration(milliseconds: 160),
+          reverseTransitionDuration: const Duration(milliseconds: 120),
+          pageBuilder: (_, _, _) => EditorPage(
+              path: old,
+              prefix: 'scan_',
+              initialTab: tab,
+              canRetake: true,
+              pageIndex: idx,
+              pageCount: pages.length,
+              canDelete: true),
+          transitionsBuilder: (_, a, _, child) => FadeTransition(opacity: a, child: child),
+        ),
+      );
+      tab = 0;
+      if (!mounted) return _EditEnd.stop;
+      if (out == null) {
+        await _bakePending(pages.indexOf(page)); // رجوع من غير ✓: الاتجاه/الفلتر المتسجل بيترسم
+        _goto(pages.indexOf(page));
+        return _EditEnd.done;
+      }
+      if (out == kRetake) {
+        final at = pages.indexOf(page);
+        pages.remove(page);
+        await Store.archivePath(old); // إعادة التصوير مبتمسحش: القديمة للأرشيف
+        await _persist();
+        if (mounted) setState(() {});
+        if (fromCapture && source == 0) return _EditEnd.retake; // الكاميرا لسه مفتوحة تحت
+        await _capture(replaceAt: at.clamp(0, pages.length));
+        return _EditEnd.retake;
+      }
+      if (out == kDelete) {
+        await _removePage(page, ask: false);
+        continue;
+      }
+      final (:path, :dir, :allStyle) = parseEditorResult(out);
+      if (path != old && File(path).existsSync()) {
+        page.path = path;
+        await _persist();
+        if (mounted) setState(() {});
+      }
+      if (allStyle != null) {
+        await _applyStyleToAll(allStyle, except: page);
+        return _EditEnd.done;
+      }
+      if (dir == null) {
+        _goto(pages.indexOf(page));
+        return _EditEnd.done;
+      }
+      if (dir == 'prev') {
+        idx = pages.indexOf(page) - 1;
+        continue;
+      }
+      idx = pages.indexOf(page) + 1;
+      if (idx >= pages.length) {
+        // آخر صفحة + «التالي»: صفحة جديدة
+        if (fromCapture && source == 0) return _EditEnd.done; // الكاميرا مفتوحة تحت
+        await _capture();
+        return _EditEnd.done;
+      }
+    }
+    return _EditEnd.done;
+  }
+
+  /// فلتر/تباين/إضاءة/حدة على كل الصفحات مع الحفاظ على قص وتدوير كل صفحة (رسمة واحدة من الأصل لكل صفحة).
+  Future<void> _applyStyleToAll(EditParams? style, {ScanPage? except, ScanFilter? filter}) async {
+    final list = [for (final p in pages) if (p != except) p];
+    if (list.isEmpty) return;
+    var done = 0, failed = 0;
+    _setBusy(true, 'بنطبّق على الكل 0/${list.length}');
+    try {
+      for (final pg in list) {
+        if (!mounted) break;
+        try {
+          final prev = await Store.editOf(pg.path);
+          final f = filter ?? style?.filter ?? prev?.filter ?? ScanFilter.original;
+          final np = await renderEditedPage(
+              pg.path,
+              'scan_',
+              EditParams(
+                quad: prev?.quad,
+                turns: prev?.turns ?? 0,
+                angle: prev?.angle ?? 0,
+                filter: f,
+                contrast: style?.contrast ?? prev?.contrast ?? 0,
+                brightness: style?.brightness ?? prev?.brightness ?? 0,
+                sharp: style?.sharp ?? prev?.sharp ?? 0,
+                levels: f == prev?.filter ? prev?.levels : null,
+              ));
+          pg.path = np;
+          await _persist();
+        } catch (e, st) {
+          failed++;
+          AppLog.e('scanner.applyAll', e, st);
+        }
+        done++;
+        if (mounted) setState(() => progress = 'بنطبّق على الكل $done/${list.length}');
+      }
+    } finally {
+      _setBusy(false);
+    }
+    if (mounted) snack(context, failed == 0 ? 'اتطبق على كل الصفحات' : 'اتطبق، و$failed صفحة فشلت');
+  }
+
+  /// تدوير سريع ٩٠° (من الأصل، رسمة واحدة) مع لف حدود القص ومكان العلامات.
+  Future<void> _rotate(int i) async {
+    if (busy || i < 0 || i >= pages.length) return;
+    final pg = pages[i];
+    _setBusy(true, 'بنلف الصفحة...');
+    try {
+      final e = await Store.editOf(pg.path) ?? const EditParams();
+      final np = await renderEditedPage(
+          pg.path,
+          'scan_',
+          EditParams(
+              quad: e.quad == null ? null : rotateQuadCw(e.quad!, 1),
+              turns: (e.turns + 1) % 4,
+              angle: e.angle,
+              filter: e.filter,
+              contrast: e.contrast,
+              brightness: e.brightness,
+              sharp: e.sharp,
+              levels: e.levels));
+      final a = _aspect[pg.path];
+      pg.marks = [
+        for (final m in pg.marks) m.copy(cx: 1 - m.cy, cy: m.cx, w: a == null ? m.w : (m.w * a).clamp(.03, 1.0).toDouble())
+      ];
+      pg.path = np;
+      await _persist();
+    } catch (e, st) {
+      AppLog.e('scanner.rotate', e, st);
+      if (mounted) snack(context, errText(e));
+    } finally {
+      _setBusy(false);
+    }
+  }
+
+  /// حذف صفحة (بتأكيد) مع «تراجع». الملف بيتمسح بعد ما الرسالة تختفي.
+  Future<void> _removePage(ScanPage pg, {bool ask = true}) async {
+    if (ask) {
+      final ok = await askYesNo(context, 'حذف الصفحة؟', 'الصفحة ${pages.indexOf(pg) + 1} هتتشال من المستند.',
+          yes: 'احذف', no: 'لا');
+      if (!ok || !mounted) return;
+    }
+    final at = pages.indexOf(pg);
+    if (at < 0) return;
+    pages.removeAt(at);
+    ScanDocs.hold.add(pg.path);
+    cur = cur.clamp(0, math.max(0, pages.length - 1));
+    await _persist();
+    if (!mounted) return;
+    setState(() {});
+    var undone = false;
+    final m = ScaffoldMessenger.of(context);
+    m.hideCurrentSnackBar();
+    final ctl = m.showSnackBar(SnackBar(
+      content: const Text('الصفحة اتحذفت'),
+      duration: const Duration(seconds: 5),
+      action: SnackBarAction(
+          label: 'تراجع',
+          onPressed: () async {
+            undone = true;
+            ScanDocs.hold.remove(pg.path);
+            if (!mounted || doc == null) return;
+            doc!.pages.insert(at.clamp(0, doc!.pages.length), pg);
+            await _persist();
+            if (mounted) _goto(at);
+          }),
+    ));
+    unawaited(ctl.closed.then((_) async {
+      if (undone) return;
+      ScanDocs.hold.remove(pg.path);
+      final still = (await ScanDocs.files()).contains(pg.path);
+      if (!still) {
+        await Store.del(pg.path);
+        for (final mk in pg.marks) {
+          try {
+            await File(mk.png).delete();
+          } catch (_) {}
+        }
+      }
+    }));
+  }
+
+  Future<void> _reorder(int a, int b) async {
+    // onReorderItem: b متظبط خلاص بعد شيل العنصر
+    final p = pages.removeAt(a);
+    pages.insert(b, p);
+    cur = b;
+    await _persist();
+    if (mounted) _goto(b);
+  }
+
+  // ---------- الفلتر ----------
+
+  Future<void> _filterSheet() async {
+    if (pages.isEmpty || busy) return;
+    final pg = pages[cur.clamp(0, pages.length - 1)];
+    final e = await Store.editOf(pg.path);
+    if (!mounted) return;
+    final res = await showModalBottomSheet<(ScanFilter, bool)>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => _DocFilterSheet(
+        path: pg.path,
+        current: e?.filter ?? ScanFilter.original,
+        isDefault: (f) => saved == f,
+        onStar: (f) async {
+          sel = f;
+          await _toggleDefault();
+        },
+        multi: pages.length > 1,
+      ),
+    );
+    if (res == null || !mounted) return;
+    final (f, all) = res;
+    sel = f;
+    if (all) {
+      await _applyStyleToAll(null, filter: f);
+      return;
+    }
+    _setBusy(true, 'بنطبّق الفلتر...');
+    try {
+      final prev = await Store.editOf(pg.path);
+      final np = await renderEditedPage(
+          pg.path,
+          'scan_',
+          EditParams(
+              quad: prev?.quad,
+              turns: prev?.turns ?? 0,
+              angle: prev?.angle ?? 0,
+              filter: f,
+              contrast: prev?.contrast ?? 0,
+              brightness: prev?.brightness ?? 0,
+              sharp: prev?.sharp ?? 0));
+      pg.path = np;
+      await _persist();
+    } catch (e, st) {
+      AppLog.e('scanner.filter', e, st);
+      if (mounted) snack(context, errText(e));
+    } finally {
+      _setBusy(false);
+    }
+  }
+
+  // ---------- النص والتوقيع ----------
+
+  Future<void> _ocr() async {
+    if (pages.isEmpty) return;
+    await showOcrTextSheet(context, pages[cur.clamp(0, pages.length - 1)].path,
+        title: 'النص (إنجليزي وأرقام بس، العربي مش مدعوم)');
+  }
+
+  Future<void> _sign() async {
+    if (pages.isEmpty || busy || doc == null) return;
+    final pg = pages[cur.clamp(0, pages.length - 1)];
+    final png = await Navigator.push<String>(
+        context, MaterialPageRoute(builder: (_) => SignMarkPicker(docId: doc!.id)));
+    if (png == null || !mounted) return;
+    // نسخة خاصة بالصفحة دي جوه فولدر المستند: مسح التوقيع المحفوظ أو مسح صفحة تانية ميأثرش عليها
+    String own = png;
+    try {
+      final dir = await ScanDocs.folder(doc!.id);
+      own = '${dir.path}/mark_${DateTime.now().microsecondsSinceEpoch}.png';
+      await File(png).copy(own);
+    } catch (e, st) {
+      AppLog.e('scan.markCopy', e, st);
+      own = png;
+    }
+    if (!mounted) return;
+    final placed = await Navigator.push<ScanMark>(
+        context, MaterialPageRoute(builder: (_) => MarkPlaceScreen(page: pg.path, mark: ScanMark(own, .7, .85, .3))));
+    if (placed == null && own != png) await Store.del(own);
+    if (placed == null || !mounted) return;
+    setState(() => pg.marks.add(placed));
+    await _persist();
+  }
+
+  Future<void> _editMark(ScanPage pg, int mi) async {
+    final r = await Navigator.push<ScanMark>(context,
+        MaterialPageRoute(builder: (_) => MarkPlaceScreen(page: pg.path, mark: pg.marks[mi], canRemove: true)));
+    if (r == null || !mounted) return;
+    setState(() {
+      if (r.w <= 0) {
+        pg.marks.removeAt(mi);
+      } else {
+        pg.marks[mi] = r;
+      }
+    });
+    await _persist();
+  }
+
+  // ---------- التصدير ----------
+
+  Future<void> _rename() async {
+    final d = doc;
+    if (d == null) return;
+    final n = await askScanName(context, d.name);
+    if (n == null || !mounted) return;
+    setState(() => d.name = n);
+    await _persist();
+  }
+
+  Future<void> _export() async {
+    final d = doc;
+    if (d == null || pages.isEmpty || busy) return;
+    final opt = await showModalBottomSheet<ScanExportOptions>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => _ExportSheet(name: d.name, pages: pages.length, card: d.isCard && pages.length == 2),
+    );
+    if (opt == null || !mounted) return;
+    if (opt.name != d.name) {
+      d.name = opt.name;
+      await _persist();
+    }
+    _setBusy(true, opt.pdf ? 'بنعمل الـ PDF...' : 'بنجهّز الصور...');
+    List<String> out;
+    try {
+      if (opt.pdf) {
+        final f = await buildScanPdf(d, balanced: opt.balanced, realCardSize: opt.realCard,
+            onProgress: (a, b) {
+          if (mounted) setState(() => progress = 'بنعمل الـ PDF $a/$b');
+        });
+        if (!d.pdfs.contains(f.path)) d.pdfs.add(f.path);
+        await _persist();
+        out = [f.path];
+      } else {
+        out = await buildScanJpgs(d, balanced: opt.balanced);
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.export', e, st);
+      if (mounted) snack(context, errText(e));
+      _setBusy(false);
+      return;
+    }
+    _setBusy(false);
+    if (!mounted) return;
+    final sent = await shareFiles(context, out);
+    final s = widget.session;
+    if (sent && s != null) {
+      await Store.addLog(s, 'scan', '${d.name} · ${pages.length} صفحة · ${opt.pdf ? 'PDF' : 'JPG'}');
+    }
+  }
+
+  // ---------- الشكل ----------
+
+  Widget _pageView(ScanPage pg) {
+    return LayoutBuilder(builder: (c, box) {
+      return FutureBuilder<double>(
+        future: _aspect.containsKey(pg.path)
+            ? Future.value(_aspect[pg.path])
+            : imageAspect(pg.path).then((h) {
+                final a = h > 0 ? 1 / h : 1.0; // imageAspect = طول/عرض
+                _aspect[pg.path] = a;
+                return a;
+              }),
+        builder: (_, snap) {
+          final a = snap.data;
+          if (a == null) return const Center(child: CircularProgressIndicator());
+          var w = box.maxWidth, h = w / a;
+          if (h > box.maxHeight) {
+            h = box.maxHeight;
+            w = h * a;
+          }
+          return Center(
+            child: SizedBox(
+              width: w,
+              height: h,
+              child: Stack(clipBehavior: Clip.none, children: [
+                Positioned.fill(
+                  child: Material(
+                    elevation: 3,
+                    child: Image.file(File(pg.path), fit: BoxFit.fill, cacheWidth: 1200, gaplessPlayback: true),
+                  ),
+                ),
+                for (var mi = 0; mi < pg.marks.length; mi++)
+                  Positioned(
+                    left: pg.marks[mi].cx * w - pg.marks[mi].w * w / 2,
+                    top: pg.marks[mi].cy * h - pg.marks[mi].w * w / 4,
+                    width: pg.marks[mi].w * w,
+                    child: GestureDetector(
+                      onTap: () => _editMark(pg, mi),
+                      child: Image.file(File(pg.marks[mi].png), fit: BoxFit.contain),
+                    ),
+                  ),
+              ]),
+            ),
+          );
+        },
+      );
+    });
+  }
+
+  Widget _tool(IconData ic, String t, VoidCallback? onTap, {Color? color}) => Expanded(
+        child: InkWell(
+          onTap: busy ? null : onTap,
+          borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Icon(ic, color: color),
+              const SizedBox(height: 2),
+              FittedBox(fit: BoxFit.scaleDown, child: Text(t, style: TextStyle(fontSize: 11, color: color))),
+            ]),
+          ),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final d = doc;
+    final srcLabel = kScanSources.firstWhere((e) => e.$1 == source, orElse: () => kScanSources.first);
+    return Scaffold(
+      appBar: AppBar(
+        title: InkWell(
+          onTap: d == null ? null : _rename,
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Flexible(child: Text(d?.name ?? 'سكانر', overflow: TextOverflow.ellipsis)),
+            const SizedBox(width: 4),
+            const Icon(Icons.edit_rounded, size: 16),
+          ]),
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'مستنداتي',
+            icon: const Icon(Icons.folder_copy_rounded),
+            onPressed: busy
+                ? null
+                : () async {
+                    await _persist();
+                    if (!context.mounted) return;
+                    await Navigator.push(
+                        context, MaterialPageRoute(builder: (_) => ScanDocsScreen(session: widget.session)));
+                  },
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: d == null
+            ? const Center(child: CircularProgressIndicator())
+            : Column(children: [
+                Expanded(
+                  child: pages.isEmpty
+                      ? _empty(cs, d)
+                      : Stack(children: [
+                          PageView.builder(
+                            controller: pager,
+                            itemCount: pages.length,
+                            onPageChanged: (i) => setState(() => cur = i),
+                            itemBuilder: (_, i) => Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                              child: GestureDetector(
+                                  onTap: () => _edit(i), child: _pageView(pages[i])),
+                            ),
+                          ),
+                          PositionedDirectional(
+                            top: 16,
+                            start: 22,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                              decoration: BoxDecoration(
+                                  color: Colors.black.withAlpha(150), borderRadius: BorderRadius.circular(20)),
+                              child: Text('${cur + 1} / ${pages.length}',
+                                  textDirection: TextDirection.ltr,
+                                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                            ),
+                          ),
+                          if (d.isCard && pages.length < 2)
+                            PositionedDirectional(
+                              bottom: 12,
+                              start: 0,
+                              end: 0,
+                              child: Center(
+                                child: FilledButton.icon(
+                                    onPressed: busy ? null : _captureCard,
+                                    icon: const Icon(Icons.flip_rounded),
+                                    label: const Text('صوّر ضهر البطاقة')),
+                              ),
+                            ),
+                        ]),
+                ),
+                if (busy)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    child: Column(children: [
+                      if (progress != null) Text(progress!, style: const TextStyle(fontSize: 12)),
+                      const LinearProgressIndicator(),
+                    ]),
+                  ),
+                if (pages.isNotEmpty) _strip(cs, d),
+                if (pages.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(4, 2, 4, 0),
+                    child: Row(children: [
+                      _tool(Icons.crop_rounded, 'قص', () => _edit(cur, tab: 0)),
+                      _tool(Icons.rotate_right_rounded, 'تدوير', () => _rotate(cur)),
+                      _tool(Icons.auto_awesome_rounded, 'فلتر', _filterSheet),
+                      _tool(Icons.camera_alt_rounded, 'إعادة تصوير', () async {
+                        final pg = pages[cur];
+                        final ok = await askYesNo(context, 'إعادة تصوير؟',
+                            'الصفحة ${cur + 1} القديمة هتتنقل للأرشيف (مش هتتمسح) وتتصوّر مكانها.',
+                            yes: 'صوّر', no: 'لا');
+                        if (!ok || !mounted) return;
+                        final at = pages.indexOf(pg);
+                        pages.remove(pg);
+                        await Store.archivePath(pg.path);
+                        await _persist();
+                        if (mounted) setState(() {});
+                        await _capture(replaceAt: at);
+                      }),
+                      _tool(Icons.text_snippet_rounded, 'النص', _ocr),
+                      _tool(Icons.draw_rounded, 'توقيع', _sign),
+                      _tool(Icons.delete_outline_rounded, 'حذف', () => _removePage(pages[cur]), color: cs.error),
+                    ]),
+                  ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+                  child: Row(children: [
+                    OutlinedButton.icon(
+                      onPressed: busy ? null : _pickSource,
+                      icon: Icon(srcLabel.$3, size: 18),
+                      label: Text(srcLabel.$2),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: SizedBox(
+                        height: 48,
+                        child: FilledButton.icon(
+                          style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+                          onPressed: busy || pages.isEmpty ? null : _export,
+                          icon: const Icon(Icons.ios_share_rounded),
+                          label: const Text('تصدير', style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                    ),
+                  ]),
+                ),
+              ]),
+      ),
+    );
+  }
+
+  Widget _empty(ColorScheme cs, ScanDoc d) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Icon(d.isCard ? Icons.badge_rounded : Icons.document_scanner_rounded, size: 72, color: kAccent),
+            const SizedBox(height: 12),
+            Text(d.isCard ? 'صوّر وش البطاقة وبعدين الضهر' : 'مستند جديد: صوّر صفحة أو أكتر (لحد $kScanMaxPages)',
+                textAlign: TextAlign.center, style: TextStyle(color: cs.onSurfaceVariant)),
+            const SizedBox(height: 18),
+            SizedBox(
+              width: 240,
+              height: 50,
+              child: FilledButton.icon(
+                  onPressed: busy ? null : (d.isCard ? _captureCard : () => _capture()),
+                  icon: const Icon(Icons.photo_camera_rounded),
+                  label: const Text('صوّر')),
+            ),
+            if (!d.isCard) ...[
+              const SizedBox(height: 10),
+              SizedBox(
+                width: 240,
+                child: OutlinedButton.icon(
+                    onPressed: busy ? null : _captureCard,
+                    icon: const Icon(Icons.badge_rounded),
+                    label: const Text('بطاقة (وش وضهر)')),
+              ),
+            ],
+          ]),
+        ),
+      );
+
+  Widget _strip(ColorScheme cs, ScanDoc d) => SizedBox(
+        height: 84,
+        child: Row(children: [
+          Expanded(
+            child: ReorderableListView.builder(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              buildDefaultDragHandles: false,
+              itemCount: pages.length,
+              onReorderItem: busy ? (a, b) {} : _reorder,
+              itemBuilder: (_, i) => ReorderableDelayedDragStartListener(
+                key: ValueKey('${pages[i].path}#$i'),
+                index: i,
+                child: GestureDetector(
+                  onTap: () => _goto(i),
+                  child: Container(
+                    width: 56,
+                    margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: i == cur ? kAccent : cs.outlineVariant, width: i == cur ? 2.5 : 1),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(6),
+                      child: Stack(fit: StackFit.expand, children: [
+                        Image.file(File(pages[i].path), fit: BoxFit.contain, cacheWidth: 160, gaplessPlayback: true),
+                        PositionedDirectional(
+                          bottom: 0,
+                          end: 0,
+                          child: Container(
+                            color: Colors.black54,
+                            padding: const EdgeInsets.symmetric(horizontal: 4),
+                            child: Text('${i + 1}', style: const TextStyle(color: Colors.white, fontSize: 11)),
+                          ),
+                        ),
+                      ]),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (!(d.isCard && pages.length >= 2))
+            Padding(
+              padding: const EdgeInsetsDirectional.only(end: 8),
+              child: InkWell(
+                onTap: busy ? null : (d.isCard ? _captureCard : () => _capture()),
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  width: 56,
+                  height: 72,
+                  decoration: BoxDecoration(
+                      border: Border.all(color: kAccent, width: 1.5), borderRadius: BorderRadius.circular(8)),
+                  child: Icon(Icons.add_rounded, color: kAccent, size: 30),
+                ),
+              ),
+            ),
+        ]),
+      );
+}
+
+enum _EditEnd { done, retake, stop }
+
+/// B1: نتيجة المحرر ممكن تكون مسار، أو «__nav__|next|مسار»، أو «__all__|ستايل|مسار».
+/// بنفصل المسار الحقيقي عن الأمر عشان الأمر ميتحفظش أبداً كمسار صفحة.
+({String path, String? dir, EditParams? allStyle}) parseEditorResult(String out) {
+  if (out.startsWith('$kAllPrefix|')) {
+    final parts = out.split('|');
+    return (path: parts.sublist(2).join('|'), dir: null, allStyle: EditParams.decode(parts[1]));
+  }
+  if (out.startsWith('$kNavPrefix|')) {
+    final parts = out.split('|');
+    return (path: parts.sublist(2).join('|'), dir: parts[1], allStyle: null);
+  }
+  return (path: out, dir: null, allStyle: null);
+}
+
+// ---------------------------------------------------------------------
+//  شيت الفلاتر (معاينة حيّة)
+// ---------------------------------------------------------------------
+class _DocFilterSheet extends StatefulWidget {
+  final String path;
+  final ScanFilter current;
+  final bool Function(ScanFilter) isDefault;
+  final Future<void> Function(ScanFilter) onStar;
+  final bool multi;
+  const _DocFilterSheet(
+      {required this.path, required this.current, required this.isDefault, required this.onStar, required this.multi});
+  @override
+  State<_DocFilterSheet> createState() => _DocFilterSheetState();
+}
+
+class _DocFilterSheetState extends State<_DocFilterSheet> {
+  late ScanFilter f = widget.current;
+  ui.Image? base; // معاينة مصغّرة من أصل الصفحة (قبل أي فلتر)
+  final Map<ScanFilter, ui.Image> clean = {};
+  bool loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    base?.dispose();
+    for (final i in clean.values) {
+      i.dispose();
+    }
+    super.dispose();
+  }
+
+  /// المعاينة من الصفحة الحالية لو مفيش فلتر مرسوم عليها؛ لو فيه، من نسخة الأصل (قبل القص).
+  Future<void> _load() async {
+    try {
+      final e = await Store.editOf(widget.path);
+      final bf = File(Store.baseOf(widget.path));
+      final useBase = e != null && e.filter != ScanFilter.original && await bf.exists();
+      final bytes = await File(useBase ? bf.path : widget.path).readAsBytes();
+      final img = await decodeImage(bytes, maxWidth: 700);
+      if (!mounted) {
+        img.dispose();
+        return;
+      }
+      setState(() {
+        base = img;
+        loading = false;
+      });
+      await _prep(f);
+    } catch (e, st) {
+      AppLog.e('scanner.filterPreview', e, st);
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> _prep(ScanFilter x) async {
+    final b = base;
+    if (b == null || !isCleanFilter(x) || clean.containsKey(x)) return;
+    setState(() => loading = true);
+    try {
+      final r = await cleanUiImage(b,
+          thermal: usesThermalClean(x), plain: x == ScanFilter.clean, photocopy: x == ScanFilter.receiptBw);
+      if (mounted) {
+        clean[x] = r;
+      } else {
+        r.dispose();
+      }
+    } catch (e, st) {
+      AppLog.e('scanner.filterClean', e, st);
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  Widget _preview() {
+    final b = base;
+    if (b == null) return const SizedBox(height: 280, child: Center(child: CircularProgressIndicator()));
+    final img = isCleanFilter(f) ? clean[f] : b;
+    Widget w = img == null
+        ? const Center(child: CircularProgressIndicator())
+        : RawImage(image: img, fit: BoxFit.contain);
+    if (img != null && !isCleanFilter(f) && f != ScanFilter.original) {
+      w = ColorFiltered(colorFilter: ColorFilter.matrix(editMatrix(f, 0, 0)), child: w);
+    }
+    return SizedBox(height: 300, child: w);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final star = widget.isDefault(f);
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          _preview(),
+          if (loading) const LinearProgressIndicator(minHeight: 2),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 44,
+            child: ListView(scrollDirection: Axis.horizontal, children: [
+              for (final x in kDocFilterOrder)
+                Padding(
+                  padding: const EdgeInsetsDirectional.only(end: 6),
+                  child: ChoiceChip(
+                    label: Text(kFilterLabels[x] ?? x.name),
+                    selected: x == f,
+                    onSelected: (_) {
+                      setState(() => f = x);
+                      _prep(x);
+                    },
+                  ),
+                ),
+            ]),
+          ),
+          const SizedBox(height: 8),
+          Row(children: [
+            IconButton(
+              tooltip: 'الفلتر الافتراضي للسكانر (الصفحات الجديدة)',
+              icon: Icon(star ? Icons.star_rounded : Icons.star_border_rounded, color: kAccent),
+              onPressed: () async {
+                await widget.onStar(f);
+                if (mounted) setState(() {});
+              },
+            ),
+            const Expanded(
+                child: Text('⭐ = افتراضي للسكانر بس', style: TextStyle(fontSize: 11), overflow: TextOverflow.ellipsis)),
+            if (widget.multi)
+              TextButton(onPressed: () => Navigator.pop(context, (f, true)), child: const Text('على الكل')),
+            const SizedBox(width: 4),
+            FilledButton(onPressed: () => Navigator.pop(context, (f, false)), child: const Text('طبّق')),
+          ]),
+        ]),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------
+//  شيت التصدير
+// ---------------------------------------------------------------------
+class ScanExportOptions {
+  final String name;
+  final bool pdf, balanced, realCard;
+  const ScanExportOptions(this.name, {this.pdf = true, this.balanced = true, this.realCard = true});
+}
+
+class _ExportSheet extends StatefulWidget {
+  final String name;
+  final int pages;
+  final bool card;
+  const _ExportSheet({required this.name, required this.pages, required this.card});
+  @override
+  State<_ExportSheet> createState() => _ExportSheetState();
+}
+
+class _ExportSheetState extends State<_ExportSheet> {
+  late final name = TextEditingController(text: widget.name);
+  bool pdf = true, balanced = true, realCard = true;
+
+  @override
+  void dispose() {
+    name.dispose();
+    super.dispose();
+  }
+
+  Widget _seg<T>(String title, T v, List<(T, String)> opts, ValueChanged<T> on) => Padding(
+        padding: const EdgeInsets.only(top: 10),
+        child: Row(children: [
+          SizedBox(width: 64, child: Text(title, style: const TextStyle(fontWeight: FontWeight.bold))),
+          Expanded(
+            child: SegmentedButton<T>(
+              showSelectedIcon: false,
+              segments: [for (final (k, t) in opts) ButtonSegment(value: k, label: Text(t))],
+              selected: {v},
+              onSelectionChanged: (s) => setState(() => on(s.first)),
+            ),
+          ),
+        ]),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Text('تصدير ${widget.pages} صفحة', style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            TextField(controller: name, decoration: const InputDecoration(labelText: 'اسم الملف', isDense: true)),
+            _seg<bool>('النوع', pdf, const [(true, 'PDF'), (false, 'صور JPG')], (v) => pdf = v),
+            _seg<bool>('الحجم', balanced, const [(true, 'متوازن'), (false, 'الأصل')], (v) => balanced = v),
+            if (widget.card && pdf)
+              _seg<bool>('البطاقة', realCard, const [(true, 'مقاسها الحقيقي'), (false, 'ملء الصفحة')],
+                  (v) => realCard = v),
+            const SizedBox(height: 6),
+            Text(
+                balanced
+                    ? 'متوازن: نفس وضوح الصور بحجم أقل (زي PDF الإيصالات)'
+                    : 'الأصل: الصور بحجمها الكامل (ملف أكبر)',
+                style: const TextStyle(fontSize: 12)),
+            if (pdf)
+              Text(widget.card ? 'صفحة A4 فيها الوش والضهر' : 'صفحات A4، كل صفحة طولي أو عرضي حسب الصورة',
+                  style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 14),
+            SizedBox(
+              height: 50,
+              child: FilledButton.icon(
+                style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+                onPressed: () => Navigator.pop(
+                    context,
+                    ScanExportOptions(scanSafeName(name.text),
+                        pdf: pdf, balanced: balanced, realCard: realCard)),
+                icon: const Icon(Icons.ios_share_rounded),
+                label: const Text('مشاركة', style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------
+//  بناء الـ PDF / JPG
+// ---------------------------------------------------------------------
+const kIdCardLongMm = 85.6, kIdCardShortMm = 53.98;
+double _mm(double v) => v * 72 / 25.4;
+
+/// مقاس صورة داخل صفحة PDF: [contain] جوه المساحة المتاحة.
+({double w, double h}) scanFit(double iw, double ih, double bw, double bh) {
+  final k = math.min(bw / iw, bh / ih);
+  return (w: iw * k, h: ih * k);
+}
+
+/// مقاس وش البطاقة الحقيقي (ID-1): الضلع الطويل 85.6 مم.
+({double w, double h}) idCardSize(double iw, double ih) {
+  final long = _mm(kIdCardLongMm);
+  return iw >= ih ? (w: long, h: long * ih / iw) : (w: long * iw / ih, h: long);
+}
+
+pw.Widget _pdfMarked(pw.ImageProvider img, double w, double h, List<(pw.ImageProvider, ScanMark)> marks) =>
+    pw.SizedBox(
+      width: w,
+      height: h,
+      child: pw.Stack(children: [
+        pw.Positioned.fill(child: pw.Image(img, fit: pw.BoxFit.fill)),
+        for (final (mi, m) in marks)
+          pw.Positioned(
+            left: m.cx * w - m.w * w / 2,
+            top: m.cy * h - m.w * w / 4,
+            child: pw.SizedBox(width: m.w * w, child: pw.Image(mi, fit: pw.BoxFit.contain)),
+          ),
+      ]),
+    );
+
+/// PDF المستند: كل صفحة A4 (طولي أو عرضي حسب الصورة). «متوازن» = pdfPageJpeg (نفس الإيصالات).
+/// بطاقة (صفحتين): صفحة A4 واحدة فيها الوش والضهر بنفس المقاس (حقيقي 85.6 مم أو ملء الصفحة).
+/// العلامات (توقيع/ختم) بتترسم طبقة فوق الصورة في الـ PDF بس. الملف بيتحفظ في مجلد المستند.
+Future<File> buildScanPdf(ScanDoc d,
+    {bool balanced = true, bool realCardSize = true, void Function(int, int)? onProgress}) async {
+  final doc = pw.Document(title: d.name);
+  Future<Uint8List> pageBytes(String p) async {
+    final b = await File(p).readAsBytes();
+    return balanced ? await pdfPageJpeg(b) : b;
+  }
+
+  Future<List<(pw.ImageProvider, ScanMark)>> marksOf(ScanPage pg) async => [
+        for (final m in pg.marks)
+          if (File(m.png).existsSync()) (pw.MemoryImage(await File(m.png).readAsBytes()), m)
+      ];
+
+  const margin = 18.0;
+  final total = d.pages.length;
+  if (d.isCard && total == 2) {
+    final faces = <(pw.ImageProvider, double, double, List<(pw.ImageProvider, ScanMark)>)>[];
+    for (final pg in d.pages) {
+      final b = await pageBytes(pg.path);
+      final sz = await imageSize(b);
+      faces.add((pw.MemoryImage(b), sz.w.toDouble(), sz.h.toDouble(), await marksOf(pg)));
+      onProgress?.call(faces.length, total);
+    }
+    const fmt = PdfPageFormat.a4;
+    final gap = _mm(12);
+    final availW = fmt.width - 2 * _mm(15), availH = (fmt.height - 2 * _mm(15) - gap) / 2;
+    // الاتنين بنفس المقاس: الضلع الطويل لكل وش متساوي
+    final sizes = [
+      for (final f in faces)
+        realCardSize ? idCardSize(f.$2, f.$3) : scanFit(f.$2, f.$3, availW, availH),
+    ];
+    if (!realCardSize) {
+      final long = math.min(math.max(sizes[0].w, sizes[0].h), math.max(sizes[1].w, sizes[1].h));
+      for (var i = 0; i < 2; i++) {
+        final f = faces[i];
+        sizes[i] = f.$2 >= f.$3 ? (w: long, h: long * f.$3 / f.$2) : (w: long * f.$2 / f.$3, h: long);
+      }
+    }
+    doc.addPage(pw.Page(
+      pageFormat: fmt,
+      margin: pw.EdgeInsets.all(_mm(15)),
+      build: (_) => pw.Column(
+        mainAxisAlignment: realCardSize ? pw.MainAxisAlignment.start : pw.MainAxisAlignment.spaceEvenly,
+        children: [
+          if (realCardSize) pw.SizedBox(height: _mm(20)),
+          pw.Center(child: _pdfMarked(faces[0].$1, sizes[0].w, sizes[0].h, faces[0].$4)),
+          pw.SizedBox(height: gap),
+          pw.Center(child: _pdfMarked(faces[1].$1, sizes[1].w, sizes[1].h, faces[1].$4)),
+        ],
+      ),
+    ));
+  } else {
+    var n = 0;
+    for (final pg in d.pages) {
+      final b = await pageBytes(pg.path);
+      final sz = await imageSize(b);
+      final land = sz.w > sz.h;
+      final fmt = land ? PdfPageFormat.a4.landscape : PdfPageFormat.a4;
+      final fit = scanFit(sz.w.toDouble(), sz.h.toDouble(), fmt.width - 2 * margin, fmt.height - 2 * margin);
+      final img = pw.MemoryImage(b);
+      final ms = await marksOf(pg);
+      doc.addPage(pw.Page(
+        pageFormat: fmt,
+        margin: const pw.EdgeInsets.all(margin),
+        build: (_) => pw.Center(child: _pdfMarked(img, fit.w, fit.h, ms)),
+      ));
+      onProgress?.call(++n, total);
+    }
+  }
+  final dir = await ScanDocs.folder(d.id);
+  final f = File('${dir.path}/${scanSafeName(d.name)}.pdf');
+  await f.writeAsBytes(await doc.save(), flush: true);
+  return f;
+}
+
+/// JPG للمشاركة (ملفات مؤقتة باسم المستند، مش في «ملفاتي»).
+/// بطاقة: صورة واحدة فيها الوش فوق والضهر تحت بنفس العرض. صفحة عليها توقيع: نسخة مؤقتة بالتوقيع.
+/// الصفحات من غير علامات وفي «الأصل»: الملف نفسه من غير أي إعادة ضغط.
+Future<List<String>> buildScanJpgs(ScanDoc d, {bool balanced = true}) async {
+  final tmp = Directory('${(await getTemporaryDirectory()).path}/scan_share_${DateTime.now().millisecondsSinceEpoch}');
+  await tmp.create(recursive: true);
+  final name = scanSafeName(d.name);
+  if (d.isCard && d.pages.length == 2) {
+    final out = File('${tmp.path}/$name.jpg');
+    await out.writeAsBytes(await composeCardJpeg(d.pages, balanced: balanced), flush: true);
+    return [out.path];
+  }
+  final res = <String>[];
+  for (var i = 0; i < d.pages.length; i++) {
+    final pg = d.pages[i];
+    var b = pg.marks.isEmpty ? await File(pg.path).readAsBytes() : await _withMarks(pg);
+    if (balanced) b = await pdfPageJpeg(b);
+    final out = File('${tmp.path}/$name${d.pages.length > 1 ? '_${i + 1}' : ''}.jpg');
+    await out.writeAsBytes(b, flush: true);
+    res.add(out.path);
+  }
+  return res;
+}
+
+/// نسخة من الصفحة عليها التوقيع/الختم (للمشاركة كـ JPG بس). جودة JPEG بتاعة السكانر (الأصل).
+Future<Uint8List> _withMarks(ScanPage pg) async {
+  final img = await decodeImage(await File(pg.path).readAsBytes());
+  try {
+    final w = img.width.toDouble(), h = img.height.toDouble();
+    final rec = ui.PictureRecorder();
+    final c = ui.Canvas(rec);
+    c.drawImage(img, ui.Offset.zero, ui.Paint());
+    for (final m in pg.marks) {
+      if (!File(m.png).existsSync()) continue;
+      final mi = await decodeImage(await File(m.png).readAsBytes());
+      final mw = m.w * w, mh = mw * mi.height / mi.width;
+      c.drawImageRect(mi, ui.Rect.fromLTWH(0, 0, mi.width.toDouble(), mi.height.toDouble()),
+          ui.Rect.fromLTWH(m.cx * w - mw / 2, m.cy * h - mw / 4, mw, mh), ui.Paint()..filterQuality = ui.FilterQuality.high);
+      mi.dispose();
+    }
+    final out = await rec.endRecording().toImage(img.width, img.height);
+    final bd = await out.toByteData(format: ui.ImageByteFormat.png);
+    out.dispose();
+    if (bd == null) throw Exception('تعذر رسم التوقيع');
+    return await FlutterImageCompress.compressWithList(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+        minWidth: img.width,
+        minHeight: img.height,
+        quality: await Store.jpegQuality(profile: ImageQualityProfile.receipts),
+        format: CompressFormat.jpeg);
+  } finally {
+    img.dispose();
+  }
+}
+
+/// وش وضهر البطاقة في صورة واحدة: الاتنين بنفس العرض (الأصغر فيهم، من غير تكبير)، على خلفية بيضا.
+/// بيتعمل للمشاركة بس (مؤقت)، والصفحات الأصلية زي ما هي.
+Future<Uint8List> composeCardJpeg(List<ScanPage> faces, {bool balanced = true}) async {
+  final imgs = <ui.Image>[];
+  try {
+    for (final f in faces) {
+      imgs.add(await decodeImage(f.marks.isEmpty ? await File(f.path).readAsBytes() : await _withMarks(f)));
+    }
+    final inner = imgs.map((e) => e.width).reduce(math.min).toDouble();
+    final m = (inner * 0.04).roundToDouble(), gap = (inner * 0.04).roundToDouble();
+    final hs = [for (final i in imgs) (i.height * inner / i.width).roundToDouble()];
+    final w = inner + 2 * m, h = hs.fold<double>(0, (a, b) => a + b) + 2 * m + gap;
+    final rec = ui.PictureRecorder();
+    final c = ui.Canvas(rec);
+    c.drawRect(ui.Rect.fromLTWH(0, 0, w, h), ui.Paint()..color = const ui.Color(0xFFFFFFFF));
+    var y = m;
+    for (var i = 0; i < imgs.length; i++) {
+      final im = imgs[i];
+      c.drawImageRect(im, ui.Rect.fromLTWH(0, 0, im.width.toDouble(), im.height.toDouble()),
+          ui.Rect.fromLTWH(m, y, inner, hs[i]), ui.Paint()..filterQuality = ui.FilterQuality.high);
+      y += hs[i] + gap;
+    }
+    final out = await rec.endRecording().toImage(w.toInt(), h.toInt());
+    // صورة واحدة بالعرض الأصغر (من غير تكبير)، وبعدين JPEG مرة واحدة
+    final bd = await out.toByteData(format: ui.ImageByteFormat.png);
+    out.dispose();
+    if (bd == null) throw Exception('تعذر دمج الوش والضهر');
+    final q = balanced ? kPdfJpegQuality : await Store.jpegQuality(profile: ImageQualityProfile.receipts);
+    return await FlutterImageCompress.compressWithList(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+        minWidth: w.toInt(), minHeight: h.toInt(), quality: q, format: CompressFormat.jpeg);
+  } finally {
+    for (final i in imgs) {
+      i.dispose();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+//  توقيع / ختم
+// ---------------------------------------------------------------------
+/// اختيار توقيع: ترسمه بصباعك، أو ختم/توقيع من صورة (الأبيض بيبقى شفاف). التوقيعات المحفوظة بتترجع تاني.
+class SignMarkPicker extends StatefulWidget {
+  final String docId;
+  const SignMarkPicker({super.key, required this.docId});
+  @override
+  State<SignMarkPicker> createState() => _SignMarkPickerState();
+}
+
+class _SignMarkPickerState extends State<SignMarkPicker> {
+  List<String> savedMarks = [];
+  final strokes = <List<Offset>>[];
+  Size pad = Size.zero;
+  bool busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<Directory> _marksDir() async {
+    final d = Directory('${(await Store.dir()).path}/scandocs/_marks');
+    if (!await d.exists()) await d.create(recursive: true);
+    return d;
+  }
+
+  Future<void> _load() async {
+    try {
+      final d = await _marksDir();
+      final l = [
+        await for (final e in d.list())
+          if (e is File && e.path.endsWith('.png')) e.path
+      ]..sort((a, b) => b.compareTo(a));
+      if (mounted) setState(() => savedMarks = l);
+    } catch (e, st) {
+      AppLog.e('sign.load', e, st);
+    }
+  }
+
+  Future<String> _save(Uint8List png) async {
+    final d = await _marksDir();
+    final f = File('${d.path}/m_${DateTime.now().microsecondsSinceEpoch}.png');
+    await f.writeAsBytes(png, flush: true);
+    return f.path;
+  }
+
+  Future<void> _fromDrawing() async {
+    if (strokes.isEmpty || pad.isEmpty) return;
+    setState(() => busy = true);
+    try {
+      const k = 3.0;
+      final rec = ui.PictureRecorder();
+      final c = ui.Canvas(rec);
+      final p = ui.Paint()
+        ..color = const ui.Color(0xFF0A2A8A)
+        ..strokeWidth = 3.2 * k
+        ..strokeCap = ui.StrokeCap.round
+        ..strokeJoin = ui.StrokeJoin.round
+        ..style = ui.PaintingStyle.stroke;
+      var minX = double.infinity, minY = double.infinity, maxX = 0.0, maxY = 0.0;
+      for (final s in strokes) {
+        for (final o in s) {
+          minX = math.min(minX, o.dx);
+          minY = math.min(minY, o.dy);
+          maxX = math.max(maxX, o.dx);
+          maxY = math.max(maxY, o.dy);
+        }
+      }
+      const pd = 8.0;
+      final ox = minX - pd, oy = minY - pd;
+      final w = ((maxX - minX + 2 * pd) * k).ceil(), h = ((maxY - minY + 2 * pd) * k).ceil();
+      for (final s in strokes) {
+        final path = ui.Path();
+        for (var i = 0; i < s.length; i++) {
+          final o = Offset((s[i].dx - ox) * k, (s[i].dy - oy) * k);
+          i == 0 ? path.moveTo(o.dx, o.dy) : path.lineTo(o.dx, o.dy);
+        }
+        if (s.length == 1) path.lineTo((s[0].dx - ox) * k + .1, (s[0].dy - oy) * k);
+        c.drawPath(path, p);
+      }
+      final img = await rec.endRecording().toImage(math.max(w, 8), math.max(h, 8));
+      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+      img.dispose();
+      if (bd == null) throw Exception('تعذر حفظ التوقيع');
+      final path = await _save(bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes));
+      if (mounted) Navigator.pop(context, path);
+    } catch (e, st) {
+      AppLog.e('sign.draw', e, st);
+      if (mounted) snack(context, errText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  /// ختم من صورة: بنصغّرها لـ 900 بكسل ونخلّي الأبيض شفاف.
+  Future<void> _fromPhoto() async {
+    XFile? x;
+    try {
+      x = await ImagePicker().pickImage(source: ImageSource.gallery);
+    } catch (e, st) {
+      AppLog.e('sign.pick', e, st);
+    }
+    if (x == null || !mounted) return;
+    setState(() => busy = true);
+    try {
+      final img = await decodeImage(await File(x.path).readAsBytes(), maxWidth: 900);
+      final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+      final w = img.width, h = img.height;
+      img.dispose();
+      if (bd == null) throw Exception('تعذر قراءة الصورة');
+      final px = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+      stampWhiteToAlpha(px);
+      final comp = Completer<ui.Image>();
+      ui.decodeImageFromPixels(px, w, h, ui.PixelFormat.rgba8888, comp.complete);
+      final o = await comp.future;
+      final png = await o.toByteData(format: ui.ImageByteFormat.png);
+      o.dispose();
+      if (png == null) throw Exception('تعذر حفظ الختم');
+      final path = await _save(png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes));
+      if (mounted) Navigator.pop(context, path);
+    } catch (e, st) {
+      AppLog.e('sign.photo', e, st);
+      if (mounted) snack(context, errText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(title: const Text('توقيع أو ختم')),
+      body: SafeArea(
+        child: ListView(padding: const EdgeInsets.all(12), children: [
+          const Text('ارسم توقيعك هنا:', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
+          LayoutBuilder(builder: (_, b) {
+            pad = Size(b.maxWidth, 200);
+            return Container(
+              height: 200,
+              decoration: BoxDecoration(
+                  color: Colors.white, border: Border.all(color: cs.outline), borderRadius: BorderRadius.circular(12)),
+              child: GestureDetector(
+                onPanStart: (d) => setState(() => strokes.add([d.localPosition])),
+                onPanUpdate: (d) => setState(() => strokes.last.add(d.localPosition)),
+                child: CustomPaint(painter: _StrokePainter(strokes), size: Size.infinite),
+              ),
+            );
+          }),
+          Row(children: [
+            TextButton(onPressed: busy ? null : () => setState(strokes.clear), child: const Text('امسح')),
+            const Spacer(),
+            FilledButton(
+                onPressed: busy || strokes.isEmpty ? null : _fromDrawing, child: const Text('استخدم التوقيع')),
+          ]),
+          const Divider(height: 24),
+          OutlinedButton.icon(
+              onPressed: busy ? null : _fromPhoto,
+              icon: const Icon(Icons.approval_rounded),
+              label: const Text('ختم أو توقيع من صورة')),
+          if (savedMarks.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            const Text('محفوظين قبل كده:', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              for (final m in savedMarks)
+                InkWell(
+                  onTap: () => Navigator.pop(context, m),
+                  onLongPress: () async {
+                    final ok = await askYesNo(context, 'مسح التوقيع المحفوظ؟', 'هيتشال من القايمة دي بس.',
+                        yes: 'امسح', no: 'لا');
+                    if (!ok) return;
+                    // الصفحات اللي عليها التوقيع ده بتفضل زي ما هي (لها نسخة في مجلد المستند)
+                    try {
+                      await File(m).delete();
+                    } catch (_) {}
+                    await _load();
+                  },
+                  child: Container(
+                    width: 110,
+                    height: 60,
+                    padding: const EdgeInsets.all(4),
+                    decoration: BoxDecoration(
+                        color: Colors.white, border: Border.all(color: cs.outlineVariant), borderRadius: BorderRadius.circular(8)),
+                    child: Image.file(File(m), fit: BoxFit.contain),
+                  ),
+                ),
+            ]),
+          ],
+          const SizedBox(height: 10),
+          Text('التوقيع بيترسم فوق الصفحة وقت التصدير بس، وصورة الصفحة نفسها مبتتغيرش.',
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// الأبيض/الفاتح جداً بيبقى شفاف، والباقي بيتدرّج (عشان حواف الختم تبقى ناعمة).
+void stampWhiteToAlpha(Uint8List px) {
+  for (var i = 0; i + 3 < px.length; i += 4) {
+    final l = (px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) ~/ 1000;
+    if (l >= 225) {
+      px[i + 3] = 0;
+    } else if (l > 170) {
+      px[i + 3] = (px[i + 3] * (225 - l) ~/ 55);
+    }
+  }
+}
+
+class _StrokePainter extends CustomPainter {
+  final List<List<Offset>> s;
+  _StrokePainter(this.s);
+  @override
+  void paint(Canvas c, Size size) {
+    final p = Paint()
+      ..color = const Color(0xFF0A2A8A)
+      ..strokeWidth = 3.2
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
+      ..style = PaintingStyle.stroke;
+    for (final st in s) {
+      final path = Path();
+      for (var i = 0; i < st.length; i++) {
+        i == 0 ? path.moveTo(st[i].dx, st[i].dy) : path.lineTo(st[i].dx, st[i].dy);
+      }
+      c.drawPath(path, p);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_StrokePainter o) => true;
+}
+
+/// مكان التوقيع على الصفحة: اسحبه بصباع، وكبّره/صغّره بصباعين أو بالشريط.
+class MarkPlaceScreen extends StatefulWidget {
+  final String page;
+  final ScanMark mark;
+  final bool canRemove;
+  const MarkPlaceScreen({super.key, required this.page, required this.mark, this.canRemove = false});
+  @override
+  State<MarkPlaceScreen> createState() => _MarkPlaceScreenState();
+}
+
+class _MarkPlaceScreenState extends State<MarkPlaceScreen> {
+  late ScanMark m = widget.mark;
+  double? aspect; // عرض/طول الصفحة
+  double _w0 = .3;
+
+  @override
+  void initState() {
+    super.initState();
+    imageAspect(widget.page).then((h) {
+      if (mounted) setState(() => aspect = h > 0 ? 1 / h : 1);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('مكان التوقيع'), actions: [
+        if (widget.canRemove)
+          IconButton(
+              tooltip: 'شيل التوقيع',
+              icon: const Icon(Icons.delete_outline_rounded),
+              onPressed: () => Navigator.pop(context, m.copy(w: 0))),
+        IconButton(
+            tooltip: 'تم', icon: const Icon(Icons.check_rounded), onPressed: () => Navigator.pop(context, m)),
+      ]),
+      body: SafeArea(
+        child: aspect == null
+            ? const Center(child: CircularProgressIndicator())
+            : Column(children: [
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: LayoutBuilder(builder: (_, box) {
+                      var w = box.maxWidth, h = w / aspect!;
+                      if (h > box.maxHeight) {
+                        h = box.maxHeight;
+                        w = h * aspect!;
+                      }
+                      return Center(
+                        child: SizedBox(
+                          width: w,
+                          height: h,
+                          child: GestureDetector(
+                            onScaleStart: (_) => _w0 = m.w,
+                            onScaleUpdate: (d) => setState(() {
+                              m = m.copy(
+                                cx: (m.cx + d.focalPointDelta.dx / w).clamp(0.0, 1.0).toDouble(),
+                                cy: (m.cy + d.focalPointDelta.dy / h).clamp(0.0, 1.0).toDouble(),
+                                w: d.pointerCount > 1 ? (_w0 * d.scale).clamp(.05, 1.0).toDouble() : m.w,
+                              );
+                            }),
+                            child: Stack(children: [
+                              Positioned.fill(child: Image.file(File(widget.page), fit: BoxFit.fill, cacheWidth: 1200)),
+                              Positioned(
+                                left: m.cx * w - m.w * w / 2,
+                                top: m.cy * h - m.w * w / 4,
+                                width: m.w * w,
+                                child: DecoratedBox(
+                                  decoration: BoxDecoration(border: Border.all(color: kAccent, width: 1.5)),
+                                  child: Image.file(File(m.png), fit: BoxFit.contain),
+                                ),
+                              ),
+                            ]),
+                          ),
+                        ),
+                      );
+                    }),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Row(children: [
+                    const Text('الحجم'),
+                    Expanded(
+                      child: Slider(
+                          value: m.w.clamp(.05, 1.0).toDouble(),
+                          min: .05,
+                          max: 1,
+                          onChanged: (v) => setState(() => m = m.copy(w: v))),
+                    ),
+                  ]),
+                ),
+              ]),
+      ),
+    );
+  }
+}
